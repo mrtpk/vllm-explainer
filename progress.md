@@ -77,7 +77,7 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 - FACT-CHECK FOCUS (all batches): b0 defect rate was ~41% (39/95). Brief every writer: check arg_utils overrides for defaults; FlashInfer sampler default; async scheduling default.
 
 - DECISION 1a questions: site/ is committed (as DeepInfer) at stage ends; code/v1-attention-backend merges backend.py + selector.py (OK); nav titles OK.
-- QUEUE (max 2 running): next writers B1b, B2b, B3a ... (plan §12 order), each followed by its fact check. Pattern: one writer + one fact checker at a time.
+- QUEUE (max 2 running): B3a FC, B4a FC, then B3b, B4b, B5, B5t, B6a, B6b, B6t, B7a, B7b, B8a, B8b, B9, B10, F. Pattern: one writer + one fact checker at a time.
 
 - FAQ material from b0: docs/design/metrics.md queue-time wording, arrival_time wording, TPOT formula differ from code (see notes/facts.md Conflicts).
 
@@ -110,7 +110,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-22 21:01 | B2a fact check | done ~21:35: ~270 claims, 37 defects. Supervisor REJECTED its 'last-slice abort bug' (abort is inside the loop) and removed the note from 3 pages; supervisor fixed the msgspec claim on processes-and-ipc. |
 | 2026-10-22 21:37 | B2b writer | done ~22:10; 5 diagrams, b2b.json 9 terms |
 | 2026-10-22 22:11 | B2b fact check | done ~22:45: ~380 claims, ~73 defects. NOTE: it started 3 forks itself (the 'unknown agents'); briefs now forbid sub-agents. |
-| 2026-10-22 22:32 | B3a writer (scheduler, kv-cache-manager + 3 modules + scheduler simulator) | running |
+| 2026-10-22 22:32 | B3a writer (scheduler, kv-cache-manager + 3 modules + scheduler simulator) | running (told: no sub-agents) |
+| 2026-10-22 22:47 | B4a writer (plugin-map, platform-plugins, platform-interface + 2 modules + plugin timeline) | running |
 | 2026-10-22 19:18 | 1b Tour 1 (t1) | done 19:45: 16 stops, 3 diagrams, request_stepper.js, t1.json (12 terms); not browser-checked by writer |
 | 2026-10-22 19:46 | Fact check t1 (+ browser check of stepper) | done ~20:00: ~230 claims, 38 defects (11 citation, 6 value, 9 logic, 3 default source, 9 other). Stepper OK at 1280/390, no overflow. |
 | 2026-10-22 19:49 | Fact check concepts/plugin-loading (+ folder descriptions) | done ~19:58: ~80 claims, 30 defects fixed (8 citation, 11 value/condition, 4 logic, 3 missing source, 5 glossary/folder). Open question answered (platform before general plugins in every process). |
