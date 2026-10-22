@@ -1,0 +1,206 @@
+---
+title: v1/engine/input_processor.py: from engine input to EngineCoreRequest
+nav_title: v1/engine/input_processor.py
+level: Intermediate
+prerequisites: concepts/engine-client, concepts/data-contracts
+related: concepts/engine-client, concepts/data-contracts, concepts/renderers-and-chat-templates, concepts/sampling-and-logits-processors, code/v1-engine-async-llm, code/v1-engine-output-processor, tours/life-of-a-chat-request
+summary: vllm/v1/engine/input_processor.py checks a rendered prompt and its sampling or pooling parameters, fills in defaults such as max_tokens and the EOS stop ids, and builds the EngineCoreRequest that goes to the engine core. It also makes the internal request id.
+---
+<h2>Purpose</h2>
+<p><code>vllm/v1/engine/input_processor.py</code> turns one rendered prompt and its parameters into one {{term engine-core-request}}. On the way, it rejects requests that the engine cannot run and fills in the defaults that the engine core needs.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/v1/engine/input_processor.py</code>, 657 lines of Python. One class.</td></tr>
+    <tr><th>Main class</th><td><code>InputProcessor</code> ({{cite vllm/v1/engine/input_processor.py:41}}).</td></tr>
+    <tr><th>Runs in</th><td>The API server process. <code>process_inputs</code> runs on the event loop for rendered inputs, and in the renderer's thread pool for raw prompts (<code>process_inputs_async</code>).</td></tr>
+    <tr><th>Called by</th><td><code>AsyncLLM.add_request</code> and <code>LLMEngine.add_request</code>; the beam search code reads its fields.</td></tr>
+    <tr><th>Calls</th><td><code>SamplingParams.verify</code>, <code>clone</code>, <code>update_from_generation_config</code>, <code>update_from_tokenizer</code>; <code>PoolingParams.verify</code>; the renderer (raw prompts, token-id checks); <code>current_platform.validate_request</code>; the logits processor validator.</td></tr>
+    <tr><th>Not in this file</th><td>Chat templates and tokenization (<code>vllm/renderers/</code>), the multimodal processor, the sending of the request (<code>core_client.py</code>), the engine core's <code>Request</code> (<code>vllm/v1/request.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>The name says "processor", but for <code>vllm serve</code> the heavy work is already done: the renderer has applied the chat template and tokenized the prompt. The input processor checks and packs.</p>
+
+<h2>Where it sits</h2>
+<p>The input processor stands between the renderer and the engine core client: renderer → <code>EngineInput</code> dict → <code>InputProcessor.process_inputs</code> → <code>EngineCoreRequest</code> → <code>assign_request_id</code> → engine core client. The page {{link concepts/data-contracts}} shows the types on both sides.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong><code>AsyncLLM.__init__</code></strong> makes one instance and gives it the shared renderer ({{cite vllm/v1/engine/async_llm.py:170}}). <code>LLMEngine</code> does the same ({{cite vllm/v1/engine/llm_engine.py:101}}).</li>
+  <li><strong><code>AsyncLLM.add_request</code></strong> calls <code>process_inputs</code> for rendered inputs and <code>process_inputs_async</code> for raw prompts, then <code>assign_request_id</code> ({{cite vllm/v1/engine/async_llm.py:481-521}}).</li>
+  <li><strong>The serving classes</strong> keep a reference to it as <code>self.input_processor</code> ({{cite vllm/entrypoints/generate/base/serving.py:151}}). Online beam search calls <code>resolve_watermarking</code> and reads <code>generation_config_fields</code> ({{cite vllm/entrypoints/generate/beam_search/online.py:49}}, {{cite vllm/entrypoints/generate/beam_search/online.py:78}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>SamplingParams.verify</code> and <code>PoolingParams.verify</code> for the parameter rules ({{cite vllm/v1/engine/input_processor.py:157-162}}, {{cite vllm/v1/engine/input_processor.py:245}}).</li>
+  <li>The logits processor validator, built once in the constructor. With Model Runner V2 it loads the custom logits processor classes ({{cite vllm/v1/engine/input_processor.py:93-113}}).</li>
+  <li><code>current_platform.validate_request</code>, a hook for platform plugins ({{cite vllm/v1/engine/input_processor.py:430}}).</li>
+  <li><code>renderer.validate_token_ids</code>, which rejects token ids outside the vocabulary ({{cite vllm/v1/engine/input_processor.py:646-647}}, {{cite vllm/renderers/base.py:453-458}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>InputProcessor.__init__</code></td><td>{{cite vllm/v1/engine/input_processor.py:42-84}}</td><td>Keeps config parts, the generation config, the renderer and the multimodal budget; makes <code>process_inputs_async</code>.</td></tr>
+    <tr><td><code>_build_logits_processors_params_validator</code></td><td>{{cite vllm/v1/engine/input_processor.py:93-113}}</td><td>Picks the validator of Model Runner V2 or V1.</td></tr>
+    <tr><td><code>resolve_watermarking</code> / <code>apply_watermarking</code></td><td>{{cite vllm/v1/engine/input_processor.py:115-136}}</td><td>Decide and store whether this request is watermarked.</td></tr>
+    <tr><td><code>_validate_params</code></td><td>{{cite vllm/v1/engine/input_processor.py:138-252}}</td><td>All checks of <code>SamplingParams</code> or <code>PoolingParams</code>.</td></tr>
+    <tr><td><code>_validate_lora</code></td><td>{{cite vllm/v1/engine/input_processor.py:278-295}}</td><td>A LoRA request needs LoRA to be enabled.</td></tr>
+    <tr><td><code>assign_request_id</code></td><td>{{cite vllm/v1/engine/input_processor.py:353-371}}</td><td>Moves the caller's id to <code>external_req_id</code> and adds 8 random characters.</td></tr>
+    <tr><td><code>process_inputs</code></td><td>{{cite vllm/v1/engine/input_processor.py:373-555}}</td><td>The main method: checks, defaults, multimodal features, the struct.</td></tr>
+    <tr><td><code>_validate_prompt_len</code></td><td>{{cite vllm/v1/engine/input_processor.py:557-602}}</td><td>Empty prompt, too long, or no room for one output token.</td></tr>
+    <tr><td><code>_validate_model_input(s)</code></td><td>{{cite vllm/v1/engine/input_processor.py:604-657}}</td><td>Length, embeddings mask, multimodal item size, token-id range.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>process_inputs</code>, part 1: checks and the engine input</h3>
+<x-code file="vllm/v1/engine/input_processor.py" lines="389-406" highlight="389-390,396-400,402-406" />
+<x-code file="vllm/v1/engine/input_processor.py" lines="420-433" highlight="425-428,430,433" />
+<ol>
+  <li><strong>Lines 389-390.</strong> Check the parameters and the LoRA request first. <code>_validate_params</code> returns the watermark decision; the code applies it later to its own copy.</li>
+  <li><strong>Lines 392-400.</strong> An explicit <code>data_parallel_rank</code> must be in range. The range is the local DP size with hybrid or external load balancing, else the full DP size.</li>
+  <li><strong>Lines 402-406.</strong> The <code>vllm serve</code> path: the prompt is already an engine input. Its <code>arrival_time</code>, set by the renderer, wins over a new <code>time.time()</code>.</li>
+  <li><strong>Lines 407-428.</strong> The old path for raw prompts logs a deprecation warning once and renders the prompt here.</li>
+  <li><strong>Line 430.</strong> The platform can reject the request.</li>
+  <li><strong>Lines 432-433.</strong> Split encoder and decoder inputs, and check their lengths and token ids.</li>
+</ol>
+
+<h3><code>process_inputs</code>, part 2: sampling parameters and defaults</h3>
+<x-code file="vllm/v1/engine/input_processor.py" lines="445-456" highlight="449,453" />
+<x-code file="vllm/v1/engine/input_processor.py" lines="476-499" highlight="476-480,489-492,493-494,498" />
+<ol>
+  <li><strong>Line 449.</strong> <code>clone()</code>: the caller's <code>SamplingParams</code> object can be shared by many requests, so the code changes only a copy. The comment at lines 450-451 says so.</li>
+  <li><strong>Lines 457-475.</strong> Two range checks for rarely used fields: <code>routed_experts_prompt_start</code> and the rows of <code>prompt_logprob_token_ids</code>.</li>
+  <li><strong>Lines 476-487.</strong> No <code>max_tokens</code>: use all the room that is left, <code>max_model_len − prompt_len</code>. Only now can <code>min_tokens</code> be checked against it.</li>
+  <li><strong>Lines 489-492.</strong> <code>update_from_generation_config</code> sets the EOS token id and adds the <code>eos_token_id</code> values of the model's generation config to <code>stop_token_ids</code>. With <code>ignore_eos</code>, it changes neither ({{cite vllm/sampling_params.py:775-803}}).</li>
+  <li><strong>Lines 493-494.</strong> <code>update_from_tokenizer</code> turns <code>bad_words</code> into token ids ({{cite vllm/sampling_params.py:805-847}}).</li>
+  <li><strong>Line 498.</strong> Pooling parameters are cloned too, but get no defaults here.</li>
+</ol>
+<x-note title="Not the sampling defaults">
+<p>This file does not apply the default temperature or top_p of the model's generation config. The chat serving layer does that when it builds <code>SamplingParams</code>: "Priority: user -&gt; server default -&gt; OpenAI default" ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:740-748}}). The input processor reads the generation config only for EOS ids (line 490 and {{cite vllm/v1/engine/input_processor.py:64}}).</p>
+</x-note>
+
+<h3><code>process_inputs</code>, part 3: the struct</h3>
+<x-code file="vllm/v1/engine/input_processor.py" lines="538-555" />
+<p>Every field comes from the steps above. <code>cache_salt</code> comes from the decoder input (line 548): a client can set it to keep its prefix-cache entries apart from other clients. <code>client_index</code>, <code>current_wave</code> and <code>external_req_id</code> keep their defaults here. The client and <code>assign_request_id</code> set them later.</p>
+
+<h3><code>assign_request_id</code></h3>
+<x-code file="vllm/v1/engine/input_processor.py" lines="353-371" highlight="358-362,363,364,371" />
+<ol>
+  <li><strong>Lines 358-362.</strong> A caller must not set <code>external_req_id</code> itself.</li>
+  <li><strong>Line 363.</strong> The caller's id becomes the external id. The output processor returns it in <code>RequestOutput.request_id</code>.</li>
+  <li><strong>Lines 364-369.</strong> With <code>VLLM_DISABLE_REQUEST_ID_RANDOMIZATION</code>, the id stays unchanged, with a warning about duplicates.</li>
+  <li><strong>Line 371.</strong> Else the first 8 characters of a new UUID are appended after a dash.</li>
+</ol>
+
+<h3><code>_validate_params</code> for sampling</h3>
+<x-code file="vllm/v1/engine/input_processor.py" lines="150-177" highlight="151-155,157-162,163-169,177" />
+<ol>
+  <li><strong>Lines 151-155.</strong> A <code>SamplingParams</code> request needs a model with a generation task.</li>
+  <li><strong>Lines 157-162.</strong> <code>SamplingParams.verify</code> checks the fields against the model, the spec decoding config, the structured output config and the tokenizer.</li>
+  <li><strong>Lines 163-175.</strong> <code>prompt_logprob_token_ids</code> needs Model Runner V2 and does not work with <code>--kv-sharing-fast-prefill</code>.</li>
+  <li><strong>Line 177.</strong> Custom logits processors can check their own request arguments.</li>
+</ol>
+<p>Further checks follow for diffusion models, sampling-mask replay, <code>thinking_token_budget</code> (needs a reasoning config) and trace replay ({{cite vllm/v1/engine/input_processor.py:179-220}}). Watermarking is resolved last, so a missing feature is reported before an incompatibility with watermarking ({{cite vllm/v1/engine/input_processor.py:221-223}}).</p>
+
+<h3><code>_validate_prompt_len</code></h3>
+<x-code file="vllm/v1/engine/input_processor.py" lines="565-602" highlight="565-566,569-573,574,593" />
+<ol>
+  <li><strong>Lines 565-566.</strong> An empty decoder prompt is an error.</li>
+  <li><strong>Lines 569-573.</strong> The limit is <code>max_model_len</code> for the decoder and the encoder cache size for an encoder prompt.</li>
+  <li><strong>Lines 574-591.</strong> Longer than the limit: error, with a hint for multimodal models.</li>
+  <li><strong>Lines 593-602.</strong> Exactly the limit, for a generative model: error too, because no room is left for one output token.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types in and out">
+<table>
+  <thead><tr><th>Value</th><th>Type</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>prompt</code></td><td><code>EngineInput</code> (a TypedDict such as <code>TokensInput</code>: <code>type</code>, <code>prompt_token_ids</code>, optional <code>prompt</code>, <code>arrival_time</code>, <code>cache_salt</code>) or a raw <code>PromptType</code></td><td>{{cite vllm/v1/engine/input_processor.py:376}}, {{cite vllm/inputs/engine.py:18-40}}</td></tr>
+    <tr><td><code>params</code></td><td><code>SamplingParams | PoolingParams</code></td><td>{{cite vllm/v1/engine/input_processor.py:377}}</td></tr>
+    <tr><td><code>supported_tasks</code></td><td><code>tuple[SupportedTask, ...]</code>, from the engine core</td><td>{{cite vllm/v1/engine/input_processor.py:378}}</td></tr>
+    <tr><td>multimodal features</td><td><code>list[MultiModalFeatureSpec]</code>, sorted by position in the prompt</td><td>{{cite vllm/v1/engine/input_processor.py:500-536}}</td></tr>
+    <tr><td>result</td><td><code>EngineCoreRequest</code></td><td>{{cite vllm/v1/engine/input_processor.py:538-555}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Processes and threads">
+<p>The class lives in the API server process. It has no lock and no thread of its own. <code>process_inputs_async</code> is <code>make_async(process_inputs)</code> with the renderer's executor ({{cite vllm/v1/engine/input_processor.py:79-84}}). So raw-prompt requests run in the same thread pool as the tokenizer. The comment explains why: tokenization and multimodal processing block, and must not block the event loop.</p>
+<p>The engine core repeats a few checks. For example, it checks the pooling task again in <code>EngineCore.add_request</code> ({{cite vllm/v1/engine/core.py:520-529}}). Structured-output grammars are compiled only in the engine core. The input thread starts the compilation in a thread pool of the structured output manager ({{cite vllm/v1/engine/core.py:1129-1135}}, {{cite vllm/v1/structured_output/__init__.py:196-197}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: three prompts and max_model_len = 32768">
+<p>Assume a generative model with <code>max_model_len = 32768</code> and a request with no <code>max_tokens</code> and no <code>min_tokens</code>.</p>
+<table>
+  <thead><tr><th>Prompt length</th><th>Result</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>61</td><td><code>max_tokens = 32707</code></td><td>32768 − 61 (lines 477-480)</td></tr>
+    <tr><td>32768</td><td><code>VLLMValidationError</code>: "plus the number of requested output tokens (at least 1) is longer"</td><td>equal to the limit, generative model (lines 593-602)</td></tr>
+    <tr><td>40000</td><td><code>VLLMValidationError</code>: "longer than the maximum model length of 32768"</td><td>line 574</td></tr>
+  </tbody>
+</table>
+<p>With <code>vllm serve</code>, the renderer usually rejects a too-long prompt first, during tokenization ({{cite vllm/renderers/params.py:518-538}}). The checks here also protect the paths that skip the renderer.</p>
+<p>The EOS ids work like this (illustrative ids). The tokenizer's EOS id is 151645, and the generation config lists <code>eos_token_id: [151645, 151643]</code>. Then <code>_eos_token_id</code> = 151645, and 151643 is added to <code>stop_token_ids</code>, because the code removes the primary EOS id from the set ({{cite vllm/sampling_params.py:789-803}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>sampling request for a pooling-only model</td><td><code>VLLMValidationError("This model does not support generation")</code></td><td>{{cite vllm/v1/engine/input_processor.py:151-155}}</td></tr>
+    <tr><td>pooling task not supported</td><td><code>VLLMValidationError</code> with the supported tasks</td><td>{{cite vllm/v1/engine/input_processor.py:239-243}}</td></tr>
+    <tr><td>params of another type</td><td><code>TypeError</code></td><td>{{cite vllm/v1/engine/input_processor.py:246-250}}</td></tr>
+    <tr><td>LoRA request without <code>--enable-lora</code></td><td><code>VLLMValidationError</code></td><td>{{cite vllm/v1/engine/input_processor.py:283-286}}</td></tr>
+    <tr><td><code>data_parallel_rank</code> out of range</td><td><code>VLLMValidationError</code></td><td>{{cite vllm/v1/engine/input_processor.py:396-400}}</td></tr>
+    <tr><td>raw prompt instead of a rendered input</td><td>deprecation warning, once</td><td>{{cite vllm/v1/engine/input_processor.py:408-412}}</td></tr>
+    <tr><td><code>min_tokens</code> larger than the computed <code>max_tokens</code></td><td><code>VLLMValidationError</code></td><td>{{cite vllm/v1/engine/input_processor.py:481-487}}</td></tr>
+    <tr><td>multimodal hashes that are not strings</td><td><code>ValueError</code> (a broken custom processor)</td><td>{{cite vllm/v1/engine/input_processor.py:508-515}}</td></tr>
+    <tr><td>multimodal item larger than the encoder cache</td><td><code>VLLMValidationError</code> that names <code>--limit-mm-per-prompt</code></td><td>{{cite vllm/v1/engine/input_processor.py:630-643}}</td></tr>
+    <tr><td>caller set <code>external_req_id</code></td><td><code>ValueError</code></td><td>{{cite vllm/v1/engine/input_processor.py:358-362}}</td></tr>
+  </tbody>
+</table>
+<p><code>VLLMValidationError</code> becomes HTTP 400 in the API server ({{cite vllm/entrypoints/serve/exception_handling/error_response.py:43-46}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_DISABLE_REQUEST_ID_RANDOMIZATION</code></td><td>0 ({{cite vllm/envs.py:1715-1716}})</td><td>{{cite vllm/v1/engine/input_processor.py:364}}</td><td>Keeps the caller's request id; deprecated.</td></tr>
+    <tr><td><code>VLLM_MAX_NUM_BAD_WORDS</code></td><td>128 ({{cite vllm/envs.py:1152-1154}})</td><td>{{cite vllm/sampling_params.py:809}}</td><td>Limit for the tokenized <code>bad_words</code>; more raises <code>VLLMValidationError</code>.</td></tr>
+  </tbody>
+</table>
+<p>The full list of variables is on {{link reference/env-vars}}.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/engine-client}}: where <code>add_request</code> calls this class.</li>
+  <li>{{link concepts/data-contracts}}: the fields of <code>EngineCoreRequest</code>.</li>
+  <li>{{link concepts/renderers-and-chat-templates}}: the step before, which makes the engine input.</li>
+  <li>{{link concepts/sampling-and-logits-processors}}: the parameters that this file checks.</li>
+  <li>{{link tours/life-of-a-chat-request#stop-5 | Tour 1, stop 5}}: this file in the path of one request.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">A chat request has no <code>max_tokens</code>. The prompt has 1,000 tokens, and <code>max_model_len</code> is 8192. Which <code>max_tokens</code> reaches the engine core?
+    <x-a><p>7192, if the server and the platform set no smaller limit. The chat serving layer computes it with <code>get_max_tokens</code>, the smallest of <code>max_model_len − prompt_len</code> and the other limits ({{cite vllm/entrypoints/serve/utils/api_utils.py:253-270}}). <code>process_inputs</code> would fill the same value if it were still <code>None</code> ({{cite vllm/v1/engine/input_processor.py:476-480}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>process_inputs</code> clone the <code>SamplingParams</code>?
+    <x-a><p>The caller's object can be shared across prompts, requests and engines. The code then changes the copy: watermarking, <code>max_tokens</code>, EOS and stop ids ({{cite vllm/v1/engine/input_processor.py:447-453}}, {{cite vllm/v1/engine/input_processor.py:476-494}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">The client sends the id <code>abc</code>. Which ids do the output processor and the engine core use?
+    <x-a><p>The engine core uses <code>abc-</code> plus 8 random characters, for example <code>abc-1f2e3d4c</code>. The output processor keeps <code>abc</code> as <code>external_req_id</code> and puts it into <code>RequestOutput.request_id</code> ({{cite vllm/v1/engine/input_processor.py:363-371}}). (For chat, the serving layer has already added the prefix <code>chatcmpl-</code>.)</p></x-a>
+  </x-q>
+  <x-q level="hard">A model has <code>max_model_len = 4096</code>. A prompt of exactly 4096 tokens reaches <code>process_inputs</code>. What happens, and would an embedding model behave the same?
+    <x-a><p>The generative model rejects it: the prompt length equals the limit, and the runner type is <code>"generate"</code>, so no room is left for one output token ({{cite vllm/v1/engine/input_processor.py:593-602}}). An embedding model has another runner type, so a prompt of exactly 4096 tokens passes; only a longer one fails ({{cite vllm/v1/engine/input_processor.py:574}}).</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,185 @@
+---
+title: The process and thread architecture of vllm serve
+nav_title: Architecture overview
+level: Intermediate
+prerequisites: learn/processes-and-ipc, learn/what-is-vllm
+related: concepts/engine-client, concepts/data-contracts, concepts/engine-core-loop, concepts/executors-and-workers, concepts/data-parallel-serving, concepts/distributed-groups, tours/life-of-a-chat-request, tours/multi-gpu-step, tours/serve-startup, code/v1-engine-core-client, code/v1-engine-async-llm
+summary: vllm serve runs API server processes for HTTP and text, one engine core process per data parallel rank for scheduling, and worker processes for the GPUs. ZMQ, shared memory and NCCL connect them.
+---
+<x-sentence>vllm serve splits its work over processes: API servers for HTTP and text, engine cores for scheduling, and workers for the GPUs.</x-sentence>
+
+<h2>The idea</h2>
+<p>An inference server does two kinds of work. CPU work: parse HTTP, apply the chat template, tokenize, detokenize and write the stream. GPU work: plan a batch, run the model and sample tokens. The GPU must never wait for the CPU work of the server. So vLLM puts the two kinds of work into different processes. The design doc says the multi-process architecture "separate[s] concerns and maximize[s] throughput" ({{cite docs/design/arch_overview.md:69}}).</p>
+<p><code>vllm serve</code> has three kinds of process:</p>
+<ul>
+  <li>The <strong>API server process</strong> (the {{term front-end}}). It runs FastAPI on uvicorn, the renderer and {{term async-llm}}. AsyncLLM is the {{term engine-client}} of the server.</li>
+  <li>The <strong>{{term engine-core | engine core}} process</strong>. It runs the scheduler, the KV cache manager and the {{term executor}} in a busy loop. There is one engine core process for each data parallel rank.</li>
+  <li>The <strong>{{term worker}} processes</strong>. Each one owns one GPU and holds a model runner. With one GPU and no parallelism, there is no worker process: the worker is an object inside the engine core process.</li>
+</ul>
+<p>The processes talk through three channels. {{term zmq | ZMQ}} sockets with {{term msgpack}} bytes connect the API servers and the engine cores. A shared-memory queue connects an engine core with its workers. NCCL connects the GPUs of one model copy. The page {{link learn/processes-and-ipc}} explains processes, sockets and serialization in general.</p>
+<p><strong>An everyday comparison.</strong> Think of an airport. The check-in desks (API servers) talk to the passengers and print the tickets. The control tower (engine core) decides which plane takes off next, but it does not fly a plane. The pilots (workers) fly the planes (GPUs). A large airport adds more desks, more towers and more pilots. The comparison stops here: in vLLM, each tower has its own fixed group of pilots, and every desk can send passengers to every tower.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b2a_arch_single" alt="Panel 1: three boxes. The API server process, which is the CLI process, runs uvicorn and FastAPI, the serving classes and AsyncLLM. AsyncLLM owns the renderer, the InputProcessor, the OutputProcessor with one RequestState per request, the AsyncMPClient with a ROUTER and a PULL socket, and the StatLoggerManager. The engine core process runs EngineCoreProc with a DEALER socket in the input thread, a PUSH socket in the output thread and the busy loop in the main thread; it owns the scheduler with the KV cache manager, the StructuredOutputManager and the UniProcExecutor with the worker and Model Runner V2. The GPU holds weights, KV cache blocks and CUDA graphs. EngineCoreRequest goes from the API server to the engine core as msgpack over ipc; EngineCoreOutputs come back the same way. Panel 2: the asyncio tasks of the front end, the three threads of the engine core, and the two CUDA streams of the GPU." caption="Figure: vllm serve on one GPU. Two processes, the objects that each one owns (panel 1), and the threads that do the work (panel 2)." />
+<p>Read panel 1 from left to right. Blue is the API server process, violet is the engine core process and green is the GPU. Amber arrows are ZMQ messages. Panel 2 shows that the front end has one event loop, and the engine core has two I/O threads beside the busy loop. The tour {{link tours/life-of-a-chat-request}} follows one request through this picture.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the API server process and AsyncLLM</h3>
+<p>With one API server, <code>vllm serve</code> runs the server in the CLI process itself. With more than one, the CLI process starts the API servers as children:</p>
+<x-code file="vllm/entrypoints/cli/serve.py" lines="147-156" highlight="151-152,156" />
+<p>Each API server builds its engine client with <code>AsyncLLM.from_vllm_config</code> ({{cite vllm/entrypoints/launchers/api_server/entry.py:93-103}}). The constructor makes all front-end parts of the engine:</p>
+<x-code file="vllm/v1/engine/async_llm.py" lines="167-201" highlight="167,170,180,193" caption="The renderer, the input processor, the output processor and the engine core client. <code>make_async_mp_client</code> also starts the engine core processes (Step 2)." />
+<p>The serving classes, for example the chat completion handler, take the renderer and the input processor from the engine client ({{cite vllm/entrypoints/generate/base/serving.py:150-151}}). So there is one renderer per API server process. The page {{link concepts/engine-client}} explains AsyncLLM in full.</p>
+
+<h3>Step 2: the engine core process starts</h3>
+<p>With one API server, the engine core client binds its sockets first. Then it starts the engine core processes and waits for them. (With several API servers, the CLI process binds the sockets and starts the engines; see Step 6.)</p>
+<x-code file="vllm/v1/engine/core_client.py" lines="670-697" highlight="673-682,695-697" />
+<p><code>launch_core_engines</code> makes one process per local data parallel rank. Its target is <code>EngineCoreProc.run_engine_core</code>, and its name is <code>EngineCore</code> or <code>EngineCore_DP&lt;rank&gt;</code> ({{cite vllm/v1/engine/utils.py:281-288}}). The client then waits for one ready message from each engine core. The wait has a timeout of <code>VLLM_ENGINE_READY_TIMEOUT_S</code> seconds, 600 by default ({{cite vllm/v1/engine/core_client.py:753-771}}, {{cite vllm/envs.py:812-814}}).</p>
+<p>The ready message is an <code>EngineCoreReadyResponse</code> ({{cite vllm/v1/engine/__init__.py:73-110}}). It carries values that the engine core computes at start-up, for example the number of KV cache blocks. The client copies them into its own config ({{cite vllm/v1/engine/core_client.py:847-873}}).</p>
+
+<h3>Step 3: inside the engine core process</h3>
+<p><code>EngineCore.__init__</code> makes its parts in this order: executor (with workers and model), KV caches, structured output manager, scheduler:</p>
+<x-code file="vllm/v1/engine/core.py" lines="146-185" highlight="147,160,161,177" />
+<p>The scheduler owns the KV cache manager ({{cite vllm/v1/core/sched/scheduler.py:329}}). <code>EngineCoreProc</code> adds the sockets and two I/O threads. The comment explains why: the threads release the GIL during socket I/O, so I/O and (de)serialization overlap with the GPU work:</p>
+<x-code file="vllm/v1/engine/core.py" lines="1238-1265" highlight="1244-1245,1256-1257" />
+<p>The main thread runs the {{term busy-loop}}: it takes messages from <code>input_queue</code>, runs one engine step and puts the outputs into <code>output_queue</code> ({{cite vllm/v1/engine/core.py:1609-1620}}). The page {{link concepts/engine-core-loop}} explains the loop.</p>
+
+<h3>Step 4: workers, in the same process or in their own</h3>
+<p>The executor backend decides where the workers run. The config chooses it in <code>ParallelConfig.__post_init__</code>:</p>
+<x-code file="vllm/config/parallel.py" lines="1055-1061" />
+<x-code file="vllm/config/parallel.py" lines="1096-1100" />
+<p>The first test uses <code>world_size_across_dp</code>, which is <code>world_size × data_parallel_size</code> ({{cite vllm/config/parallel.py:627-629}}). The <code>world_size</code> is <code>PP × TP × PCP</code> ({{cite vllm/config/parallel.py:965-969}}). So the <code>"uni"</code> backend applies only when TP, PP and DP are all 1 (and PCP too). Then <code>UniProcExecutor</code> builds the worker in its own process, the engine core process ({{cite vllm/v1/executor/uniproc_executor.py:51-75}}).</p>
+<p>In all other single-node cases on CUDA, the default backend is <code>"mp"</code>. Ray replaces it when Ray is active with a placement group, or when the data parallel backend is Ray ({{cite vllm/config/parallel.py:1061-1096}}). <code>MultiprocExecutor</code> starts one process per local rank, named <code>VllmWorker-&lt;rank&gt;</code> ({{cite vllm/v1/executor/multiproc_executor.py:191-207}}, {{cite vllm/v1/executor/multiproc_executor.py:745-750}}). The page {{link concepts/executors-and-workers}} explains both executors.</p>
+<x-warning title="DP > 1 also makes worker processes">
+<p>With <code>--data-parallel-size 2</code> and TP = 1, <code>world_size</code> is 1 but <code>world_size_across_dp</code> is 2. So the backend is <code>"mp"</code>, and each engine core gets one worker process. A dense engine core later sets its own DP size to 1, but it does not change the backend ({{cite vllm/config/parallel.py:1192-1201}}). (Derived from {{cite vllm/config/parallel.py:1055}}, {{cite vllm/v1/executor/abstract.py:80-83}} and {{cite vllm/v1/executor/multiproc_executor.py:191}}.) The worker runs inside the engine core process only when DP is 1 too.</p>
+</x-warning>
+
+<h3>Step 5: the three channels</h3>
+<p><strong>ZMQ between API servers and engine cores.</strong> The client binds a <code>ROUTER</code> socket for requests and a <code>PULL</code> socket for outputs (Step 2). The engine core connects a <code>DEALER</code> socket with its identity, one for each API server ({{cite vllm/v1/engine/core.py:1935-1943}}). It also connects one <code>PUSH</code> socket for each API server ({{cite vllm/v1/engine/core.py:2046-2052}}). The identity is the engine index as 2 little-endian bytes ({{cite vllm/v1/engine/core.py:1178-1179}}). The addresses are <code>ipc://</code> paths when the API server sends only to engines on its own node, and TCP addresses otherwise ({{cite vllm/v1/engine/utils.py:1137-1151}}). The client encodes requests with <code>MsgpackEncoder</code> and decodes <code>EngineCoreOutputs</code> with <code>MsgpackDecoder</code> ({{cite vllm/v1/engine/core_client.py:731-732}}).</p>
+<p><strong>Shared memory between an engine core and its workers.</strong> <code>MultiprocExecutor</code> makes one <code>MessageQueue</code> with a reader for each worker ({{cite vllm/v1/executor/multiproc_executor.py:165-171}}). Every call, for example <code>execute_model</code>, goes into this queue once and reaches all workers ({{cite vllm/v1/executor/multiproc_executor.py:428}}). The queue pickles the object ({{cite vllm/distributed/device_communicators/shm_broadcast.py:934-940}}). Only one worker replies to <code>execute_model</code>: the first TP rank of the last PP stage ({{cite vllm/v1/executor/multiproc_executor.py:549-563}}).</p>
+<p><strong>NCCL between GPUs.</strong> Inside the forward pass, the workers of one TP group exchange activations with collectives. On CUDA, each device communicator with more than one rank makes a <code>PyNcclCommunicator</code> ({{cite vllm/distributed/device_communicators/cuda_communicator.py:106-111}}). With PP, each stage after the first receives the intermediate tensors of the stage before it. Each stage before the last sends them on ({{cite vllm/v1/worker/gpu_worker.py:1337-1342}}, {{cite vllm/v1/worker/gpu_worker.py:1375-1378}}). The page {{link concepts/distributed-groups}} explains the groups.</p>
+
+<h3>Step 6: how the counts change with TP, PP, DP and API servers</h3>
+<p>TP and PP are explained in {{deepinfer learn/parallelism | Parallelism basics}}. In vLLM they change only the number of workers per engine core. DP changes the number of engine cores. <code>--api-server-count</code> changes the number of API servers. Its default depends on the load balancing mode:</p>
+<x-code file="vllm/entrypoints/cli/serve.py" lines="107-130" highlight="114-115,124-125" />
+<p>So with internal load balancing, the default is one API server per DP rank. Each API server gets a <code>client_index</code> and the <code>client_count</code> ({{cite vllm/v1/utils.py:230-238}}). With DP &gt; 1 and internal load balancing, the client is a <code>DPLBAsyncMPClient</code> that can send each request to any engine core ({{cite vllm/v1/engine/core_client.py:158-169}}). So the API servers and the engine cores form a many-to-many network.</p>
+<x-diagram name="b2a_arch_multi" alt="Panel 1: the CLI process starts and watches all processes and serves no HTTP. Two API server processes, ApiServer_0 and ApiServer_1, each with AsyncLLM, a DPLBAsyncMPClient and its own ROUTER and PULL pair, share one listen socket. A DP coordinator process collects waiting, running and KV usage counts and publishes them to the API servers. A ZMQ bus connects every API server with both engine cores. DP rank 0 holds EngineCore_DP0 with the scheduler, the KV cache manager and a MultiprocExecutor, and two worker processes on GPUs 0 and 1. DP rank 1 holds EngineCore_DP1 and two workers on GPUs 2 and 3. A shared-memory MessageQueue connects each engine core with its workers. Panel 2: three cards for the three channels. ZMQ with msgpack carries EngineCoreRequest and EngineCoreOutputs. The shared-memory queue with pickle carries SchedulerOutput to every worker and ModelRunnerOutput back from rank 0 only. NCCL carries activations between the workers of a TP group inside the forward pass." caption="Figure: <code>vllm serve -tp 2 -dp 2</code> with a dense model. Ten processes (panel 1) and the format of each channel (panel 2)." />
+<p>The model is dense, so each DP rank is an independent copy of the model. The {{term dp-coordinator}} exists because the API servers balance the load with its counts. The deep dive below gives the rules for each process type.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Every thread and task, by process">
+<table>
+  <thead><tr><th>Process</th><th>Thread or task</th><th>What it does</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>API server</td><td>main thread, uvloop event loop</td><td>runs uvicorn, FastAPI and all asyncio tasks below</td><td>{{cite vllm/entrypoints/cli/serve.py:156}}, {{cite vllm/v1/utils.py:527-529}}</td></tr>
+    <tr><td>API server</td><td>one uvicorn task per HTTP request, plus one handler task for routes with <code>with_cancellation</code></td><td><code>with_cancellation</code> runs the route in its own task and cancels it when the client goes away</td><td>{{cite vllm/entrypoints/serve/utils/api_utils.py:93-109}}</td></tr>
+    <tr><td>API server</td><td>task <code>output_handler</code></td><td>moves engine outputs into the per-request collectors</td><td>{{cite vllm/v1/engine/async_llm.py:876-946}}</td></tr>
+    <tr><td>API server</td><td>task <code>EngineCoreOutputQueueTask</code></td><td>reads the PULL socket and decodes the outputs</td><td>{{cite vllm/v1/engine/core_client.py:1208-1262}}</td></tr>
+    <tr><td>API server</td><td>task <code>watchdog_loop</code></td><td>every 5 seconds, stops the server if the engine has died</td><td>{{cite vllm/entrypoints/launchers/launcher.py:233-237}}, {{cite vllm/entrypoints/launchers/launcher.py:314-322}}</td></tr>
+    <tr><td>API server</td><td>stats task (DP clients only)</td><td>reads the load counts that the DP coordinator publishes</td><td>{{cite vllm/v1/engine/core_client.py:1513-1597}}</td></tr>
+    <tr><td>API server</td><td>renderer thread pools</td><td>chat template and tokenizer; a second one-thread pool for multimodal work</td><td>{{cite vllm/renderers/base.py:140-150}}</td></tr>
+    <tr><td>API server</td><td>thread <code>MPClientEngineMonitor</code></td><td>only when this client started the engine cores: marks the engine dead when an engine core process exits</td><td>{{cite vllm/v1/engine/core_client.py:818-845}}</td></tr>
+    <tr><td>engine core</td><td>main thread</td><td><code>run_busy_loop()</code>: input queue, engine step, output queue</td><td>{{cite vllm/v1/engine/core.py:1609-1620}}</td></tr>
+    <tr><td>engine core</td><td>input thread</td><td><code>process_input_sockets()</code>: receive, decode, make the <code>Request</code></td><td>{{cite vllm/v1/engine/core.py:1921-2028}}</td></tr>
+    <tr><td>engine core</td><td>output thread</td><td><code>process_output_sockets()</code>: encode and send the outputs</td><td>{{cite vllm/v1/engine/core.py:2030-2096}}</td></tr>
+    <tr><td>engine core</td><td>thread pools of <code>StructuredOutputManager</code></td><td>grammar compilation (half the CPUs); a bitmask pool only when <code>max_num_seqs</code> &gt; 128. Python starts the pool threads at the first task.</td><td>{{cite vllm/v1/structured_output/__init__.py:78-96}}</td></tr>
+    <tr><td>engine core</td><td>thread <code>MultiprocWorkerMonitor</code> (mp executor only)</td><td>detects a dead worker, shuts the executor down and calls the failure callback</td><td>{{cite vllm/v1/executor/multiproc_executor.py:300-331}}</td></tr>
+    <tr><td>worker</td><td>main thread</td><td><code>worker_busy_loop()</code>: dequeue an RPC from the shared-memory queue and run it</td><td>{{cite vllm/v1/executor/multiproc_executor.py:1041-1048}}</td></tr>
+    <tr><td>worker</td><td>thread <code>WorkerAsyncOutputCopy</code> (async scheduling only)</td><td>waits for the GPU result and puts it into the response queue</td><td>{{cite vllm/v1/executor/multiproc_executor.py:690-699}}</td></tr>
+    <tr><td>DP coordinator</td><td>one process</td><td>collects and publishes load counts; for MoE, tracks the request waves and wakes paused engines</td><td>{{cite vllm/v1/engine/coordinator.py:23-54}}</td></tr>
+  </tbody>
+</table>
+<p>The ZMQ library also starts its own I/O threads. The client context of the front end asks for two ({{cite vllm/v1/engine/core_client.py:621}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Process counts: the rules and four worked examples">
+<p>The counts below are for one node and the default settings. A = API servers, DP = data parallel size, W = workers.</p>
+<table>
+  <thead><tr><th>Process</th><th>Count</th><th>Rule in the code</th></tr></thead>
+  <tbody>
+    <tr><td>CLI supervisor</td><td>1 when A &gt; 1, else 0 (the CLI process is the API server)</td><td>{{cite vllm/entrypoints/cli/serve.py:151-156}}</td></tr>
+    <tr><td>API server</td><td>A; default DP with internal load balancing</td><td>{{cite vllm/entrypoints/cli/serve.py:113-130}}</td></tr>
+    <tr><td>DP coordinator</td><td>1 when DP &gt; 1 and (MoE model, or not external load balancing); only DP rank 0 starts it</td><td>{{cite vllm/config/vllm.py:870-874}}, {{cite vllm/v1/engine/utils.py:1230-1232}}</td></tr>
+    <tr><td>engine core</td><td>DP (one per rank)</td><td>{{cite vllm/v1/engine/utils.py:281-288}}</td></tr>
+    <tr><td>worker</td><td>0 when TP = PP = DP = 1; else TP × PP per engine core</td><td>{{cite vllm/config/parallel.py:1055-1100}}, {{cite vllm/v1/executor/multiproc_executor.py:191-207}}</td></tr>
+  </tbody>
+</table>
+<p>Worked examples (derived from the rules above):</p>
+<table>
+  <thead><tr><th>Command</th><th>CLI</th><th>API</th><th>coord.</th><th>engine cores</th><th>workers</th><th>total</th></tr></thead>
+  <tbody>
+    <tr><td><code>vllm serve M</code></td><td>0</td><td>1</td><td>0</td><td>1</td><td>0</td><td>2</td></tr>
+    <tr><td><code>vllm serve M -tp 4</code></td><td>0</td><td>1</td><td>0</td><td>1</td><td>4</td><td>6</td></tr>
+    <tr><td><code>vllm serve M -dp 2</code> (dense)</td><td>1</td><td>2</td><td>1</td><td>2</td><td>2</td><td>8</td></tr>
+    <tr><td><code>vllm serve M -tp 2 -dp 2</code> (dense)</td><td>1</td><td>2</td><td>1</td><td>2</td><td>4</td><td>10</td></tr>
+  </tbody>
+</table>
+<p>The totals do not count short-lived helpers. A model registry subprocess can run for a short time at start-up, only when the model information cache misses ({{cite vllm/model_executor/models/registry.py:1086-1109}}). vLLM sets <code>TORCHINDUCTOR_COMPILE_THREADS=1</code>, so torch.compile starts no pool of compile processes ({{cite vllm/env_override.py:168}}).</p>
+<x-note title="Process titles in ps and top">
+<p>vLLM sets readable process titles when the <code>setproctitle</code> package is present. The prefix is <code>VLLM_PROCESS_NAME_PREFIX</code>, default <code>VLLM</code> ({{cite vllm/utils/system_utils.py:203-217}}, {{cite vllm/envs.py:1921}}). Examples: <code>VLLM::APIServer_0</code> ({{cite vllm/v1/utils.py:524}}), <code>VLLM::EngineCore</code> or <code>VLLM::EngineCore_DP1</code> ({{cite vllm/v1/engine/core.py:1464-1470}}). Workers rename themselves after the parallel groups exist, for example <code>Worker_TP0</code> ({{cite vllm/v1/executor/multiproc_executor.py:1083-1115}}).</p>
+</x-note>
+</x-deepdive>
+
+<x-deepdive title="Data parallel: engine cores, GPUs and the coordinator">
+<ol>
+  <li><strong>Engine class.</strong> For a MoE model with DP &gt; 1, the engine core is a <code>DPEngineCoreProc</code>. For every other model, it is a plain <code>EngineCoreProc</code>, and the config of the rank is changed to DP = 1. The comment says: "Non-MoE DP ranks are completely independent, so treat like DP=1" ({{cite vllm/v1/engine/core.py:1533-1543}}).</li>
+  <li><strong>GPUs per rank.</strong> Local DP rank <code>r</code> gets the visible devices <code>r × world_size</code> to <code>r × world_size + local_world_size − 1</code>, mapped to physical ids through <code>CUDA_VISIBLE_DEVICES</code>. The docstring gives the example "[2, 3] for local_dp_rank=1" with <code>world_size=2</code> and 4 devices ({{cite vllm/v1/engine/utils.py:444-445}}, {{cite vllm/v1/engine/utils.py:462-469}}).</li>
+  <li><strong>Coordinator.</strong> The engines send their counts of waiting and running requests and the KV cache usage when the counts change ({{cite vllm/v1/engine/core.py:1622-1633}}). The coordinator publishes them to the API servers every 100 ms by default when they changed, else every 5 s ({{cite vllm/v1/engine/coordinator.py:152}}, {{cite vllm/v1/engine/coordinator.py:264-267}}). Wave coordination is on only for MoE models ({{cite vllm/v1/engine/utils.py:1261-1265}}).</li>
+  <li><strong>MoE lock-step.</strong> A <code>DPEngineCoreProc</code> runs a dummy batch when it has no work but other ranks have work. A collective tells all ranks if any rank has unfinished requests ({{cite vllm/v1/engine/core.py:2485-2505}}).</li>
+  <li><strong>Outputs and stats.</strong> The engine core sends each output to the socket of the API server that sent the request: <code>client_index</code> selects the socket ({{cite vllm/v1/engine/core.py:2071}}, {{cite vllm/v1/engine/core.py:2089-2091}}). It sends the scheduler stats of a step to only one front end ({{cite vllm/v1/core/sched/scheduler.py:2516-2521}}).</li>
+</ol>
+<p>The page {{link concepts/data-parallel-serving}} explains load balancing modes and waves.</p>
+</x-deepdive>
+
+<x-deepdive title="Start-up order and the ready handshake">
+<ol>
+  <li>The API server process makes <code>AsyncLLM</code> ({{cite vllm/entrypoints/launchers/api_server/entry.py:93-103}}).</li>
+  <li>The engine core client binds the ROUTER and PULL sockets and starts the engine core processes ({{cite vllm/v1/engine/core_client.py:670-702}}).</li>
+  <li>Each engine core loads the general plugins, builds the executor and the workers, profiles memory and builds the KV cache, then the scheduler ({{cite vllm/v1/engine/core.py:129-185}}).</li>
+  <li>The engine core starts its I/O threads. The input thread sends the ready payload on each DEALER socket. A ROUTER can only send to a peer that has sent to it first ({{cite vllm/v1/engine/core.py:1961-1968}}).</li>
+  <li>The client receives one ready message per engine, with timeout <code>VLLM_ENGINE_READY_TIMEOUT_S</code>, and applies the values from the engine ({{cite vllm/v1/engine/core_client.py:753-771}}). For example, it takes the smaller <code>max_model_len</code> and adds up <code>num_gpu_blocks</code> over the engines ({{cite vllm/v1/engine/core_client.py:865-873}}).</li>
+  <li>The client starts <code>MPClientEngineMonitor</code> ({{cite vllm/v1/engine/core_client.py:776-777}}). Then <code>AsyncLLM</code> makes the stat loggers and starts the output handler if an event loop runs ({{cite vllm/v1/engine/async_llm.py:203-224}}).</li>
+</ol>
+<p>The tour {{link tours/serve-startup}} follows the full start-up.</p>
+</x-deepdive>
+
+<x-deepdive title="Docs and code: four differences">
+<ul>
+  <li><strong>"1 worker process per GPU".</strong> The design doc says so for every GPU ({{cite docs/design/arch_overview.md:89-91}}). In the code, with TP = PP = DP = 1, the backend is <code>"uni"</code> and the worker is an object in the engine core process ({{cite vllm/config/parallel.py:1099-1100}}). So the doc's formula <code>A + DP + N</code> gives 3 processes for a single GPU ({{cite docs/design/arch_overview.md:113}}), but the code runs 2.</li>
+  <li><strong>"1 DP coordinator process (only when data parallelism is enabled)".</strong> The doc gives this rule ({{cite docs/design/arch_overview.md:97-99}}). The code does not start it for a dense model with external load balancing ({{cite vllm/config/vllm.py:868-874}}).</li>
+  <li><strong>The process total.</strong> The doc counts 17 processes for <code>-tp=2 -dp=4</code> ({{cite docs/design/arch_overview.md:123-125}}). With more than one API server, the CLI process stays alive as a supervisor ({{cite vllm/entrypoints/cli/serve.py:384-390}}). So the real total is 18. (Derived.)</li>
+  <li><strong>AsyncLLMEngine.</strong> The doc says the OpenAI-compatible server uses <code>AsyncLLMEngine</code> ({{cite docs/design/arch_overview.md:166}}). The server makes <code>AsyncLLM</code> ({{cite vllm/entrypoints/launchers/api_server/entry.py:94}}); <code>AsyncLLMEngine</code> is only an old alias.</li>
+</ul>
+<p>The docs images are useful as a second view: <a href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/assets/design/arch_overview/v1_process_architecture_tp4.png">TP = 4</a> and <a href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/assets/design/arch_overview/v1_process_architecture_tp2_dp4.png">TP = 2, DP = 4</a>.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>The engine core does not become ready.</strong> A large model can load for a long time. After <code>VLLM_ENGINE_READY_TIMEOUT_S</code> (600 s by default) the client raises <code>TimeoutError</code> with a message that names the variable ({{cite vllm/v1/engine/core_client.py:756-768}}).</li>
+  <li><strong>A worker process dies.</strong> The worker monitor of the executor logs "Worker proc ... died unexpectedly" and calls the failure callback ({{cite vllm/v1/executor/multiproc_executor.py:314-326}}). The callback puts <code>EXECUTOR_FAILED</code> into the input queue of the engine core ({{cite vllm/v1/engine/core.py:1174-1176}}). The busy loop raises <code>RuntimeError("Executor failed.")</code> ({{cite vllm/v1/engine/core.py:1766-1767}}).</li>
+  <li><strong>The engine core dies.</strong> On a fatal error it sends <code>ENGINE_CORE_DEAD</code> to every API server ({{cite vllm/v1/engine/core.py:1570-1576}}, {{cite vllm/v1/engine/core.py:2066-2069}}). The client then raises {{term engine-dead-error}} ({{cite vllm/v1/engine/core_client.py:581-584}}). The API server shuts down, unless <code>VLLM_KEEP_ALIVE_ON_ENGINE_DEATH</code> is set ({{cite vllm/entrypoints/launchers/launcher.py:325-337}}).</li>
+  <li><strong>Not enough GPUs.</strong> When the world size is larger than the number of GPUs on the node, the config raises <code>ValueError</code> ({{cite vllm/config/parallel.py:1067-1078}}).</li>
+  <li><strong>Flags that do not combine.</strong> <code>--api-server-count</code> &gt; 0 with <code>--headless</code> raises <code>ValueError</code> ({{cite vllm/entrypoints/cli/serve.py:69-75}}). Runtime LoRA updates with more than one API server raise <code>ValueError</code> ({{cite vllm/entrypoints/cli/serve.py:315-318}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> To size a server, you must know how many processes and CPU threads it needs. To debug it, you must know which process logs what. A tokenizer error appears in an API server, a scheduler error in an engine core, and a CUDA error in a worker. To scale it, you must know which flag adds which process.</p>
+
+<x-quiz>
+  <x-q level="easy">You run <code>vllm serve</code> with one GPU and default flags. How many vLLM processes run, and where does the worker run?
+    <x-a><p>Two: the API server (the CLI process) and one engine core process. The world size across DP is 1, so the executor backend is <code>"uni"</code> ({{cite vllm/config/parallel.py:1099-1100}}). <code>UniProcExecutor</code> builds the worker inside the engine core process ({{cite vllm/v1/executor/uniproc_executor.py:51-75}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Which socket types carry requests and outputs between an API server and an engine core?
+    <x-a><p>Requests: the API server's <code>ROUTER</code> sends to the engine core's <code>DEALER</code>. Outputs: the engine core's <code>PUSH</code> sends to the API server's <code>PULL</code> ({{cite vllm/v1/engine/core_client.py:673-682}}, {{cite vllm/v1/engine/core.py:1935-1943}}, {{cite vllm/v1/engine/core.py:2046-2052}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does the engine core process have an input thread and an output thread, and not only the busy loop?
+    <x-a><p>ZMQ socket I/O releases the GIL, and the main thread often waits for the GPU. So the I/O threads can receive, send and (de)serialize messages while the GPU runs the step. The comment at {{cite vllm/v1/engine/core.py:1238-1242}} gives this reason. The input thread even builds the <code>Request</code> object, with its block hashes, in parallel with the model ({{cite vllm/v1/engine/core.py:1114-1128}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You run <code>vllm serve</code> with <code>-dp 2</code>, TP = 1 and a dense model on one node. How many processes run, and is there a worker process?
+    <x-a><p>Eight: the CLI supervisor, two API servers, one DP coordinator, two engine cores and two worker processes. The default API server count is the DP size ({{cite vllm/entrypoints/cli/serve.py:124-125}}). Internal load balancing needs the coordinator ({{cite vllm/config/vllm.py:870-874}}). The backend test uses <code>world_size_across_dp</code> = 2, so the backend is <code>"mp"</code>, not <code>"uni"</code> ({{cite vllm/config/parallel.py:1055-1061}}). <code>MultiprocExecutor</code> starts one process for its one local rank ({{cite vllm/v1/executor/multiproc_executor.py:191-207}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With TP = 2, which worker answers <code>execute_model</code>, and how does the call reach the other worker?
+    <x-a><p>The executor puts the call once into the shared-memory <code>MessageQueue</code>, which every worker reads ({{cite vllm/v1/executor/multiproc_executor.py:428}}). Only the output rank replies. It is <code>world_size − TP × PCP</code> = 2 − 2 = 0, the first TP rank of the last PP stage ({{cite vllm/v1/executor/multiproc_executor.py:549-563}}).</p></x-a>
+  </x-q>
+</x-quiz>

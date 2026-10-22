@@ -1,0 +1,227 @@
+---
+title: v1/engine/output_processor.py: from token ids to RequestOutputs
+nav_title: v1/engine/output_processor.py
+level: Advanced
+prerequisites: concepts/engine-client, concepts/data-contracts
+related: concepts/engine-client, concepts/data-contracts, code/v1-engine-async-llm, code/v1-engine-input-processor, concepts/metrics-and-observability, tours/life-of-a-chat-request
+summary: vllm/v1/engine/output_processor.py turns the EngineCoreOutputs of each step into RequestOutputs. It keeps one RequestState per request, detokenizes incrementally, checks stop strings, collects logprobs, merges n > 1 children and feeds the per-request collectors.
+---
+<h2>Purpose</h2>
+<p><code>vllm/v1/engine/output_processor.py</code> turns the token ids that come back from the engine core into {{term request-output | RequestOutputs}} with text. It is the only place in the front end that loops over all outputs of a step.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/v1/engine/output_processor.py</code>, 1,047 lines of Python. Helpers in <code>detokenizer.py</code> (373 lines), <code>logprobs.py</code> (366 lines) and <code>parallel_sampling.py</code> (152 lines).</td></tr>
+    <tr><th>Main classes</th><td><code>RequestOutputCollector</code> ({{cite vllm/v1/engine/output_processor.py:53}}), <code>RequestState</code> ({{cite vllm/v1/engine/output_processor.py:183}}), <code>OutputProcessor</code> ({{cite vllm/v1/engine/output_processor.py:551}}).</td></tr>
+    <tr><th>Runs in</th><td>The API server process, on the event loop, inside the {{term output-handler}} task. Offline: in the caller's thread of <code>LLMEngine.step</code>.</td></tr>
+    <tr><th>Called by</th><td><code>AsyncLLM</code> (<code>add_request</code>, <code>abort</code>, the output handler) and <code>LLMEngine</code>.</td></tr>
+    <tr><th>Calls</th><td><code>IncrementalDetokenizer</code>, <code>LogprobsProcessor</code>, <code>ParentRequest</code>, <code>IterationStats</code>, the tracing helpers.</td></tr>
+    <tr><th>Not in this file</th><td>EOS and stop-token-id checks (the scheduler in the engine core), the SSE format (the serving classes), the Prometheus metrics (<code>vllm/v1/metrics/</code>).</td></tr>
+  </tbody>
+</table>
+<p>The docstring of <code>process_outputs</code> states the design rule: "vLLM V1 minimizes the number of python loops over the full batch ... This is the only function that should loop over EngineCoreOutputs" ({{cite vllm/v1/engine/output_processor.py:746-753}}).</p>
+
+<h2>Where it sits</h2>
+<p>The engine core client gives the output handler one <code>EngineCoreOutputs</code> per step. The handler passes slices of its <code>outputs</code> list to <code>process_outputs</code>. For each entry, the output processor finds the {{term request-state}}, updates it, and puts a <code>RequestOutput</code> into the collector of the request. The <code>generate()</code> task of the request takes it from there. The diagram on {{link concepts/engine-client#the-picture}} shows this path.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong><code>AsyncLLM.__init__</code></strong> makes one <code>OutputProcessor</code> with the tokenizer, <code>log_stats</code> and the server-wide <code>stream_interval</code> ({{cite vllm/v1/engine/async_llm.py:180-186}}).</li>
+  <li><strong><code>AsyncLLM._add_request</code></strong> calls <code>add_request</code> before it sends the request ({{cite vllm/v1/engine/async_llm.py:581}}). <code>add_request</code> makes the collector first ({{cite vllm/v1/engine/async_llm.py:529}}).</li>
+  <li><strong>The output handler</strong> calls <code>process_outputs</code> per slice and <code>update_scheduler_stats</code> per message; on an error it calls <code>propagate_error</code> ({{cite vllm/v1/engine/async_llm.py:905-910}}, {{cite vllm/v1/engine/async_llm.py:924}}, {{cite vllm/v1/engine/async_llm.py:944}}).</li>
+  <li><strong><code>AsyncLLM.abort</code></strong> calls <code>abort_requests</code> ({{cite vllm/v1/engine/async_llm.py:955}}).</li>
+  <li><strong><code>AsyncLLM.check_admission</code></strong> reads <code>get_num_unfinished_requests</code> and <code>get_num_queued_tokens</code> ({{cite vllm/v1/engine/async_llm.py:319-323}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>IncrementalDetokenizer.from_new_request</code>: a fast detokenizer with a <code>tokenizers</code> <code>DecodeStream</code>, a slow Python one, or a no-op one when there is no tokenizer. <code>detokenize=False</code> removes the tokenizer for the request ({{cite vllm/v1/engine/detokenizer.py:49-66}}, {{cite vllm/v1/engine/output_processor.py:297-298}}).</li>
+  <li><code>LogprobsProcessor.from_new_request</code> and <code>update_from_output</code> ({{cite vllm/v1/engine/logprobs.py:46-71}}, {{cite vllm/v1/engine/logprobs.py:360-366}}).</li>
+  <li><code>ParentRequest.get_outputs</code> for <code>n &gt; 1</code> ({{cite vllm/v1/engine/parallel_sampling.py:102-128}}).</li>
+  <li><code>IterationStats.update_from_output</code> and <code>update_from_finished_request</code> for metrics ({{cite vllm/v1/engine/output_processor.py:1003-1047}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>RequestOutputCollector</code></td><td>{{cite vllm/v1/engine/output_processor.py:53-113}}</td><td>One-slot queue per request; merges DELTA outputs.</td></tr>
+    <tr><td><code>StreamingInputOutputCollector</code></td><td>{{cite vllm/v1/engine/output_processor.py:128-160}}</td><td>Like the collector, but does not merge across input-chunk boundaries.</td></tr>
+    <tr><td><code>RequestState</code></td><td>{{cite vllm/v1/engine/output_processor.py:183-252}}</td><td>Everything the front end keeps per request.</td></tr>
+    <tr><td><code>RequestState.from_new_request</code></td><td>{{cite vllm/v1/engine/output_processor.py:273-352}}</td><td>Builds the state, the detokenizer and the logprobs processor from an <code>EngineCoreRequest</code>.</td></tr>
+    <tr><td><code>RequestState.make_request_output</code></td><td>{{cite vllm/v1/engine/output_processor.py:354-420}}</td><td>Decides if an output is due, and builds it.</td></tr>
+    <tr><td><code>RequestState._new_completion_output</code></td><td>{{cite vllm/v1/engine/output_processor.py:475-529}}</td><td>Text, token ids and logprobs for one sequence, by output kind.</td></tr>
+    <tr><td><code>OutputProcessor.add_request</code></td><td>{{cite vllm/v1/engine/output_processor.py:663-693}}</td><td>Registers a new request, or queues a streaming-input update.</td></tr>
+    <tr><td><code>OutputProcessor.process_outputs</code></td><td>{{cite vllm/v1/engine/output_processor.py:728-894}}</td><td>The loop over all outputs of a step.</td></tr>
+    <tr><td><code>OutputProcessor.abort_requests</code></td><td>{{cite vllm/v1/engine/output_processor.py:599-661}}</td><td>Removes requests by external or internal id; emits a final ABORT output.</td></tr>
+    <tr><td><code>_trim_surplus_tokens</code></td><td>{{cite vllm/v1/engine/output_processor.py:896-915}}</td><td>Drops tokens after a matched stop string.</td></tr>
+    <tr><td><code>BaseIncrementalDetokenizer.update</code></td><td>{{cite vllm/v1/engine/detokenizer.py:96-155}}</td><td>Decodes new ids into text and checks stop strings.</td></tr>
+    <tr><td><code>check_stop_strings</code></td><td>{{cite vllm/v1/engine/detokenizer.py:321-373}}</td><td>Finds the earliest stop string in the new text.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>process_outputs</code>, part 1: find the state, update stats</h3>
+<x-code file="vllm/v1/engine/output_processor.py" lines="757-777" highlight="759-762,764-772,775-777" />
+<x-code file="vllm/v1/engine/output_processor.py" lines="790-800" />
+<ol>
+  <li><strong>Lines 759-762.</strong> No state means the request was aborted, or finished on a stop string, in the front end. The output is ignored.</li>
+  <li><strong>Lines 764-772.</strong> An output with <code>error</code> set means the engine rejected the request on arrival, for example a paused engine. The collector gets the exception.</li>
+  <li><strong>Lines 775-777.</strong> Timing stats, only when <code>iteration_stats</code> exists (stats on).</li>
+  <li><strong>Lines 790-800.</strong> The first output ends the prefill. Its <code>prefill_stats</code> give the number of prompt tokens that came from the prefix cache.</li>
+</ol>
+
+<h3><code>process_outputs</code>, part 2: detokenize, logprobs, output</h3>
+<x-code file="vllm/v1/engine/output_processor.py" lines="818-842" highlight="824-833,842" />
+<x-code file="vllm/v1/engine/output_processor.py" lines="849-866" highlight="849-857,861-866" />
+<ol>
+  <li><strong>Lines 824-827.</strong> The detokenizer appends the new ids and returns a matched stop string or <code>None</code>. The second argument is true when the engine stopped the request with <code>STOP</code>: EOS or a stop token id.</li>
+  <li><strong>Lines 828-833.</strong> A stop string sets the finish reason to <code>STOP</code>, with the string as <code>stop_reason</code>, and trims surplus tokens.</li>
+  <li><strong>Line 842.</strong> Sample and prompt logprobs, if the request asked for them.</li>
+  <li><strong>Lines 849-857.</strong> <code>make_request_output</code> can return <code>None</code>: in <code>FINAL_ONLY</code> mode before the end, or between two stream intervals.</li>
+  <li><strong>Lines 861-866.</strong> AsyncLLM: into the collector. LLMEngine: into the returned list.</li>
+</ol>
+
+<h3><code>process_outputs</code>, part 3: free finished requests</h3>
+<x-code file="vllm/v1/engine/output_processor.py" lines="868-894" highlight="869,877,878-882,885-889" />
+<ol>
+  <li><strong>Line 877.</strong> <code>_finish_request</code> removes the state, the id mapping and, for the last child, the parent ({{cite vllm/v1/engine/output_processor.py:917-932}}).</li>
+  <li><strong>Lines 878-882.</strong> If the engine core did not finish the request itself (a stop string), its id goes to <code>reqs_to_abort</code>. The output handler sends these aborts after each slice ({{cite vllm/v1/engine/async_llm.py:918-922}}).</li>
+  <li><strong>Lines 885-889.</strong> Finished-request stats and an optional trace span.</li>
+</ol>
+
+<h3><code>make_request_output</code>: is an output due?</h3>
+<x-code file="vllm/v1/engine/output_processor.py" lines="364-400" highlight="367-369,379-392,394-400" />
+<x-code file="vllm/v1/engine/output_processor.py" lines="402-420" highlight="402,406-412" />
+<ol>
+  <li><strong>Lines 367-369.</strong> <code>FINAL_ONLY</code> (a request without <code>stream</code>) gets one output, at the end.</li>
+  <li><strong>Lines 379-392.</strong> With <code>stream_interval &gt; 1</code>, an output goes out only at the end, for the first token, or after <code>stream_interval</code> new tokens.</li>
+  <li><strong>Lines 394-400.</strong> In that case the DELTA output carries all tokens since the last sent one.</li>
+  <li><strong>Line 402.</strong> The output uses the external id, the one the client knows.</li>
+  <li><strong>Lines 406-412.</strong> A child of an <code>n &gt; 1</code> request asks its parent which outputs to send, and uses the parent's external id.</li>
+</ol>
+
+<h3>Incremental detokenization and stop strings</h3>
+<x-code file="vllm/v1/engine/detokenizer.py" lines="103-131" highlight="107-111,116-124,126-128" />
+<ol>
+  <li><strong>Lines 107-111.</strong> When the engine stopped the request on EOS or a stop token, the last token is not decoded, unless <code>include_stop_str_in_output</code> is set. So the final chunk of a chat stream has empty content.</li>
+  <li><strong>Lines 116-124.</strong> Each new id gives the next piece of text through <code>decode_next</code>. With stop strings, <code>token_offsets</code> records the text length after each token.</li>
+  <li><strong>Lines 126-128.</strong> The skipped stop token still counts as an output token.</li>
+</ol>
+<x-code file="vllm/v1/engine/detokenizer.py" lines="132-155" highlight="134,136,137-142,150-153" />
+<ol>
+  <li><strong>Line 134.</strong> Stop strings count only after <code>min_tokens</code> output tokens.</li>
+  <li><strong>Line 136.</strong> The new text starts at the first token after <code>min_tokens</code>.</li>
+  <li><strong>Lines 137-142.</strong> <code>check_stop_strings</code> searches the new text plus up to (stop string length − 1) characters before it. So it finds a stop string that two tokens complete. It picks the stop string that ends first ({{cite vllm/v1/engine/detokenizer.py:336-361}}).</li>
+  <li><strong>Lines 150-153.</strong> Tokens after the token that completed the stop string are dropped, and the text is cut.</li>
+</ol>
+<p>The fast detokenizer primes a <code>DecodeStream</code> with the prompt ids, so the first output token decodes in context ({{cite vllm/v1/engine/detokenizer.py:191-198}}). The text that a stream may send is shorter than the decoded text by <code>stop_buffer_length</code> = the longest stop string minus 1. This holds back a stop string that is only partly generated ({{cite vllm/v1/engine/detokenizer.py:85-90}}, {{cite vllm/v1/engine/detokenizer.py:161-176}}).</p>
+
+<h3>n &gt; 1: the parent request</h3>
+<x-code file="vllm/v1/engine/parallel_sampling.py" lines="102-128" highlight="108-115,117-121,122-125,127" />
+<ol>
+  <li><strong>Lines 108-115.</strong> A finished child leaves <code>child_requests</code>. A second finished output of the same child is not sent again.</li>
+  <li><strong>Lines 117-121.</strong> Streaming: each child's output goes out as it comes, with its own <code>index</code>.</li>
+  <li><strong>Lines 122-125.</strong> <code>FINAL_ONLY</code>: the parent collects all <code>n</code> outputs and sends them together when the last child finishes.</li>
+  <li><strong>Line 127.</strong> The parent is finished when no child is left.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: what RequestState holds">
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td><code>request_id</code>, <code>external_req_id</code></td><td><code>str</code></td><td>internal key; id for the client</td></tr>
+    <tr><td><code>parent_req</code>, <code>request_index</code></td><td><code>ParentRequest | None</code>, <code>int</code></td><td><code>n &gt; 1</code> fan-in; the <code>index</code> of the choice</td></tr>
+    <tr><td><code>output_kind</code></td><td><code>RequestOutputKind</code>: <code>CUMULATIVE</code>, <code>DELTA</code> or <code>FINAL_ONLY</code> ({{cite vllm/sampling_params.py:208-214}})</td><td>what each output carries</td></tr>
+    <tr><td><code>prompt</code>, <code>prompt_token_ids</code>, <code>prompt_len</code></td><td><code>str | None</code>, <code>list[int] | None</code>, <code>int</code></td><td>copied into every <code>RequestOutput</code></td></tr>
+    <tr><td><code>detokenizer</code>, <code>logprobs_processor</code></td><td>see above</td><td>text, stop strings, logprobs</td></tr>
+    <tr><td><code>is_prefilling</code>, <code>num_cached_tokens</code></td><td><code>bool</code>, <code>int</code></td><td>admission token count; prefix-cache hits for the usage info</td></tr>
+    <tr><td><code>queue</code></td><td><code>RequestOutputCollector | None</code></td><td>AsyncLLM only</td></tr>
+    <tr><td><code>stats</code></td><td><code>RequestStateStats | None</code></td><td>timing, only with <code>log_stats</code></td></tr>
+    <tr><td><code>stream_interval</code>, <code>sent_tokens_offset</code></td><td><code>int</code></td><td>chunking of the stream</td></tr>
+  </tbody>
+</table>
+<p>Sources: {{cite vllm/v1/engine/output_processor.py:208-252}}. A request's own <code>stream_interval</code> can only raise the server value, never lower it ({{cite vllm/v1/engine/output_processor.py:300-302}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: a stop string across two tokens">
+<p>A request has <code>stop=["END"]</code>, <code>include_stop_str_in_output=False</code>, <code>min_tokens=0</code> and a stream (DELTA). So <code>stop_buffer_length</code> = 3 − 1 = 2. The tokens are illustrative.</p>
+<table>
+  <thead><tr><th>Step</th><th>New token text</th><th><code>output_text</code></th><th>Stop check</th><th>Chunk sent</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><code>"The"</code></td><td><code>"The"</code> (3)</td><td>no match</td><td><code>"T"</code>: text[0:1], because 3 − 2 = 1</td></tr>
+    <tr><td>2</td><td><code>" answer"</code></td><td><code>"The answer"</code> (10)</td><td>no match</td><td><code>"he answ"</code>: text[1:8]</td></tr>
+    <tr><td>3</td><td><code>" E"</code></td><td><code>"The answer E"</code> (12)</td><td>searches the last 2 + 3 − 1 characters; no match</td><td><code>"er"</code>: text[8:10]</td></tr>
+    <tr><td>4</td><td><code>"ND"</code></td><td><code>"The answer END"</code> (14), then cut to <code>"The answer "</code> (11)</td><td>"END" at index 11; truncate to 11</td><td><code>" "</code>: text[10:11], with <code>finish_reason="stop"</code>, <code>stop_reason="END"</code></td></tr>
+  </tbody>
+</table>
+<p>The client receives <code>"The answer "</code> without "END". In step 4, <code>engine_core_output.finished</code> is false, because the engine core did not stop the request. So the request goes to <code>reqs_to_abort</code>, and the engine core gets an ABORT ({{cite vllm/v1/engine/output_processor.py:878-882}}). The arithmetic follows {{cite vllm/v1/engine/detokenizer.py:132-153}}, {{cite vllm/v1/engine/detokenizer.py:161-176}} and {{cite vllm/v1/engine/detokenizer.py:351-373}}.</p>
+<x-simplified><p>Real tokenizers split text in other places. The fast detokenizer can also return an empty string for a token that is only part of a multi-byte character; the text then appears with the next token.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Logprobs in the front end">
+<ul>
+  <li>The engine core sends logprobs as arrays: for each new token, the token ids, the logprobs and the ranks of the top candidates ({{cite vllm/v1/outputs.py:34-45}}). The sampled token comes first ({{cite vllm/v1/engine/logprobs.py:110-111}}).</li>
+  <li><code>_update_sample_logprobs</code> adds the sampled token's logprob to <code>cumulative_logprob</code> and decodes each candidate token on its own, not incrementally ({{cite vllm/v1/engine/logprobs.py:89-122}}).</li>
+  <li>A decoded candidate that ends with the replacement character "�" is corrected with the sampled context, because it can be part of a multi-byte character ({{cite vllm/v1/engine/logprobs.py:341-358}}).</li>
+  <li>In DELTA mode, each <code>CompletionOutput</code> carries only the logprobs of its new tokens ({{cite vllm/v1/engine/output_processor.py:492-498}}). Prompt logprobs are sent once and then forgotten ({{cite vllm/v1/engine/output_processor.py:449-454}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Aborts by external or internal id">
+<p><code>abort_requests</code> accepts both kinds of id ({{cite vllm/v1/engine/output_processor.py:599-661}}):</p>
+<ol>
+  <li>With <code>internal=True</code>, each id is an internal id, or the id of a parent request. The code removes it from the external-to-internal map.</li>
+  <li>With <code>internal=False</code>, each id is an external id. All internal ids that share it are aborted. This is how one external id can stop several requests.</li>
+  <li>For each internal id with a state, the code removes the state and puts a final output with <code>finish_reason=ABORT</code> into the collector. So a waiting <code>generate()</code> ends cleanly.</li>
+  <li>For a parent id, it aborts all children first.</li>
+  <li>It returns the internal ids, which the caller sends to the engine core.</li>
+</ol>
+<p>A client-disconnect abort skips the finished-request stats: <code>abort_requests</code> does not call <code>_update_stats_from_finished</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Processes and threads">
+<p>The output processor has no lock. All its methods run on the event loop of one API server process: <code>add_request</code> and <code>abort_requests</code> in request tasks, <code>process_outputs</code> in the output handler task. They do not run in parallel, because asyncio runs one task at a time, and these methods do not <code>await</code>. (Derived from the code: none of the methods is <code>async</code>.)</p>
+<p>The CPU cost of this file grows with the number of output tokens per step: one detokenizer step per token, plus logprobs work. That cost is why the output handler cuts large steps into slices ({{cite vllm/v1/engine/async_llm.py:887-893}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>output for an unknown request</td><td>ignored</td><td>{{cite vllm/v1/engine/output_processor.py:759-762}}</td></tr>
+    <tr><td>output with <code>error</code> (rejected on arrival)</td><td>the collector gets the exception; the state is removed</td><td>{{cite vllm/v1/engine/output_processor.py:764-772}}</td></tr>
+    <tr><td>engine-wide failure</td><td><code>propagate_error</code> puts the exception into every collector</td><td>{{cite vllm/v1/engine/output_processor.py:593-597}}</td></tr>
+    <tr><td>invalid token id in the fast detokenizer</td><td>logged; the token decodes as empty text</td><td>{{cite vllm/v1/engine/detokenizer.py:236-242}}</td></tr>
+    <tr><td>"Invalid prefix" error of the decode stream</td><td>warning; the stream is reset and the token decoded again</td><td>{{cite vllm/v1/engine/detokenizer.py:243-258}}</td></tr>
+    <tr><td>multimodal cache miss on a pooling request</td><td>a retryable <code>RequestError</code> in the output</td><td>{{cite vllm/v1/engine/output_processor.py:805-816}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/engine-client}}: the output handler and the collectors.</li>
+  <li>{{link concepts/data-contracts}}: <code>EngineCoreOutput</code> and <code>RequestOutput</code> field by field.</li>
+  <li>{{link concepts/metrics-and-observability}}: what the stats calls in this file feed.</li>
+  <li>{{link tours/life-of-a-chat-request#stop-15 | Tour 1, stop 15}}: this file in the path of one request.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Where are stop strings checked, and why not in the engine core?
+    <x-a><p>In the front end, in the detokenizer that the output processor calls ({{cite vllm/v1/engine/output_processor.py:825-833}}). The engine core works with token ids only and has no text; <code>EngineCoreOutput</code> carries <code>new_token_ids</code> ({{cite vllm/v1/engine/__init__.py:209-210}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A request has <code>stream_interval</code> 4 on a server with the default 1. Which tokens make a new <code>RequestOutput</code>?
+    <x-a><p>The first token, then each time 4 new tokens are ready, and the last one. The request value is clamped up to at least the server value, so 4 applies ({{cite vllm/v1/engine/output_processor.py:300-302}}). The rule is at {{cite vllm/v1/engine/output_processor.py:379-392}}.</p></x-a>
+  </x-q>
+  <x-q level="medium">A request with <code>n = 2</code> and no stream finishes child 1 before child 0. When does the client get an output?
+    <x-a><p>Only when child 0 finishes too. In <code>FINAL_ONLY</code> mode the parent stores each final output and returns all of them when no child is left ({{cite vllm/v1/engine/parallel_sampling.py:122-128}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">The stop strings are <code>["END", "STOP"]</code>, without <code>include_stop_str_in_output</code>. How many characters does the stream hold back, and why?
+    <x-a><p>3: the longest stop string has 4 characters, minus 1 ({{cite vllm/v1/engine/detokenizer.py:87-88}}). The last 3 characters could be the start of "STOP", so the stream must not send them before the next token decides. When the request finishes, the buffer is 0 and the rest goes out ({{cite vllm/v1/engine/detokenizer.py:165}}).</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,254 @@
+---
+title: v1/engine/core_client.py: the engine core clients
+nav_title: v1/engine/core_client.py
+level: Advanced
+prerequisites: concepts/engine-client, concepts/architecture-overview, learn/processes-and-ipc
+related: concepts/engine-client, concepts/architecture-overview, concepts/data-parallel-serving, concepts/data-contracts, code/v1-engine-async-llm, code/v1-engine-core, tours/life-of-a-chat-request
+summary: vllm/v1/engine/core_client.py holds the clients that the front end uses to talk to the engine core: an in-process client, and ZMQ clients for blocking, asyncio and data parallel use. It binds the sockets, waits for the engines, reads the outputs and runs utility calls.
+---
+<h2>Purpose</h2>
+<p><code>vllm/v1/engine/core_client.py</code> holds the {{term engine-core-client | engine core clients}}: the objects in the front end that send requests to the engine core and get its outputs back.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/v1/engine/core_client.py</code>, 2,162 lines of Python. Nine classes and one helper function.</td></tr>
+    <tr><th>Main classes</th><td><code>EngineCoreClient</code> (abstract, {{cite vllm/v1/engine/core_client.py:83}}), {{term mp-client | <code>MPClient</code>}} ({{cite vllm/v1/engine/core_client.py:594}}), <code>AsyncMPClient</code> ({{cite vllm/v1/engine/core_client.py:1143}}), <code>DPAsyncMPClient</code> ({{cite vllm/v1/engine/core_client.py:1461}}), <code>DPLBAsyncMPClient</code> ({{cite vllm/v1/engine/core_client.py:1702}}). For offline use: <code>InprocClient</code> and <code>SyncMPClient</code>.</td></tr>
+    <tr><th>Runs in</th><td>The API server process (asyncio clients) or the process of the offline <code>LLM</code> (sync and in-process clients). One monitor thread per <code>MPClient</code> that started engines.</td></tr>
+    <tr><th>Called by</th><td><code>AsyncLLM</code> (<code>make_async_mp_client</code>) and <code>LLMEngine</code> (<code>make_client</code>).</td></tr>
+    <tr><th>Calls</th><td>pyzmq sockets, <code>MsgpackEncoder</code> / <code>MsgpackDecoder</code>, <code>launch_core_engines</code> in <code>v1/engine/utils.py</code>, the DP coordinator.</td></tr>
+    <tr><th>Not in this file</th><td>The engine side of the sockets (<code>v1/engine/core.py</code>), the process launch (<code>v1/engine/utils.py</code>), the coordinator process (<code>v1/engine/coordinator.py</code>), encoding details (<code>v1/serial_utils.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/engine-client}} shows how AsyncLLM uses these clients. This page reads the clients themselves.</p>
+
+<h2>Where it sits</h2>
+<p>The class tree has two branches: one in-process client, and the multiprocess clients that use ZMQ. The asyncio branch is the one of <code>vllm serve</code>:</p>
+<pre><code class="language-none">EngineCoreClient                  abstract; factories
+├── InprocClient                  EngineCore in this process
+└── MPClient                      ZMQ, launch, ready wait
+    ├── SyncMPClient              blocking; offline LLM
+    └── AsyncMPClient             asyncio; vllm serve, DP = 1
+        └── DPAsyncMPClient       DP &gt; 1, external LB
+            └── DPLBAsyncMPClient DP &gt; 1, internal LB</code></pre>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong><code>AsyncLLM.__init__</code></strong> calls <code>EngineCoreClient.make_async_mp_client</code> ({{cite vllm/v1/engine/async_llm.py:193-201}}). For every request it calls <code>add_request_async</code>; the output handler calls <code>get_output_async</code> and <code>abort_requests_async</code> ({{cite vllm/v1/engine/async_llm.py:584}}, {{cite vllm/v1/engine/async_llm.py:880}}, {{cite vllm/v1/engine/async_llm.py:920}}).</li>
+  <li><strong><code>LLMEngine</code></strong> (offline) calls <code>make_client</code> with <code>asyncio_mode=False</code>. That gives <code>SyncMPClient</code> or, without multiprocessing, <code>InprocClient</code> ({{cite vllm/v1/engine/core_client.py:128-136}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>make_zmq_socket</code> for the ROUTER, PULL, XSUB and PAIR sockets ({{cite vllm/v1/engine/core_client.py:673-682}}, {{cite vllm/v1/engine/core_client.py:1524-1527}}).</li>
+  <li><code>launch_core_engines</code>, which starts the engine core processes and, when needed, the DP coordinator ({{cite vllm/v1/engine/core_client.py:695-702}}).</li>
+  <li><code>MsgpackEncoder</code> and <code>MsgpackDecoder(EngineCoreOutputs)</code> ({{cite vllm/v1/engine/core_client.py:731-732}}).</li>
+  <li>The engine manager's <code>monitor_engine_liveness</code> in a thread ({{cite vllm/v1/engine/core_client.py:829-845}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>EngineCoreClient.make_client</code></td><td>{{cite vllm/v1/engine/core_client.py:97-136}}</td><td>Factory for the offline engine: sync or in-process.</td></tr>
+    <tr><td><code>EngineCoreClient.make_async_mp_client</code></td><td>{{cite vllm/v1/engine/core_client.py:138-173}}</td><td>Factory for AsyncLLM: picks the class by the DP settings.</td></tr>
+    <tr><td><code>InprocClient</code></td><td>{{cite vllm/v1/engine/core_client.py:364-494}}</td><td>Wraps an <code>EngineCore</code> in the same process; no busy loop.</td></tr>
+    <tr><td><code>BackgroundResources</code></td><td>{{cite vllm/v1/engine/core_client.py:497-584}}</td><td>Sockets, tasks and the engine manager; the finalizer; <code>validate_alive</code>.</td></tr>
+    <tr><td><code>MPClient.__init__</code></td><td>{{cite vllm/v1/engine/core_client.py:606-782}}</td><td>Binds sockets, launches engines, waits for ready messages, starts the monitor.</td></tr>
+    <tr><td><code>MPClient._apply_ready_response</code></td><td>{{cite vllm/v1/engine/core_client.py:847-923}}</td><td>Copies start-up values of each engine into the front-end config.</td></tr>
+    <tr><td><code>_process_utility_output</code></td><td>{{cite vllm/v1/engine/core_client.py:929-948}}</td><td>Completes the future of a utility call.</td></tr>
+    <tr><td><code>SyncMPClient</code></td><td>{{cite vllm/v1/engine/core_client.py:951-1140}}</td><td>Blocking client with an output thread.</td></tr>
+    <tr><td><code>AsyncMPClient._ensure_output_queue_task</code></td><td>{{cite vllm/v1/engine/core_client.py:1187-1262}}</td><td>Starts the task that reads the PULL socket.</td></tr>
+    <tr><td><code>AsyncMPClient._send_input</code> / <code>_send_input_message</code></td><td>{{cite vllm/v1/engine/core_client.py:1275-1294}}</td><td>Encodes and sends one message to one engine.</td></tr>
+    <tr><td><code>AsyncMPClient._call_utility_async</code></td><td>{{cite vllm/v1/engine/core_client.py:1316-1328}}</td><td>A remote method call with a call id and a future.</td></tr>
+    <tr><td><code>AsyncMPClient.add_request_async</code></td><td>{{cite vllm/v1/engine/core_client.py:1333-1336}}</td><td>Sets <code>client_index</code> and sends ADD.</td></tr>
+    <tr><td><code>DPAsyncMPClient._ensure_stats_update_task</code></td><td>{{cite vllm/v1/engine/core_client.py:1513-1597}}</td><td>Reads load counts and waves from the DP coordinator.</td></tr>
+    <tr><td><code>DPLBAsyncMPClient.get_core_engine_for_request</code></td><td>{{cite vllm/v1/engine/core_client.py:1743-1804}}</td><td>Load balancing: picks the engine with the lowest score.</td></tr>
+    <tr><td><code>DPLBAsyncMPClient.abort_requests_async</code></td><td>{{cite vllm/v1/engine/core_client.py:1866-1890}}</td><td>Sends each abort to the engine that has the request.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>make_async_mp_client</code>: which class</h3>
+<x-code file="vllm/v1/engine/core_client.py" lines="138-173" highlight="158-159,161,166,170" />
+<ol>
+  <li><strong>Lines 150-157.</strong> All three classes take the same six arguments: the config, the executor class, <code>log_stats</code>, and the client addresses, count and index of this API server.</li>
+  <li><strong>Lines 158-164.</strong> DP &gt; 1 with an external load balancer: <code>DPAsyncMPClient</code>, which sends everything to one engine core.</li>
+  <li><strong>Lines 165-169.</strong> DP &gt; 1 otherwise: <code>DPLBAsyncMPClient</code>, which balances over all engine cores.</li>
+  <li><strong>Line 170.</strong> DP = 1: <code>AsyncMPClient</code>.</li>
+</ol>
+<p>There is no asyncio client without multiprocessing: <code>make_client</code> raises <code>NotImplementedError</code> for that case ({{cite vllm/v1/engine/core_client.py:114-118}}). So <code>vllm serve</code> always runs the engine core in its own process.</p>
+
+<h3><code>MPClient.__init__</code>: sockets and launch</h3>
+<x-code file="vllm/v1/engine/core_client.py" lines="620-628" highlight="621-622,627-628" />
+<ol>
+  <li><strong>Lines 621-622.</strong> One ZMQ context with 2 I/O threads. The asyncio clients wrap it in a <code>zmq.asyncio.Context</code>.</li>
+  <li><strong>Lines 627-628.</strong> <code>BackgroundResources</code> holds everything that must be closed. A <code>weakref.finalize</code> calls it when the client is collected, even if the constructor fails half-way (lines 624-626).</li>
+</ol>
+<p>Then the client binds its two sockets. In the multi-API-server case, the parent process has bound them already, and the client gets the listeners through <code>client_addresses</code> ({{cite vllm/v1/engine/core_client.py:643-669}}). In the single-server case, the client binds them itself and launches the engines:</p>
+<x-code file="vllm/v1/engine/core_client.py" lines="670-702" highlight="673-679,680-682,695-697" />
+<ol>
+  <li><strong>Lines 673-679.</strong> A <code>ROUTER</code> socket for requests, bound by the client. A ROUTER sends each message to the peer whose identity is the first frame.</li>
+  <li><strong>Lines 680-682.</strong> A <code>PULL</code> socket for outputs. All engine cores push into it.</li>
+  <li><strong>Lines 686-693.</strong> The real bound addresses go to the engines.</li>
+  <li><strong>Lines 695-697.</strong> <code>launch_core_engines</code> starts the engine core processes (and the DP coordinator when needed).</li>
+</ol>
+<p>Next the client computes which engines it talks to, and waits for each one:</p>
+<x-code file="vllm/v1/engine/core_client.py" lines="738-777" highlight="740-743,749-751,756-759,769-771,777" />
+<ol>
+  <li><strong>Lines 740-743.</strong> With internal load balancing, the client manages all DP ranks. With hybrid or external load balancing, only the local ones.</li>
+  <li><strong>Lines 749-751.</strong> The ZMQ identity of each engine is its DP rank as 2 little-endian bytes. The engine core uses the same bytes as the identity of its DEALER socket ({{cite vllm/v1/engine/core.py:1178-1179}}).</li>
+  <li><strong>Lines 756-768.</strong> A blocking poll with timeout <code>VLLM_ENGINE_READY_TIMEOUT_S</code>. The error message names the variable.</li>
+  <li><strong>Lines 769-771.</strong> Each ready message carries the identity and an <code>EngineCoreReadyResponse</code>, which <code>_apply_ready_response</code> applies.</li>
+  <li><strong>Line 773.</strong> <code>core_engine</code> is the first engine: the default target of a DP = 1 client.</li>
+  <li><strong>Line 777.</strong> The monitor thread starts.</li>
+</ol>
+
+<h3><code>AsyncMPClient</code>: the output task</h3>
+<x-code file="vllm/v1/engine/core_client.py" lines="1208-1214" highlight="1211-1213" />
+<x-code file="vllm/v1/engine/core_client.py" lines="1239-1262" highlight="1240-1243,1245-1251,1253-1254,1255-1258,1260-1262" />
+<ol>
+  <li><strong>Line 1211.</strong> Receive one multipart message without a copy.</li>
+  <li><strong>Line 1212.</strong> <code>validate_alive</code> raises <code>EngineDeadError</code> when the message is the single frame <code>ENGINE_CORE_DEAD</code> ({{cite vllm/v1/engine/core_client.py:581-584}}).</li>
+  <li><strong>Line 1213.</strong> Decode into <code>EngineCoreOutputs</code>.</li>
+  <li><strong>Lines 1214-1243</strong> (first excerpt ends at 1214). A message with <code>utility_output</code> is a reply to a utility call, or one of two special notifications. It never goes into the queue.</li>
+  <li><strong>Lines 1245-1251.</strong> A subclass hook. <code>DPLBAsyncMPClient</code> uses it to count finished requests per engine ({{cite vllm/v1/engine/core_client.py:1810-1817}}).</li>
+  <li><strong>Lines 1253-1254.</strong> Only messages with outputs or stats go to <code>outputs_queue</code>.</li>
+  <li><strong>Lines 1255-1258.</strong> An exception goes into the queue. A cancel puts an <code>EngineDeadError</code> there. The next <code>get_output_async()</code> raises it ({{cite vllm/v1/engine/core_client.py:1264-1273}}).</li>
+  <li><strong>Lines 1260-1262.</strong> The task is named <code>EngineCoreOutputQueueTask</code>. The constructor starts it if a loop runs, so that early <code>EXECUTOR_FAILED</code> messages are not missed ({{cite vllm/v1/engine/core_client.py:1177-1185}}).</li>
+</ol>
+
+<h3>Sending a request</h3>
+<x-code file="vllm/v1/engine/core_client.py" lines="1275-1294" highlight="1284,1290,1294" />
+<x-code file="vllm/v1/engine/core_client.py" lines="1333-1340" highlight="1334-1335,1339" />
+<ol>
+  <li><strong>Line 1284.</strong> The frames are the type byte (for example <code>b"\x00"</code> for ADD) and the encoded buffers.</li>
+  <li><strong>Line 1290.</strong> <code>ensure_alive</code> raises <code>EngineDeadError</code> when the dead flag is set ({{cite vllm/v1/engine/core_client.py:803-805}}).</li>
+  <li><strong>Line 1294.</strong> The engine identity goes first. The ROUTER uses it to route the message, and removes it before delivery. <code>send_multipart</code> of the asyncio socket returns an awaitable.</li>
+  <li><strong>Line 1334.</strong> <code>client_index</code> tells the engine core which output socket to use for this request.</li>
+  <li><strong>Line 1339.</strong> Aborts are skipped when the engine is dead.</li>
+</ol>
+
+<h3>Utility calls: a small RPC system</h3>
+<p>A {{term utility-call}} runs one method of <code>EngineCore</code> in the engine core process and returns its result. Control methods such as <code>sleep</code>, <code>add_lora</code> and <code>collective_rpc</code> use it.</p>
+<x-code file="vllm/v1/engine/core_client.py" lines="1316-1328" highlight="1319-1321,1322-1325,1328" />
+<ol>
+  <li><strong>Line 1319.</strong> A 64-bit call id from a UUID.</li>
+  <li><strong>Lines 1320-1321.</strong> An asyncio future, stored under the call id.</li>
+  <li><strong>Lines 1322-1325.</strong> The message is <code>UTILITY</code> plus <code>(client_index, call_id, method, args)</code>.</li>
+  <li><strong>Line 1328.</strong> The caller waits on the future. The output task completes it with <code>_process_utility_output</code> ({{cite vllm/v1/engine/core_client.py:929-948}}).</li>
+</ol>
+<p>On the engine side, the busy loop looks up the method by name on the <code>EngineCore</code> object and calls it. The result goes back as <code>EngineCoreOutputs(utility_output=...)</code> to the client that asked ({{cite vllm/v1/engine/core.py:1752-1765}}). If the method returns a <code>Future</code>, the reply waits for it ({{cite vllm/v1/engine/core.py:1826-1834}}). Three variants exist in the client: one engine (<code>call_utility_async</code>), all engines (<code>call_utility_all_async</code>), and all engines with a check that the results agree (<code>call_utility_consensus_async</code>) ({{cite vllm/v1/engine/core_client.py:1296-1314}}). <code>DPLBAsyncMPClient</code> changes <code>call_utility_async</code>: it calls all engines and returns the first result ({{cite vllm/v1/engine/core_client.py:1806-1808}}).</p>
+
+<h3><code>DPLBAsyncMPClient.get_core_engine_for_request</code>: load balancing</h3>
+<x-code file="vllm/v1/engine/core_client.py" lines="1760-1799" highlight="1768,1777-1778,1779-1786,1792,1798" />
+<ol>
+  <li><strong>Lines 1755-1759</strong> (above the excerpt). A request with <code>data_parallel_rank</code> set, or a late-interaction pooling request, goes to a fixed engine. Streaming-input sessions stick to their engine ({{cite vllm/v1/engine/core_client.py:1750-1752}}).</li>
+  <li><strong>Line 1768.</strong> The scan starts at <code>eng_start_index</code>, which depends on the client index, and rotates after each pick (line 1798).</li>
+  <li><strong>Lines 1777-1778.</strong> The base score is the larger of the coordinator's <code>waiting + running</code> and this client's in-flight count times the number of clients.</li>
+  <li><strong>Lines 1779-1786.</strong> Waiting requests add a penalty that grows with the KV cache usage above 50%: from 0 at 50% to 3 × waiting at 100%.</li>
+  <li><strong>Line 1792.</strong> The local waiting count goes up at once, so that the next request sees the new load before the next coordinator update.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: frames and types">
+<table>
+  <thead><tr><th>Direction</th><th>Frames</th><th>Payload type</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>client → engine, ADD</td><td>identity, <code>b"\x00"</code>, msgpack buffers</td><td><code>EngineCoreRequest</code></td><td>{{cite vllm/v1/engine/core_client.py:1333-1335}}</td></tr>
+    <tr><td>client → engine, ABORT</td><td>identity, <code>b"\x01"</code>, msgpack</td><td><code>list[str]</code> of internal ids</td><td>{{cite vllm/v1/engine/core_client.py:1338-1340}}</td></tr>
+    <tr><td>client → engine, UTILITY</td><td>identity, <code>b"\x03"</code>, msgpack</td><td><code>(client_index, call_id, method, args)</code></td><td>{{cite vllm/v1/engine/core_client.py:1322-1325}}</td></tr>
+    <tr><td>engine → client, ready</td><td>identity, payload</td><td>msgpack <code>EngineCoreReadyResponse</code></td><td>{{cite vllm/v1/engine/core_client.py:847-855}}</td></tr>
+    <tr><td>engine → client, outputs</td><td>msgpack buffers</td><td><code>EngineCoreOutputs</code></td><td>{{cite vllm/v1/engine/core_client.py:1211-1213}}</td></tr>
+    <tr><td>engine → client, death</td><td>one frame <code>b"ENGINE_CORE_DEAD"</code></td><td>none</td><td>{{cite vllm/v1/engine/core.py:1156}}, {{cite vllm/v1/engine/core_client.py:581-584}}</td></tr>
+    <tr><td>coordinator → client (DP)</td><td>one buffer</td><td>msgpack <code>(counts, wave, running)</code>; counts per engine are <code>[waiting, running, kv_cache_usage]</code></td><td>{{cite vllm/v1/engine/core_client.py:1580-1590}}</td></tr>
+  </tbody>
+</table>
+<p>Utility results come back as plain msgpack types unless <code>VLLM_ALLOW_INSECURE_SERIALIZATION</code> is set. Without the variable, the encoder sends <code>(None, result)</code>, with no type information ({{cite vllm/v1/serial_utils.py:211-214}}), so a tuple or a set from the engine side reaches the client as a list. This is msgspec behaviour: without a target type, it decodes a msgpack array as a list ({{cite vllm/v1/serial_utils.py:366-378}}). For example, <code>get_supported_tasks_async</code> is typed as a tuple, but returns a list ({{cite vllm/v1/engine/core_client.py:1330-1331}}). (Derived.)</p>
+</x-deepdive>
+
+<x-deepdive title="Processes, tasks and threads">
+<table>
+  <thead><tr><th>Client</th><th>Background work</th><th>Kind</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>every <code>MPClient</code> that launched engines</td><td><code>MPClientEngineMonitor</code>: waits for an engine process to exit, sets <code>engine_dead</code>, shuts down</td><td>daemon thread</td><td>{{cite vllm/v1/engine/core_client.py:818-845}}</td></tr>
+    <tr><td><code>AsyncMPClient</code></td><td><code>EngineCoreOutputQueueTask</code></td><td>asyncio task</td><td>{{cite vllm/v1/engine/core_client.py:1260-1262}}</td></tr>
+    <tr><td><code>DPAsyncMPClient</code></td><td>stats task: XSUB socket to the coordinator, PAIR socket for scale events</td><td>asyncio task</td><td>{{cite vllm/v1/engine/core_client.py:1522-1597}}</td></tr>
+    <tr><td><code>SyncMPClient</code></td><td><code>EngineCoreOutputQueueThread</code>: polls the PULL socket and a shutdown PAIR socket</td><td>daemon thread</td><td>{{cite vllm/v1/engine/core_client.py:985-1021}}</td></tr>
+    <tr><td><code>InprocClient</code></td><td>none: <code>get_output()</code> runs one engine step in the caller's thread</td><td>-</td><td>{{cite vllm/v1/engine/core_client.py:396-399}}</td></tr>
+  </tbody>
+</table>
+<p>The background functions do not refer to the client object directly. They copy the parts they need, or keep a <code>weakref</code>. So the client can be garbage-collected, and its finalizer can close the sockets ({{cite vllm/v1/engine/core_client.py:1192-1200}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: one load-balancing decision">
+<p>Two API servers (<code>client_count = 2</code>) and two engine cores. The last coordinator snapshot for this client says:</p>
+<table>
+  <thead><tr><th>Engine</th><th>waiting</th><th>running</th><th>KV usage</th><th>this client's in-flight</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>3</td><td>10</td><td>0.80</td><td>4</td></tr>
+    <tr><td>1</td><td>0</td><td>12</td><td>0.40</td><td>5</td></tr>
+  </tbody>
+</table>
+<ol>
+  <li>Engine 0: base = max(2 × 4, 3 + 10) = 13. Penalty = 3 × 6.0 × max(0, 0.80 − 0.5) = 5.4. Score = 18.4.</li>
+  <li>Engine 1: base = max(2 × 5, 0 + 12) = 12. No waiting requests, so no penalty. Score = 12.</li>
+  <li>The client picks engine 1. It adds <code>client_count</code> = 2 to engine 1's local waiting count, records the request in <code>reqs_in_flight</code>, and adds 1 to <code>engine_inflight</code> for engine 1 ({{cite vllm/v1/engine/core_client.py:1792-1803}}).</li>
+  <li>When the engine reports the request in <code>finished_requests</code>, the in-flight count goes down again ({{cite vllm/v1/engine/core_client.py:1814-1817}}). The engine core sends this set only for internal DP balancing, which turns on <code>include_finished_set</code> ({{cite vllm/v1/engine/core.py:1207-1226}}).</li>
+</ol>
+<p>The coordinator publishes new counts every 100 ms by default when they changed ({{cite vllm/v1/engine/coordinator.py:152}}, {{cite vllm/v1/engine/coordinator.py:264-267}}). Between two snapshots, the local increments keep a burst of requests from going to the same engine.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>no ready message within the timeout</td><td><code>TimeoutError</code> that names <code>VLLM_ENGINE_READY_TIMEOUT_S</code></td><td>{{cite vllm/v1/engine/core_client.py:756-768}}</td></tr>
+    <tr><td>the constructor fails half-way</td><td>the finalizer closes what exists; the exception goes on</td><td>{{cite vllm/v1/engine/core_client.py:779-782}}</td></tr>
+    <tr><td><code>ENGINE_CORE_DEAD</code> received</td><td><code>engine_dead = True</code>, <code>EngineDeadError</code></td><td>{{cite vllm/v1/engine/core_client.py:581-584}}</td></tr>
+    <tr><td>an engine process exits</td><td>warning "engine core exited unexpectedly"; flag set; client shuts down</td><td>{{cite vllm/v1/engine/core_client.py:829-838}}</td></tr>
+    <tr><td>a send after the engine died</td><td><code>EngineDeadError</code> from <code>ensure_alive</code></td><td>{{cite vllm/v1/engine/core_client.py:803-805}}</td></tr>
+    <tr><td>any error after death</td><td>replaced by <code>EngineDeadError(suppress_context=True)</code>, so the root cause stays clear</td><td>{{cite vllm/v1/engine/core_client.py:797-801}}</td></tr>
+    <tr><td>a utility method fails in the engine</td><td>the future gets <code>Exception(failure_message)</code></td><td>{{cite vllm/v1/engine/core_client.py:933-937}}</td></tr>
+    <tr><td>the caller of a utility call was cancelled</td><td>the result is dropped; a failure is logged as an error</td><td>{{cite vllm/v1/engine/core_client.py:941-948}}</td></tr>
+    <tr><td>engines disagree in a consensus call</td><td><code>RuntimeError</code></td><td>{{cite vllm/v1/engine/core_client.py:1308-1314}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_ENGINE_READY_TIMEOUT_S</code></td><td>600 ({{cite vllm/envs.py:812-814}})</td><td>imported once at module load ({{cite vllm/v1/engine/core_client.py:29}})</td><td>Seconds to wait for each engine's ready message. Set it before vLLM is imported.</td></tr>
+    <tr><td><code>VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS</code></td><td>5 ({{cite vllm/envs.py:1865-1867}})</td><td>{{cite vllm/v1/engine/core_client.py:525-527}}</td><td>Timeout for the engine manager shutdown in the finalizer.</td></tr>
+    <tr><td><code>VLLM_ALLOW_INSECURE_SERIALIZATION</code></td><td>0 ({{cite vllm/envs.py:1710-1712}})</td><td>{{cite vllm/v1/serial_utils.py:213}}</td><td>Allows pickled objects and typed utility results on the ZMQ channel.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/engine-client}}: how AsyncLLM uses this client.</li>
+  <li>{{link concepts/architecture-overview}}: the sockets and processes on both sides.</li>
+  <li>{{link concepts/data-parallel-serving}}: load balancing modes, waves and the DP coordinator.</li>
+  <li>{{link code/v1-engine-core}}: the engine side of the sockets.</li>
+  <li>{{link learn/processes-and-ipc}}: ZMQ socket types in general.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which client class does <code>vllm serve</code> use with one engine core, and which socket types does it bind?
+    <x-a><p><code>AsyncMPClient</code> ({{cite vllm/v1/engine/core_client.py:170-173}}). It binds a <code>ROUTER</code> socket for requests and a <code>PULL</code> socket for outputs ({{cite vllm/v1/engine/core_client.py:673-682}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">How does the client know which engine core a message on the ROUTER socket goes to?
+    <x-a><p>The first frame is the engine identity: the DP rank as 2 little-endian bytes ({{cite vllm/v1/engine/core_client.py:749-751}}, {{cite vllm/v1/engine/core_client.py:1294}}). Each engine core sets the same bytes as the identity of its DEALER socket ({{cite vllm/v1/engine/core.py:1178-1179}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A utility reply and a step output both arrive on the PULL socket. How does the output task tell them apart?
+    <x-a><p>A utility reply has <code>utility_output</code> set. The task completes the future of its call id and does not put the message into <code>outputs_queue</code> ({{cite vllm/v1/engine/core_client.py:1214-1243}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Two engines: engine 0 has waiting 2, running 6, KV usage 0.9; engine 1 has waiting 0, running 9. One API server, and no request in flight. Which engine does <code>DPLBAsyncMPClient</code> pick?
+    <x-a><p>Engine 0: base max(1 × 0, 8) = 8, penalty 2 × 6.0 × 0.4 = 4.8, score 12.8. Engine 1: base max(0, 9) = 9, no penalty, score 9. It picks engine 1 ({{cite vllm/v1/engine/core_client.py:1777-1789}}).</p></x-a>
+  </x-q>
+</x-quiz>

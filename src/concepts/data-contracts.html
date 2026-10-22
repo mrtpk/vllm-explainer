@@ -1,0 +1,181 @@
+---
+title: Data contracts between the parts of vLLM
+nav_title: Data contracts
+level: Intermediate
+prerequisites: concepts/architecture-overview, tours/life-of-a-chat-request
+related: concepts/engine-client, concepts/engine-core-loop, concepts/scheduler, concepts/model-runner, concepts/openai-server, code/v1-engine-input-processor, code/v1-engine-output-processor, code/v1-engine-core-client
+summary: The typed messages between the parts of vllm serve: EngineCoreRequest, Request, SchedulerOutput, ModelRunnerOutput, EngineCoreOutput(s), RequestOutput and the OpenAI response objects. Their fields, who makes them, and how they travel.
+---
+<x-sentence>Each boundary in vLLM has a fixed message type: msgspec structs over ZMQ, dataclasses between scheduler and worker, pydantic models over HTTP.</x-sentence>
+
+<h2>The idea</h2>
+<p>A request crosses two process boundaries in <code>vllm serve</code>, and more with several GPUs. At each boundary the sender turns a Python object into bytes. The receiver turns the bytes back into an object of a known type. So vLLM defines one type for each hop. We call these types the <em>data contracts</em>. If you know them, you can read any log line, debug any hop, and write a plugin that touches a hop.</p>
+<p>There are three families:</p>
+<ul>
+  <li><strong>msgspec structs</strong> cross the ZMQ boundary between the API server and the engine core: {{term engine-core-request}} one way and {{term engine-core-outputs}} the other way. They are encoded as {{term msgpack}}.</li>
+  <li><strong>dataclasses</strong> stay inside the engine core, or go to the workers: {{term scheduler-output}} and <code>ModelRunnerOutput</code>. With one GPU they are passed by a plain call; with worker processes they are pickled into shared memory.</li>
+  <li><strong>pydantic models</strong> describe the HTTP JSON: the OpenAI request and response objects.</li>
+</ul>
+<p>Two more types never cross a boundary: the engine core's own <code>Request</code>, and the front end's {{term request-output}}. The page {{link concepts/architecture-overview}} shows the processes and channels.</p>
+<p><strong>An everyday comparison.</strong> Think of the forms in international shipping. The shop fills in an order form, customs needs a fixed declaration form, and the receiver gets a delivery note. Each form has fixed fields in a fixed order, so every office can read it. The comparison stops here: in vLLM, the "declaration" (<code>EngineCoreRequest</code>) is written as a list without field names. So both sides must agree on the field order, not only on the names.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b2a_data_contracts" alt="Panel 1, front end on the way in: ChatCompletionRequest, a pydantic object with 4 messages, stream true and max_tokens None; then the EngineInput dict with type token, 61 prompt token ids, the prompt text and arrival_time; then EngineCoreRequest with request_id chatcmpl-3f9c...-a1b2c3d4, external_req_id chatcmpl-3f9c...e1, 61 prompt token ids, max_tokens 32707 and client_index 0. An amber arrow: the ADD frame goes as msgpack over ZMQ. Panel 2, engine core, read from right to left: Request, a Python object that is never sent, status WAITING then RUNNING, 61 prompt tokens, num_computed_tokens 0 then 48 then 61, 3 block hashes; SchedulerOutput with one new request, num_computed_tokens 48, block_ids 7, 3, 12, 40, and 13 scheduled tokens; ModelRunnerOutput with sampled_token_ids [[785]]. An amber arrow: update_from_output makes EngineCoreOutputs, sent as msgpack over ZMQ. Panel 3, front end on the way out: EngineCoreOutputs with engine_index 0, a monotonic timestamp and one EngineCoreOutput with new_token_ids [785], no finish reason, and events QUEUED and SCHEDULED; RequestOutput with request_id chatcmpl-3f9c...e1 and one CompletionOutput with text The and token_ids [785], not finished; ChatCompletionStreamResponse with delta content The, sent as an SSE data line." caption="Figure: the types of one chat request in its first engine step, with the example values of Tour 1. Amber arrows cross a process boundary." />
+<p>Read the panels from top to bottom. Panel 2 reads from right to left. The values come from {{link tours/life-of-a-chat-request}}: a 61-token prompt, 48 tokens from the prefix cache, and the first output token 785 ("The").</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: EngineCoreRequest, the message into the engine core</h3>
+<x-code file="vllm/v1/engine/__init__.py" lines="113-138" highlight="115-117,119-127,138" />
+<ul>
+  <li><code>array_like=True</code>: msgpack writes the fields as an array in this order, without names. So a new field must go at the end, as comments in <code>EngineCoreOutput</code> say ({{cite vllm/v1/engine/__init__.py:231-235}}).</li>
+  <li><code>omit_defaults=True</code> has no effect on an <code>array_like</code> struct: msgspec still writes every field. The decoder accepts a shorter array and fills the missing last fields with their defaults. <code>gc=False</code>: the garbage collector does not track the object. (This is msgspec behaviour, not vLLM code; we checked it with msgspec 0.21.1 and 0.22.0.)</li>
+  <li>The input processor makes it ({{cite vllm/v1/engine/input_processor.py:538-555}}). The client sets <code>client_index</code> just before it sends ({{cite vllm/v1/engine/core_client.py:1333-1335}}).</li>
+</ul>
+<p>The rest of the fields are optional: <code>current_wave</code> and <code>priority</code>, <code>trace_headers</code>, <code>resumable</code>, <code>external_req_id</code>, the reasoning fields, <code>abort_immediately</code>, <code>session_id</code> and <code>kv_hints</code> ({{cite vllm/v1/engine/__init__.py:143-165}}). <code>SamplingParams</code> and <code>LoRARequest</code> inside it are msgspec structs too ({{cite vllm/sampling_params.py:271-277}}, {{cite vllm/lora/request.py:8-11}}).</p>
+
+<h3>Step 2: Request, the engine core's own object</h3>
+<p>The input thread of the engine core turns the struct into a <code>Request</code> ({{cite vllm/v1/engine/core.py:1128}}, {{cite vllm/v1/request.py:243-270}}). This object never leaves the engine core process. It holds the counters that the scheduler uses:</p>
+<x-code file="vllm/v1/request.py" lines="161-184" highlight="162,173,183-184" />
+<p>Three properties read the token lists: <code>num_tokens</code> (prompt plus output), <code>num_tokens_with_spec</code> (plus draft tokens) and <code>num_output_tokens</code> ({{cite vllm/v1/request.py:294-304}}). The status is an integer enum. Every status after <code>PREEMPTED</code> counts as finished:</p>
+<x-code file="vllm/v1/request.py" lines="370-397" highlight="379-381,393" />
+<p>A finished status maps to a <code>FinishReason</code>. <code>FINISHED_IGNORED</code> (a prompt that is too long) maps to <code>LENGTH</code>, like in the OpenAI API ({{cite vllm/v1/request.py:400-412}}).</p>
+
+<h3>Step 3: SchedulerOutput, the plan of one step</h3>
+<p>The scheduler makes one <code>SchedulerOutput</code> per step ({{cite vllm/v1/core/sched/scheduler.py:1588-1609}}). The comments give the design: a new request travels in full once, and later steps send only the difference.</p>
+<x-code file="vllm/v1/core/sched/output.py" lines="231-263" highlight="236,240,244,251,260" />
+<p><code>NewRequestData</code> carries the prompt, the sampling parameters, the block ids and the computed-token count ({{cite vllm/v1/core/sched/output.py:40-56}}). With Model Runner V2 it also carries <code>prefill_token_ids</code>: all token ids of the request ({{cite vllm/v1/core/sched/scheduler.py:1505-1516}}). <code>CachedRequestData</code> is column-wise: one list per field, indexed like <code>req_ids</code> ({{cite vllm/v1/core/sched/output.py:137-152}}). Its <code>new_token_ids</code> is used only with pipeline parallelism (line 144).</p>
+
+<h3>Step 4: ModelRunnerOutput, the result of one step</h3>
+<x-code file="vllm/v1/outputs.py" lines="264-296" highlight="264-265,269,271,277,282" />
+<p>The comment at the top says why the fields are lists: the object is sent to the scheduler process, and tensors are expensive to send. <code>sampled_token_ids</code> has one list per request, because spec decoding can accept several tokens in one step. Model Runner V2 does not return it directly. On the last pipeline stage, <code>sample_tokens</code> wraps it in an <code>AsyncOutput</code>, a subclass of <code>AsyncModelRunnerOutput</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2209-2218}}, {{cite vllm/v1/worker/gpu/async_utils.py:115}}). Its <code>get_output()</code> waits for the GPU copy and then gives the <code>ModelRunnerOutput</code> ({{cite vllm/v1/outputs.py:353-363}}). Model Runner V2 fills <code>req_id_to_index</code> only for compatibility; the comment says that it does not use it ({{cite vllm/v1/worker/gpu/model_runner.py:2197-2199}}).</p>
+
+<h3>Step 5: EngineCoreOutput and EngineCoreOutputs, the message back</h3>
+<x-code file="vllm/v1/engine/__init__.py" lines="203-222" highlight="209-210,217-219" />
+<p>The output carries token ids, never text. The scheduler adds an <code>EngineCoreOutput</code> only when a request has new tokens, a pooling output, or has stopped ({{cite vllm/v1/core/sched/scheduler.py:2293-2295}}, {{cite vllm/v1/core/sched/scheduler.py:2356-2380}}). The outputs of one step are grouped by API server:</p>
+<x-code file="vllm/v1/engine/__init__.py" lines="266-297" highlight="275,278-280,282-283,296-297" />
+<ul>
+  <li><code>outputs</code> holds one entry per request with news. The scheduler builds one <code>EngineCoreOutputs</code> per <code>client_index</code> ({{cite vllm/v1/core/sched/scheduler.py:2486-2491}}).</li>
+  <li><code>scheduler_stats</code> goes to only one API server per step ({{cite vllm/v1/core/sched/scheduler.py:2516-2521}}).</li>
+  <li><code>timestamp</code> is <code>time.monotonic()</code> of the engine core process, set when the object is made (lines 295-297).</li>
+  <li><code>utility_output</code> carries the reply to a {{term utility-call}}. Such a message has no request outputs.</li>
+</ul>
+<p>Events and finish reasons are small integer enums, so the message stays short. <code>EngineCoreEvent</code> has a type (<code>QUEUED</code>, <code>SCHEDULED</code>, <code>PREEMPTED</code>) and a monotonic timestamp ({{cite vllm/v1/engine/__init__.py:176-200}}). <code>FinishReason</code> is <code>STOP = 0</code> to <code>REPETITION = 4</code>, and <code>str()</code> gives the OpenAI string ({{cite vllm/v1/engine/__init__.py:37}}, {{cite vllm/v1/engine/__init__.py:49-70}}).</p>
+
+<h3>Step 6: RequestOutput and CompletionOutput, the result in the front end</h3>
+<p>The output processor makes a <code>RequestOutput</code> per request and step ({{cite vllm/v1/engine/output_processor.py:459-473}}). It holds the external request id, the prompt, and one <code>CompletionOutput</code> per sequence:</p>
+<x-code file="vllm/outputs.py" lines="87-98" />
+<p><code>finish_reason</code> is now a string such as <code>"stop"</code> ({{cite vllm/v1/engine/output_processor.py:525}}). The other fields of <code>RequestOutput</code> are the prompt, the prompt token ids, the prompt logprobs, <code>finished</code>, <code>metrics</code>, <code>num_cached_tokens</code> and the KV transfer parameters ({{cite vllm/outputs.py:169-209}}).</p>
+
+<h3>Step 7: the OpenAI response objects</h3>
+<p>The chat handler turns each <code>RequestOutput</code> into pydantic objects. For a stream, the chunk is a <code>ChatCompletionStreamResponse</code> with one <code>ChatCompletionResponseStreamChoice</code> per sequence; each choice has a <code>DeltaMessage</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:162-193}}, {{cite vllm/entrypoints/generate/base/protocol.py:356-360}}). Without a stream, the handler builds one <code>ChatCompletionResponse</code> with a <code>ChatMessage</code> per choice and a <code>UsageInfo</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:137-145}}, {{cite vllm/entrypoints/serve/engine/protocol.py:135-140}}). The fields <code>stop_reason</code> and <code>token_ids</code> are vLLM additions that are not in the OpenAI spec ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:118-122}}).</p>
+
+<h3>Step 8: who makes what, and how it travels</h3>
+<table>
+  <thead><tr><th>Type</th><th>Kind</th><th>Made by (process)</th><th>Read by (process)</th><th>Travels as</th></tr></thead>
+  <tbody>
+    <tr><td><code>ChatCompletionRequest</code></td><td>pydantic</td><td>FastAPI, from the JSON body (API server)</td><td><code>OpenAIServingChat</code> (API server)</td><td>HTTP JSON</td></tr>
+    <tr><td>engine input (<code>TokensInput</code>)</td><td>TypedDict</td><td>renderer (API server)</td><td><code>InputProcessor</code> (API server)</td><td>in-process</td></tr>
+    <tr><td><code>EngineCoreRequest</code></td><td>msgspec struct</td><td><code>InputProcessor</code> (API server)</td><td>input thread (engine core)</td><td>msgpack over ZMQ ROUTER → DEALER</td></tr>
+    <tr><td><code>Request</code></td><td>class</td><td>input thread (engine core)</td><td>scheduler (engine core)</td><td>in-process, never sent</td></tr>
+    <tr><td><code>SchedulerOutput</code></td><td>dataclass</td><td>scheduler (engine core)</td><td>model runner (worker)</td><td>plain call with the uni executor; pickle in shared memory with worker processes</td></tr>
+    <tr><td><code>ModelRunnerOutput</code></td><td>dataclass</td><td>model runner (worker)</td><td><code>Scheduler.update_from_output</code> (engine core)</td><td>plain call; or pickle through the response queue of one worker</td></tr>
+    <tr><td><code>EngineCoreOutputs</code></td><td>msgspec struct</td><td>scheduler (engine core)</td><td>engine core client (API server)</td><td>msgpack over ZMQ PUSH → PULL</td></tr>
+    <tr><td><code>RequestOutput</code></td><td>class</td><td><code>OutputProcessor</code> (API server)</td><td><code>generate()</code> and the chat handler (API server)</td><td>in-process, through the collector</td></tr>
+    <tr><td><code>ChatCompletionStreamResponse</code></td><td>pydantic</td><td>chat handler (API server)</td><td>the HTTP client</td><td>SSE line <code>data: {JSON}</code></td></tr>
+  </tbody>
+</table>
+<p>Sources for the transports: msgpack encoder and decoder of the client ({{cite vllm/v1/engine/core_client.py:731-732}}) and of the engine core ({{cite vllm/v1/engine/core.py:1930-1933}}, {{cite vllm/v1/engine/core.py:2035}}); the uni executor's direct call ({{cite vllm/v1/executor/uniproc_executor.py:102-117}}); the shared-memory queue's pickler ({{cite vllm/distributed/device_communicators/shm_broadcast.py:934-940}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: the field values of one request at each stage">
+<p>The example is the request of Tour 1. It has four chat messages, a ChatML template and 61 prompt tokens. The block size is 16, and 3 blocks (48 tokens) are already in the prefix cache. All values are illustrative.</p>
+<table>
+  <thead><tr><th>#</th><th>Stage</th><th>Field values</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><code>ChatCompletionRequest</code></td><td><code>messages</code>: 4 entries; <code>stream=True</code>; <code>max_tokens=None</code>; <code>n=1</code>; <code>request_id="3f9c...e1"</code> from <code>random_uuid</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:403-410}})</td></tr>
+    <tr><td>2</td><td><code>TokensInput</code></td><td><code>type="token"</code>; <code>prompt_token_ids</code>: 61 ids; <code>prompt</code>: the template text; <code>arrival_time=1761140000.12</code> ({{cite vllm/inputs/engine.py:18-40}})</td></tr>
+    <tr><td>3</td><td><code>EngineCoreRequest</code></td><td><code>request_id="chatcmpl-3f9c...e1-a1b2c3d4"</code>; <code>external_req_id="chatcmpl-3f9c...e1"</code>; <code>prompt_token_ids</code>: 61 ids; <code>sampling_params.max_tokens=32707</code> (32768 − 61, {{cite vllm/v1/engine/input_processor.py:476-480}}); <code>sampling_params.output_kind=DELTA</code>; <code>client_index=0</code>; <code>data_parallel_rank=None</code>; <code>priority=0</code></td></tr>
+    <tr><td>4</td><td><code>Request</code>, after <code>add_request</code></td><td><code>status=WAITING</code>; <code>num_prompt_tokens=61</code>; <code>num_tokens=61</code>; <code>num_computed_tokens=0</code>; <code>num_output_placeholders=0</code>; <code>max_tokens=32707</code>; <code>block_hashes</code>: 3 (61 // 16 full blocks); <code>events=[QUEUED]</code></td></tr>
+    <tr><td>5</td><td><code>SchedulerOutput</code>, step 1</td><td><code>scheduled_new_reqs=[NewRequestData(num_computed_tokens=48, block_ids=([7, 3, 12, 40],), ...)]</code>; <code>scheduled_cached_reqs</code>: empty; <code>num_scheduled_tokens={id: 13}</code>; <code>total_num_scheduled_tokens=13</code>; <code>scheduled_spec_decode_tokens={}</code>; <code>finished_req_ids=set()</code></td></tr>
+    <tr><td>6</td><td><code>Request</code>, after <code>schedule()</code></td><td><code>status=RUNNING</code> ({{cite vllm/v1/core/sched/scheduler.py:1438-1439}}); <code>num_computed_tokens=61</code> ({{cite vllm/v1/core/sched/scheduler.py:1714-1716}}); <code>is_prefill_chunk=False</code>; <code>num_output_placeholders=1</code> (the async scheduler adds one for the token in flight, {{cite vllm/v1/core/sched/async_scheduler.py:32-47}}); <code>events=[QUEUED, SCHEDULED]</code></td></tr>
+    <tr><td>7</td><td><code>ModelRunnerOutput</code></td><td><code>req_ids=["chatcmpl-...-a1b2c3d4"]</code>; <code>req_id_to_index={id: 0}</code>; <code>sampled_token_ids=[[785]]</code>; <code>logprobs=None</code></td></tr>
+    <tr><td>8</td><td><code>Request</code>, after <code>update_from_output</code></td><td><code>output_token_ids=[785]</code>; <code>num_tokens=62</code>; <code>num_output_placeholders=0</code> ({{cite vllm/v1/core/sched/async_scheduler.py:71-73}})</td></tr>
+    <tr><td>9</td><td><code>EngineCoreOutputs</code></td><td><code>engine_index=0</code>; <code>timestamp</code>: monotonic; <code>outputs=[EngineCoreOutput(new_token_ids=[785], finish_reason=None, events=[QUEUED, SCHEDULED], prefill_stats=PrefillStats(num_prompt_tokens=61, num_computed_tokens=13, num_cached_tokens=48, ...))]</code>; <code>scheduler_stats</code>: set</td></tr>
+    <tr><td>10</td><td><code>RequestOutput</code></td><td><code>request_id="chatcmpl-3f9c...e1"</code> (the external id); <code>outputs=[CompletionOutput(index=0, text="The", token_ids=[785], finish_reason=None)]</code>; <code>finished=False</code>; <code>num_cached_tokens=48</code></td></tr>
+    <tr><td>11</td><td>last <code>EngineCoreOutput</code></td><td><code>new_token_ids=[&lt;eos&gt;]</code>; <code>finish_reason=FinishReason.STOP</code> (0 on the wire); <code>stop_reason=None</code> for EOS</td></tr>
+    <tr><td>12</td><td>last chunk</td><td><code>finish_reason="stop"</code>; <code>delta.content=""</code>, because the detokenizer skips the EOS token ({{cite vllm/v1/engine/detokenizer.py:107-111}})</td></tr>
+  </tbody>
+</table>
+<p>The <code>PrefillStats</code> in row 9 come from <code>set()</code> at the first schedule: 61 prompt tokens, 48 local cached, 0 external, so 13 computed ({{cite vllm/v1/core/sched/scheduler.py:1136-1143}}, {{cite vllm/v1/metrics/stats.py:327-340}}). The front end takes <code>num_cached_tokens</code> from them for <code>RequestOutput</code> ({{cite vllm/v1/engine/output_processor.py:790-800}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The three request ids">
+<table>
+  <thead><tr><th>Id</th><th>Example</th><th>Made at</th><th>Seen by</th></tr></thead>
+  <tbody>
+    <tr><td>body or header id</td><td><code>3f9c...e1</code></td><td>the <code>X-Request-Id</code> header if it is present, else <code>ChatCompletionRequest.request_id</code> ({{cite vllm/entrypoints/serve/engine/serving.py:133-142}})</td><td>the serving layer</td></tr>
+    <tr><td>external id</td><td><code>chatcmpl-3f9c...e1</code></td><td>the chat handler adds the prefix ({{cite vllm/entrypoints/openai/chat_completion/serving.py:320-322}})</td><td>the client (chunk <code>id</code>), <code>RequestOutput.request_id</code>, <code>abort()</code></td></tr>
+    <tr><td>internal id</td><td><code>chatcmpl-3f9c...e1-a1b2c3d4</code></td><td><code>assign_request_id</code> adds 8 random characters ({{cite vllm/v1/engine/input_processor.py:363-371}})</td><td>the engine core, the scheduler, the workers, the logs of the engine core</td></tr>
+  </tbody>
+</table>
+<p>The output processor keeps a map from external id to internal ids, so <code>abort()</code> works with both ({{cite vllm/v1/engine/output_processor.py:599-630}}). With <code>n &gt; 1</code>, the children have the ids <code>0_&lt;internal id&gt;</code>, <code>1_&lt;internal id&gt;</code> and so on ({{cite vllm/v1/engine/parallel_sampling.py:94}}).</p>
+</x-deepdive>
+
+<x-deepdive title="How msgspec and msgpack encode the structs">
+<ol>
+  <li>The client encoder is <code>MsgpackEncoder</code>. <code>encode()</code> returns a list of buffers: the msgpack message first, then the large arrays as extra frames ({{cite vllm/v1/serial_utils.py:165-175}}).</li>
+  <li>A NumPy array or a tensor smaller than <code>VLLM_MSGPACK_ZERO_COPY_THRESHOLD</code> (256 bytes by default) goes inline. A larger one goes as its own frame, with no copy ({{cite vllm/v1/serial_utils.py:236-254}}, {{cite vllm/envs.py:1704-1706}}).</li>
+  <li>Any other type that msgspec does not know raises <code>TypeError</code>. Only with <code>VLLM_ALLOW_INSECURE_SERIALIZATION=1</code> does the encoder fall back to pickle or cloudpickle ({{cite vllm/v1/serial_utils.py:220-234}}).</li>
+  <li>On the engine side, the input thread uses a typed decoder for ADD messages, <code>MsgpackDecoder(EngineCoreRequest)</code>, and a generic decoder for the rest ({{cite vllm/v1/engine/core.py:1930-1933}}).</li>
+  <li>The output thread encodes into reused <code>bytearray</code> buffers, to avoid a new allocation per step ({{cite vllm/v1/engine/core.py:2081-2096}}).</li>
+</ol>
+<p>The message frames are: the engine identity (added by the ROUTER), one request-type byte, then the encoded buffers ({{cite vllm/v1/engine/core_client.py:1284-1294}}). The type bytes are <code>ADD = b"\x00"</code>, <code>ABORT = b"\x01"</code>, <code>START_DP_WAVE = b"\x02"</code> and <code>UTILITY = b"\x03"</code> ({{cite vllm/v1/engine/__init__.py:300-312}}).</p>
+<x-simplified><p>Multimodal tensors can take another path: with <code>mm_tensor_ipc="torch_shm"</code> they go through a torch shared-memory queue, not through ZMQ ({{cite vllm/v1/engine/core_client.py:723-731}}). The page {{link concepts/multimodal-serving}} explains it.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="SchedulerOutput: the less common fields">
+<table>
+  <thead><tr><th>Field</th><th>Meaning</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td><code>scheduled_spec_decode_tokens</code></td><td>draft token ids per request; requests without drafts are not in the dict</td><td>{{cite vllm/v1/core/sched/output.py:248-251}}</td></tr>
+    <tr><td><code>scheduled_encoder_inputs</code></td><td>which multimodal items the encoder must run this step</td><td>{{cite vllm/v1/core/sched/output.py:252-255}}</td></tr>
+    <tr><td><code>finished_req_ids</code></td><td>requests that finished since the last step, so the workers can free their state</td><td>{{cite vllm/v1/core/sched/output.py:257-260}}</td></tr>
+    <tr><td><code>preempted_req_ids</code></td><td>preempted in this step; only used by Model Runner V2</td><td>{{cite vllm/v1/core/sched/output.py:267-269}}</td></tr>
+    <tr><td><code>has_structured_output_requests</code>, <code>pending_structured_output_tokens</code></td><td>flags for the grammar bitmask with async scheduling</td><td>{{cite vllm/v1/core/sched/output.py:271-277}}</td></tr>
+    <tr><td><code>kv_connector_metadata</code></td><td>instructions for a KV connector (disaggregated prefill)</td><td>{{cite vllm/v1/core/sched/output.py:282-283}}</td></tr>
+    <tr><td><code>new_block_ids_to_zero</code></td><td>fresh blocks that the worker must zero before use</td><td>{{cite vllm/v1/core/sched/output.py:296-299}}</td></tr>
+    <tr><td><code>num_common_prefix_blocks</code></td><td>deprecated; always empty, because cascade attention was removed</td><td>{{cite vllm/v1/core/sched/output.py:311-313}}</td></tr>
+  </tbody>
+</table>
+<p>Model Runner V2 sends a resumed (preempted) request again as a new request, with all its token ids. The scheduler moves it into <code>scheduled_new_reqs</code> ({{cite vllm/v1/core/sched/scheduler.py:1505-1507}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A plugin adds an object that msgpack cannot encode.</strong> The encoder raises <code>TypeError</code> and names <code>VLLM_ALLOW_INSECURE_SERIALIZATION</code> ({{cite vllm/v1/serial_utils.py:220-225}}). Do not turn the flag on in production: it lets the peer send pickled objects.</li>
+  <li><strong>Field order of an <code>array_like</code> struct.</strong> A field in the middle of <code>EngineCoreRequest</code> or <code>EngineCoreOutput</code> shifts all later fields. Front end and engine core must run the same vLLM version. The comments ask developers to append new fields last ({{cite vllm/v1/engine/__init__.py:231-235}}).</li>
+  <li><strong>The wrong request id.</strong> The engine core logs the internal id with the random suffix, but the client knows only the external id. Search the logs by the prefix. <code>VLLM_DISABLE_REQUEST_ID_RANDOMIZATION</code> removes the suffix, but then duplicate ids can break the engine ({{cite vllm/v1/engine/input_processor.py:364-369}}).</li>
+  <li><strong>Engine timestamps compared with wall-clock time.</strong> Event and output timestamps are monotonic values of the engine core process. The docstring says that they must not be compared with timestamps of other processes ({{cite vllm/v1/engine/__init__.py:184-190}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> The contracts are the seams of vLLM. A custom scheduler reads <code>Request</code> and writes <code>SchedulerOutput</code>. A KV connector rides in <code>SchedulerOutput</code> and <code>ModelRunnerOutput</code>. A stat logger reads what <code>EngineCoreOutputs</code> carries. Each extension starts with the right type.</p>
+
+<x-quiz>
+  <x-q level="easy">Which type crosses the ZMQ boundary from the API server to the engine core, and how is it encoded?
+    <x-a><p><code>EngineCoreRequest</code>, a <code>msgspec.Struct</code> with <code>array_like=True</code>, encoded as msgpack ({{cite vllm/v1/engine/__init__.py:113-118}}, {{cite vllm/v1/engine/core_client.py:731}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Does <code>EngineCoreOutput</code> contain the generated text?
+    <x-a><p>No. It carries <code>new_token_ids</code> ({{cite vllm/v1/engine/__init__.py:209-210}}). The text appears only in the front end, where the detokenizer of the output processor makes it ({{cite vllm/v1/engine/output_processor.py:823-827}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">In step 2 of our example, the request is a decode. Is it in <code>scheduled_new_reqs</code> or in <code>scheduled_cached_reqs</code>, and what does the worker receive for it?
+    <x-a><p>In <code>scheduled_cached_reqs</code>. The worker already has the request's data from step 1. So it gets only the difference: new block ids, <code>num_computed_tokens</code> and <code>num_output_tokens</code> ({{cite vllm/v1/core/sched/output.py:137-152}}, comments at {{cite vllm/v1/core/sched/output.py:233-240}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Right after <code>schedule()</code> in step 1, <code>num_computed_tokens</code> is 61, but no token has come back yet. What tells the next <code>schedule()</code> that one token is in flight, and when does that counter go back to 0?
+    <x-a><p><code>num_output_placeholders</code>. The async scheduler adds 1 after a step that samples a token ({{cite vllm/v1/core/sched/async_scheduler.py:32-47}}). <code>update_from_output</code> removes it when the token arrives ({{cite vllm/v1/core/sched/async_scheduler.py:71-73}}). The running pass adds the placeholders to the token count ({{cite vllm/v1/core/sched/scheduler.py:759-763}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A request finishes with an EOS token. Which finish values do the engine core, the front end and the HTTP client see?
+    <x-a><p>The engine core sets status <code>FINISHED_STOPPED</code>, which maps to <code>FinishReason.STOP</code> ({{cite vllm/v1/request.py:404-405}}). On the wire this is the integer 0 ({{cite vllm/v1/engine/__init__.py:63}}). The output processor writes <code>str(finish_reason)</code>, which is <code>"stop"</code>, into <code>CompletionOutput</code> ({{cite vllm/v1/engine/output_processor.py:525}}, {{cite vllm/v1/engine/__init__.py:69-70}}). The client sees <code>"finish_reason": "stop"</code> and <code>stop_reason</code> null.</p></x-a>
+  </x-q>
+</x-quiz>

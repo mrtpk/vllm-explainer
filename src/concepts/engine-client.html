@@ -1,0 +1,195 @@
+---
+title: The engine client: AsyncLLM in the API server
+nav_title: The engine client (AsyncLLM)
+level: Intermediate
+prerequisites: concepts/architecture-overview, learn/processes-and-ipc
+related: code/v1-engine-async-llm, code/v1-engine-core-client, code/v1-engine-input-processor, code/v1-engine-output-processor, concepts/data-contracts, concepts/openai-server, concepts/data-parallel-serving, tours/life-of-a-chat-request
+summary: AsyncLLM implements the EngineClient interface of the API server. It turns requests into EngineCoreRequests, sends them to the engine core, and streams RequestOutputs back through one background task and one collector per request.
+---
+<x-sentence>AsyncLLM is the engine client of the API server. It sends each request to the engine core and streams the outputs back through a per-request collector.</x-sentence>
+
+<h2>The idea</h2>
+<p>The OpenAI-compatible routes do not talk to the engine core process directly. They call one object, the {{term engine-client}}, through a fixed set of methods: <code>generate()</code>, <code>abort()</code>, <code>check_health()</code> and some more. In <code>vllm serve</code> this object is {{term async-llm}}. It lives in the API server process, the {{term front-end}}.</p>
+<p>AsyncLLM does three jobs. On the way in, it checks the rendered prompt and makes an {{term engine-core-request}}. In the middle, its {{term engine-core-client}} sends the request over {{term zmq | ZMQ}} and receives {{term engine-core-outputs}}. On the way out, its {{term output-processor}} detokenizes the token ids and makes a {{term request-output}} for each request.</p>
+<p>Many requests run at the same time, but the engine core sends one message per step for all of them. So AsyncLLM has one background task, the {{term output-handler}}, that reads all outputs. It puts each request's output into a small queue for that request, the {{term request-output-collector}}. The task that serves the HTTP request waits only on its own collector.</p>
+<p><strong>An everyday comparison.</strong> Think of a post office with mailboxes. A truck (the engine core) brings one bag of letters after each step. One clerk (the output handler) sorts the bag into the mailboxes. Each customer (a <code>generate()</code> task) waits at its own mailbox. The comparison stops in one place: a mailbox holds only one item. When a new letter arrives before the customer takes the old one, the clerk staples the two letters together.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b2a_engine_client" alt="Panel 1: three boxes for what AsyncLLM owns. Input side: the renderer, shared with the serving classes, and the InputProcessor, which checks parameters, fills defaults, makes an EngineCoreRequest and adds 8 random characters to the request id. Engine core client: the AsyncMPClient with a ROUTER socket for requests, a PULL socket for outputs, an asyncio outputs queue, a map from utility call ids to futures, and the engine_dead flag. Output side: the OutputProcessor with one RequestState per request, holding the detokenizer, logprobs, collector and stats, a map from external to internal ids, and the StatLoggerManager. Panel 2: a flow in two rows. The PULL socket feeds EngineCoreOutputQueueTask, which decodes EngineCoreOutputs, sets utility futures and fills outputs_queue. The output_handler task awaits get_output_async, processes slices of 128 outputs and calls process_outputs. process_outputs detokenizes, checks stop strings, makes a RequestOutput and puts it into the RequestOutputCollector of the request. The generate() task takes it with get_nowait or get and yields it, until finished is true." caption="Figure: what AsyncLLM owns (panel 1), and the path of one output from the socket to the generate() task of its request (panel 2)." />
+<p>Read panel 2 along the arrows: the top row from left to right, then the bottom row from right to left. All boxes in panel 2 run on the one event loop of the API server process. Only the collector belongs to one request; everything else is shared by all requests.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the EngineClient interface</h3>
+<p><code>EngineClient</code> is an abstract class in <code>vllm/engine/protocol.py</code>. It declares four attributes and the state properties that the server checks:</p>
+<x-code file="vllm/engine/protocol.py" lines="43-69" highlight="46-49,61,69" />
+<p>The main abstract methods are <code>generate</code> ({{cite vllm/engine/protocol.py:93-115}}), <code>encode</code> for pooling models, <code>abort</code> ({{cite vllm/engine/protocol.py:132-141}}) and <code>check_health</code> ({{cite vllm/engine/protocol.py:163-166}}). Sleep, wake-up, LoRA, cache resets and pause are abstract too ({{cite vllm/engine/protocol.py:184-256}}). <code>collective_rpc</code> and the weight-transfer methods have a default that raises <code>NotImplementedError</code> ({{cite vllm/engine/protocol.py:275-283}}, {{cite vllm/engine/protocol.py:303-335}}). In the <code>vllm/</code> package, <code>AsyncLLM</code> is the one class that implements it ({{cite vllm/v1/engine/async_llm.py:93}}).</p>
+<p>The serving classes use the attributes too. They take the renderer and the input processor from the engine client ({{cite vllm/entrypoints/generate/base/serving.py:150-151}}). Before they start a response, they check <code>errored</code> and call <code>check_admission</code> ({{cite vllm/entrypoints/generate/base/serving.py:169-181}}).</p>
+
+<h3>Step 2: construction</h3>
+<p>The API server calls <code>AsyncLLM.from_vllm_config</code> ({{cite vllm/entrypoints/launchers/api_server/entry.py:93-103}}). This class method picks the executor class from the config and turns <code>disable_log_stats</code> into <code>log_stats</code>:</p>
+<x-code file="vllm/v1/engine/async_llm.py" lines="249-276" highlight="266,270" />
+<p>The constructor then builds the parts in this order: the renderer, the {{term input-processor}}, the output processor and the engine core client ({{cite vllm/v1/engine/async_llm.py:167-201}}). With one API server, the engine core client also starts the engine core processes. In every case it waits until each engine core is ready (page {{link concepts/architecture-overview}}, Step 2). Then the constructor makes the stat loggers when <code>log_stats</code> is on ({{cite vllm/v1/engine/async_llm.py:203-214}}). Stat logger plugins can turn on <code>log_stats</code> even when you disable the default loggers ({{cite vllm/v1/engine/async_llm.py:155-165}}).</p>
+<p>At the end, the constructor starts the output handler, but only if an event loop already runs. Otherwise the first <code>add_request</code> starts it ({{cite vllm/v1/engine/async_llm.py:218-224}}, {{cite vllm/v1/engine/async_llm.py:523-526}}).</p>
+
+<h3>Step 3: generate() and add_request()</h3>
+<p>The chat handler calls <code>self.engine_client.generate(...)</code> with the rendered engine input and the sampling parameters ({{cite vllm/entrypoints/openai/chat_completion/serving.py:396-408}}). <code>generate()</code> is an async generator, so this call only makes the generator object. The code runs when the HTTP stream asks for the first chunk (see {{link tours/life-of-a-chat-request#stop-4 | Tour 1, stop 4}}):</p>
+<x-code file="vllm/v1/engine/async_llm.py" lines="771-802" highlight="773,795,800,802" />
+<p><code>add_request</code> does the work before the loop. For a request with <code>n = 1</code>, the important lines are:</p>
+<x-code file="vllm/v1/engine/async_llm.py" lines="521-536" highlight="521,526,529,535" />
+<ol>
+  <li>Line 521: <code>assign_request_id</code> keeps the caller's id as <code>external_req_id</code> and adds 8 random characters to <code>request_id</code> ({{cite vllm/v1/engine/input_processor.py:353-371}}).</li>
+  <li>Line 529: one collector per request. Its mode depends on <code>output_kind</code>: <code>DELTA</code> for a stream.</li>
+  <li>Line 535: <code>_add_request</code> registers the request in the output processor first, and then sends it ({{cite vllm/v1/engine/async_llm.py:580-584}}). So an output can never arrive for a request that the output processor does not know.</li>
+</ol>
+
+<h3>Step 4: the output handler and its chunks</h3>
+<p>One task serves all requests. It loops for the whole life of the server:</p>
+<x-code file="vllm/v1/engine/async_llm.py" lines="876-893" highlight="880,891-893" />
+<x-code file="vllm/v1/engine/async_llm.py" lines="904-922" highlight="905,915-916,919-922" />
+<ul>
+  <li>Line 880 waits for the next <code>EngineCoreOutputs</code> from the engine core client.</li>
+  <li>Lines 891-893 cut the list into slices of <code>VLLM_V1_OUTPUT_PROC_CHUNK_SIZE</code> outputs, 128 by default ({{cite vllm/envs.py:1474-1476}}).</li>
+  <li>Lines 915-916 give the event loop to other tasks between two slices. The comment at lines 887-889 gives the reason: one large step must not block the event loop for too long.</li>
+  <li>Lines 919-922 abort the requests that the detokenizer stopped with a stop string. The engine core cannot know about stop strings, because it has no text.</li>
+</ul>
+<x-note title="Aborts are sent for each slice">
+<p><code>process_outputs</code> makes a new <code>reqs_to_abort</code> list for each call ({{cite vllm/v1/engine/output_processor.py:756}}). The abort call is inside the slice loop, so the handler sends the aborts of each slice before it processes the next slice ({{cite vllm/v1/engine/async_llm.py:891-922}}). A stop string in any slice stops the request in the engine core.</p>
+</x-note>
+<p>After all slices, the handler updates the LoRA state and records the scheduler and iteration stats ({{cite vllm/v1/engine/async_llm.py:924-935}}).</p>
+
+<h3>Step 5: the collector hands the output over</h3>
+<x-code file="vllm/v1/engine/output_processor.py" lines="61-93" highlight="62,71-73,79,87-88" />
+<p>The collector has one slot (<code>self.output</code>) and an <code>asyncio.Event</code>. When the slot is full and a new <code>RequestOutput</code> comes, <code>put()</code> merges it into the old one (line 79). With <code>DELTA</code>, the merge appends the new text and token ids ({{cite vllm/outputs.py:220-225}}). So a slow HTTP writer gets one larger chunk, and no token is lost. An exception in the slot replaces any output, and <code>get()</code> raises it (lines 71 and 91-92).</p>
+
+<h3>Step 6: abort when the client goes away</h3>
+<p>When the HTTP client disconnects, Starlette cancels the response task. The cancel reaches <code>generate()</code> as <code>CancelledError</code> or <code>GeneratorExit</code>:</p>
+<x-code file="vllm/v1/engine/async_llm.py" lines="807-812" highlight="809" />
+<x-code file="vllm/v1/engine/async_llm.py" lines="948-956" highlight="955-956" />
+<p><code>abort()</code> first removes the request from the output processor. It returns the internal ids, which include the children of an <code>n &gt; 1</code> request ({{cite vllm/v1/engine/output_processor.py:599-661}}). Then it sends one ABORT message with these ids to the engine core. Before a streaming response starts, the route decorator <code>with_cancellation</code> watches for the disconnect itself ({{cite vllm/entrypoints/serve/utils/api_utils.py:85-109}}).</p>
+
+<h3>Step 7: errors and engine death</h3>
+<p>vLLM has two engine exceptions. <code>EngineGenerateError</code> is for one request and "Recoverable". {{term engine-dead-error}} means that the engine core died, and it is "Unrecoverable" ({{cite vllm/v1/engine/exceptions.py:6-22}}). The death becomes visible in four places:</p>
+<ol>
+  <li>The engine core sends <code>ENGINE_CORE_DEAD</code>. The client sets <code>engine_dead</code> and raises <code>EngineDeadError</code> ({{cite vllm/v1/engine/core_client.py:581-584}}). The monitor thread sets the same flag when an engine core process exits ({{cite vllm/v1/engine/core_client.py:829-838}}).</li>
+  <li>The exception reaches the output handler, which puts it into every collector ({{cite vllm/v1/engine/async_llm.py:936-944}}, {{cite vllm/v1/engine/output_processor.py:593-597}}). Each waiting <code>generate()</code> raises it again, without an abort ({{cite vllm/v1/engine/async_llm.py:814-818}}).</li>
+  <li><code>errored</code> becomes true when the flag is set or the output handler task has ended ({{cite vllm/v1/engine/async_llm.py:1373-1384}}). New requests then fail at once ({{cite vllm/v1/engine/async_llm.py:418-419}}), and <code>/health</code> returns 503 ({{cite vllm/entrypoints/serve/instrumentator/health.py:29-33}}).</li>
+  <li>A watchdog task checks every 5 seconds and stops uvicorn, unless <code>VLLM_KEEP_ALIVE_ON_ENGINE_DEATH</code> is set ({{cite vllm/entrypoints/launchers/launcher.py:314-337}}).</li>
+</ol>
+
+<h3>Step 8: which engine core client</h3>
+<p>AsyncLLM always uses a multiprocess client: <code>make_async_mp_client</code> chooses the class by the data parallel settings:</p>
+<x-code file="vllm/v1/engine/core_client.py" lines="158-173" />
+<ul>
+  <li><strong><code>AsyncMPClient</code></strong> (DP = 1): one engine core, one ZMQ identity.</li>
+  <li><strong><code>DPLBAsyncMPClient</code></strong> (DP &gt; 1, internal load balancing): picks an engine core for each request by load ({{cite vllm/v1/engine/core_client.py:1743-1804}}).</li>
+  <li><strong><code>DPAsyncMPClient</code></strong> (DP &gt; 1, external load balancer): sends everything to its own engine core ({{cite vllm/v1/engine/core_client.py:1611-1612}}).</li>
+</ul>
+<p>The page {{link code/v1-engine-core-client}} reads these classes line by line. The page {{link concepts/data-parallel-serving}} explains the load balancing modes.</p>
+
+<h3>Step 9: sleep, wake-up and collective RPCs at a glance</h3>
+<p>Control methods do not go through <code>generate()</code>. AsyncLLM forwards them as {{term utility-call | utility calls}}. For example, <code>sleep()</code> clears the multimodal cache and calls <code>engine_core.sleep_async</code> ({{cite vllm/v1/engine/async_llm.py:1196-1202}}). <code>collective_rpc</code> forwards any worker method name ({{cite vllm/v1/engine/async_llm.py:1247-1257}}). In the engine core, the utility method <code>collective_rpc</code> calls the executor, which runs the method on every worker ({{cite vllm/v1/engine/core.py:1098-1105}}).</p>
+<p>The HTTP routes <code>/sleep</code>, <code>/wake_up</code> and <code>/collective_rpc</code> exist only when <code>VLLM_SERVER_DEV_MODE</code> is set ({{cite vllm/entrypoints/launchers/api_server/routers.py:46-49}}, {{cite vllm/entrypoints/serve/__init__.py:43-65}}).</p>
+<x-note title="Offline inference: LLMEngine and SyncMPClient">
+<p>The offline <code>LLM</code> class uses <code>LLMEngine</code>, not AsyncLLM. It has the same input and output processors ({{cite vllm/v1/engine/llm_engine.py:101-104}}). With <code>VLLM_ENABLE_V1_MULTIPROCESSING</code> on (the default), it uses <code>SyncMPClient</code>: a blocking client with a background output thread ({{cite vllm/v1/engine/llm_engine.py:186-188}}, {{cite vllm/v1/engine/core_client.py:1015-1021}}). There is no collector: <code>process_outputs</code> returns the outputs as a list ({{cite vllm/v1/engine/output_processor.py:864-866}}).</p>
+</x-note>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="add_request(), line by line">
+<x-code file="vllm/v1/engine/async_llm.py" lines="417-436" />
+<ol>
+  <li><strong>Lines 418-419.</strong> A dead engine fails the request at once with <code>EngineDeadError</code>.</li>
+  <li><strong>Lines 421-423.</strong> Trace headers without an OTLP endpoint only log a warning, and the headers are dropped.</li>
+  <li><strong>Lines 427-436.</strong> <code>--kv-sharing-fast-prefill</code> with prompt logprobs raises <code>VLLMValidationError</code>, which becomes HTTP 400.</li>
+</ol>
+<x-code file="vllm/v1/engine/async_llm.py" lines="480-514" />
+<ol>
+  <li><strong>Line 481.</strong> A dict with a <code>"type"</code> key is a rendered engine input. This is the normal path of <code>vllm serve</code>: the renderer has already tokenized. So <code>process_inputs</code> runs in the event loop, with no thread hop (line 483).</li>
+  <li><strong>Lines 497-513.</strong> A raw prompt still needs tokenization. <code>process_inputs_async</code> runs the same function in the renderer's thread pool ({{cite vllm/v1/engine/input_processor.py:82-84}}).</li>
+  <li><strong>Line 487.</strong> <code>get_supported_tasks()</code> is a utility call to the engine core, but only the first time. AsyncLLM caches the result ({{cite vllm/v1/engine/async_llm.py:390-395}}).</li>
+  <li><strong>Line 514.</strong> The prompt text is kept for the output, for example for <code>RequestOutput.prompt</code>.</li>
+</ol>
+<x-code file="vllm/v1/engine/async_llm.py" lines="538-565" />
+<ol>
+  <li><strong>Line 542.</strong> With <code>n &gt; 1</code>, a <code>ParentRequest</code> makes <code>n</code> child requests. Child <code>i</code> gets the id <code>f"{i}_{request_id}"</code> and a copy of the parameters with <code>n = 1</code> ({{cite vllm/v1/engine/parallel_sampling.py:84-96}}). With a seed, child <code>i</code> gets the seed <code>seed + i</code> ({{cite vllm/v1/engine/parallel_sampling.py:76-81}}).</li>
+  <li><strong>Line 551.</strong> Admission control counts the request as <code>n</code> slots.</li>
+  <li><strong>Lines 553-559.</strong> All children are registered with the same collector, then sent one by one. The engine core sees <code>n</code> independent requests.</li>
+  <li><strong>Lines 562-564.</strong> If a send fails, the parent and all its children are aborted.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="A worked example: a step with 300 outputs">
+<p>Assume 300 requests are running, and one engine step produces one token for each. The engine core sends one <code>EngineCoreOutputs</code> with 300 entries in <code>outputs</code>.</p>
+<ol>
+  <li><code>EngineCoreOutputQueueTask</code> receives the frames, decodes them and puts the object into <code>outputs_queue</code> ({{cite vllm/v1/engine/core_client.py:1211-1254}}).</li>
+  <li>The output handler gets it. <code>num_outputs</code> = 300, and with stats on it makes one <code>IterationStats</code> ({{cite vllm/v1/engine/async_llm.py:880-885}}).</li>
+  <li>With the default chunk size 128, the loop runs for <code>start</code> = 0, 128 and 256. The slices have 128, 128 and 44 outputs.</li>
+  <li>After the first and the second slice, <code>end</code> (128, then 256) is smaller than 300, so the handler calls <code>asyncio.sleep(0)</code>. After the third slice, <code>end</code> = 384 is not smaller than 300, so there is no sleep. (Derived from lines 891-916.)</li>
+  <li>Between the slices, other tasks can run: for example, 128 <code>generate()</code> tasks wake up and write their SSE chunks before the next slice is detokenized.</li>
+</ol>
+<p>A smaller chunk size gives more fairness on the event loop and more task switches. The code gives no measured numbers for this trade-off.</p>
+</x-deepdive>
+
+<x-deepdive title="generate(): every exit path">
+<table>
+  <thead><tr><th>Exception in generate()</th><th>Abort sent?</th><th>What the caller gets</th><th>Lines</th></tr></thead>
+  <tbody>
+    <tr><td><code>CancelledError</code>, <code>GeneratorExit</code></td><td>yes</td><td>the same exception again</td><td>{{cite vllm/v1/engine/async_llm.py:807-812}}</td></tr>
+    <tr><td><code>EngineDeadError</code></td><td>no</td><td>the same exception; HTTP 500 with the message "The server had an error while processing your request." ({{cite vllm/entrypoints/serve/exception_handling/error_response.py:68-72}})</td><td>{{cite vllm/v1/engine/async_llm.py:814-818}}</td></tr>
+    <tr><td><code>VLLMClientError</code>, <code>GracefulHTTPError</code>, <code>GenerationError</code></td><td>yes</td><td>the same exception</td><td>{{cite vllm/v1/engine/async_llm.py:820-827}}</td></tr>
+    <tr><td><code>InputStreamError</code></td><td>yes</td><td>the cause of the error</td><td>{{cite vllm/v1/engine/async_llm.py:829-835}}</td></tr>
+    <tr><td>any other <code>Exception</code></td><td>yes</td><td><code>EngineGenerateError</code></td><td>{{cite vllm/v1/engine/async_llm.py:837-851}}</td></tr>
+  </tbody>
+</table>
+<p>In a stream, the HTTP status 200 is already sent. So the chat stream generator catches the exception and writes an error chunk instead ({{cite vllm/entrypoints/openai/chat_completion/serving.py:937-943}}). In every case, the <code>finally</code> block closes the collector ({{cite vllm/v1/engine/async_llm.py:852-854}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Admission control before the stream starts">
+<p><code>check_admission</code> rejects a request with HTTP 503 before any response starts. It applies two optional limits from the scheduler config ({{cite vllm/v1/engine/async_llm.py:325-383}}):</p>
+<ul>
+  <li><code>max_num_queued_reqs</code>: the number of unfinished requests, waiting plus running. A request with <code>n</code> = 4 needs 4 slots.</li>
+  <li><code>max_num_queued_tokens</code>: the sum of the prompt lengths of the requests that are still in prefill.</li>
+</ul>
+<p>The docstring warns that the token count overestimates the work. The API server does not see chunked prefill progress or prefix-cache hits until the prefill is complete ({{cite vllm/v1/engine/async_llm.py:337-341}}). The count comes from the output processor: <code>prompt_len</code> of every request whose <code>is_prefilling</code> is still true ({{cite vllm/v1/engine/output_processor.py:579-588}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_V1_OUTPUT_PROC_CHUNK_SIZE</code></td><td>128 ({{cite vllm/envs.py:1474-1476}})</td><td>{{cite vllm/v1/engine/async_llm.py:874}}</td><td>Outputs per slice in the output handler. Read once, when the handler starts.</td></tr>
+    <tr><td><code>VLLM_KEEP_ALIVE_ON_ENGINE_DEATH</code></td><td>0 ({{cite vllm/envs.py:1107-1108}})</td><td>{{cite vllm/entrypoints/launchers/launcher.py:333-335}}</td><td>Keeps the HTTP server up after the engine died; requests and <code>/health</code> still fail.</td></tr>
+    <tr><td><code>VLLM_ENGINE_READY_TIMEOUT_S</code></td><td>600 ({{cite vllm/envs.py:812-814}})</td><td>{{cite vllm/v1/engine/core_client.py:756-759}}</td><td>Seconds to wait for each engine core's ready message.</td></tr>
+    <tr><td><code>VLLM_DISABLE_REQUEST_ID_RANDOMIZATION</code></td><td>0 ({{cite vllm/envs.py:1715-1716}})</td><td>{{cite vllm/v1/engine/input_processor.py:364}}</td><td>Keeps the caller's request id unchanged; logs a deprecation warning.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>The server exits after an engine error.</strong> This is the default for <code>EngineDeadError</code>: the watchdog stops uvicorn ({{cite vllm/entrypoints/launchers/launcher.py:325-337}}). Read the log of the engine core process for the root cause. The message of the exception says "See stack trace (above) for the root cause" ({{cite vllm/v1/engine/exceptions.py:19-21}}).</li>
+  <li><strong>A stop string ends the text, but the engine still runs a step.</strong> The engine core does not see stop strings. The output handler sends an ABORT after the detokenizer finds one ({{cite vllm/v1/engine/async_llm.py:918-922}}). The default loop schedules the next step before it processes the output of the current one ({{cite vllm/v1/engine/core.py:724-759}}, {{cite vllm/v1/engine/core.py:767-785}}). So the next step for that request is usually already on the GPU, and more steps can start before the ABORT arrives. (Derived.) The front end ignores these outputs, because the request state is gone ({{cite vllm/v1/engine/output_processor.py:759-762}}).</li>
+  <li><strong>The event loop is busy.</strong> All requests share one event loop and one output handler. A very large batch, long stop strings or many logprobs make <code>process_outputs</code> slow, and all streams wait. More API servers (<code>--api-server-count</code>) split this CPU work ({{link concepts/architecture-overview}}).</li>
+  <li><strong>The 503 errors come early.</strong> With <code>max_num_queued_tokens</code> set, the admission check counts full prompt lengths, so it can reject requests while the GPU still has room ({{cite vllm/v1/engine/async_llm.py:337-341}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Every request of <code>vllm serve</code> goes through AsyncLLM twice: once on the way in and once on the way out. Its single event loop and its error handling decide how the server behaves under load and after a crash.</p>
+
+<x-quiz>
+  <x-q level="easy">Which class implements <code>EngineClient</code> for <code>vllm serve</code>, and which method does the chat route call to start a request?
+    <x-a><p><code>AsyncLLM</code> ({{cite vllm/v1/engine/async_llm.py:93}}). The chat handler calls <code>self.engine_client.generate(...)</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:396}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>_add_request</code> call <code>output_processor.add_request</code> before <code>engine_core.add_request_async</code>?
+    <x-a><p>So the output processor knows the request before its first output can arrive, and before any other task runs. The comment says "Register locally before the first await so concurrent tasks see this request" ({{cite vllm/v1/engine/async_llm.py:580-584}}). The output processor ignores outputs of unknown requests ({{cite vllm/v1/engine/output_processor.py:759-762}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">The engine core produces two tokens for a stream before the HTTP writer reads the first one. What does the writer get?
+    <x-a><p>One <code>RequestOutput</code> with both tokens. The collector has one slot. With <code>DELTA</code> output, <code>put()</code> merges the second output into the first ({{cite vllm/v1/engine/output_processor.py:74-79}}), and the merge appends the text and the token ids ({{cite vllm/outputs.py:220-225}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A step returns 200 outputs. With the default settings, how many slices does the output handler process, and how often does it call <code>asyncio.sleep(0)</code>?
+    <x-a><p>Two slices: 128 and 72 outputs, because <code>VLLM_V1_OUTPUT_PROC_CHUNK_SIZE</code> is 128 ({{cite vllm/envs.py:1474-1476}}). It sleeps once, after the first slice, because <code>end</code> = 128 &lt; 200. After the second slice <code>end</code> = 256, so there is no sleep ({{cite vllm/v1/engine/async_llm.py:891-916}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">The engine core process crashes while 10 streams run. Trace what each stream sees and what the server does.
+    <x-a><p>The engine core sends <code>ENGINE_CORE_DEAD</code>, and the client raises <code>EngineDeadError</code> ({{cite vllm/v1/engine/core_client.py:581-584}}). The output handler puts it into all 10 collectors ({{cite vllm/v1/engine/async_llm.py:936-944}}). Each <code>generate()</code> raises it without an abort ({{cite vllm/v1/engine/async_llm.py:814-818}}). Each stream generator writes an error chunk, because the 200 status is already sent ({{cite vllm/entrypoints/openai/chat_completion/serving.py:941-943}}). Within 5 seconds the watchdog stops the server, unless <code>VLLM_KEEP_ALIVE_ON_ENGINE_DEATH</code> is set ({{cite vllm/entrypoints/launchers/launcher.py:314-337}}).</p></x-a>
+  </x-q>
+</x-quiz>

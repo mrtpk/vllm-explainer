@@ -50,6 +50,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
 
+- LESSON: fact checkers can also be wrong (B2a 'last-slice abort bug' was an indentation misread). Supervisor verifies any 'bug in vLLM' claim before it reaches a page or the FAQ.
+
 - FINAL-PASS TODO: tours/life-of-a-chat-request ~537 errors table: validator errors (stream_options, tool_choice) go through the VLLMError handler, not RequestValidationError. Any page citing the `priority` docstring or saying continuous_usage_stats works alone. architecture-overview ~153: total 18 with CLI supervisor (B2a FC may fix).
 
 - FINAL-PASS TODO: every page that says 'TP=1 → uni executor / worker inside engine core' must say TP = PP = DP = 1 (parallel.py:1055). Check: Tour 1, home map, plugin-loading, plugins-init, ml-basics-recap, processes-and-ipc, learn pages. Tour 1 deep dive 'What changes with DP > 1' LB score must use client_count × inflight (core_client.py:~1778).
@@ -98,7 +100,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-22 20:51 | B1a fact check | done ~21:20: ~250 claims, 38 defects (21 logic, 6 value, 7 citation, 4 missing) |
 | 2026-10-22 21:21 | B1b writer | running |
 | 2026-10-22 20:36 | B2a writer (architecture-overview, engine-client, data-contracts + 4 engine module pages) | done ~21:00; 4 diagrams, b2a.json 7 terms |
-| 2026-10-22 21:01 | B2a fact check | running |
+| 2026-10-22 21:01 | B2a fact check | done ~21:35: ~270 claims, 37 defects. Supervisor REJECTED its 'last-slice abort bug' (abort is inside the loop) and removed the note from 3 pages; supervisor fixed the msgspec claim on processes-and-ipc. |
+| 2026-10-22 21:37 | B2b writer | running |
 | 2026-10-22 19:18 | 1b Tour 1 (t1) | done 19:45: 16 stops, 3 diagrams, request_stepper.js, t1.json (12 terms); not browser-checked by writer |
 | 2026-10-22 19:46 | Fact check t1 (+ browser check of stepper) | done ~20:00: ~230 claims, 38 defects (11 citation, 6 value, 9 logic, 3 default source, 9 other). Stepper OK at 1280/390, no overflow. |
 | 2026-10-22 19:49 | Fact check concepts/plugin-loading (+ folder descriptions) | done ~19:58: ~80 claims, 30 defects fixed (8 citation, 11 value/condition, 4 logic, 3 missing source, 5 glossary/folder). Open question answered (platform before general plugins in every process). |
