@@ -1,0 +1,182 @@
+---
+title: Prefix caching: the idea
+nav_title: Prefix caching
+level: Beginner
+prerequisites: learn/ml-basics-recap
+related: concepts/prefix-caching, concepts/kv-cache-manager, concepts/hybrid-kv-cache, learn/serving-metrics, learn/lora-adapters, concepts/metrics-and-observability
+summary: Chat requests often start with the same tokens. Prefix caching keeps the KV cache blocks of earlier requests under a chain of hashes, so a new request with the same prefix skips the prefill of those blocks and gets a shorter TTFT.
+---
+<x-sentence>Prefix caching keeps the KV cache of earlier prompts, so a new request with the same first tokens skips their prefill.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>Chat traffic repeats itself</h3>
+<p>The KV cache keeps the keys and values of earlier tokens, in blocks of a fixed number of tokens ({{deepinfer learn/kv-cache | The KV cache}}). Without {{term prefix-caching}}, the engine frees these blocks when a request ends. But many requests start with the same tokens as an earlier request:</p>
+<ul>
+  <li><strong>System prompt.</strong> Every request of one application often starts with the same system message and tool list. That can be thousands of tokens.</li>
+  <li><strong>Multi-turn chat.</strong> The client sends the whole conversation again for each new turn. Turn 5 starts with turns 1 to 4.</li>
+  <li><strong>Few-shot examples.</strong> A fixed list of examples comes before each new question.</li>
+  <li><strong>RAG documents.</strong> Several questions about the same document all start with that document.</li>
+</ul>
+<p>The KV values of a token depend only on that token and the tokens before it (causal attention). So if two prompts have the same first 1,000 tokens, the KV cache of those 1,000 tokens is also the same. The engine can keep it and use it again.</p>
+
+<h3>What reuse saves</h3>
+<p>Prefill computes the KV cache of all prompt tokens before the first output token ({{deepinfer learn/prefill-decode | Prefill and decode}}). A cache hit skips the prefill of the matched tokens. This saves GPU compute, and it makes the {{term ttft}} (time to first token) shorter. It also frees part of the {{term token-budget}} of the step for other requests.</p>
+<p>A cache hit does not change the output. The model sees the same KV values that it would compute again.</p>
+
+<h3>Blocks, not single tokens</h3>
+<p>vLLM shares the cache in whole blocks, with 16 tokens per block by default. Only a <em>full</em> block can be shared. A block that is not full still gets new tokens from its own request, so another request cannot use it.</p>
+<p>To find a block, vLLM computes a hash for each full block. The hash of a block uses three inputs. They are the hash of the block before it (the <em>parent</em>), the token ids of the block, and extra keys. This makes a {{term hash-chain}}: the hash of block 3 depends on blocks 0, 1 and 2 too. So one hash names the whole prefix up to the end of its block.</p>
+<p>The chain is necessary because the same 16 tokens can stand after different text. Their KV values are then different. A hash of only the 16 tokens would match the wrong KV values. With the chain, two blocks match only when everything before them matches too.</p>
+
+<h3>Eviction: least recently used</h3>
+<p>When a request ends, its blocks are free, but they keep their hashes and their KV data. A later request can still hit them. In the normal case, the engine overwrites a cached block only when it needs a free block and has no free block without a hash. It then takes the block that was used least recently (LRU).</p>
+
+<h3>What breaks a hit</h3>
+<ul>
+  <li><strong>Any change early in the prompt.</strong> One different token in block 0 changes the hash of block 0, so every later hash changes too. A date or a request id at the top of the system prompt removes all reuse.</li>
+  <li><strong>A different LoRA adapter.</strong> The adapter changes the KV values, so the adapter is part of the hash.</li>
+  <li><strong>Different images or audio.</strong> The placeholder tokens of two images can be the same, so the hash also includes a hash of each multimodal item.</li>
+  <li><strong>A different {{term cache-salt}}.</strong> A client can add a secret salt. Only requests with the same salt share blocks.</li>
+  <li><strong>A different tokenization.</strong> The chat template renders the earlier turns again. If the result has other tokens than the first time, the hit stops there.</li>
+</ul>
+
+<h3>An everyday comparison</h3>
+<p>Think of a long recipe that many cooks start in the same way. The first cook makes the base sauce and puts it in the fridge, with a label that says how it was made, step by step. The next cook who needs the same base takes it from the fridge and starts at the next step. When the fridge is full, the sauce that nobody used for the longest time goes out first.</p>
+<p>The comparison stops here: a cook can use part of a pot. vLLM shares only full blocks of 16 tokens. Also, the label of each pot names <em>all</em> earlier steps, not only the last step.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b1b_prefix_hash_chain" alt="Panel 1: request A has 120 tokens. Seven full blocks with token ranges 0-15 to 96-111 get hashes h0 to h6, joined by arrows from each hash to the next. The last block, tokens 112-119, is not full and has no hash. Panel 2: request B has 150 prompt tokens. Blocks 0 to 6 have the same hashes h0 to h6 and are cache hits. Block 7 (tokens 112-127) contains new tokens from 118 on, so its hash h7' misses. Block 8 also misses because its hash depends on h7'. Block 9 (tokens 144-149) is not full. A bracket says 7 blocks times 16 = 112 tokens come from the cache, and 150 - 112 = 38 tokens are computed." caption="Figure: each full block hash includes the hash of the block before it (panel 1). The next turn hits the longest run of matching blocks from the start, and computes the rest (panel 2). The token counts are a made-up example." />
+<p>Read panel 1 from left to right: each arrow carries a parent hash into the next hash. Panel 2 is the second chat turn. vLLM looks up the hashes of request B from block 0 and stops at the first miss. All blocks after a miss also miss, because their hashes include the missed hash.</p>
+
+<h2>In vLLM</h2>
+<p>This is a basics page, so this part gives only pointers. The page {{link concepts/prefix-caching}} explains the data structures and the code in full.</p>
+<ol>
+  <li><strong>The default.</strong> <code>--enable-prefix-caching</code> has the default <code>None</code> ({{cite vllm/engine/arg_utils.py:1391-1397}}). <code>EngineArgs</code> then sets it from <code>ModelConfig.is_prefix_caching_supported</code> ({{cite vllm/engine/arg_utils.py:3032}}, {{cite vllm/engine/arg_utils.py:3062-3063}}). For generative models this is true for decoder and hybrid models, and false for encoder-decoder and attention-free models ({{cite vllm/config/model.py:2276-2291}}). So prefix caching is on by default for a normal chat model.</li>
+  <li><strong>The hash.</strong> The engine core picks the hash function from <code>--prefix-caching-hash-algo</code> (default <code>sha256</code>, {{cite vllm/config/cache.py:256}}). It does this only when prefix caching or a KV connector is on ({{cite vllm/v1/engine/core.py:216-225}}). <code>hash_block_tokens()</code> hashes the tuple of parent hash, block tokens and extra keys ({{cite vllm/v1/core/kv_cache_utils.py:707-737}}).</li>
+  <li><strong>The lookup.</strong> The full-attention manager walks the hashes from block 0 and stops at the first block that is not in the cache ({{cite vllm/v1/core/single_type_kv_cache_manager.py:791-799}}).</li>
+</ol>
+<x-code file="vllm/v1/core/kv_cache_utils.py" lines="707-737" highlight="731-737" caption="One block hash. Block 0 has no parent, so it uses the fixed value <code>NONE_HASH</code>. The hash function gets the parent hash, the token ids and the extra keys as one tuple." />
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: two chat turns with block size 16">
+<p>The numbers are made up, but the arithmetic follows the code. The block size is 16, the default ({{cite vllm/config/cache.py:182}}, {{cite vllm/config/cache.py:459-460}}). Some attention backends need another size, and then the platform changes it ({{cite vllm/platforms/interface.py:771-781}}). With one {{term kv-cache-group}}, vLLM hashes at the same size as the block size ({{cite vllm/v1/core/kv_cache_utils.py:840-858}}).</p>
+<p><strong>Turn 1 (request A).</strong> The system prompt, the first user message and the chat template give 75 prompt tokens. The cache is empty, so the hit is 0 and the engine computes all 75 tokens.</p>
+<ul>
+  <li>75 tokens = 4 full blocks (64 tokens) + 11 tokens in block 4. So request A has 4 block hashes after its prompt ({{cite vllm/v1/core/kv_cache_utils.py:990-993}}).</li>
+  <li>The model answers with 45 tokens. The request then has 120 tokens. The block hasher runs again when new full blocks appear, so blocks 4, 5 and 6 also get hashes ({{cite vllm/v1/core/kv_cache_utils.py:966-972}}). Request A ends with 7 hashed blocks (112 tokens) and one block with 8 tokens and no hash.</li>
+  <li>When request A finishes, its blocks go back to the free queue with their hashes.</li>
+</ul>
+<p><strong>Turn 2 (request B).</strong> The client sends the system prompt, user message 1, the answer 1 and user message 2. The chat template renders this as 150 tokens. Assume that tokens 0 to 117 are the same as in request A. The template adds tokens after the answer, so token 118 is the first new token.</p>
+<table>
+  <thead><tr><th>Block</th><th>Tokens</th><th>Same as request A?</th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td>0 to 6</td><td>0-111</td><td>yes, all tokens and all parents</td><td>hit (7 blocks)</td></tr>
+    <tr><td>7</td><td>112-127</td><td>no: tokens 118-127 are new; request A had no hash for this block</td><td>miss</td></tr>
+    <tr><td>8</td><td>128-143</td><td>its parent hash is new</td><td>miss</td></tr>
+    <tr><td>9</td><td>144-149</td><td>not full, no hash</td><td>computed</td></tr>
+  </tbody>
+</table>
+<p>So request B gets 7 × 16 = 112 cached tokens and computes 150 − 112 = 38 tokens. That is 75 % less prefill work for this turn. With a long system prompt, the saving is often larger.</p>
+<p><strong>The metric for both turns.</strong> vLLM counts the prompt tokens of each lookup as queries and the matched tokens as hits (next deep dive). Queries = 75 + 150 = 225 tokens. Hits = 0 + 112 = 112 tokens. The hit rate is 112 / 225 = 49.8 %.</p>
+<p><strong>One edge case.</strong> Assume a prompt of exactly 64 tokens that is fully in the cache. The model must still compute the last prompt token, because it needs the logits of that token. So the maximum hit is <code>num_tokens − 1</code> = 63 tokens ({{cite vllm/v1/core/kv_cache_manager.py:289-300}}). The lookup checks only <code>63 // 16</code> = 3 blocks ({{cite vllm/v1/core/single_type_kv_cache_manager.py:793}}). So the hit is 48 tokens, and the engine computes the last 16 tokens again.</p>
+</x-deepdive>
+
+<x-deepdive title="The hash chain in the code, line by line">
+<p>The engine core makes one hasher function at start-up. The function gets the hash block size and the hash function ({{cite vllm/v1/engine/core.py:216-225}}). The engine core then computes the block hashes of each new request.</p>
+<x-code file="vllm/v1/core/kv_cache_utils.py" lines="966-1010" />
+<ol>
+  <li><strong>Lines 967-972.</strong> The hasher starts after the blocks that already have a hash. If no new full block exists, it returns an empty list.</li>
+  <li><strong>Lines 974-983.</strong> For multimodal requests, it finds the first multimodal item that can touch the next block.</li>
+  <li><strong>Lines 985-987.</strong> The parent of the first new block is the last hash of the request, or <code>None</code> for block 0.</li>
+  <li><strong>Lines 988-993.</strong> The loop stops before a block that is not full: <em>"We only hash full blocks"</em>.</li>
+  <li><strong>Lines 996-998.</strong> It makes the extra keys of this block (LoRA, multimodal items, cache salt, prompt embeddings).</li>
+  <li><strong>Lines 1001-1004.</strong> It hashes the parent hash, the 16 token ids and the extra keys.</li>
+  <li><strong>Lines 1006-1008.</strong> The new hash becomes the parent of the next block. This is the chain.</li>
+</ol>
+<p><strong>The value of block −1.</strong> Block 0 has no parent, so <code>hash_block_tokens()</code> uses <code>NONE_HASH</code> ({{cite vllm/v1/core/kv_cache_utils.py:731-732}}). <code>init_none_hash()</code> derives it from a seed ({{cite vllm/v1/core/kv_cache_utils.py:146-159}}). <code>PYTHONHASHSEED</code> wins if it is set. Otherwise <code>sha256</code> uses the fixed seed <code>"vllm-none-hash"</code>, and the <code>xxhash</code> options use random bytes ({{cite vllm/v1/core/kv_cache_utils.py:117-130}}). With a random seed, two vLLM instances compute different hashes for the same tokens.</p>
+<p><strong>The hash functions.</strong> Four names are valid ({{cite vllm/config/cache.py:174}}), and <code>get_hash_fn_by_name()</code> maps them to functions ({{cite vllm/utils/hashing.py:84-103}}):</p>
+<table>
+  <thead><tr><th><code>--prefix-caching-hash-algo</code></th><th>Serialization</th><th>Hash</th><th>Note ({{cite vllm/config/cache.py:257-271}})</th></tr></thead>
+  <tbody>
+    <tr><td><code>sha256</code> (default)</td><td>pickle</td><td>SHA-256</td><td>cryptographic; the docs call it the most secure choice</td></tr>
+    <tr><td><code>sha256_cbor</code></td><td>canonical CBOR</td><td>SHA-256</td><td>reproducible across languages and versions</td></tr>
+    <tr><td><code>xxhash</code></td><td>pickle</td><td>xxHash 128-bit</td><td>faster, not cryptographic; needs the <code>xxhash</code> package</td></tr>
+    <tr><td><code>xxhash_cbor</code></td><td>canonical CBOR</td><td>xxHash 128-bit</td><td>reproducible, not cryptographic</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Extra keys: LoRA, images, cache salt">
+<p><code>generate_block_hash_extra_keys()</code> collects the extra keys of one block ({{cite vllm/v1/core/kv_cache_utils.py:637-675}}):</p>
+<ul>
+  <li><strong>LoRA.</strong> <code>("lora", lora_name, lora_path)</code> for every block of a LoRA request ({{cite vllm/v1/core/kv_cache_utils.py:590-607}}). The path is in the key, so a name that points to a new adapter path does not reuse old blocks.</li>
+  <li><strong>Multimodal items.</strong> <code>("mm", identifier, offset)</code> for each image, audio or video item that overlaps the block. The offset is the start of the item minus the start of the block. It is negative when the item starts in an earlier block ({{cite vllm/v1/core/kv_cache_utils.py:564-574}}).</li>
+  <li><strong>Cache salt.</strong> <code>("cache_salt", salt)</code>, but only for block 0 ({{cite vllm/v1/core/kv_cache_utils.py:659-663}}). Block 0 is enough: every later hash depends on the hash of block 0.</li>
+  <li><strong>Prompt embeddings.</strong> A SHA-256 of the embedding tensor of the block, when the request sends embeddings instead of token ids ({{cite vllm/v1/core/kv_cache_utils.py:610-634}}).</li>
+</ul>
+<p><strong>The <code>cache_salt</code> request field.</strong> The chat completions request has an optional <code>cache_salt</code> string ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:499-511}}). Its description says that the salt should be random and long, for example 256 bits in base64. A validator checks it before the request runs ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:560-566}}). The salt must be a non-empty string of at most 128 characters, without <code>@</code>, <code>/</code>, <code>\</code> or NUL. Otherwise the server returns HTTP 400 ({{cite vllm/entrypoints/generate/base/protocol.py:39-58}}).</p>
+<pre><code class="language-json">{
+  "model": "Qwen/Qwen3-0.6B",
+  "messages": [{"role": "user", "content": "Hi"}],
+  "cache_salt": "Zk9hc2l2ZS1yYW5kb20tc2FsdC1mb3ItdGVuYW50LTQy"
+}</code></pre>
+<x-note title="Two length limits"><p>The field declares <code>max_length=1024</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:502}}). The validator allows only 128 characters ({{cite vllm/entrypoints/generate/base/protocol.py:39}}, {{cite vllm/entrypoints/generate/base/protocol.py:51-58}}). So a salt of 129 to 1,024 characters fails with HTTP 400.</p></x-note>
+<p><strong>Why a salt.</strong> A hit makes TTFT shorter. An attacker could send a guessed prompt and measure TTFT to learn whether another user sent that prompt. The design document gives this reason ({{cite docs/design/prefix_caching.md:87}}). Requests with different salts never share blocks.</p>
+</x-deepdive>
+
+<x-deepdive title="Free blocks, LRU order and eviction">
+<p>The {{term block-pool}} keeps all free blocks in one doubly linked list, <code>FreeKVCacheBlockQueue</code>. The class comment gives the order: the least recently used block is at the front. For two blocks that a request freed at the same time, the block with more hashed tokens (the tail of the chain) comes first ({{cite vllm/v1/core/kv_cache_utils.py:258-279}}).</p>
+<ol>
+  <li><strong>Free.</strong> A request frees its blocks in reverse order, so its tail block is first ({{cite vllm/v1/core/single_type_kv_cache_manager.py:597-598}}). <code>free_blocks()</code> puts blocks without a hash at the front of the queue, and blocks with a hash at the end ({{cite vllm/v1/core/block_pool.py:776-807}}). So the pool reuses blocks without a hash first, and it keeps cached blocks as long as it can.</li>
+  <li><strong>Hit.</strong> When a request hits a free cached block, <code>touch()</code> removes the block from the free queue and increments its reference count ({{cite vllm/v1/core/block_pool.py:752-770}}). Several running requests can share one block.</li>
+  <li><strong>Allocate.</strong> <code>get_new_blocks()</code> pops blocks from the front of the queue ({{cite vllm/v1/core/block_pool.py:678-681}}). If such a block still has a hash, <code>_maybe_evict_cached_block()</code> removes the hash from the cache ({{cite vllm/v1/core/block_pool.py:729-750}}). This is the eviction.</li>
+</ol>
+<p>There is no time limit and no separate cache size. The cache is simply the set of free blocks that still have a hash. The more free KV memory the GPU has, the longer cached blocks survive.</p>
+</x-deepdive>
+
+<x-deepdive title="Watching the hit rate">
+<p>The scheduler records one lookup per admitted request ({{cite vllm/v1/core/sched/scheduler.py:1378-1382}}). The KV cache manager adds the prompt tokens as <em>queries</em> and the matched tokens as <em>hits</em> ({{cite vllm/v1/core/kv_cache_manager.py:253-262}}). It skips requests that did not look up the cache.</p>
+<table>
+  <thead><tr><th>Where</th><th>Name</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td>Prometheus counter</td><td><code>vllm:prefix_cache_queries</code></td><td>prompt tokens that were looked up ({{cite vllm/v1/metrics/loggers.py:661-667}})</td></tr>
+    <tr><td>Prometheus counter</td><td><code>vllm:prefix_cache_hits</code></td><td>tokens found in the cache ({{cite vllm/v1/metrics/loggers.py:672-676}})</td></tr>
+    <tr><td>Log line</td><td><code>Prefix cache hit rate: x%</code></td><td>printed by the log-line stat logger ({{cite vllm/v1/metrics/loggers.py:321-323}})</td></tr>
+  </tbody>
+</table>
+<p>A hit rate for a dashboard is <code>rate(vllm:prefix_cache_hits[5m]) / rate(vllm:prefix_cache_queries[5m])</code>. The rate is a fraction of <em>tokens</em>, not of requests.</p>
+<p><strong>Requests that skip the cache.</strong> A request that asks for prompt logprobs does not read the cache by default, because the hit tokens would have no logprobs ({{cite vllm/sampling_params.py:625-632}}). The lookup also does not run when prefix caching is off ({{cite vllm/v1/core/kv_cache_manager.py:249-251}}).</p>
+<p><strong>Reset.</strong> The route <code>POST /reset_prefix_cache</code> exists, but only as a development route ({{cite vllm/entrypoints/serve/dev/cache/api_router.py:20}}). The API server adds the dev routes only when <code>VLLM_SERVER_DEV_MODE</code> is set ({{cite vllm/entrypoints/launchers/api_server/routers.py:46-49}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A changing value at the top of the prompt.</strong> A timestamp, a user name or a random id in the system prompt changes block 0. Every hash after it changes too ({{cite vllm/v1/core/kv_cache_utils.py:1001-1008}}). Put the fixed text first and the changing text last.</li>
+  <li><strong>The last turn does not hit.</strong> The chat template renders earlier answers again. Some templates change them, for example they drop reasoning text. Then the tokens differ from the generated tokens, and the hit stops at that point.</li>
+  <li><strong>The hit rate drops under load.</strong> Cached blocks are only free blocks with a hash. When many requests run, the pool takes free blocks for new requests and evicts the cached ones ({{cite vllm/v1/core/block_pool.py:686-690}}). More KV memory, or fewer concurrent requests, keeps more of the cache.</li>
+  <li><strong>No reuse across instances with xxhash.</strong> Without <code>PYTHONHASHSEED</code>, each process picks a random seed for <code>NONE_HASH</code> and logs a warning ({{cite vllm/v1/core/kv_cache_utils.py:146-159}}). That matters for KV connectors that share blocks between instances.</li>
+  <li><strong>A reloaded LoRA with the same path.</strong> The LoRA key holds the name and the path, not the weights. If you load new weights in place from the same path, old blocks still match. The API server logs a warning about this ({{cite vllm/entrypoints/openai/models/serving.py:215-224}}).</li>
+  <li><strong>Prompt logprobs.</strong> A request with <code>prompt_logprobs</code> skips the cache read, so its TTFT does not improve ({{cite vllm/sampling_params.py:625-632}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> For chat traffic, prefix caching is often the largest single cut of TTFT and prefill compute. You get the full benefit only when the prompts share long, exact token prefixes. Design the prompt order for it, and watch the hit rate.</p>
+
+<x-quiz>
+  <x-q level="easy">The block size is 16. A prompt has 40 tokens. How many block hashes does vLLM compute for it before any output?
+    <x-a><p>Two. 40 tokens are 2 full blocks (32 tokens) and 8 tokens in a third block. The hasher hashes only full blocks ({{cite vllm/v1/core/kv_cache_utils.py:990-993}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does the hash of a block include the hash of the block before it?
+    <x-a><p>The KV values of a token depend on all earlier tokens. The same 16 tokens after different text have different KV values. The parent hash makes each hash depend on the whole prefix ({{cite vllm/v1/core/kv_cache_utils.py:731-737}}), so a match means that all earlier tokens match too.</p></x-a>
+  </x-q>
+  <x-q level="medium">Two users send the same system prompt. User 1 sends <code>cache_salt</code> "a", user 2 sends no salt. Do they share blocks?
+    <x-a><p>No. The salt is an extra key of block 0 ({{cite vllm/v1/core/kv_cache_utils.py:659-663}}). So block 0 has a different hash, and every later hash is different too, because each hash includes its parent.</p></x-a>
+  </x-q>
+  <x-q level="hard">A prompt of 48 tokens is fully in the cache (3 hashed blocks). How many tokens does the engine compute for it, and why?
+    <x-a><p>16 tokens. The maximum hit is <code>num_tokens − 1</code> = 47, because the engine needs the logits of the last prompt token ({{cite vllm/v1/core/kv_cache_manager.py:289-295}}). The lookup checks only <code>47 // 16</code> = 2 blocks ({{cite vllm/v1/core/single_type_kv_cache_manager.py:793}}). So the hit is 32 tokens, and the engine computes the last block of 16 tokens again.</p></x-a>
+  </x-q>
+  <x-q level="hard">A request finishes. Its blocks have hashes. Which of them does the block pool reuse first for a new request, and which last?
+    <x-a><p>The pool first reuses free blocks without a hash, because <code>free_blocks()</code> puts them at the front of the queue. It puts blocks with a hash at the end ({{cite vllm/v1/core/block_pool.py:797-807}}). Among the blocks of the finished request, the tail block is freed first ({{cite vllm/v1/core/single_type_kv_cache_manager.py:598}}), so it is evicted before the head blocks. The head blocks are the shared prefix that other requests most probably need.</p></x-a>
+  </x-q>
+</x-quiz>

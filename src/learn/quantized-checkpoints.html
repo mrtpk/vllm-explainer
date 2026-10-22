@@ -1,0 +1,152 @@
+---
+title: Quantized checkpoints
+nav_title: Quantized checkpoints
+level: Intermediate
+prerequisites: learn/ml-basics-recap, learn/hf-checkpoints
+related: concepts/quantization-plugins, concepts/weight-loading, learn/hf-checkpoints, learn/tp-pp-in-practice, concepts/kv-cache-manager, concepts/tuning
+summary: A quantized checkpoint stores weights, and sometimes activations, in fewer bits with scales. Weight-only schemes (AWQ, GPTQ) save memory; W8A8 and FP4 schemes also make the matrix multiply cheaper. vLLM reads the scheme from config.json and frees the saved memory for the KV cache.
+---
+<x-sentence>A quantized checkpoint stores weights in 8 or 4 bits with scales. vLLM reads the format from config.json; the saved memory goes to the KV cache.</x-sentence>
+
+<h2>The idea</h2>
+<p>BF16, FP8 and FP4 are number formats with fewer bits per value, and block scales map the small values back to real values ({{deepinfer learn/number-formats | Number formats}}). A <em>quantized checkpoint</em> is a model folder that stores some tensors in such a small format. This page explains which tensors, how the checkpoint says it, and what that does to memory in a server.</p>
+
+<h3>Three families</h3>
+<ul>
+  <li><strong>{{term weight-only-quantization | Weight-only}} (W4A16, W8A16).</strong> Only the weights are small, for example 4-bit integers. The kernel expands them to 16 bits and multiplies with 16-bit activations. AWQ and GPTQ are the common 4-bit methods. This saves memory and memory bandwidth, so it helps decode, which reads all weights for each step. It does not make the multiply itself cheaper.</li>
+  <li><strong>Weight and activation ({{term w8a8}}).</strong> Weights <em>and</em> the activations that enter each linear layer are 8-bit, FP8 or INT8. The GPU then runs the multiply in 8 bits. On GPUs with FP8 tensor cores (for example NVIDIA Hopper), the FP8 peak is about twice the BF16 peak. This is general knowledge, not from the vLLM repository. This helps prefill and large batches.</li>
+  <li><strong>FP4 (NVFP4, MXFP4).</strong> 4-bit floating point with a scale for each small block of values. On the newest GPUs, weights and activations can both be FP4 (W4A4). On other GPUs, vLLM can run some FP4 checkpoints weight-only.</li>
+</ul>
+
+<h3>Scales: per tensor, per channel, per group, per block</h3>
+<p>A small format has a small range. So each group of values gets a <em>scale</em>: real value ≈ stored value × scale. The checkpoint stores the scales next to the weights. The group size is a trade-off: more scales give better accuracy but use more memory.</p>
+<table>
+  <thead><tr><th>Granularity</th><th>One scale for</th><th>Example for a weight [4096, 4096]</th></tr></thead>
+  <tbody>
+    <tr><td>per tensor</td><td>the whole tensor</td><td>1 scale</td></tr>
+    <tr><td>per channel</td><td>each output row</td><td>4,096 scales</td></tr>
+    <tr><td>per group</td><td>each run of g input values in a row (g = 128 is common for AWQ and GPTQ)</td><td>4,096 × 32 = 131,072 scales</td></tr>
+    <tr><td>per block</td><td>each 2-D tile, for example 128 × 128 (block FP8)</td><td>32 × 32 = 1,024 scales</td></tr>
+    <tr><td>micro-block (FP4)</td><td>each run of 16 (NVFP4) or 32 (MXFP4) values</td><td>4,096 × 256 = 1,048,576 scales (NVFP4)</td></tr>
+  </tbody>
+</table>
+<p>Activations change with every request. So their scales come from calibration data (<em>static</em>, one fixed scale), or from the live values (<em>dynamic</em>). A dynamic scheme computes, for example, one scale per token in the kernel.</p>
+
+<h3>The KV cache is separate</h3>
+<p>{{term kv-cache-quantization}} stores the keys and values in a small format, normally FP8. It is a separate choice from the weight format. You can serve a BF16 model with an FP8 KV cache, or an AWQ model with a BF16 KV cache. FP8 KV halves the bytes per token, so the same memory holds twice the tokens.</p>
+
+<h3>How a checkpoint says that it is quantized</h3>
+<p>A Hugging Face model folder has a <code>config.json</code> ({{link learn/hf-checkpoints}}). A quantized checkpoint adds a <code>quantization_config</code> object to it. The key <code>quant_method</code> names the format. The other keys depend on the format:</p>
+<pre><code class="language-json">"quantization_config": {
+  "quant_method": "awq",
+  "bits": 4,
+  "group_size": 128,
+  "zero_point": true
+}</code></pre>
+<p>Common values of <code>quant_method</code> are <code>awq</code>, <code>gptq</code>, <code>fp8</code>, <code>compressed-tensors</code> (from llm-compressor) and <code>modelopt</code> (from NVIDIA ModelOpt). A <code>compressed-tensors</code> config has <code>config_groups</code>. Each group says, for a list of target layers, how the <code>weights</code> and the <code>input_activations</code> are quantized.</p>
+
+<h3>Memory math: an 8B model</h3>
+<p>Take a Llama-3.1-8B-shaped model: 8.03 billion weights. 6.98 billion are in the linear layers of the 32 decoder layers. 1.05 billion are in the embedding and the LM head, which many quantized checkpoints keep in BF16.</p>
+<table>
+  <thead><tr><th>Weights</th><th>Bytes per linear weight</th><th>Weights in GB</th><th>Free for KV on a 24 GB GPU</th><th>KV tokens (BF16 KV)</th><th>KV tokens (FP8 KV)</th></tr></thead>
+  <tbody>
+    <tr><td>BF16</td><td>2</td><td>16.1</td><td>6.0 GB</td><td>45,900</td><td>91,900</td></tr>
+    <tr><td>FP8 (W8A8)</td><td>1 (+ scales)</td><td>9.1</td><td>13.0 GB</td><td>99,200</td><td>198,300</td></tr>
+    <tr><td>INT4, group 128 (W4A16)</td><td>0.5 + 2/128 + 0.5/128</td><td>5.7</td><td>16.4 GB</td><td>124,800</td><td>249,500</td></tr>
+  </tbody>
+</table>
+<p>The assumptions: 1 GB = 10<sup>9</sup> bytes, and the GPU has 24 GB. The model is untied, with a vocabulary of 128,256 tokens. The computation: the budget is 24 GB × 0.92 (the default <code>gpu_memory_utilization</code>, {{cite vllm/config/cache.py:212}}) = 22.1 GB. The KV cache needs 32 layers × 8 KV heads × 128 × 2 (K and V) × 2 bytes = 128 KiB per token in BF16. For FP8 weights, 22.1 − 9.1 = 13.0 GB, and 13.0 GB / 131,072 bytes = 99,200 tokens. The INT4 row counts one 16-bit scale and one 4-bit zero point per group of 128 weights, as AWQ stores them.</p>
+<x-simplified><p>The table ignores the activation memory, the CUDA graph memory and the other buffers that vLLM measures at start-up. A real server has less free memory. But a card that is sold as "24 GB" usually has 24 GiB (25.8 × 10<sup>9</sup> bytes). Its budget is then about 1.6 GB larger. The ratios stay about the same: FP8 weights double the KV room here, and INT4 weights almost triple it.</p></x-simplified>
+
+<h3>An everyday comparison</h3>
+<p>Think of a photo library. Weight-only quantization is like small JPEG files that you open to full size when you look at them. They use less disk space, but the viewing work is the same. W8A8 is like a viewer that can show the small files directly, without the expand step. The KV cache is the stack of photos on your desk: if each one is smaller, more of them fit.</p>
+<p>The comparison stops here: a JPEG loses detail in a fixed way. Quantization methods such as AWQ and GPTQ choose the scales with calibration data, to keep the error small where the model is sensitive.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b1b_quant_where" alt="Panel 1: a table with five schemes as rows and three columns: weights, activations into the GEMM, and the KV cache. No quantization: BF16, BF16, BF16 (auto = model dtype). W4A16 weight-only (AWQ, GPTQ): INT4 weights with group scales, group size 128 common; BF16 or FP16 activations, the kernel expands the weights; BF16 KV unless --kv-cache-dtype. W8A8-FP8 (fp8, compressed-tensors, modelopt): FP8 weights with per-tensor, per-channel or block scales; FP8 activations, dynamic or static; BF16 KV or FP8 if the checkpoint says. W8A8-INT8 (compressed-tensors): INT8 weights per channel or per tensor; INT8 activations; BF16 KV. FP4 (NVFP4, MXFP4): FP4 weights with block scales of 16 or 32 values; FP4 or BF16 activations depending on GPU and kernel; BF16 KV. A dashed box says --kv-cache-dtype fp8 works with any row. Panel 2: an 8B model on a 24 GB GPU with a 22.1 GB budget. BF16 weights 16.1 GB leave 6.0 GB, 45,900 tokens with BF16 KV or 91,900 with FP8 KV. FP8 weights 9.1 GB leave 13.0 GB, 99,200 or 198,300 tokens. INT4 weights 5.7 GB leave 16.4 GB, 124,800 or 249,500 tokens." caption="Figure: each scheme makes different tensors small; the KV cache format is a separate choice (panel 1). Smaller weights leave more memory for the KV cache (panel 2, derived numbers for a Llama-3.1-8B-shaped model)." />
+<p>Read panel 1 row by row. The colour of a cell gives the number of bits. Panel 2 is the memory table of this page as a picture: the weight format moves the line between weight memory and KV cache memory.</p>
+
+<h2>In vLLM</h2>
+<p>This is a basics page, so this part gives only pointers. The page {{link concepts/quantization-plugins}} explains how a quantization method plugs into the layers.</p>
+<ol>
+  <li><strong>The flag.</strong> <code>--quantization</code> / <code>-q</code> selects a method ({{cite vllm/engine/arg_utils.py:985}}). Its default is <code>None</code>. Then vLLM reads <code>quantization_config</code> from the model config; without one, the weights are not quantized ({{cite vllm/config/model.py:264-268}}).</li>
+  <li><strong>Detection.</strong> <code>ModelConfig._verify_quantization()</code> runs in <code>__post_init__</code> ({{cite vllm/config/model.py:922}}). It reads <code>quant_method</code> and asks each method class whether it wants to take over the checkpoint ({{cite vllm/config/model.py:1388-1462}}).</li>
+  <li><strong>The list.</strong> <code>QuantizationMethods</code> has 30 names: 24 methods such as <code>awq</code>, <code>gptq</code>, <code>fp8</code>, <code>compressed-tensors</code>, <code>modelopt_fp4</code> and <code>mxfp4</code>, and 6 short names for online quantization such as <code>fp8_per_tensor</code> ({{cite vllm/model_executor/layers/quantization/__init__.py:15-48}}).</li>
+  <li><strong>The KV cache.</strong> <code>--kv-cache-dtype</code> has the default <code>"auto"</code> ({{cite vllm/config/cache.py:232}}). A KV format in the checkpoint wins first; otherwise <code>"auto"</code> means the model dtype (next deep dives).</li>
+</ol>
+<x-code file="vllm/config/model.py" lines="1388-1426" highlight="1389,1392,1396" caption="The start of the detection: the quantization config from <code>config.json</code>, its <code>quant_method</code>, and the ordered list of methods that can override it." />
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="From config.json to a quantization method, step by step">
+<ol>
+  <li><strong>Read the file.</strong> <code>get_config()</code> takes <code>quantization_config</code> from <code>config.json</code>. Older ModelOpt checkpoints keep it in a separate <code>hf_quant_config.json</code>, and vLLM reads that file instead ({{cite vllm/transformers_utils/config.py:945-958}}).</li>
+  <li><strong>Normalize.</strong> <code>_normalize_quantization_config()</code> also accepts the key <code>compression_config</code> of compressed-tensors. It sets <code>quant_method</code> for ModelOpt checkpoints from their <code>quant_algo</code> (<code>FP8</code> → <code>modelopt</code>, <code>NVFP4</code> → <code>modelopt_fp4</code>). It lower-cases the name and writes <code>compressed_tensors</code> as <code>compressed-tensors</code> ({{cite vllm/transformers_utils/model_arch_config_convertor.py:241-281}}). For multimodal models it also looks in the text config ({{cite vllm/transformers_utils/model_arch_config_convertor.py:283-290}}).</li>
+  <li><strong>Overrides.</strong> <code>_verify_quantization()</code> tries all methods; the methods in the <code>overrides</code> list go last, in a fixed order ({{cite vllm/config/model.py:1396-1426}}). Each class can return a better name for the checkpoint ({{cite vllm/config/model.py:1429-1450}}). For example, on a GPU an AWQ checkpoint becomes <code>auto_awq</code> ({{cite vllm/model_executor/layers/quantization/auto_awq.py:262-286}}), and a GPTQ checkpoint becomes <code>auto_gptq</code> ({{cite vllm/model_executor/layers/quantization/auto_gptq.py:214-233}}).</li>
+  <li><strong>Compare with the flag.</strong> Without <code>--quantization</code>, vLLM uses the detected method. With a flag that does not match the checkpoint, it raises <code>ValueError</code> ({{cite vllm/config/model.py:1452-1462}}).</li>
+  <li><strong>Check the platform.</strong> An unknown name raises <code>ValueError</code>, and the platform can reject a method ({{cite vllm/config/model.py:1464-1470}}). Deprecated methods (<code>fbgemm_fp8</code>, <code>fp_quant</code>) need <code>--allow-deprecated-quantization</code> ({{cite vllm/config/model.py:1472-1485}}, {{cite vllm/model_executor/layers/quantization/__init__.py:52-55}}).</li>
+  <li><strong>Build the config object.</strong> <code>VllmConfig._get_quantization_config()</code> makes the <code>QuantizationConfig</code> from the checkpoint dict. It raises if the GPU compute capability is too low or the model dtype is not supported ({{cite vllm/config/vllm.py:898-931}}).</li>
+</ol>
+<p>The name maps to a class in <code>get_quantization_config()</code>: for example <code>awq</code>, <code>awq_marlin</code> and <code>auto_awq</code> all map to <code>AutoAWQConfig</code> ({{cite vllm/model_executor/layers/quantization/__init__.py:156-185}}). A plugin can add a new name with <code>register_quantization_config()</code> ({{cite vllm/model_executor/layers/quantization/__init__.py:61}}).</p>
+</x-deepdive>
+
+<x-deepdive title="What each method reads from quantization_config">
+<table>
+  <thead><tr><th>Method</th><th>Keys that vLLM reads</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>AWQ</td><td><code>w_bit</code> or <code>bits</code>, <code>q_group_size</code> or <code>group_size</code>, <code>zero_point</code>, optional <code>lm_head</code>, <code>modules_to_not_convert</code></td><td>{{cite vllm/model_executor/layers/quantization/auto_awq.py:241-248}}</td></tr>
+    <tr><td>GPTQ</td><td><code>bits</code>, <code>group_size</code>, <code>desc_act</code>, <code>sym</code>, optional <code>lm_head</code>, <code>dynamic</code></td><td>{{cite vllm/model_executor/layers/quantization/auto_gptq.py:191-198}}</td></tr>
+    <tr><td>FP8</td><td><code>activation_scheme</code>, optional <code>ignored_layers</code>, <code>weight_block_size</code></td><td>{{cite vllm/model_executor/layers/quantization/fp8.py:158-163}}</td></tr>
+    <tr><td>compressed-tensors</td><td><code>config_groups</code>: for each group, <code>targets</code>, <code>weights</code>, <code>input_activations</code>, <code>format</code></td><td>{{cite vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py:319-346}}</td></tr>
+  </tbody>
+</table>
+<p><strong>compressed-tensors schemes.</strong> One checkpoint format covers many schemes. vLLM has one scheme class for each, for example <code>W8A8Fp8</code>, <code>W8A8Int8</code>, <code>WNA16</code>, <code>W4A4Fp4</code> (NVFP4) and <code>W4A4Mxfp4</code> ({{cite vllm/model_executor/layers/quantization/compressed_tensors/schemes/}}). The NVFP4 scheme uses a group size of 16 and packs two FP4 values in one byte ({{cite vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py:32}}, {{cite vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_nvfp4.py:52-58}}). The MXFP4 class comment says: E8M0 scales for groups of 32, true W4A4 on SM100+ with FlashInfer, otherwise W4A16 with Marlin ({{cite vllm/model_executor/layers/quantization/compressed_tensors/schemes/compressed_tensors_w4a4_mxfp4.py:25-37}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Quantizing a BF16 checkpoint at load time">
+<p>You can also quantize a normal BF16 checkpoint while vLLM loads it. This is <em>online</em> quantization. The 6 short names in <code>QuantizationMethods</code> are for this: <code>fp8_per_tensor</code>, <code>fp8_per_block</code>, <code>fp8_per_channel</code>, <code>int8_per_channel_weight_only</code>, <code>nvfp4_per_token</code> and <code>mxfp8</code> ({{cite vllm/model_executor/layers/quantization/__init__.py:43-48}}). <code>mxfp4</code> and <code>mxfp8</code> are also checkpoint formats. They mean online quantization only when the checkpoint has no quantization metadata ({{cite vllm/config/quantization.py:233-235}}).</p>
+<x-note title="--quantization fp8 on a BF16 checkpoint is deprecated"><p>The loader still accepts it, if the checkpoint has no quantization config. It logs a deprecation warning that names <code>fp8_per_tensor</code> as the new flag. Then it uses the <code>fp8_per_tensor</code> online config ({{cite vllm/model_executor/model_loader/weight_utils.py:354-363}}). <code>Fp8Config</code> itself accepts only FP8 checkpoint configs, and raises an error for others ({{cite vllm/model_executor/layers/quantization/fp8.py:105-112}}, {{cite vllm/model_executor/layers/quantization/fp8.py:158-160}}). Many older guides still show <code>--quantization fp8</code> for a BF16 model. Use the new name.</p></x-note>
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-8B-Instruct --quantization fp8_per_tensor</code></pre>
+<p>Online quantization saves weight memory, but it uses no calibration data. A checkpoint that a tool such as llm-compressor or ModelOpt made with calibration is usually more accurate.</p>
+</x-deepdive>
+
+<x-deepdive title="--kv-cache-dtype and its real default">
+<p>The flag is <code>--kv-cache-dtype</code> ({{cite vllm/engine/arg_utils.py:1387}}). The field default is <code>"auto"</code>, and the allowed names include <code>fp8</code>, <code>fp8_e4m3</code>, <code>fp8_e5m2</code>, <code>nvfp4</code> and several per-head INT and FP formats ({{cite vllm/config/cache.py:44-63}}, {{cite vllm/config/cache.py:232-244}}). <code>"auto"</code> goes through three places:</p>
+<ol>
+  <li><strong>ModelOpt checkpoints.</strong> <code>EngineArgs</code> resolves <code>"auto"</code> before it makes the <code>CacheConfig</code> ({{cite vllm/engine/arg_utils.py:2285-2288}}, {{cite vllm/engine/arg_utils.py:2300}}). <code>resolve_kv_cache_dtype_string()</code> reads the KV algorithm from <code>quantization_config</code> ({{cite vllm/utils/torch_utils.py:503-521}}). But <code>get_kv_cache_quant_algo_string()</code> reads it only when <code>quant_method</code> starts with <code>modelopt</code>; for other methods it returns <code>None</code> ({{cite vllm/utils/torch_utils.py:457-458}}, {{cite vllm/utils/torch_utils.py:500}}).</li>
+  <li><strong>llm-compressor checkpoints.</strong> The attention layer checks the <code>kv_cache_scheme</code> of the quantization config. If the dtype is still <code>"auto"</code>, it sets <code>"fp8"</code> ({{cite vllm/model_executor/layers/attention/attention.py:281-291}}). An explicit <code>--kv-cache-dtype</code> wins.</li>
+  <li><strong>Everything else.</strong> <code>"auto"</code> means the model dtype, for example BF16 ({{cite vllm/utils/torch_utils.py:524-529}}).</li>
+</ol>
+<x-note title="A code comment that is not quite right"><p>The comment in the attention layer says that <code>resolve_kv_cache_dtype_string</code> normally resolves the <code>kv_cache_scheme</code> case ({{cite vllm/model_executor/layers/attention/attention.py:284-286}}). That function handles only ModelOpt configs. For llm-compressor checkpoints, the attention layer is the place that actually sets FP8.</p></x-note>
+<p><strong>Scales.</strong> An FP8 KV cache needs a scale for K and V. A checkpoint can bring them; the attention layer reads the scheme, for example <code>attn_head</code> strategy for one scale per head ({{cite vllm/model_executor/layers/attention/attention.py:293-297}}). The page {{link concepts/quantization-plugins}} explains how the scales load.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>The flag does not match the checkpoint.</strong> <code>--quantization fp8</code> on an AWQ checkpoint raises <em>"Quantization method specified in the model config (awq) does not match ..."</em> ({{cite vllm/config/model.py:1456-1462}}). Leave the flag out for a quantized checkpoint; vLLM detects the method.</li>
+  <li><strong><code>--quantization fp8</code> on a BF16 model.</strong> It still works, but it logs a deprecation warning and runs as <code>fp8_per_tensor</code> ({{cite vllm/model_executor/model_loader/weight_utils.py:356-363}}). Use <code>fp8_per_tensor</code> or another online short name.</li>
+  <li><strong>The GPU is too old.</strong> Each method has a minimum compute capability; vLLM stops at start-up below it ({{cite vllm/config/vllm.py:910-918}}).</li>
+  <li><strong>The dtype does not fit the method.</strong> Some methods support only FP16 or only BF16 activations. Start-up then fails with "is not supported for quantization method" ({{cite vllm/config/vllm.py:919-925}}). Set <code>--dtype</code> to a supported type.</li>
+  <li><strong>An FP8 KV cache without good scales.</strong> FP8 KV halves KV memory, but without calibrated scales the accuracy can drop. Test the quality of your task before you use it in production.</li>
+  <li><strong>Docs that show old flags.</strong> Guides from older versions use <code>--quantization fp8</code> for online quantization. The code marks it as deprecated ({{cite vllm/model_executor/model_loader/weight_utils.py:357-360}}). Use the new short names.</li>
+</ul>
+<p><strong>Why it matters.</strong> The weight format decides how much GPU memory is left for the KV cache, and so how many requests the server can hold at once. The activation format decides how fast prefill and large batches run. Pick both on purpose, and keep the KV cache format as a separate decision.</p>
+
+<x-quiz>
+  <x-q level="easy">What is the difference between W4A16 and W8A8?
+    <x-a><p>W4A16 stores only the weights in 4 bits; the activations and the multiply stay in 16 bits. W8A8 stores weights and activations in 8 bits, so the multiply runs in 8 bits too.</p></x-a>
+  </x-q>
+  <x-q level="easy">You start <code>vllm serve</code> with an AWQ checkpoint and no <code>--quantization</code> flag. How does vLLM know that the model is quantized?
+    <x-a><p>It reads <code>quantization_config.quant_method</code> from <code>config.json</code> ({{cite vllm/config/model.py:1389-1392}}). On a GPU, the AWQ class takes over the name and the method becomes <code>auto_awq</code> ({{cite vllm/model_executor/layers/quantization/auto_awq.py:267-284}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">An 8B model has 6.98 billion linear weights and 1.05 billion embedding and LM-head weights in BF16. About how many GB do the weights need with FP8 linear layers?
+    <x-a><p>The FP8 linear weights need 6.98 GB (1 byte each). The BF16 embedding and LM head need 1.05 × 2 = 2.1 GB. Together that is about 9.1 GB, plus a little for the scales.</p></x-a>
+  </x-q>
+  <x-q level="hard">A compressed-tensors checkpoint has an FP8 <code>kv_cache_scheme</code>. You start vLLM without <code>--kv-cache-dtype</code>. What KV dtype do you get, and which code decides it?
+    <x-a><p>FP8. <code>resolve_kv_cache_dtype_string()</code> returns <code>"auto"</code> for this checkpoint, because it reads only ModelOpt configs ({{cite vllm/utils/torch_utils.py:457-458}}). The attention layer then sees the <code>kv_cache_scheme</code> and the dtype <code>"auto"</code>, and it sets <code>"fp8"</code> ({{cite vllm/model_executor/layers/attention/attention.py:287-291}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does a BF16 KV cache hold only 45,900 tokens next to BF16 weights on a 24 GB GPU, in this page's example? Give the computation.
+    <x-a><p>The budget is 24 GB × 0.92 = 22.1 GB. The BF16 weights take 16.1 GB, so 6.0 GB are left. One token needs 32 × 8 × 128 × 2 × 2 = 131,072 bytes, and 6.0 GB / 131,072 B ≈ 45,900 tokens. The default 0.92 comes from the config ({{cite vllm/config/cache.py:212}}). Activations and other buffers make the real number lower.</p></x-a>
+  </x-q>
+</x-quiz>

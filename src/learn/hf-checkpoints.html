@@ -1,0 +1,151 @@
+---
+title: Hugging Face checkpoints
+nav_title: Hugging Face checkpoints
+level: Beginner
+prerequisites: learn/ml-basics-recap
+related: concepts/model-definition, concepts/weight-loading, concepts/renderers-and-chat-templates, concepts/oot-models, learn/quantized-checkpoints, concepts/config-system
+summary: A Hugging Face model folder holds config.json, generation_config.json, tokenizer files and safetensors weights. vLLM reads config.json to pick the model class and the limits, the generation config for default sampling values, the tokenizer files for the chat template, and the safetensors files for the weights.
+---
+<x-sentence>A model folder holds a config, a generation config, tokenizer files and weight files; each part of vLLM reads its own file.</x-sentence>
+
+<h2>The idea</h2>
+<p>When you run <code>vllm serve Qwen/Qwen3-0.6B</code>, the name points to a folder of files on the Hugging Face Hub, or to a local folder. vLLM needs four kinds of information from it. They are the shape of the model, the default sampling values, the tokenizer with its chat template, and the weights. Each kind lives in its own files.</p>
+
+<h3>config.json: the shape of the model</h3>
+<p>The {{term hf-config}} is a JSON object. The keys that matter most for serving:</p>
+<ul>
+  <li><strong><code>architectures</code></strong>: the name of the model class, for example <code>["Qwen3ForCausalLM"]</code>. vLLM looks this name up in its model registry to find its own implementation.</li>
+  <li><strong><code>max_position_embeddings</code></strong>: the longest context that the model was trained for. It becomes the default <code>max_model_len</code>.</li>
+  <li><strong><code>torch_dtype</code></strong> (in newer files <code>dtype</code>): the dtype of the weights, for example <code>bfloat16</code>. It becomes the default <code>--dtype</code>.</li>
+  <li><strong><code>quantization_config</code></strong>: only in quantized checkpoints ({{link learn/quantized-checkpoints}}).</li>
+  <li><strong><code>rope_scaling</code></strong> or <code>rope_parameters</code>: RoPE settings for long context. Some RoPE types make the usable context longer than <code>max_position_embeddings</code>.</li>
+  <li>Sizes: <code>hidden_size</code>, <code>num_hidden_layers</code>, <code>num_attention_heads</code>, <code>num_key_value_heads</code>, <code>vocab_size</code>. They give the shapes of all weights and of the KV cache.</li>
+</ul>
+
+<h3>generation_config.json: default sampling values</h3>
+<p>The {{term generation-config}} holds the values that the model authors suggest for sampling, for example <code>temperature</code>, <code>top_p</code> and <code>top_k</code>, and the end-of-sequence token ids. By default, vLLM uses these values when a request does not set them. So two models can sample differently with the same request.</p>
+
+<h3>Tokenizer files and the chat template</h3>
+<p>The tokenizer turns text into token ids ({{deepinfer learn/tokens | Tokens}}). Its files are <code>tokenizer.json</code> (the vocabulary and merge rules) and <code>tokenizer_config.json</code> (special tokens and settings). The {{term chat-template}} turns a list of chat messages into one prompt. It is a Jinja template, in the key <code>chat_template</code> of <code>tokenizer_config.json</code>, or in its own file <code>chat_template.jinja</code> in newer repositories. Transformers reads both places (general knowledge about Transformers, not vLLM code).</p>
+
+<h3>Weights: safetensors files</h3>
+<p>The weights are in {{term safetensors}} files. A file starts with a JSON header that lists each tensor: name, dtype, shape and byte offsets. The raw bytes follow. Loading a safetensors file runs no code, unlike a pickled <code>.bin</code> file. A small model has one <code>model.safetensors</code>. A large model has shards such as <code>model-00001-of-00004.safetensors</code>, and <code>model.safetensors.index.json</code> maps each tensor name to its shard.</p>
+
+<h3>Where the files come from</h3>
+<ul>
+  <li><strong>A Hub name</strong> such as <code>Qwen/Qwen3-0.6B</code>. vLLM downloads the files with the <code>huggingface_hub</code> library into the Hugging Face cache. By default, this library uses <code>~/.cache/huggingface/hub</code>. <code>HF_HOME</code> moves it to <code>$HF_HOME/hub</code>, and <code>HF_HUB_CACHE</code> sets it directly (general knowledge about <code>huggingface_hub</code>). A second start finds the files there.</li>
+  <li><strong>A local path</strong> such as <code>/models/qwen3</code>. vLLM reads the folder directly and downloads nothing.</li>
+  <li><strong><code>--revision</code></strong> selects a branch, a tag or a commit of the Hub repository. Pin a commit in production, so a new upload does not change your server.</li>
+</ul>
+
+<h3>An everyday comparison</h3>
+<p>Think of a flat-pack furniture box. <code>config.json</code> is the label with the model name and the sizes. <code>generation_config.json</code> is the "recommended use" sheet. The tokenizer files are the dictionary for the instruction language. The safetensors files are the parts, in numbered bags, and the index is the parts list. vLLM is the worker who reads the label first, picks the right assembly plan (the model class), and then puts each part in its place.</p>
+<p>The comparison stops here: vLLM does not use the assembly plan in the box (the Python code of the repository) by default. It uses its own plan for the architecture name. Only with <code>--trust-remote-code</code> can code from the repository run.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b1b_hf_folder" alt="Panel 1: four rows. config.json, with architectures Qwen3ForCausalLM, max_position_embeddings 40960 and torch_dtype bfloat16, goes to get_config() in transformers_utils/config.py and becomes ModelConfig.hf_config: architectures to ModelRegistry, and max_model_len, dtype and quantization. generation_config.json, with temperature 0.6, top_k 20 and top_p 0.95, goes to try_get_generation_config() with --generation-config auto and get_diff_sampling_param(): default sampling values used when the request does not set them. Tokenizer files, tokenizer.json, tokenizer_config.json and chat_template.jinja, go to the tokenizer and resolve_chat_template() in renderers/hf.py: chat messages become one prompt and then token ids. Weight files, model.safetensors or sharded files with model.safetensors.index.json, go to DefaultModelLoader._prepare_weights(), which finds, downloads and filters them; the weights go into the model with load_weights on every worker. Panel 2: three boxes. Name or path Qwen/Qwen3-0.6B, with --revision and HF_HUB_OFFLINE. ModelConfig: hf_config = get_config, architectures[0] = Qwen3ForCausalLM, inspect_model_cls. ModelRegistry: Qwen3ForCausalLM maps to the module qwen3 and the class Qwen3ForCausalLM in model_executor/models/qwen3.py." caption="Figure: each kind of file has its own reader in vLLM (panel 1). The architecture name in config.json selects the Python class through the model registry (panel 2). The file values (40960, 0.6, 20, 0.95) come from the Qwen3-0.6B repository on the Hugging Face Hub, not from the vLLM repository." />
+<p>Read panel 1 row by row, from the file on the left to what vLLM gets on the right. Panel 2 follows only the first row further: from the name on the command line to the class that the workers build.</p>
+
+<h2>In vLLM</h2>
+<p>This is a basics page, so this part gives only pointers. The pages {{link concepts/model-definition}}, {{link concepts/weight-loading}} and {{link concepts/renderers-and-chat-templates}} explain the code in full.</p>
+<ol>
+  <li><strong>The default model.</strong> <code>ModelConfig.model</code> defaults to <code>"Qwen/Qwen3-0.6B"</code> ({{cite vllm/config/model.py:155}}), and <code>EngineArgs</code> copies it ({{cite vllm/engine/arg_utils.py:486}}). <code>vllm serve &lt;name&gt;</code> puts the positional name into <code>args.model</code> ({{cite vllm/entrypoints/cli/serve.py:56-57}}).</li>
+  <li><strong>Name → config → class.</strong> <code>ModelConfig.__post_init__()</code> calls <code>get_config()</code> ({{cite vllm/config/model.py:680-690}}). It then asks the registry for the architecture: <code>registry.inspect_model_cls(architectures, self)</code> ({{cite vllm/config/model.py:739-744}}). On the workers, <code>resolve_model_cls()</code> imports the class ({{cite vllm/model_executor/model_loader/utils.py:310-313}}).</li>
+  <li><strong>The registry entry.</strong> <code>"Qwen3ForCausalLM": ("qwen3", "Qwen3ForCausalLM")</code> maps the name to a module and a class ({{cite vllm/model_executor/models/registry.py:199}}).</li>
+</ol>
+<x-code file="vllm/config/model.py" lines="680-690" caption="<code>ModelConfig</code> loads <code>config.json</code> with <code>get_config()</code>: from <code>--hf-config-path</code> or the model, with <code>--trust-remote-code</code> and the revision." />
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="config.json: how vLLM reads it">
+<ol>
+  <li><strong>Find the format.</strong> With <code>--config-format auto</code>, <code>get_config()</code> checks for a Mistral repository with <code>params.json</code> first, then for <code>config.json</code>. With neither, it raises <code>ValueError</code> with a list of what to check ({{cite vllm/transformers_utils/config.py:883-917}}).</li>
+  <li><strong>Parse.</strong> A config parser builds a Transformers <code>PretrainedConfig</code>. It passes <code>trust_remote_code</code>, <code>revision</code>, <code>code_revision</code> and <code>--hf-overrides</code> ({{cite vllm/transformers_utils/config.py:919-931}}).</li>
+  <li><strong>No <code>architectures</code>?</strong> vLLM fills it from <code>model_type</code> if Transformers knows the type. Otherwise it warns and expects <code>hf_overrides={'architectures': [...]}</code> ({{cite vllm/transformers_utils/config.py:933-943}}).</li>
+  <li><strong>Quantization config.</strong> It takes <code>quantization_config</code> from the file, or from <code>hf_quant_config.json</code> for old ModelOpt checkpoints ({{cite vllm/transformers_utils/config.py:945-958}}).</li>
+</ol>
+<p><strong>dtype.</strong> With <code>--dtype auto</code> (the default, {{cite vllm/config/model.py:200}}), vLLM reads the config dtype ({{cite vllm/transformers_utils/model_arch_config_convertor.py:208-219}}). If the config has none, it reads the dtypes in the safetensors headers ({{cite vllm/transformers_utils/model_arch_config_convertor.py:221-231}}). FP32 models get the first dtype that the platform supports, or FP16 for pooling models when the platform supports it ({{cite vllm/config/model.py:2429-2445}}).</p>
+<p><strong>max_model_len.</strong> vLLM takes the <em>smallest</em> of several keys: <code>max_position_embeddings</code>, <code>n_positions</code>, <code>max_seq_len</code>, <code>seq_length</code> and others ({{cite vllm/transformers_utils/model_arch_config_convertor.py:372-399}}). It also caps the value with <code>model_max_length</code> from <code>tokenizer_config.json</code> ({{cite vllm/config/model.py:2570-2575}}). Some RoPE scaling types multiply it by their <code>factor</code>; for <code>llama3</code>, <code>yarn</code> and others the config value already includes the scaling ({{cite vllm/config/model.py:2603-2634}}). With no key at all, vLLM assumes 2,048 and warns ({{cite vllm/config/model.py:2589-2596}}). Example: Qwen3-0.6B has <code>max_position_embeddings</code> 40,960 and no RoPE scaling, so its default <code>max_model_len</code> is 40,960. These two values come from its <code>config.json</code> on the Hugging Face Hub, not from the vLLM repository.</p>
+</x-deepdive>
+
+<x-deepdive title="generation_config.json and --generation-config">
+<p><code>--generation-config</code> has the default <code>"auto"</code> ({{cite vllm/config/model.py:358-364}}). The three values:</p>
+<table>
+  <thead><tr><th>Value</th><th>Default sampling values come from</th></tr></thead>
+  <tbody>
+    <tr><td><code>auto</code> (default)</td><td><code>generation_config.json</code> of the model folder</td></tr>
+    <tr><td><code>vllm</code></td><td>vLLM's neutral defaults; the file is ignored for sampling</td></tr>
+    <tr><td>a folder path</td><td><code>generation_config.json</code> in that folder</td></tr>
+  </tbody>
+</table>
+<p><code>try_get_generation_config()</code> loads the file with Transformers. If the folder has no such file, it makes a generation config from <code>config.json</code> ({{cite vllm/transformers_utils/config.py:1269-1295}}). <code>get_diff_sampling_param()</code> then keeps only these keys: <code>repetition_penalty</code>, <code>presence_penalty</code>, <code>frequency_penalty</code>, <code>temperature</code>, <code>top_k</code>, <code>top_p</code>, <code>min_p</code>, <code>max_new_tokens</code> and <code>skip_special_tokens</code>. It renames <code>max_new_tokens</code> to <code>max_tokens</code> ({{cite vllm/config/model.py:1877-1902}}). <code>--override-generation-config</code> is applied on top ({{cite vllm/config/model.py:1880}}).</p>
+<p>When the file changes the defaults, vLLM logs: <em>"Default vLLM sampling parameters have been overridden by the model's <code>generation_config.json</code>"</em> ({{cite vllm/config/model.py:1906-1914}}). The EOS ids of the file become extra stop token ids ({{cite vllm/sampling_params.py:789-803}}). The page {{link learn/openai-api}} shows how a request value, this default and the OpenAI default combine.</p>
+</x-deepdive>
+
+<x-deepdive title="Tokenizer and chat template">
+<p>The tokenizer path defaults to the model path ({{cite vllm/config/model.py:607-610}}). <code>--tokenizer</code> and <code>--tokenizer-revision</code> change it. <code>cached_tokenizer_from_config()</code> loads it with the tokenizer mode, revision and <code>trust_remote_code</code> of the model config ({{cite vllm/tokenizers/registry.py:298-315}}).</p>
+<p>The chat template comes from the first source that has one ({{cite vllm/renderers/hf.py:264-319}}):</p>
+<ol>
+  <li>the template that the server or the request gives (<code>--chat-template</code>);</li>
+  <li>the template of the Transformers processor (<code>AutoProcessor</code>), but only when the request has no tools;</li>
+  <li>the template of the tokenizer: Transformers reads it from <code>tokenizer_config.json</code> or <code>chat_template.jinja</code> (Transformers behaviour);</li>
+  <li>a template that vLLM ships for some model types.</li>
+</ol>
+<p>The page {{link concepts/renderers-and-chat-templates}} explains how the renderer uses the template.</p>
+</x-deepdive>
+
+<x-deepdive title="Weights: download, cache and the index file">
+<p><code>DefaultModelLoader._prepare_weights()</code> finds the weight files ({{cite vllm/model_executor/model_loader/default_loader.py:147-263}}):</p>
+<ol>
+  <li><strong>Format.</strong> With <code>--load-format auto</code>, a folder with <code>consolidated*.safetensors</code> uses the Mistral format. Otherwise vLLM tries <code>*.safetensors</code>, then <code>*.bin</code> ({{cite vllm/model_executor/model_loader/default_loader.py:170-186}}).</li>
+  <li><strong>Download.</strong> For a Hub name, <code>download_weights_from_hf()</code> calls <code>snapshot_download()</code> with the allowed patterns and <code>--download-dir</code> as the cache directory ({{cite vllm/model_executor/model_loader/default_loader.py:213-221}}). A file lock stops two processes from downloading the same model at once ({{cite vllm/model_executor/model_loader/weight_utils.py:516-527}}). With <code>HF_HUB_OFFLINE=1</code>, it uses only local files ({{cite vllm/model_executor/model_loader/weight_utils.py:466}}).</li>
+  <li><strong>Filter.</strong> It keeps only files that <code>model.safetensors.index.json</code> names. A file that the index names but that is missing raises <code>FileNotFoundError</code> ({{cite vllm/model_executor/model_loader/weight_utils.py:590-616}}). This matters for repositories that contain both shards and one consolidated file.</li>
+  <li><strong>Nothing found.</strong> <code>RuntimeError: Cannot find any model weights</code> ({{cite vllm/model_executor/model_loader/default_loader.py:258-261}}).</li>
+</ol>
+<p><strong>The cache folder.</strong> <code>--download-dir</code> defaults to the Hugging Face default cache ({{cite vllm/config/load.py:62-64}}). The cache stores each repository as <code>models--&lt;org&gt;--&lt;name&gt;/snapshots/&lt;commit&gt;/</code> under <code>HF_HUB_CACHE</code> ({{cite vllm/model_executor/model_loader/weight_utils.py:903-906}}). With <code>VLLM_USE_MODELSCOPE</code>, vLLM downloads from ModelScope instead ({{cite vllm/model_executor/model_loader/weight_utils.py:161-175}}).</p>
+<p>After the files are found, each worker reads the tensors and gives them to <code>model.load_weights()</code>. With TP, each worker keeps only its slice ({{link concepts/weight-loading}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Names, revisions and remote code">
+<table>
+  <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--revision</code></td><td>none (the default branch)</td><td>Branch, tag or commit of the model ({{cite vllm/config/model.py:238-240}}). The tokenizer revision follows it unless <code>--tokenizer-revision</code> is set ({{cite vllm/config/model.py:609-610}}).</td></tr>
+    <tr><td><code>--trust-remote-code</code></td><td>off</td><td>Allows Python code from the repository, for config and tokenizer classes ({{cite vllm/config/model.py:197-199}}).</td></tr>
+    <tr><td><code>--tokenizer</code></td><td>the model</td><td>Another tokenizer name or path ({{cite vllm/config/model.py:170-172}}).</td></tr>
+    <tr><td><code>--served-model-name</code></td><td>the model</td><td>The names that clients put in <code>model</code>. The first name is in responses and metrics ({{cite vllm/config/model.py:329-336}}). The API server uses all names, or <code>[args.model]</code> ({{cite vllm/entrypoints/launchers/api_server/app_state.py:49-52}}).</td></tr>
+    <tr><td><code>--hf-overrides</code></td><td><code>{}</code></td><td>Changes keys of <code>config.json</code> at load time ({{cite vllm/config/model.py:348-350}}).</td></tr>
+  </tbody>
+</table>
+<p><strong>Architecture lookup.</strong> <code>inspect_model_cls()</code> tries each name in <code>architectures</code>. If vLLM has no implementation for any of them and <code>--model-impl</code> is <code>auto</code>, it falls back to the Transformers implementation ({{cite vllm/model_executor/models/registry.py:1373-1400}}). The model loader then logs that some features may not work ({{cite vllm/model_executor/model_loader/utils.py:315-323}}). With no match at all, vLLM raises an error for an unsupported architecture ({{cite vllm/model_executor/models/registry.py:1402}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>"Invalid repository ID or local directory".</strong> The name is wrong, the repository is private (log in, or set <code>HF_TOKEN</code>), or the folder has no <code>config.json</code> ({{cite vllm/transformers_utils/config.py:904-917}}).</li>
+  <li><strong>Unexpected sampling.</strong> The model's <code>generation_config.json</code> changes the defaults, for example temperature 0.6 (Qwen3-0.6B on the Hub) instead of 1.0. Check the log line, or start with <code>--generation-config vllm</code> ({{cite vllm/config/model.py:1906-1914}}).</li>
+  <li><strong>A slow model on the Transformers fallback.</strong> If vLLM has no class for the architecture, it uses the Transformers implementation and warns ({{cite vllm/model_executor/model_loader/utils.py:315-323}}). Check the "Resolved architecture" log line ({{cite vllm/config/model.py:744}}).</li>
+  <li><strong>A model that changes under you.</strong> Without <code>--revision</code>, a new upload to the repository can change the weights or the chat template at the next start. Pin a commit.</li>
+  <li><strong>Missing shards.</strong> An index file that names a shard that is not in the folder raises <code>FileNotFoundError</code> ({{cite vllm/model_executor/model_loader/weight_utils.py:609-613}}).</li>
+  <li><strong>Remote code.</strong> Some repositories need <code>--trust-remote-code</code>. It runs Python code from the repository in every vLLM process. Read the code first, and pin the revision.</li>
+</ul>
+<p><strong>Why it matters.</strong> Most surprises at start-up come from the model folder: the wrong class, the wrong context length, other default sampling values or a missing file. When you know which file feeds which setting, you can fix them with the right flag.</p>
+
+<x-quiz>
+  <x-q level="easy">Which key of <code>config.json</code> selects the Python class that vLLM builds?
+    <x-a><p><code>architectures</code>. <code>ModelConfig</code> passes it to <code>registry.inspect_model_cls()</code> ({{cite vllm/config/model.py:741}}), and the registry maps the name to a module and a class ({{cite vllm/model_executor/models/registry.py:199}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">What model does <code>vllm serve</code> use when you give no model name?
+    <x-a><p><code>Qwen/Qwen3-0.6B</code>, the default of <code>ModelConfig.model</code> ({{cite vllm/config/model.py:155}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A request sets no <code>temperature</code>. The model folder has <code>generation_config.json</code> with <code>"temperature": 0.6</code>. Which temperature does the request get by default, and how can the operator change that?
+    <x-a><p>0.6. With the default <code>--generation-config auto</code>, <code>get_diff_sampling_param()</code> takes <code>temperature</code> from the file ({{cite vllm/config/model.py:1877-1902}}). <code>--generation-config vllm</code> ignores the file, and <code>--override-generation-config '{"temperature": 0.7}'</code> replaces the value ({{cite vllm/config/model.py:1880}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A config has <code>max_position_embeddings</code> 131072, and <code>tokenizer_config.json</code> has <code>model_max_length</code> 32768. What is the default <code>max_model_len</code>, before RoPE scaling?
+    <x-a><p>32,768. vLLM takes the derived length from the config and then the minimum with <code>model_max_length</code> of the tokenizer config ({{cite vllm/config/model.py:2570-2575}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A repository has both <code>model-00001-of-00002.safetensors</code>, <code>model-00002-of-00002.safetensors</code> and a <code>consolidated.safetensors</code> with the same weights. Why does vLLM not load the weights twice?
+    <x-a><p>With <code>--load-format auto</code>, a folder with <code>consolidated*.safetensors</code> uses the Mistral format and loads only those files ({{cite vllm/model_executor/model_loader/default_loader.py:170-182}}). In the <code>hf</code> format, vLLM keeps only the files that <code>model.safetensors.index.json</code> names ({{cite vllm/model_executor/model_loader/default_loader.py:236-254}}). Both rules stop it from loading both copies.</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,180 @@
+---
+title: Tensor and pipeline parallelism in practice
+nav_title: TP and PP in practice
+level: Intermediate
+prerequisites: learn/ml-basics-recap, learn/processes-and-ipc
+related: concepts/tp-layers, concepts/distributed-groups, concepts/data-parallel-serving, concepts/expert-parallel-moe, concepts/executors-and-workers, concepts/deployment-recipes
+summary: Tensor parallelism splits every weight matrix across GPUs and adds the parts with an all-reduce. Pipeline parallelism gives each GPU a range of layers. This page shows the split of one MLP with real shapes, the head limits of attention, and how to choose TP, PP, DP or EP for a deployment.
+---
+<x-sentence>Tensor parallelism splits each layer across GPUs; pipeline parallelism gives each GPU different layers. Use them only when one GPU is too small.</x-sentence>
+
+<h2>The idea</h2>
+<p>A model can be too large for one GPU, or too slow on one GPU. Then the model runs on several GPUs. DeepInfer Explained introduces the five kinds: data, tensor, pipeline, context and expert parallelism, with their collectives ({{deepinfer learn/parallelism | Parallelism}}). This page shows the two kinds that split one model copy, with small real numbers, and how a serving operator picks one.</p>
+
+<h3>Tensor parallelism: split every layer</h3>
+<p>With {{term tensor-parallel}} (TP), each GPU holds a slice of every weight matrix. All GPUs work on the same tokens at the same time. A linear layer computes <code>Y = X W</code>. You can split W in two ways:</p>
+<ul>
+  <li><strong>By output columns</strong> (a {{term column-parallel}}). Each GPU computes some of the output features from the full input. The result on each GPU is a slice of Y.</li>
+  <li><strong>By input rows</strong> (a {{term row-parallel}}). Each GPU gets a slice of the input features and multiplies it with its rows of W. The result on each GPU is a partial sum of the full Y. An {{term all-reduce}} adds the partial sums.</li>
+</ul>
+<p>The trick is to put the two splits one after the other. The MLP has two linear layers. The first layer is column-parallel, so each GPU gets a slice of the 14,336 intermediate features. The activation function works on each feature alone, so it needs no data from other GPUs. The second layer is row-parallel, and its input slice is exactly the slice that the GPU already has. So one MLP needs only one all-reduce, at the end.</p>
+
+<h3>Small numbers: one MLP with TP = 2</h3>
+<p>Take a Llama-3.1-8B-style MLP: hidden size 4,096, intermediate size 14,336, BF16. T is the number of tokens in the step.</p>
+<table>
+  <thead><tr><th>Layer</th><th>Full weight [out, in]</th><th>Weight on each GPU (TP = 2)</th><th>Output on each GPU</th></tr></thead>
+  <tbody>
+    <tr><td>input X</td><td>–</td><td>–</td><td><code>[T, 4096]</code> (same on both)</td></tr>
+    <tr><td><code>gate_up_proj</code> (column-parallel)</td><td><code>[2 × 14336, 4096]</code></td><td><code>[2 × 7168, 4096]</code></td><td><code>[T, 2 × 7168]</code></td></tr>
+    <tr><td>SiLU(gate) × up</td><td>–</td><td>–</td><td><code>[T, 7168]</code></td></tr>
+    <tr><td><code>down_proj</code> (row-parallel)</td><td><code>[4096, 14336]</code></td><td><code>[4096, 7168]</code></td><td>partial sum <code>[T, 4096]</code></td></tr>
+    <tr><td>all-reduce</td><td>–</td><td>–</td><td>full Y <code>[T, 4096]</code> (same on both)</td></tr>
+  </tbody>
+</table>
+<p>Each GPU holds 88.1 million MLP weights (176 MB) instead of 176.2 million (352 MB). It does half of the multiply work. The price is one all-reduce of <code>T × 4096 × 2</code> bytes: 16 MiB for a step of 2,048 tokens.</p>
+
+<h3>Attention: split by heads</h3>
+<p>Attention heads are independent of each other, so TP gives each GPU a group of heads. The QKV projection is column-parallel: each GPU computes the Q, K and V of its own heads. The output projection is row-parallel, with one all-reduce ({{cite vllm/model_executor/models/llama.py:165-181}}). So one decoder layer has two all-reduces: one after attention and one after the MLP.</p>
+<p>With grouped-query attention, the model has fewer KV heads than query heads (Llama-3.1-8B: 32 query heads, 8 KV heads, head size 128). Two rules follow:</p>
+<ul>
+  <li>The number of query heads must divide by TP. With TP = 3, 32 heads do not divide, and vLLM stops at start-up.</li>
+  <li>If TP is larger than the number of KV heads, vLLM gives one KV head to each GPU and <em>replicates</em> it. With TP = 16, each of the 8 KV heads is on 2 GPUs. TP must then be a multiple of the KV head count.</li>
+</ul>
+<p>The KV cache follows the heads. With TP = 2, each GPU stores 4 KV heads. That is 32 layers × 4 × 128 × 2 (K and V) × 2 bytes = 64 KiB per token, half of 128 KiB. With TP = 16, each GPU stores one replicated head: 16 KiB per token. The 16 GPUs then store 256 KiB per token together, twice the real size.</p>
+
+<h3>Pipeline parallelism: split the layers</h3>
+<p>With {{term pipeline-parallel}} (PP), each GPU, or each group of TP GPUs, holds a range of layers. With 32 layers and PP = 2, stage 0 has layers 0 to 15 and stage 1 has layers 16 to 31. Stage 0 also has the embedding. The last stage also has the final norm and the LM head.</p>
+<p>A stage sends its hidden states to the next stage once per step. For Llama, these are two tensors: <code>hidden_states</code> and <code>residual</code>, each <code>[T, 4096]</code>. For T = 2,048 that is 32 MiB per step and stage boundary. TP instead sends 64 all-reduces per step (2 per layer) inside every group. So PP needs much less bandwidth, and it works over a slower network between nodes.</p>
+<p>The cost of PP is the {{term pipeline-bubble}}. With one batch in flight, stage 1 waits while stage 0 works, and stage 0 waits while stage 1 works. Each GPU is busy only half of the time. vLLM keeps several batches in flight to fill the stages. PP also does not make one step faster: the stages still run one after the other.</p>
+
+<h3>Data and expert parallelism</h3>
+<ul>
+  <li><strong>{{term data-parallel | Data parallelism}} (DP)</strong> runs full copies of the model. Each copy serves other requests. It adds throughput but does not make one model fit. See {{link concepts/data-parallel-serving}}.</li>
+  <li><strong>{{term expert-parallel | Expert parallelism}} (EP)</strong> is for Mixture-of-Experts models ({{deepinfer learn/moe | Mixture of Experts}}). It puts different experts on different GPUs, instead of a TP slice of every expert. See {{link concepts/expert-parallel-moe}}.</li>
+</ul>
+
+<h3>A decision table for a serving operator</h3>
+<table>
+  <thead><tr><th>Situation</th><th>Use</th><th>Example flags</th></tr></thead>
+  <tbody>
+    <tr><td>The model fits on one GPU, with room for the KV cache</td><td>one GPU; add DP copies for more throughput</td><td><code>-dp 4</code></td></tr>
+    <tr><td>The model does not fit on one GPU, but fits on one node</td><td>TP inside the node (fast links between GPUs)</td><td><code>-tp 4</code></td></tr>
+    <tr><td>The model does not fit on one node</td><td>TP inside each node, PP across the nodes</td><td><code>-tp 8 -pp 2</code></td></tr>
+    <tr><td>The GPUs of one node have no fast links, or the GPU count does not divide the heads</td><td>PP inside the node</td><td><code>-pp 4</code></td></tr>
+    <tr><td>A large MoE model</td><td>DP for attention plus EP for the experts</td><td><code>-dp 8 -ep</code></td></tr>
+  </tbody>
+</table>
+<p>The vLLM docs give the same rules for one model replica ({{cite docs/serving/parallelism_scaling.md:7-11}}). They also suggest PP when the GPU count does not divide the model, or when the GPUs have no NVLink ({{cite docs/serving/parallelism_scaling.md:23}}).</p>
+
+<h3>An everyday comparison</h3>
+<p>Think of a team that must type a long book. With TP, every typist types a part of every page, and after each page they put the parts together. With PP, typist 1 types chapters 1 to 10 and typist 2 types chapters 11 to 20. Typist 2 can only start a book when typist 1 hands it over. With DP, each typist types a different book.</p>
+<p>The comparison stops here: in TP, the "put together" step is an addition of numbers (an all-reduce), not a join of pages. And in serving, the pipeline gets a new batch every step, so several batches can be in different stages at the same time.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b1b_mlp_split" alt="Panel 1: two lanes, GPU 0 and GPU 1. In each lane: step 1, input X of shape [T, 4096], the same copy on both GPUs. Step 2, gate_up_proj, a MergedColumnParallelLinear with weight [2 x 7168, 4096] of the full [2 x 14336, 4096], output [T, 2 x 7168]. Step 3, SiluAndMul, output [T, 7168], local. Step 4, down_proj, a RowParallelLinear with weight [4096, 7168] of the full [4096, 14336], output a partial sum Y0 or Y1 of shape [T, 4096]. Both lanes go into one all-reduce box: Y = Y0 + Y1, [T, 4096], the same result on both GPUs. Panel 2: three boxes. Weights per GPU: 88.1 M parameters, 176 MB in BF16; the full MLP has 176.2 M, 352 MB. Data per all-reduce: T x 4096 x 2 bytes, 16 MiB for T = 2048. All-reduces per decoder layer: 2, after o_proj and after down_proj; 64 per step for 32 layers." caption="Figure: with TP = 2, each GPU computes half of the MLP. The column split of gate_up_proj feeds the row split of down_proj with no communication. One all-reduce at the end adds the two partial sums (panel 1). Panel 2 gives the memory and communication numbers." />
+<p>Read each lane from top to bottom: one GPU and its slice of every weight. The only arrow between the lanes is the all-reduce at the bottom. Panel 2 gives the cost of this split for one MLP block.</p>
+
+<h2>In vLLM</h2>
+<p>This is a basics page, so this part gives only pointers. The pages {{link concepts/tp-layers}} and {{link concepts/distributed-groups}} explain the code in full.</p>
+<ol>
+  <li><strong>The layers.</strong> <code>LlamaMLP</code> builds <code>gate_up_proj</code> as a <code>MergedColumnParallelLinear</code> and <code>down_proj</code> as a <code>RowParallelLinear</code> ({{cite vllm/model_executor/models/llama.py:95-111}}). <code>RowParallelLinear.forward()</code> calls the all-reduce when <code>reduce_results</code> is true and TP is larger than 1 ({{cite vllm/model_executor/layers/linear.py:1803-1806}}).</li>
+  <li><strong>The pipeline stages.</strong> <code>make_layers()</code> builds only the layers of this PP rank. It fills the other places with <code>PPMissingLayer</code>, an identity module ({{cite vllm/model_executor/models/utils.py:886-919}}). A stage that is not the last returns <code>IntermediateTensors</code> ({{cite vllm/model_executor/models/llama.py:443-450}}).</li>
+  <li><strong>The rank layout.</strong> vLLM numbers all ranks in the order DP × PP × PCP × TP, with TP last ({{cite vllm/distributed/parallel_state.py:2157-2163}}). So the ranks of one TP group are neighbours, and they normally sit on one node.</li>
+</ol>
+<x-code file="vllm/model_executor/models/llama.py" lines="95-122" highlight="95,103,119-121" caption="The Llama MLP: column-parallel <code>gate_up_proj</code>, the local activation, and row-parallel <code>down_proj</code>. The model code does not call any collective itself; the linear layers do." />
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="ColumnParallelLinear and RowParallelLinear, line by line">
+<p><strong>Column-parallel.</strong> The class comment states the split: <code>A = [A_1, ..., A_p]</code> along the second dimension ({{cite vllm/model_executor/layers/linear.py:436-441}}). The constructor keeps the full input size and divides the output size by the TP size ({{cite vllm/model_executor/layers/linear.py:496-497}}). <code>divide()</code> raises an error when the size does not divide.</p>
+<x-code file="vllm/model_executor/layers/linear.py" lines="616-629" />
+<ol>
+  <li><strong>Line 623.</strong> The quantization method does the matrix multiply on the local slice of the weight. For a BF16 model, this is a plain GEMM.</li>
+  <li><strong>Lines 625-627.</strong> Only with <code>gather_output=True</code> does the layer all-gather the slices. The default is <code>False</code> ({{cite vllm/model_executor/layers/linear.py:473}}), because the next layer is row-parallel and wants the slice.</li>
+</ol>
+<p><strong>Row-parallel.</strong> The input size is divided, and the output size stays full ({{cite vllm/model_executor/layers/linear.py:1694-1695}}).</p>
+<x-code file="vllm/model_executor/layers/linear.py" lines="1785-1811" />
+<ol>
+  <li><strong>Lines 1789-1795.</strong> Normally the input is already split (<code>input_is_parallel=True</code>). Otherwise the layer splits it and takes its own part.</li>
+  <li><strong>Lines 1798-1801.</strong> Only rank 0 adds the bias. Otherwise the all-reduce would add the bias TP times.</li>
+  <li><strong>Lines 1803-1806.</strong> The all-reduce over the TP group. A model can set <code>reduce_results=False</code> to do the reduction later, in its own code.</li>
+</ol>
+<p><strong>Merged layers.</strong> <code>MergedColumnParallelLinear</code> keeps several output matrices in one weight, for example gate and up. Each part is split on its own, so each GPU gets 7,168 rows of gate and 7,168 rows of up. <code>QKVParallelLinear</code> does the same for Q, K and V ({{cite vllm/model_executor/layers/linear.py:1011}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Attention heads and the KV-head limit">
+<p><code>LlamaAttention</code> computes the heads of this GPU ({{cite vllm/model_executor/models/llama.py:143-156}}):</p>
+<x-code file="vllm/model_executor/models/llama.py" lines="143-156" />
+<p><code>QKVParallelLinear</code> uses the same rule for the projection sizes ({{cite vllm/model_executor/layers/linear.py:1064-1071}}). Worked out for Llama-3.1-8B (32 query heads, 8 KV heads, head size 128):</p>
+<table>
+  <thead><tr><th>TP</th><th>Query heads per GPU</th><th>KV heads per GPU</th><th>KV replicas</th><th>KV cache per token per GPU (BF16)</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>32</td><td>8</td><td>1</td><td>32 × 8 × 128 × 2 × 2 B = 128 KiB</td></tr>
+    <tr><td>2</td><td>16</td><td>4</td><td>1</td><td>64 KiB</td></tr>
+    <tr><td>8</td><td>4</td><td>1</td><td>1</td><td>16 KiB</td></tr>
+    <tr><td>16</td><td>2</td><td>1</td><td>2</td><td>16 KiB (each head stored twice)</td></tr>
+    <tr><td>3</td><td colspan="4">error: 32 heads do not divide by 3</td></tr>
+  </tbody>
+</table>
+<p>The check for the query heads runs at start-up, in <code>ModelConfig.verify_with_parallel_config()</code> ({{cite vllm/config/model.py:1557-1564}}). The same function rejects PP for a model class that does not implement the <code>SupportsPP</code> interface ({{cite vllm/config/model.py:1569-1576}}).</p>
+<p><strong>Why the KV cache matters for TP.</strong> TP splits not only the weights but also the KV cache of each token. So TP = 2 on two GPUs gives more than twice the free KV memory of one GPU. The weights shrink by half on each GPU, and each token needs half the KV bytes.</p>
+</x-deepdive>
+
+<x-deepdive title="Pipeline stages: which layers, which tensors">
+<p><strong>Which layers.</strong> <code>get_pp_indices()</code> splits the layers evenly. If the split is not even, it adds one extra layer to each stage, from the second-to-last stage toward the first stage. So the last stage never gets an extra layer. The docstring gives the reason: the last stage also has the final norm ({{cite vllm/distributed/utils.py:190-233}}). <code>VLLM_PP_LAYER_PARTITION</code> overrides the split, for example <code>"11,11,10"</code> ({{cite vllm/distributed/utils.py:206-215}}).</p>
+<table>
+  <thead><tr><th>Layers</th><th>PP</th><th>Split</th></tr></thead>
+  <tbody>
+    <tr><td>32</td><td>2</td><td>16, 16</td></tr>
+    <tr><td>32</td><td>3</td><td>11, 11, 10 (32 // 3 = 10, remainder 2 goes to stages 1 and 0)</td></tr>
+    <tr><td>32</td><td>4</td><td>8, 8, 8, 8</td></tr>
+  </tbody>
+</table>
+<p><strong>Placeholders.</strong> <code>make_layers()</code> makes a list of all layers, but only the layers of this stage are real. The others are <code>PPMissingLayer</code> objects, which return their first input ({{cite vllm/model_executor/models/utils.py:852-860}}). So the layer indices stay the same on every stage, and weight names such as <code>model.layers.20.mlp</code> still match. The embedding and the final norm are also <code>PPMissingLayer</code> on the stages that do not need them ({{cite vllm/model_executor/models/llama.py:377-397}}).</p>
+<p><strong>Which tensors.</strong> The first stage starts from the token embeddings. Every other stage reads <code>hidden_states</code> and <code>residual</code> from the <code>IntermediateTensors</code> of the stage before it ({{cite vllm/model_executor/models/llama.py:414-423}}). The worker receives them with <code>irecv_tensor_dict()</code> ({{cite vllm/v1/worker/gpu_worker.py:1337-1347}}) and sends its own with <code>isend_tensor_dict()</code> ({{cite vllm/v1/worker/gpu_worker.py:1375-1378}}).</p>
+<p><strong>Bubbles.</strong> The engine core can keep several batches in flight. With async scheduling and Model Runner V2, <code>max_concurrent_batches</code> is <code>pp_size + 1</code> ({{cite vllm/config/vllm.py:586-597}}). The code comment gives the reason: PP needs PP-size concurrent batches to fill the pipeline. So with PP = 2, up to 3 batches are in flight, and both stages can work at the same time.</p>
+<x-simplified><p>A real step on each stage has a different length (prefill chunks, decode only). So some bubble time stays, even with batches in flight. The page {{link concepts/async-scheduling}} explains the batch queue.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Ranks, groups and the flags">
+<p><strong>The flags.</strong> <code>--tensor-parallel-size</code> / <code>-tp</code>, <code>--pipeline-parallel-size</code> / <code>-pp</code> and <code>--data-parallel-size</code> / <code>-dp</code> ({{cite vllm/engine/arg_utils.py:1198-1200}}, {{cite vllm/engine/arg_utils.py:1160-1164}}, {{cite vllm/engine/arg_utils.py:1230-1232}}). All three default to 1 ({{cite vllm/config/parallel.py:140-147}}). <code>--enable-expert-parallel</code> / <code>-ep</code> is off by default ({{cite vllm/engine/arg_utils.py:1294-1298}}, {{cite vllm/config/parallel.py:190-191}}).</p>
+<p><strong>The layout.</strong> vLLM puts all ranks in a tensor of shape <code>(ExternalDP, DP, PP, PCP, TP)</code>, with <code>reshape(-1, DP, PP, PCP, TP)</code> ({{cite vllm/distributed/parallel_state.py:2148-2163}}). Each group is one line of this tensor along its dimension:</p>
+<ul>
+  <li>TP groups: <code>all_ranks.view(-1, TP)</code> ({{cite vllm/distributed/parallel_state.py:2168}}).</li>
+  <li>PP groups: move the PP dimension to the end, then reshape ({{cite vllm/distributed/parallel_state.py:2278-2280}}).</li>
+  <li>DP groups: the same with the DP dimension ({{cite vllm/distributed/parallel_state.py:2295}}).</li>
+</ul>
+<p><strong>Worked example: <code>-tp 2 -pp 2</code>.</strong> The world size is 4. The rank tensor is <code>[[[[[0, 1]], [[2, 3]]]]]</code>. The TP groups are <code>[0, 1]</code> and <code>[2, 3]</code>. The PP groups are <code>[0, 2]</code> and <code>[1, 3]</code>.</p>
+<p>Take two nodes of two GPUs. The multiprocess executor gives each node a range of neighbour ranks: global rank = GPUs per node × node rank + local rank ({{cite vllm/v1/executor/multiproc_executor.py:179-192}}). So ranks 0 and 1 are on node 0, and ranks 2 and 3 are on node 1. Then each all-reduce stays inside a node, and only the pipeline sends cross the network (derived).</p>
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-70B-Instruct --tensor-parallel-size 8 --pipeline-parallel-size 2</code></pre>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Heads do not divide.</strong> 32 query heads with TP = 3 or TP = 6 fail at start-up ({{cite vllm/config/model.py:1559-1564}}). Choose a TP that divides the head count, or use PP.</li>
+  <li><strong>The model has no PP support.</strong> PP needs a model class with <code>SupportsPP</code>. Otherwise vLLM raises <code>NotImplementedError</code> ({{cite vllm/config/model.py:1569-1576}}).</li>
+  <li><strong>TP across nodes.</strong> Each decoder layer has two all-reduces on the critical path. Over a network between nodes this is slow. Keep TP inside a node; put PP or DP across nodes ({{cite docs/serving/parallelism_scaling.md:9}}).</li>
+  <li><strong>TP larger than the KV heads.</strong> vLLM replicates KV heads ({{cite vllm/model_executor/layers/linear.py:1066-1068}}). The KV cache then stores each head several times, so the KV capacity grows less than the GPU count.</li>
+  <li><strong>An uneven pipeline.</strong> A stage with more layers is slower, and the other stages wait for it. Check the "unevenly partitioned" log line, or set <code>VLLM_PP_LAYER_PARTITION</code> ({{cite vllm/distributed/utils.py:220-228}}).</li>
+  <li><strong>DP when the model does not fit.</strong> DP copies the full model to each rank, so it does not help a model that is too large. Use TP or PP first.</li>
+</ul>
+<p><strong>Why it matters.</strong> The parallel layout decides how much memory is left for the KV cache, and how much time each step spends on communication. A wrong layout can cost more throughput than any other setting.</p>
+
+<x-quiz>
+  <x-q level="easy">Which linear layer of the Llama MLP is column-parallel, and which is row-parallel?
+    <x-a><p><code>gate_up_proj</code> is a <code>MergedColumnParallelLinear</code>, and <code>down_proj</code> is a <code>RowParallelLinear</code> ({{cite vllm/model_executor/models/llama.py:95-111}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does the MLP need no communication between <code>gate_up_proj</code> and <code>down_proj</code>?
+    <x-a><p>The column split gives each GPU a slice of the intermediate features. SiLU and the multiply work on each feature alone. The row-parallel <code>down_proj</code> wants exactly this slice as its input (<code>input_is_parallel=True</code>), so only its partial outputs need an all-reduce ({{cite vllm/model_executor/layers/linear.py:1789-1806}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A model has 8 KV heads. You start it with TP = 16. What happens to the KV heads?
+    <x-a><p>Each GPU gets one KV head, and each KV head is on 16 / 8 = 2 GPUs ({{cite vllm/model_executor/layers/linear.py:1066-1068}}). The start-up check <code>tp_size % total_num_kv_heads == 0</code> passes ({{cite vllm/model_executor/models/llama.py:152-156}}). The KV cache stores each head twice.</p></x-a>
+  </x-q>
+  <x-q level="hard">With <code>-tp 2 -pp 2</code>, which ranks form the TP groups and which form the PP groups? Why does this order help on two nodes?
+    <x-a><p>The ranks form a tensor of shape (1, 1, 2, 1, 2) in the order DP, PP, PCP, TP ({{cite vllm/distributed/parallel_state.py:2157-2163}}). TP groups are rows of the last dimension: [0, 1] and [2, 3]. PP groups take the PP dimension: [0, 2] and [1, 3]. Neighbour ranks share a TP group. When ranks 0-1 run on one node and 2-3 on the other, the frequent all-reduces stay inside a node.</p></x-a>
+  </x-q>
+  <x-q level="hard">A model has 32 layers and runs with PP = 3. How many layers does each stage get, and how many batches can be in flight with Model Runner V2 and async scheduling?
+    <x-a><p>11, 11 and 10 layers. 32 // 3 = 10 with a remainder of 2, and the code adds the extra layers to the stages before the last one ({{cite vllm/distributed/utils.py:217-222}}). <code>max_concurrent_batches</code> is <code>pp_size + 1</code> = 4 ({{cite vllm/config/vllm.py:591-593}}).</p></x-a>
+  </x-q>
+</x-quiz>
