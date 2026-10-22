@@ -1,0 +1,166 @@
+---
+title: Model capability protocols (SupportsPP, SupportsLoRA, ...)
+nav_title: Model interfaces
+level: Advanced
+prerequisites: concepts/oot-models, learn/pytorch-for-serving
+related: concepts/oot-models, concepts/model-definition, code/model-executor-models-registry, learn/tp-pp-in-practice, concepts/lora-serving, concepts/multimodal-serving, concepts/speculative-decoding, concepts/hybrid-kv-cache
+summary: A model class tells vLLM what it can do through base classes from models/interfaces.py. Detector functions turn them into a _ModelInfo record, and start-up checks use that record to allow or reject PP, LoRA, multimodal input and more.
+---
+<x-sentence>A model class inherits capability protocols such as SupportsPP; vLLM records them in _ModelInfo and checks them before it starts the workers.</x-sentence>
+
+<h2>The idea</h2>
+<p>vLLM serves hundreds of model classes, and each supports a different set of features. Pipeline parallelism needs a <code>forward</code> that accepts the hidden states of the previous stage. LoRA needs a map of the fused weight names. vLLM must know this before it starts the workers, so that it can reject a bad configuration early, with a clear message.</p>
+<p>A model class declares a feature with a {{term capability-protocol}}: it adds a base class such as <code>SupportsPP</code> or <code>SupportsLoRA</code> from <code>vllm/model_executor/models/interfaces.py</code>. The base class brings a class flag, for example <code>supports_pp = True</code>, and names the methods that the feature needs. A detector function, for example <code>supports_pp()</code>, checks the flag and often the methods too.</p>
+<p>The registry runs all detectors on the class and stores the results in one {{term model-info}} record ({{link concepts/oot-models}}). The configuration code reads the record. Workers check some capabilities again on the built model object.</p>
+<p><strong>An everyday comparison.</strong> Think of the badges on a driving licence: "trucks", "motorcycles". A clerk checks the badges before you get the job, not on the road. The comparison stops here. For some badges, vLLM also tests the skill: it looks at the <code>forward</code> signature. And a few features need no badge, only the right attribute.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b4b_model_interfaces" alt="Panel 1: LlamaForCausalLM inherits LocalArgmaxMixin, nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3 and SupportsQuant, so it inherits the flags supports_lora, supports_pp, supports_eagle and supports_eagle3; it has __init__ with keyword-only vllm_config and prefix, embed_input_ids, forward with input_ids, positions and intermediate_tensors, compute_logits and load_weights. Panel 2: three kinds of test. Flag only, with getattr, for example supports_multimodal, is_hybrid, has_inner_state. Protocol members, with isinstance, for example supports_eagle, supports_mrope, supports_kv_cache_grouping. Flag plus structure, with warnings, for LoRA and PP; the base VllmModel checks test the structure only, with no flag. Panel 3: who reads the results. ModelConfig in the front end raises ValueError for --runner generate on a non-generative model and NotImplementedError for PP without supports_pp. LoRAConfig raises ValueError for --enable-lora without LoRA support. The worker checks supports_lora in load_lora_model and supports_eagle3 for EAGLE-3." caption="Figure: what the class declares (panel 1), the three kinds of detector (panel 2), and the start-up checks that read the results (panel 3)." />
+<p>Panel 2 is the important one. A flag test trusts the flag. A protocol test needs every member of the protocol. A combined test needs the flag and the structure, and it logs a WARNING when the two do not agree.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the base expectations (VllmModel)</h3>
+<p><code>interfaces_base.py</code> defines the protocol that every model must follow. Unlike the protocols of <code>interfaces.py</code>, it has no class flag. The comment says why: old out-of-tree models do not inherit these classes ({{cite vllm/model_executor/models/interfaces_base.py:35-37}}). So vLLM checks the structure by name:</p>
+<x-code file="vllm/model_executor/models/interfaces_base.py" lines="64-115" highlight="66,70-76,86-87,111-115" />
+<ol>
+  <li><strong>Line 66.</strong> <code>__init__</code> must accept the keyword <code>vllm_config</code>.</li>
+  <li><strong>Lines 70-76.</strong> <code>embed_input_ids</code> must exist. A missing method logs a WARNING.</li>
+  <li><strong>Lines 86-87.</strong> <code>forward</code> must accept <code>input_ids</code> and <code>positions</code>.</li>
+  <li><strong>Lines 111-115.</strong> All three must pass.</li>
+</ol>
+<p>Two derived protocols build on it. A generative model also has a callable <code>compute_logits</code> ({{cite vllm/model_executor/models/interfaces_base.py:140-147}}). A pooling model sets the flag <code>is_pooling_model</code> ({{cite vllm/model_executor/models/interfaces_base.py:226-232}}). A class that is neither fails the runner check in <code>ModelConfig</code>, unless <code>--convert</code> adapts it to a pooling model ({{cite vllm/config/model.py:715-737}}).</p>
+
+<h3>Step 2: flag-only detectors</h3>
+<p>Most detectors only read the class flag:</p>
+<x-code file="vllm/model_executor/models/interfaces.py" lines="177-190" highlight="181,190" caption="The docstring says that a class need not set the flag again when the protocol is in its MRO." />
+<x-code file="vllm/model_executor/models/interfaces.py" lines="586-589" highlight="589" />
+<p><code>getattr(model, flag, False)</code> works on a class and on an object. It has a side effect: a class can set the flag without the base class. The test model <code>MyOPTRawInputTokensForCausalLM</code> sets <code>requires_raw_input_tokens = True</code> directly ({{cite tests/plugins/vllm_add_dummy_model/vllm_add_dummy_model/my_opt.py:21-24}}). The detector does not check that the methods of the protocol exist.</p>
+
+<h3>Step 3: protocol-member detectors</h3>
+<p>Some detectors call <code>isinstance</code> with a runtime-checkable <code>Protocol</code>, for example <code>supports_eagle3</code>:</p>
+<x-code file="vllm/model_executor/models/interfaces.py" lines="1783-1786" highlight="1786" />
+<p>For a class object, Python checks that the object has every member of the protocol (general Python rule). Members with a value in the protocol, such as <code>supports_eagle3</code> and the methods, come with inheritance. A member that is only annotated, such as <code>SupportsLoRA.lora_manager</code> ({{cite vllm/model_executor/models/interfaces.py:739}}), is not on the class. So <code>isinstance(cls, SupportsLoRA)</code> is false for every model class (derived). For a class, LoRA uses the helper protocol <code>_SupportsLoRAType</code>, which lists only the flag and the two mappings ({{cite vllm/model_executor/models/interfaces.py:744-749}}). The comment above it gives another reason: <code>issubclass</code> does not work with these protocols, so the code treats the class as an instance (lines 742-743). PP has a helper of the same kind, <code>_SupportsPPType</code> (Step 4).</p>
+
+<h3>Step 4: combined detectors with warnings (LoRA and PP)</h3>
+<x-code file="vllm/model_executor/models/interfaces.py" lines="760-795" highlight="763,772-779,781-786,791-795" />
+<ol>
+  <li><strong>Line 763.</strong> For a class: the flag <code>supports_lora</code> and the attributes <code>packed_modules_mapping</code> and <code>embedding_modules</code> must exist (lines 792-793 use the helper protocol).</li>
+  <li><strong>Lines 772-779.</strong> Flag set, attributes missing: WARNING "sets <code>supports_lora=True</code>, but is missing LoRA-specific attributes", and the result is false.</li>
+  <li><strong>Lines 781-786.</strong> Attributes present, flag missing: WARNING "contains all LoRA-specific attributes, but does not set <code>supports_lora=True</code>". The result is false.</li>
+</ol>
+<p>PP is stricter: it also inspects the <code>forward</code> signature.</p>
+<x-code file="vllm/model_executor/models/interfaces.py" lines="864-912" highlight="867-875,877-895,897,902,912" />
+<ol>
+  <li><strong>Lines 867-875.</strong> The attribute test passes, but <code>forward</code> has no keyword <code>intermediate_tensors</code>: WARNING, and the result is false (line 897).</li>
+  <li><strong>Line 902.</strong> For a class, <code>SupportsPP</code> in the MRO passes the attribute test. The helper protocol (with <code>make_empty_intermediate_tensors</code>) is the second way.</li>
+  <li><strong>Lines 877-895.</strong> The same two mismatch warnings as for LoRA.</li>
+</ol>
+<x-simplified><p>The page shows the main protocols. <code>interfaces.py</code> has 26 runtime-checkable protocol classes (two of them helpers) and the mixins <code>SupportsQuant</code>, <code>LocalArgmaxMixin</code> and <code>EagleModelMixin</code> (from <code>git grep</code> at this commit). The table in Step 5 lists the ones that change start-up.</p></x-simplified>
+
+<h3>Step 5: from the class to _ModelInfo</h3>
+<p>The registry runs the detectors once per class and keeps the results:</p>
+<x-code file="vllm/model_executor/models/registry.py" lines="917-954" highlight="921-922,927,935-936" />
+<p><code>ModelConfig</code> stores the record as <code>_model_info</code> ({{cite vllm/config/model.py:741-742}}) and exposes properties such as <code>is_pp_supported</code> and <code>is_lora_supported</code> ({{cite vllm/config/model.py:2028-2034}}). The table maps each protocol to its reader.</p>
+<table>
+  <thead><tr><th>Protocol</th><th>Flag / test</th><th>Who reads it</th><th>If missing</th></tr></thead>
+  <tbody>
+    <tr><td><code>VllmModelForTextGeneration</code></td><td><code>is_text_generation_model</code>: base checks + <code>compute_logits</code></td><td>runner check {{cite vllm/config/model.py:705-728}}; MRV2 tasks {{cite vllm/v1/worker/gpu/model_states/interface.py:111-112}}</td><td><code>ValueError</code> "does not support <code>--runner generate</code>"</td></tr>
+    <tr><td><code>VllmModelForPooling</code></td><td><code>is_pooling_model</code> flag</td><td>runner check {{cite vllm/config/model.py:706-722}}</td><td>"does not support <code>--runner pooling</code>" unless <code>--convert</code></td></tr>
+    <tr><td><code>SupportsMultiModal</code></td><td><code>supports_multimodal</code> flag</td><td>multimodal config set-up {{cite vllm/config/model.py:830-834}}</td><td>no multimodal config: the model takes text only</td></tr>
+    <tr><td><code>SupportsLoRA</code></td><td>flag + 2 attributes, warnings</td><td>{{cite vllm/config/lora.py:137-143}}; worker {{cite vllm/v1/worker/lora_model_runner_mixin.py:49-50}}</td><td><code>ValueError</code> with <code>--enable-lora</code></td></tr>
+    <tr><td><code>SupportsPP</code></td><td>MRO or attribute + <code>forward</code> keyword</td><td>{{cite vllm/config/model.py:1569-1576}}</td><td><code>NotImplementedError</code> when PP &gt; 1</td></tr>
+    <tr><td><code>SupportsHCSP</code></td><td><code>supports_hc_sp</code> flag</td><td>{{cite vllm/config/model.py:1549-1553}}</td><td><code>ValueError</code> with <code>--enable-hc-sp</code> and TP &gt; 1</td></tr>
+    <tr><td><code>HasInnerState</code></td><td><code>has_inner_state</code> flag</td><td>CPU platform {{cite vllm/platforms/cpu.py:53-56}}</td><td>treated as a model without recurrent state</td></tr>
+    <tr><td><code>IsAttentionFree</code></td><td><code>is_attention_free</code> flag</td><td>attention type {{cite vllm/config/model.py:2185-2186}}; MRV2 model state {{cite vllm/v1/worker/gpu/model_states/__init__.py:52-55}}</td><td>vLLM plans attention KV cache for it</td></tr>
+    <tr><td><code>IsHybrid</code></td><td><code>is_hybrid</code> flag (+ <code>layer_types</code> check)</td><td>{{cite vllm/config/model.py:2040-2049}}; MRV2 model state (same line 52)</td><td>no Mamba state groups ({{link concepts/hybrid-kv-cache}})</td></tr>
+    <tr><td><code>HasNoOps</code></td><td><code>has_noops</code> flag</td><td>layer count {{cite vllm/config/model.py:1748-1750}}</td><td>no-op layers count as attention layers</td></tr>
+    <tr><td><code>SupportsReplaySSM</code></td><td><code>supports_replayssm</code> flag</td><td>{{cite vllm/config/vllm.py:3435-3439}}</td><td><code>ValueError</code> with <code>--use-replayssm</code></td></tr>
+    <tr><td><code>SupportsKVCacheGrouping</code></td><td><code>isinstance</code> (method <code>get_kv_cache_groups</code>)</td><td>{{cite vllm/v1/core/kv_cache_planning.py:1669-1670}}</td><td>default KV cache grouping</td></tr>
+    <tr><td><code>SupportsTranscription</code></td><td><code>supports_transcription</code> flag</td><td>MRV2 tasks {{cite vllm/v1/worker/gpu/model_states/interface.py:113-116}}</td><td>no <code>transcription</code> task</td></tr>
+    <tr><td><code>SupportsEagle3</code></td><td><code>isinstance</code></td><td>{{cite vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py:29-30}}</td><td><code>RuntimeError</code> "does not support EAGLE3 interface"</td></tr>
+    <tr><td><code>SupportsMRoPE</code></td><td><code>isinstance</code></td><td>MRV2 {{cite vllm/v1/worker/gpu/mm/rope.py:134}}</td><td><code>AssertionError</code> for an M-RoPE model</td></tr>
+    <tr><td><code>MixtureOfExperts</code></td><td><code>isinstance</code> and <code>num_moe_layers &gt; 0</code></td><td>EPLB {{cite vllm/model_executor/models/interfaces.py:1170-1173}}</td><td>not an MoE model for EPLB</td></tr>
+  </tbody>
+</table>
+<p>The "if missing" column for flag-only rows is derived from the reader code; vLLM gives no error there.</p>
+
+<h3>Step 6: mixins that are not detectors</h3>
+<ul>
+  <li><strong><code>SupportsQuant</code></strong> is a plain class, not a protocol. Its <code>__new__</code> finds the quantization config in the constructor arguments and stores it on the object as <code>quant_config</code> ({{cite vllm/model_executor/models/interfaces.py:1260-1290}}). It also applies the model's name mapping and <code>packed_modules_mapping</code> to that config ({{cite vllm/model_executor/models/interfaces.py:1292-1299}}).</li>
+  <li><strong><code>EagleModelMixin</code></strong> goes on the inner decoder, not on the top class. It collects auxiliary hidden states for EAGLE-3 ({{cite vllm/model_executor/models/interfaces.py:1608-1680}}). <code>SupportsEagle3.set_aux_hidden_state_layers</code> asserts that the inner model has it ({{cite vllm/model_executor/models/interfaces.py:1745-1748}}).</li>
+  <li><strong><code>SupportsEagle</code></strong> (EAGLE-1/2) is in the MRO of Llama, but at this commit <code>git grep</code> finds no call of <code>supports_eagle()</code> outside <code>vllm/model_executor/models/</code>.</li>
+</ul>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: the _ModelInfo of LlamaForCausalLM">
+<p>The class header and its LoRA attributes:</p>
+<x-code file="vllm/model_executor/models/llama.py" lines="464-490" highlight="465-471,475-482,486-489" />
+<p>Applying each detector of <code>from_model_cls</code> to this class gives these values (derived from the code above; the cache file <code>vllm-model_executor-models-llama-LlamaForCausalLM.json</code> holds the same record):</p>
+<table>
+  <thead><tr><th>Field</th><th>Value</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td><code>architecture</code></td><td><code>"LlamaForCausalLM"</code></td><td><code>model.__name__</code></td></tr>
+    <tr><td><code>is_text_generation_model</code></td><td>true</td><td>keyword-only <code>vllm_config</code> (line 487), <code>embed_input_ids</code> ({{cite vllm/model_executor/models/llama.py:531}}), <code>forward(input_ids, positions, ...)</code> (534), <code>compute_logits</code> (546)</td></tr>
+    <tr><td><code>is_pooling_model</code></td><td>false</td><td>no flag</td></tr>
+    <tr><td><code>attn_type</code>, pooling types, <code>score_type</code></td><td><code>"decoder"</code>, <code>"LAST"</code>, <code>"ALL"</code>, <code>"bi-encoder"</code></td><td>defaults of the getters ({{cite vllm/model_executor/models/interfaces_base.py:253-287}})</td></tr>
+    <tr><td><code>supports_lora</code></td><td>true</td><td>flag + both mappings (lines 475-482)</td></tr>
+    <tr><td><code>supports_pp</code></td><td>true</td><td><code>SupportsPP</code> in MRO; <code>forward</code> has <code>intermediate_tensors</code> ({{cite vllm/model_executor/models/llama.py:534-544}})</td></tr>
+    <tr><td><code>supports_multimodal</code>, <code>is_hybrid</code>, <code>is_attention_free</code>, <code>has_inner_state</code>, <code>supports_transcription</code>, ...</td><td>false</td><td>no flag</td></tr>
+    <tr><td><code>supported_video_pruning_methods</code></td><td><code>()</code></td><td><code>getattr</code> default</td></tr>
+  </tbody>
+</table>
+<p>So <code>vllm serve meta-llama/Llama-3.1-8B -pp 2 --enable-lora</code> passes both start-up checks. A class that drops <code>SupportsPP</code> fails at {{cite vllm/config/model.py:1569-1576}}, before any worker starts.</p>
+</x-deepdive>
+
+<x-deepdive title="The 24 fields of _ModelInfo">
+<x-code file="vllm/model_executor/models/registry.py" lines="890-915" />
+<p>Every field is a bool, a string literal or a tuple of strings, so the record survives a JSON round trip to the <code>modelinfos</code> cache ({{cite vllm/model_executor/models/registry.py:1054-1070}}). Two fields read plain attributes without a detector: <code>supported_video_pruning_methods</code> and <code>supports_mm_device_do_normalize</code> (lines 948-953). <code>supports_transcription_only</code> reads the attribute only when the transcription flag is set (lines 943-945).</p>
+</x-deepdive>
+
+<x-deepdive title="Front end versus worker: two checks of the same capability">
+<p>The front end checks the <em>class</em> through the cached record. The worker checks the built <em>object</em> again in some places:</p>
+<ul>
+  <li><strong>LoRA.</strong> <code>LoRAConfig.verify_with_model_config</code> runs in <code>VllmConfig.__post_init__</code> ({{cite vllm/config/vllm.py:1572}}). The worker's <code>load_lora_model</code> calls <code>supports_lora(model)</code> on the object ({{cite vllm/v1/worker/lora_model_runner_mixin.py:49-50}}); Model Runner V2 calls it after it loads the model ({{cite vllm/v1/worker/gpu/model_runner.py:407-410}}).</li>
+  <li><strong>EAGLE-3.</strong> No front-end check in the record; the worker checks the object ({{cite vllm/v1/worker/gpu/model_runner.py:412-414}}).</li>
+  <li><strong>For an object.</strong> <code>isinstance(obj, SupportsLoRA)</code> succeeds by inheritance alone when the object's class names the protocol as a base (general Python rule for protocols). So for a class that inherits <code>SupportsLoRA</code>, the object check cannot fail where the class check passed. A class that only copies the flag and the two mappings passes the class check. But its object has no <code>lora_manager</code>, so the worker check fails. (Derived.)</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Edge cases of the detectors">
+<ul>
+  <li><strong>A flag without the base class.</strong> Works for every flag-only detector (Step 2). It does not work for <code>isinstance</code> detectors unless every protocol member exists.</li>
+  <li><strong>A wrong flag.</strong> <code>supports_multimodal = True</code> on a class without <code>embed_input_ids(..., multimodal_embeddings)</code> passes the detector. The failure comes later, at run time. (Derived from line 589.)</li>
+  <li><strong><code>SupportsPP</code> without <code>make_empty_intermediate_tensors</code>.</strong> For a class, the MRO test at line 902 passes alone. The protocol only annotates this member ({{cite vllm/model_executor/models/interfaces.py:820-821}}), so the model must set it itself. Llama sets it on the object in <code>__init__</code> ({{cite vllm/model_executor/models/llama.py:519-521}}). (Derived.)</li>
+  <li><strong>Hybrid models without non-attention layers.</strong> <code>ModelConfig.is_hybrid</code> returns false when every <code>layer_types</code> entry is attention, even with the flag set ({{cite vllm/config/model.py:2040-2049}}).</li>
+  <li><strong>Two score types.</strong> <code>get_score_type</code> asserts that the MRO has at most one non-default score type ({{cite vllm/model_executor/models/interfaces_base.py:279-287}}).</li>
+</ul>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="The cached record can hide a class change">
+<p>For a lazy entry, the front end reads the record from <code>$VLLM_CACHE_ROOT/modelinfos</code> when the hash of the model's own file is unchanged ({{cite vllm/model_executor/models/registry.py:1088-1098}}). A new base class in another file does not change that hash. See {{link concepts/oot-models}}.</p>
+</x-warning>
+<ul>
+  <li><strong>"Pipeline parallelism is not supported for this model".</strong> The class lacks <code>SupportsPP</code>, or its <code>forward</code> lacks <code>intermediate_tensors</code>. Look for the PP WARNING in the log ({{cite vllm/model_executor/models/interfaces.py:870-875}}).</li>
+  <li><strong>"LoRA is not supported for ...".</strong> The class lacks <code>SupportsLoRA</code> or the two mappings ({{cite vllm/config/lora.py:137-143}}).</li>
+  <li><strong>"This model does not support <code>--runner generate</code>".</strong> The base checks failed: a missing <code>embed_input_ids</code>, <code>compute_logits</code>, or keyword in <code>__init__</code>/<code>forward</code> ({{cite vllm/config/model.py:727-728}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> These protocols are the contract between a model and the rest of vLLM. An out-of-tree model that forgets one does not crash; it loses a feature, and start-up rejects the flag that needs it.</p>
+
+<x-quiz>
+  <x-q level="easy">Where does vLLM store the results of the capability detectors?
+    <x-a><p>In a frozen <code>_ModelInfo</code> record that the registry computes from the class ({{cite vllm/model_executor/models/registry.py:917-954}}). <code>ModelConfig</code> keeps it as <code>_model_info</code> ({{cite vllm/config/model.py:741-742}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A class sets <code>supports_lora = True</code> but has no <code>packed_modules_mapping</code>. What happens with <code>--enable-lora</code>?
+    <x-a><p><code>supports_lora</code> returns false and logs "sets <code>supports_lora=True</code>, but is missing LoRA-specific attributes" ({{cite vllm/model_executor/models/interfaces.py:772-779}}). Then <code>LoRAConfig</code> raises <code>ValueError</code> ({{cite vllm/config/lora.py:137-143}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>supports_multimodal</code> accept a class that only sets the flag?
+    <x-a><p>The detector is <code>getattr(model, "supports_multimodal", False)</code> ({{cite vllm/model_executor/models/interfaces.py:589}}). It checks only the flag, not the methods.</p></x-a>
+  </x-q>
+  <x-q level="hard">Why do <code>supports_lora</code> and <code>supports_pp</code> use helper protocols (<code>_SupportsLoRAType</code>, <code>_SupportsPPType</code>) for a class?
+    <x-a><p>A runtime <code>isinstance</code> check on a class object needs every protocol member on that object. <code>SupportsLoRA</code> only annotates <code>lora_manager</code>, so a class does not have it, and <code>isinstance(cls, SupportsLoRA)</code> is false (derived). <code>_SupportsLoRAType</code> lists only the flag and the two mappings ({{cite vllm/model_executor/models/interfaces.py:744-749}}). The comment at {{cite vllm/model_executor/models/interfaces.py:742-743}} adds that <code>issubclass</code> does not work with these protocols, so the code calls <code>isinstance</code> on the class.</p></x-a>
+  </x-q>
+</x-quiz>

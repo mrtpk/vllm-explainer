@@ -1,0 +1,202 @@
+---
+title: CustomOp, out-of-tree ops and IR op providers
+nav_title: Custom ops
+level: Advanced
+prerequisites: concepts/platform-plugins, concepts/platform-interface, learn/pytorch-for-serving
+related: code/model-executor-custom-op, concepts/platform-interface, concepts/plugin-map, concepts/compile-and-cuda-graphs, concepts/attention-backend-selection, concepts/model-definition, tours/build-a-toy-plugin
+summary: A CustomOp is a layer with one forward method per platform. It picks one method when it is built - forward_native when disabled, the platform's method when enabled. Plugins replace whole classes with register_oot, and vllm.ir adds a second, per-op provider choice.
+---
+<x-sentence>A CustomOp picks one forward method when vLLM builds it: forward_native when the op is disabled, else the method of the current platform.</x-sentence>
+
+<h2>The idea</h2>
+<p>Some layers, such as RMSNorm, rotary embedding or the SiLU-and-multiply activation, have a fast kernel on each kind of hardware and a plain PyTorch version. vLLM writes such a layer as a {{term custom-op}}: an <code>nn.Module</code> subclass with methods <code>forward_cuda</code>, <code>forward_hip</code>, <code>forward_cpu</code>, <code>forward_xpu</code>, <code>forward_tpu</code>, <code>forward_oot</code> and {{term forward-native}}. When the model builds the layer, the layer picks one method and keeps it.</p>
+<p>The choice has two inputs. The first is a switch: is the op <em>enabled</em>? The list <code>compilation_config.custom_ops</code> decides. With <code>torch.compile</code> and Inductor, which is the default of <code>vllm serve</code>, ops are disabled by default. Then <code>forward_native</code> runs. For most ops this is plain PyTorch code, and Inductor generates fused kernels for it. The second input is the {{term platform}}: an enabled op calls the method for <code>current_platform</code>.</p>
+<p>An {{term out-of-tree}} package can replace an op class with its own subclass through {{term register-oot}}. vLLM then builds the replacement wherever model code builds the in-tree class. A {{term pluggable-layer}} works the same way for a whole layer, such as a linear layer, but has no per-platform methods.</p>
+<p><strong>An everyday comparison.</strong> Think of a power tool with exchangeable heads. At assembly, the factory fits the head for the local power grid, or a manual hand crank when the "motor" switch is off. A vendor can ship a whole replacement tool with the same model name. The comparison stops here: the head is fixed at assembly. Changing the switch later does not change a tool that is already built.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b4b_custom_op_dispatch" alt="Panel 1: model code builds RotaryEmbedding inside set_current_vllm_config. CustomOp.__new__ looks up the class name RotaryEmbedding in op_registry_oot; if a class is registered there, for example DummyRotaryEmbedding, Python builds that class instead; then __init__ calls dispatch_forward. Panel 2: the enabled check. The base mode is none with Inductor and a compile mode, the default of vllm serve at O2, and all otherwise, for example with --enforce-eager. Plus-name turns an op on, minus-name turns it off, and both raise ValueError. The result is base-on or plus, and not minus, or enforce_enable. Panel 3: a disabled op uses forward_native, compiled only when compile_native is true. An enabled op uses the platform order: rocm forward_hip, cpu forward_cpu, tpu forward_tpu, xpu forward_xpu, out-of-tree forward_oot, else forward_cuda. Default bodies: forward_hip calls forward_cuda; forward_xpu, cpu, tpu and oot call forward_native." caption="Figure: one CustomOp object from construction (panel 1) through the enabled check (panel 2) to the bound forward method (panel 3)." />
+<p>Read the panels as one call of the constructor. The decision happens once, in <code>__init__</code>. Each call of <code>forward()</code> then calls the bound method directly.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: registering an op</h3>
+<p>An in-tree op class gets a name with a decorator. The name goes into the {{term op-registry}}:</p>
+<x-code file="vllm/model_executor/custom_op.py" lines="309-323" highlight="317-320" />
+<x-code file="vllm/model_executor/layers/layernorm.py" lines="37-46" highlight="38-39" caption="RMSNorm is the op <code>rms_norm</code>. The <code>+rms_norm</code> and <code>-rms_norm</code> switches use this name." />
+<p>A duplicate name fails the <code>assert</code> (line 317). <code>dynamic_arg_dims</code> marks dimensions as dynamic when vLLM compiles <code>forward_native</code> alone (see the deep dive). At this commit 47 places in <code>vllm/</code> use <code>@CustomOp.register(...)</code>, outside the second registry of Step 6 (from <code>git grep</code>).</p>
+
+<h3>Step 2: the forward methods and their defaults</h3>
+<x-code file="vllm/model_executor/custom_op.py" lines="128-170" highlight="131,133-134,147-149,167-170" />
+<ol>
+  <li><strong>Line 131.</strong> <code>__init__</code> picks the method once and keeps it in <code>_forward_method</code>.</li>
+  <li><strong>Lines 133-134.</strong> <code>forward()</code> only calls it.</li>
+  <li><strong>Lines 136-145.</strong> <code>forward_native</code> and <code>forward_cuda</code> raise <code>NotImplementedError</code>. A subclass must give them.</li>
+  <li><strong>Lines 147-149.</strong> <code>forward_hip</code> calls <code>forward_cuda</code> by default.</li>
+  <li><strong>Lines 151-170.</strong> <code>forward_xpu</code>, <code>forward_cpu</code>, <code>forward_tpu</code> and <code>forward_oot</code> call <code>forward_native</code> by default.</li>
+</ol>
+
+<h3>Step 3: the dispatch decision</h3>
+<x-code file="vllm/model_executor/custom_op.py" lines="172-205" highlight="183,184-187,189-192,194-205" />
+<ol>
+  <li><strong>Line 183.</strong> The op is enabled when <code>enforce_enable=True</code> was passed, or when <code>enabled()</code> says so.</li>
+  <li><strong>Lines 184-187.</strong> The op name goes into a counter of enabled or disabled ops. vLLM logs these counters at DEBUG level after it builds the model ({{cite vllm/config/compilation.py:1325-1330}}).</li>
+  <li><strong>Lines 189-192.</strong> Disabled: <code>forward_native</code>. <code>maybe_compile</code> wraps it in <code>torch.compile</code> only when the layer asked for <code>compile_native=True</code> (line 218).</li>
+  <li><strong>Lines 194-205.</strong> Enabled: one method per platform. The order matters: ROCm, CPU, TPU, XPU, then any out-of-tree platform, else CUDA.</li>
+</ol>
+<p>The design doc gives <code>forward_native</code> as the "final fallback for all platforms" ({{cite docs/design/custom_op.md:21}}). In the code, the final <code>else</code> is <code>forward_cuda</code> (lines 204-205). <code>forward_native</code> is only the default body of four platform methods (Step 2).</p>
+<p>So an out-of-tree platform reaches <code>forward_oot</code> only for an <em>enabled</em> op. <code>is_out_of_tree()</code> is true for a platform with <code>_enum = PlatformEnum.OOT</code> ({{cite vllm/platforms/interface.py:218-219}}, {{link concepts/platform-interface}}).</p>
+
+<h3>Step 4: enabled() and the custom_ops list</h3>
+<x-code file="vllm/model_executor/custom_op.py" lines="268-307" highlight="273-280,282-283,290,300-305,307" />
+<ol>
+  <li><strong>Lines 273-280.</strong> A class without a <code>name</code> (not registered) logs a WARNING once and follows the base mode.</li>
+  <li><strong>Lines 282-283.</strong> The switches are the strings <code>"+" + name</code> and <code>"-" + name</code>.</li>
+  <li><strong>Line 290.</strong> The result is (base mode on, or <code>+name</code>) and not <code>-name</code>.</li>
+  <li><strong>Lines 300-307.</strong> The list must hold exactly one of <code>"all"</code> and <code>"none"</code>, else <code>ValueError</code>.</li>
+</ol>
+<p>The user does not normally write the base mode. <code>VllmConfig.__post_init__</code> adds it:</p>
+<x-code file="vllm/config/vllm.py" lines="1819-1826" highlight="1821-1824" />
+<p>For <code>vllm serve</code> at the default level O2, the compilation mode is <code>VLLM_COMPILE</code> ({{cite vllm/config/vllm.py:1806-1810}}). The backend is the platform's <code>simple_compile_backend</code>, <code>"inductor"</code> by default ({{cite vllm/config/compilation.py:1080-1081}}, {{cite vllm/platforms/interface.py:172}}). So the base mode is <code>"none"</code>. An op is then disabled unless one of three things turns it on:</p>
+<ul>
+  <li>a <code>+name</code> entry in the list (line 290);</li>
+  <li><code>enforce_enable=True</code> from the layer's constructor (line 183). The vision encoders of some multimodal models build <code>ApplyRotaryEmb</code> this way ({{cite vllm/model_executor/models/qwen2_5_vl.py:404}});</li>
+  <li>a class that overrides <code>enabled()</code>. <code>MMEncoderAttention.enabled()</code> always returns true ({{cite vllm/model_executor/layers/attention/mm_encoder_attention.py:507-509}}).</li>
+</ul>
+<p>With <code>--enforce-eager</code>, the mode is <code>NONE</code> ({{cite vllm/config/vllm.py:1745-1746}}), so the base mode is <code>"all"</code>. Two more cases set the mode to <code>NONE</code> before line 1819: <code>TORCH_COMPILE_DISABLE=1</code> ({{cite vllm/config/vllm.py:1765-1770}}) and breakable CUDA graphs ({{cite vllm/config/vllm.py:849-851}}). vLLM turns on breakable CUDA graphs by default for a list of architectures, for example <code>DeepseekV4ForCausalLM</code> ({{cite vllm/config/vllm.py:75-108}}, {{cite vllm/config/vllm.py:825-833}}). So these models get the base mode <code>"all"</code> by default. <code>LlamaForCausalLM</code> is not in the list.</p>
+<p>Some code adds switches for you. A model with block-quantized weights gets <code>+quant_fp8</code> ({{cite vllm/config/vllm.py:1799-1802}}). If you turn on one of three RoPE fusion passes in the compilation config, vLLM adds <code>+rotary_embedding</code> ({{cite vllm/config/compilation.py:964-984}}). A platform can change the list in its config hooks. ROCm adds some switches, for example <code>+sparse_attn_indexer</code> ({{cite vllm/platforms/rocm.py:1111-1112}}); the CUDA platform adds none (from <code>git grep</code>). The test platform replaces the list with <code>["all"]</code> ({{cite tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_platform.py:21-23}}).</p>
+<p>To change the list yourself, use the compilation config flag ({{cite vllm/engine/arg_utils.py:1881}}):</p>
+<pre><code class="language-bash">vllm serve Qwen/Qwen3-0.6B --compilation-config '{"custom_ops": ["none", "+rms_norm"]}'</code></pre>
+<x-warning title="Write each switch as its own string">
+<p>The design doc shows one string with commas, <code>'["all,-op1"]'</code> ({{cite docs/design/custom_op.md:46-47}}). The parser keeps the JSON list as it is ({{cite vllm/utils/argparse_utils.py:476-478}}). So the list has one entry, <code>"all,-op1"</code>, and <code>CompilationConfig</code> stops start-up with "Invalid syntax" ({{cite vllm/config/compilation.py:1013-1019}}). Write <code>'["all", "-op1"]'</code>.</p>
+</x-warning>
+
+<h3>Step 5: out-of-tree replacement with register_oot</h3>
+<p>A plugin subclasses an in-tree op and decorates the subclass. vLLM's test platform does this for rotary embedding:</p>
+<x-code file="tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_custom_ops.py" lines="9-19" highlight="10,18-19" />
+<p>The plugin imports this module from a general plugin, so the registration runs in each process ({{cite tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/__init__.py:12-13}}; entry point in {{cite tests/plugins/vllm_add_dummy_platform/setup.py:14-16}}). The decorator:</p>
+<x-code file="vllm/model_executor/custom_op.py" lines="334-356" highlight="337-340,343-348,349-353,354-356" />
+<ol>
+  <li><strong>Line 337.</strong> The key is <code>name</code> if given, else the <em>name of the class on which you call the decorator</em>: <code>RotaryEmbedding.register_oot</code> uses <code>"RotaryEmbedding"</code>.</li>
+  <li><strong>Lines 338-340.</strong> A second registration with the same key fails the <code>assert</code>. The OOT class gets <code>name = key</code>.</li>
+  <li><strong>Lines 343-353.</strong> Two forms work: <code>@X.register_oot</code> and <code>@X.register_oot()</code> or <code>@CustomOp.register_oot(name="X")</code>.</li>
+  <li><strong>Lines 354-356.</strong> A string as the first argument is neither <code>None</code> nor a class, so <code>register_oot("X")</code> raises <code>TypeError</code> at once.</li>
+</ol>
+<x-warning title="The design doc shows a form that raises TypeError">
+<p><code>docs/design/custom_op.md</code> writes <code>@CustomOp.register_oot("MMEncoderAttention")</code> ({{cite docs/design/custom_op.md:11}}, {{cite docs/design/custom_op.md:285}}). Line 356 of the code raises <code>TypeError</code> for it. Write <code>@MMEncoderAttention.register_oot</code> or <code>@CustomOp.register_oot(name="MMEncoderAttention")</code>. The loop at the end of the same doc uses the keyword form, which works ({{cite docs/design/custom_op.md:315}}).</p>
+</x-warning>
+<p>The swap happens in <code>__new__</code>, when model code builds the in-tree class:</p>
+<x-code file="vllm/model_executor/custom_op.py" lines="107-126" highlight="109,117-120,126" />
+<p>Line 109 reads <code>cls.__name__</code>, the Python class name, not the registered op name. Line 126 makes an object of the OOT class. The OOT class is a subclass of the in-tree class, so Python then calls its <code>__init__</code>. (General Python rule: <code>__init__</code> runs only when <code>__new__</code> returns an instance of the called class.) A test checks the swap ({{cite tests/plugins_tests/test_platform_plugins.py:51-64}}).</p>
+
+<h3>Step 6: PluggableLayer, and the second CustomOp registry</h3>
+<p><code>PluggableLayer</code> uses the same <code>op_registry</code> and <code>op_registry_oot</code>, and the same <code>__new__</code> swap ({{cite vllm/model_executor/custom_op.py:46-65}}). Its docstring says that it has no per-platform <code>forward_*</code> methods; it allows the replacement of the whole layer, with its own sub-modules ({{cite vllm/model_executor/custom_op.py:33-44}}). The linear layers use it, for example <code>column_parallel_linear</code> ({{cite vllm/model_executor/layers/linear.py:434-435}}). LoRA code finds the replacement class with <code>maybe_get_oot_by_class</code>, so that it still wraps a swapped layer ({{cite vllm/model_executor/custom_op.py:25-29}}, {{cite vllm/lora/layers/column_parallel_linear.py:169}}).</p>
+<p><code>vllm/model_executor/hw_agnostic/custom_op.py</code> is a second copy of the module with its own <code>op_registry</code> and <code>op_registry_oot</code> ({{cite vllm/model_executor/hw_agnostic/custom_op.py:16-22}}). Its dispatch has only two methods: an enabled op uses <code>forward_oot</code> on an out-of-tree platform; all other cases use <code>forward_native</code> ({{cite vllm/model_executor/hw_agnostic/custom_op.py:163-170}}). Only two layers use it: <code>RMSNorm</code> and <code>SiluAndMul</code> in <code>hw_agnostic/layers/</code>. Only the Transformers modeling backend picks them, and only with <code>VLLM_USE_HW_AGNOSTIC</code> set to <code>1</code> or <code>true</code> ({{cite vllm/model_executor/models/transformers/layers.py:23-38}}, {{cite vllm/model_executor/models/transformers/layers.py:46-56}}, {{cite vllm/envs.py:1218-1220}}). An OOT class registered with the main <code>CustomOp.register_oot</code> does not replace these classes, because the registries are separate (derived).</p>
+
+<h3>Step 7: vllm.ir, a second level of selection</h3>
+<p>The package <code>vllm/ir</code> defines {{term ir-op | IR ops}}: a function with a native PyTorch body, registered with <code>@register_op</code>. At this commit there are three: <code>rms_norm</code>, <code>fused_add_rms_norm</code> and <code>gelu_and_mul_sparse</code> ({{cite vllm/ir/ops/__init__.py:2-6}}). Each {{term kernel-provider}} adds an implementation with <code>register_impl</code>, for example <code>vllm_c</code>:</p>
+<x-code file="vllm/kernels/vllm_c.py" lines="23-28" highlight="23-25" caption="<code>supported</code> is a static platform check; <code>supports_args</code> is checked per call (here: no variance size, matching dtypes)." />
+<p>A priority list per op selects the provider at call time:</p>
+<x-code file="vllm/ir/op.py" lines="321-359" highlight="327-335,337-344,356-359" />
+<ol>
+  <li><strong>Lines 327-335.</strong> No priority set: WARNING once, and the native body runs.</li>
+  <li><strong>Lines 337-344.</strong> Walk the list. The first provider whose <code>supports_args</code> accepts the arguments wins. The <code>ValueError</code> for an unsupported provider is only a guard: when vLLM installs a list, it removes the providers that the platform does not support ({{cite vllm/ir/op.py:387-391}}).</li>
+  <li><strong>Lines 356-359.</strong> No provider accepts: <code>RuntimeError</code>. When vLLM installs a list, it adds <code>native</code> at the end if no provider supports all arguments ({{cite vllm/ir/op.py:395-406}}).</li>
+</ol>
+<p>The lists live in <code>IrOpPriorityConfig</code>, one field per op ({{cite vllm/config/kernel.py:20-38}}); the flag is <code>--ir-op-priority</code> ({{cite vllm/engine/arg_utils.py:1827}}). The platform adds its defaults after any user list ({{cite vllm/config/kernel.py:458-475}}). On CUDA the default for <code>rms_norm</code> and <code>fused_add_rms_norm</code> is <code>["native"]</code> with Inductor compilation, else <code>["vllm_c", "native"]</code> ({{cite vllm/platforms/cuda.py:716-732}}). <code>gelu_and_mul_sparse</code> always gets <code>["triton", "native"]</code> (line 733). Each worker installs the lists once at start-up ({{cite vllm/v1/worker/worker_base.py:96-101}}).</p>
+<p>The two systems stack. <code>RMSNorm</code> is a CustomOp, and its <code>forward_native</code> calls the IR op ({{cite vllm/model_executor/layers/layernorm.py:79-99}}). Its <code>forward_cuda</code> calls <code>forward_native</code> unless batch invariance is on ({{cite vllm/model_executor/layers/layernorm.py:101-120}}). So for RMSNorm on CUDA, the IR priority, not the CustomOp switch, picks the kernel.</p>
+<table>
+  <thead><tr><th></th><th>CustomOp</th><th>IR op</th></tr></thead>
+  <tbody>
+    <tr><td>Unit</td><td>an <code>nn.Module</code> class</td><td>a function</td></tr>
+    <tr><td>Choice by</td><td>enabled switch + platform</td><td>priority list + per-call argument check</td></tr>
+    <tr><td>When</td><td>once, at layer construction</td><td>at each call (or at Inductor lowering)</td></tr>
+    <tr><td>Out-of-tree hook</td><td><code>register_oot</code> (whole class)</td><td><code>register_impl</code> (one provider); <code>Platform.import_ir_kernels</code> imports it ({{cite vllm/platforms/interface.py:258-264}})</td></tr>
+    <tr><td>Config</td><td><code>compilation_config.custom_ops</code></td><td><code>kernel_config.ir_op_priority</code></td></tr>
+  </tbody>
+</table>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: RMSNorm with the default and with --enforce-eager">
+<p><strong>Default <code>vllm serve</code> of a Llama model on an NVIDIA GPU (O2).</strong></p>
+<ol>
+  <li>Mode <code>VLLM_COMPILE</code>, backend <code>inductor</code>: <code>custom_ops = ["none"]</code> (vllm.py lines 1819-1824).</li>
+  <li>The model builds <code>RMSNorm</code> in the worker. <code>enabled()</code> finds no <code>+rms_norm</code> and returns false. The op is disabled: <code>_forward_method = forward_native</code>, not compiled alone (<code>compile_native</code> is false).</li>
+  <li><code>forward_native</code> calls <code>ir.ops.rms_norm</code>, or <code>ir.ops.fused_add_rms_norm</code> when the layer gets a residual. The CUDA priority is <code>["native"]</code> (cuda.py line 720). With <code>ir_enable_torch_wrap</code> on ({{cite vllm/config/vllm.py:1813-1817}}), the call goes through the torch op <code>vllm_ir.rms_norm</code>, and the model-level <code>torch.compile</code> sees it.</li>
+  <li>The field docstring says what follows: "Inductor generates (fused) Triton kernels for disabled custom ops" ({{cite vllm/config/compilation.py:489-492}}).</li>
+</ol>
+<p><strong>The same server with <code>--enforce-eager</code>.</strong></p>
+<ol>
+  <li>Mode <code>NONE</code>: <code>custom_ops = ["all"]</code>. <code>RMSNorm</code> is enabled: <code>_forward_method = forward_cuda</code>.</li>
+  <li><code>forward_cuda</code> calls <code>forward_native</code> (no batch invariance), which calls <code>ir.ops.rms_norm</code> (or <code>fused_add_rms_norm</code>).</li>
+  <li>The priority is <code>["vllm_c", "native"]</code>. For a BF16 input with BF16 weight and no variance size, <code>vllm_c</code> accepts the arguments, and the C++ kernel runs ({{cite vllm/kernels/vllm_c.py:17-25}}).</li>
+</ol>
+<p>(Derived by reading the lines cited on this page in order.)</p>
+</x-deepdive>
+
+<x-deepdive title="When vLLM builds the op, and what it needs">
+<ul>
+  <li><strong>A current config.</strong> <code>dispatch_forward</code> and <code>enabled()</code> read <code>get_cached_compilation_config()</code>, which needs a config set with <code>set_current_vllm_config</code> ({{cite vllm/config/vllm.py:3570-3586}}). <code>initialize_model</code> sets it around the model constructor ({{cite vllm/model_executor/model_loader/utils.py:100-101}}). A CustomOp built when no config is set, for example at module import time, raises <code>AssertionError</code> "Current vLLM config is not set".</li>
+  <li><strong>The process.</strong> The model is built in each worker (with TP = 1, in the engine core process). So <code>register_oot</code> must run in the worker before the model is built. A general plugin does this; the worker loads them in <code>init_worker</code> ({{link concepts/plugin-loading}}).</li>
+  <li><strong>After the build.</strong> When the context ends, <code>custom_op_log_check</code> logs the enabled and disabled ops and warns about a <code>+name</code> or <code>-name</code> that matched no op of the model ({{cite vllm/config/vllm.py:3544-3545}}, {{cite vllm/config/compilation.py:1333-1361}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="The name of a registered OOT class">
+<p><code>register_oot</code> sets <code>op_cls.name</code> to the key (line 339), and the key is the in-tree <em>class</em> name by default. <code>enabled()</code> builds the switch from <code>cls.name</code> (line 282). So for the test class <code>DummyRotaryEmbedding</code>, the switch is <code>+RotaryEmbedding</code>, not <code>+rotary_embedding</code>, the name that the in-tree base class registered ({{cite vllm/model_executor/layers/rotary_embedding/base.py:14-15}}). (Derived from lines 282 and 337-339; no test covers it.)</p>
+<p>The test platform turns on all ops with <code>custom_ops = ["all"]</code>. Then the name does not matter. Your platform can keep the default <code>"none"</code> base mode. Then your <code>forward_oot</code> does not run for a disabled op, because a disabled op uses <code>forward_native</code> (line 189).</p>
+</x-deepdive>
+
+<x-deepdive title="maybe_compile and dynamic_arg_dims">
+<p>Some layers call an op inside an opaque torch custom op (for example fused MoE), where the model-level <code>torch.compile</code> cannot see it. For them, <code>compile_native=True</code> compiles <code>forward_native</code> alone ({{cite vllm/model_executor/custom_op.py:207-266}}):</p>
+<ol>
+  <li>No compile when <code>enable</code> is false, the mode is <code>NONE</code>, or the backend is <code>"eager"</code> (lines 218-228).</li>
+  <li>The backend is <code>current_platform.simple_compile_backend</code> (line 233).</li>
+  <li>With <code>dynamic_arg_dims</code> from <code>register</code>, vLLM compiles with <code>dynamic=False</code> and marks the listed dimensions as dynamic at each call (lines 235-258). A negative index counts from the end (line 254).</li>
+  <li>Else it compiles with <code>dynamic=True</code> "to avoid recompilations" (lines 260-266).</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Validation errors of custom_ops">
+<table>
+  <thead><tr><th>Input</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>"rms_norm"</code> (no sign)</td><td><code>ValueError</code> "Invalid syntax"</td><td>{{cite vllm/config/compilation.py:1013-1019}}</td></tr>
+    <tr><td><code>["all", "none"]</code></td><td><code>ValueError</code> "only one base mode"</td><td>{{cite vllm/config/compilation.py:1021-1025}}</td></tr>
+    <tr><td><code>["+x", "-x"]</code></td><td><code>ValueError</code></td><td>{{cite vllm/config/compilation.py:1027-1034}}</td></tr>
+    <tr><td><code>+x</code> for an op not in the model</td><td>WARNING "has no effect"</td><td>{{cite vllm/config/compilation.py:1343-1361}}</td></tr>
+    <tr><td>duplicate <code>register</code> name</td><td><code>AssertionError</code></td><td>{{cite vllm/model_executor/custom_op.py:317}}</td></tr>
+    <tr><td>duplicate <code>register_oot</code> key</td><td><code>AssertionError</code></td><td>{{cite vllm/model_executor/custom_op.py:338}}</td></tr>
+    <tr><td><code>register_oot("X")</code></td><td><code>TypeError</code></td><td>{{cite vllm/model_executor/custom_op.py:354-356}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="forward_oot does not run for a disabled op">
+<p>Under the default base mode <code>"none"</code> of compiled serving, an op without a <code>+name</code> uses <code>forward_native</code>, unless its layer uses <code>enforce_enable=True</code> or overrides <code>enabled()</code> ({{cite vllm/model_executor/custom_op.py:183}}, {{cite vllm/model_executor/custom_op.py:189-192}}). An out-of-tree platform must turn its ops on, for example in <code>check_and_update_config</code>.</p>
+</x-warning>
+<ul>
+  <li><strong>The docs form of <code>register_oot</code>.</strong> <code>register_oot("Name")</code> raises <code>TypeError</code> (Step 5).</li>
+  <li><strong>The registration runs too late.</strong> <code>__new__</code> reads <code>op_registry_oot</code> when the layer is built. A class registered after the model build has no effect on existing layers (derived from lines 117-126).</li>
+  <li><strong>Two plugins replace the same op.</strong> The second <code>register_oot</code> fails the <code>assert</code> at line 338 and stops the plugin function.</li>
+  <li><strong>A switch with the wrong name.</strong> <code>+RMSNorm</code> instead of <code>+rms_norm</code> matches nothing; the only sign is the WARNING of <code>custom_op_log_check</code>.</li>
+</ul>
+<p><strong>Why it matters.</strong> CustomOp and IR ops decide which kernel runs for the small layers of every model. A hardware plugin uses them to bring its own kernels without a change to the model files.</p>
+
+<x-quiz>
+  <x-q level="easy">When does a CustomOp choose its forward method?
+    <x-a><p>Once, in <code>__init__</code>, through <code>dispatch_forward</code>; <code>forward()</code> then calls the stored method ({{cite vllm/model_executor/custom_op.py:128-134}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With default <code>vllm serve</code> on CUDA, is <code>RMSNorm</code> enabled? Why?
+    <x-a><p>No. The mode is <code>VLLM_COMPILE</code> and the backend is Inductor, so vLLM adds the base mode <code>"none"</code> ({{cite vllm/config/vllm.py:1819-1826}}). The CUDA platform adds no <code>+rms_norm</code>, and <code>RMSNorm</code> does not use <code>enforce_enable</code>. So <code>enabled()</code> returns false ({{cite vllm/model_executor/custom_op.py:290}}), and the op uses <code>forward_native</code>.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>@CustomOp.register_oot("MMEncoderAttention")</code> fail, and what works instead?
+    <x-a><p>The string lands in the positional parameter <code>_decorated_op_cls</code>. It is neither <code>None</code> nor a class, so the method raises <code>TypeError</code> ({{cite vllm/model_executor/custom_op.py:343-356}}). Use <code>@MMEncoderAttention.register_oot</code> or <code>@CustomOp.register_oot(name="MMEncoderAttention")</code>.</p></x-a>
+  </x-q>
+  <x-q level="hard">With <code>--enforce-eager</code> on CUDA, which code computes RMSNorm for a BF16 input, and which two settings decide it?
+    <x-a><p>The <code>vllm_c</code> provider of the IR op <code>rms_norm</code> (or <code>fused_add_rms_norm</code> with a residual). First, the base mode is <code>"all"</code>, so the CustomOp is enabled and uses <code>forward_cuda</code>, which calls <code>forward_native</code> and the IR op ({{cite vllm/model_executor/layers/layernorm.py:101-120}}). Second, the CUDA IR priority without Inductor is <code>["vllm_c", "native"]</code> ({{cite vllm/platforms/cuda.py:716-720}}), and <code>vllm_c</code> accepts these arguments ({{cite vllm/kernels/vllm_c.py:17-25}}).</p></x-a>
+  </x-q>
+</x-quiz>

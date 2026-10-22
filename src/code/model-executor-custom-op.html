@@ -1,0 +1,192 @@
+---
+title: model_executor/custom_op.py: CustomOp, PluggableLayer and their registries
+nav_title: model_executor/custom_op.py
+level: Advanced
+prerequisites: concepts/custom-ops, concepts/platform-interface
+related: concepts/custom-ops, concepts/platform-interface, concepts/plugin-map, code/platforms-interface, code/model-executor-layers-linear, concepts/compile-and-cuda-graphs
+summary: vllm/model_executor/custom_op.py defines the CustomOp base class (one forward method per platform, chosen once per object), the PluggableLayer base class (whole-layer replacement), the two name registries and the register_oot decorators.
+---
+<h2>Purpose</h2>
+<p><code>vllm/model_executor/custom_op.py</code> gives layers a way to pick a forward method per platform, and gives plugins a way to replace a layer class without a change to the model code.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/model_executor/custom_op.py</code>, 356 lines of Python. Two module dicts, one helper function, two classes.</td></tr>
+    <tr><th>Main classes</th><td><code>PluggableLayer</code> ({{cite vllm/model_executor/custom_op.py:32}}) and <code>CustomOp</code> ({{cite vllm/model_executor/custom_op.py:102}}), both subclasses of <code>nn.Module</code>.</td></tr>
+    <tr><th>Runs in</th><td>Every process that builds a model: each {{term worker}} process, or the {{term engine-core}} process with the uni executor. The decorators also run at import time in any process that imports a layer module or a plugin.</td></tr>
+    <tr><th>Called by</th><td>The layer modules that subclass the two classes (50 files in <code>vllm/</code> import from this module, from <code>git grep</code>), model constructors that build these layers, plugins that call <code>register_oot</code>, the LoRA layers (<code>maybe_get_oot_by_class</code>) and <code>CompilationConfig.custom_op_log_check</code> (<code>op_registry</code>).</td></tr>
+    <tr><th>Calls</th><td><code>get_cached_compilation_config()</code> ({{cite vllm/model_executor/custom_op.py:9}}), <code>current_platform</code> ({{cite vllm/model_executor/custom_op.py:12}}), <code>maybe_disable_graph_partition</code> ({{cite vllm/model_executor/custom_op.py:11}}), <code>torch.compile</code> and <code>torch._dynamo.mark_dynamic</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The default of the <code>custom_ops</code> list (<code>config/vllm.py</code>), its validation (<code>config/compilation.py</code>), the op implementations (the layer files), the second copy for hardware-agnostic layers (<code>hw_agnostic/custom_op.py</code>) and the IR op system (<code>vllm/ir</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/custom-ops}} explains the ideas, the default switches and the IR ops, with a worked example. This page reads the file from top to bottom.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b4b_custom_op_dispatch" alt="Panel 1: model code builds a CustomOp subclass; __new__ checks op_registry_oot by class name and may build an out-of-tree class; __init__ calls dispatch_forward. Panel 2: enabled() combines the base mode all or none with the plus and minus switches. Panel 3: a disabled op uses forward_native, maybe compiled; an enabled op uses the method for the platform, in the order rocm, cpu, tpu, xpu, out-of-tree, cuda; the default bodies fall back to forward_cuda or forward_native." caption="Figure: the life of one CustomOp object. All line numbers refer to <code>vllm/model_executor/custom_op.py</code> unless the box names another file." />
+<p>The file has three layers. At the top are the two registries (lines 16-29). <code>PluggableLayer</code> (lines 32-99) has only the class swap. <code>CustomOp</code> (lines 102-356) has the class swap and the per-platform dispatch.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Layer definitions.</strong> For example <code>@CustomOp.register("rms_norm")</code> on <code>RMSNorm</code> ({{cite vllm/model_executor/layers/layernorm.py:38-39}}) and <code>@PluggableLayer.register("column_parallel_linear")</code> ({{cite vllm/model_executor/layers/linear.py:434-435}}).</li>
+  <li><strong>Model constructors.</strong> They build the layers inside <code>set_current_vllm_config</code> ({{cite vllm/model_executor/model_loader/utils.py:100-101}}). Construction runs <code>__new__</code> and <code>__init__</code> of this file.</li>
+  <li><strong>Plugins.</strong> <code>@RotaryEmbedding.register_oot</code> in the test platform ({{cite tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_custom_ops.py:10-11}}).</li>
+  <li><strong>LoRA.</strong> <code>maybe_get_oot_by_class(QKVParallelLinear)</code> and similar calls ({{cite vllm/lora/layers/column_parallel_linear.py:448}}).</li>
+  <li><strong>Config check.</strong> <code>custom_op_log_check</code> imports <code>op_registry</code> to tell a missing op from an op that is not in the model ({{cite vllm/config/compilation.py:1343-1352}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>get_cached_compilation_config()</code>: the current <code>CompilationConfig</code>, cached until the config context changes ({{cite vllm/config/vllm.py:3570-3573}}).</li>
+  <li><code>current_platform.is_rocm()</code>, <code>is_cpu()</code>, <code>is_tpu()</code>, <code>is_xpu()</code>, <code>is_out_of_tree()</code> ({{cite vllm/model_executor/custom_op.py:194-205}}), and <code>simple_compile_backend</code> ({{cite vllm/model_executor/custom_op.py:230-233}}).</li>
+  <li><code>maybe_disable_graph_partition</code>: <code>{"graph_partition": False}</code> for Inductor on torch 2.9 or newer ({{cite vllm/model_executor/utils.py:190-194}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>op_registry</code></td><td>{{cite vllm/model_executor/custom_op.py:21}}</td><td>Registered op name → class, for <code>CustomOp</code> and <code>PluggableLayer</code>.</td></tr>
+    <tr><td><code>op_registry_oot</code></td><td>{{cite vllm/model_executor/custom_op.py:22}}</td><td>In-tree <em>class name</em> (or the given <code>name</code>) → out-of-tree class.</td></tr>
+    <tr><td><code>maybe_get_oot_by_class(cls)</code></td><td>{{cite vllm/model_executor/custom_op.py:25-29}}</td><td>The OOT replacement of a class, else the class.</td></tr>
+    <tr><td><code>PluggableLayer.__new__</code></td><td>{{cite vllm/model_executor/custom_op.py:46-65}}</td><td>Builds the OOT class when the class name is in <code>op_registry_oot</code>.</td></tr>
+    <tr><td><code>PluggableLayer.register(name)</code></td><td>{{cite vllm/model_executor/custom_op.py:68-76}}</td><td>Sets <code>name</code>, adds to <code>op_registry</code>.</td></tr>
+    <tr><td><code>PluggableLayer.register_oot</code></td><td>{{cite vllm/model_executor/custom_op.py:82-99}}</td><td>Adds an OOT layer class.</td></tr>
+    <tr><td><code>CustomOp.__new__</code></td><td>{{cite vllm/model_executor/custom_op.py:107-126}}</td><td>Same swap as above.</td></tr>
+    <tr><td><code>CustomOp.__init__</code>, <code>forward</code></td><td>{{cite vllm/model_executor/custom_op.py:128-134}}</td><td>Binds the method once; <code>forward</code> calls it.</td></tr>
+    <tr><td><code>forward_native</code> ... <code>forward_oot</code></td><td>{{cite vllm/model_executor/custom_op.py:136-170}}</td><td>Seven methods and their default bodies.</td></tr>
+    <tr><td><code>dispatch_forward</code></td><td>{{cite vllm/model_executor/custom_op.py:172-205}}</td><td>Enabled check + platform choice.</td></tr>
+    <tr><td><code>maybe_compile</code></td><td>{{cite vllm/model_executor/custom_op.py:207-266}}</td><td>Optional <code>torch.compile</code> of <code>forward_native</code>.</td></tr>
+    <tr><td><code>enabled()</code></td><td>{{cite vllm/model_executor/custom_op.py:268-290}}</td><td><code>+name</code> / <code>-name</code> / base mode.</td></tr>
+    <tr><td><code>default_on()</code></td><td>{{cite vllm/model_executor/custom_op.py:292-307}}</td><td>Base mode: <code>"all"</code> → true, <code>"none"</code> → false.</td></tr>
+    <tr><td><code>CustomOp.register(name, dynamic_arg_dims)</code></td><td>{{cite vllm/model_executor/custom_op.py:310-323}}</td><td>Sets <code>name</code> and <code>_dynamic_arg_dims</code>, adds to <code>op_registry</code>.</td></tr>
+    <tr><td><code>CustomOp.register_oot</code></td><td>{{cite vllm/model_executor/custom_op.py:334-356}}</td><td>Adds an OOT op class; string positional → <code>TypeError</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>CustomOp.__new__</code>: the class swap</h3>
+<x-code file="vllm/model_executor/custom_op.py" lines="107-126" highlight="109,117-120,126" />
+<ol>
+  <li><strong>Lines 108-115.</strong> The <code>try</code> block reads <code>cls.__name__</code>. Every Python class has <code>__name__</code>, so the <code>AttributeError</code> branch, with its text about the <code>name</code> attribute, cannot run for a class. (Derived from Python semantics.)</li>
+  <li><strong>Line 117.</strong> The key is the class name of the object that the code builds, for example <code>"RotaryEmbedding"</code>. A subclass with another name, such as a scaling variant of rotary embedding, is not swapped (derived).</li>
+  <li><strong>Lines 120-125.</strong> The OOT class is used, with a DEBUG log.</li>
+  <li><strong>Line 126.</strong> The parent <code>__new__</code> makes an object of the chosen class. Python calls <code>__init__</code> next only if that object is an instance of the called class, so the OOT class must subclass the in-tree class (general Python rule).</li>
+</ol>
+
+<h3><code>dispatch_forward</code>: the decision</h3>
+<x-code file="vllm/model_executor/custom_op.py" lines="172-205" highlight="175,183-187,189-192,194-205" />
+<ol>
+  <li><strong>Line 175.</strong> The comment above says that vLLM is built for one backend and has no dynamic dispatch. The config comes from the current config context.</li>
+  <li><strong>Line 183.</strong> <code>enforce_enable</code> from <code>__init__</code> overrides the list. The comment says it exists for the vision encoder of multimodal models and will be removed (lines 177-182).</li>
+  <li><strong>Lines 184-187.</strong> The counters <code>enabled_custom_ops</code> and <code>disabled_custom_ops</code> record <code>self.__class__.name</code>.</li>
+  <li><strong>Lines 189-192.</strong> Disabled: <code>forward_native</code>, compiled only with <code>compile_native=True</code>.</li>
+  <li><strong>Lines 194-205.</strong> Enabled: the first matching platform test wins; CUDA is the final <code>else</code>. An <code>UnspecifiedPlatform</code> therefore gets <code>forward_cuda</code> (derived).</li>
+</ol>
+
+<h3><code>enabled</code> and <code>default_on</code></h3>
+<x-code file="vllm/model_executor/custom_op.py" lines="268-307" highlight="273,282-289,290,300-305,307" />
+<ol>
+  <li><strong>Line 273.</strong> A class with no <code>name</code> attribute was never registered: WARNING once, and the base mode decides.</li>
+  <li><strong>Lines 282-289.</strong> Both <code>+name</code> and <code>-name</code>: <code>ValueError</code>. <code>CompilationConfig</code> already rejects this earlier ({{cite vllm/config/compilation.py:1027-1034}}).</li>
+  <li><strong>Line 290.</strong> <code>(default_on() or enabled) and not disabled</code>.</li>
+  <li><strong>Lines 300-305.</strong> Exactly one base mode, else <code>ValueError</code>.</li>
+  <li><strong>Line 307.</strong> <code>not count_none &gt; 0 or count_all &gt; 0</code>: true for <code>"all"</code>, false for <code>"none"</code>.</li>
+</ol>
+
+<h3><code>register_oot</code>: the two working forms</h3>
+<x-code file="vllm/model_executor/custom_op.py" lines="334-356" highlight="337,338,339-340,343-348,349-353,354-356" />
+<ol>
+  <li><strong>Line 337.</strong> The key is <code>name</code>, or the name of the class on which the decorator is called. On <code>CustomOp.register_oot()</code> without <code>name</code>, the key would be <code>"CustomOp"</code> (derived).</li>
+  <li><strong>Line 338.</strong> A duplicate key fails the <code>assert</code>.</li>
+  <li><strong>Line 339.</strong> The OOT class's <code>name</code> becomes the key. The <code>+name</code> switch for it is then <code>+RotaryEmbedding</code>, not the in-tree op name (derived; see {{link concepts/custom-ops}}).</li>
+  <li><strong>Lines 343-356.</strong> <code>None</code> → return the decorator; a class → decorate it now; anything else (a string) → <code>TypeError</code>.</li>
+</ol>
+<p><code>PluggableLayer.register_oot</code> (lines 82-99) has the same structure, with the text "Duplicate layer name".</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data: the registries and the attributes this file sets">
+<table>
+  <thead><tr><th>Value</th><th>Type</th><th>Set at</th></tr></thead>
+  <tbody>
+    <tr><td><code>op_registry</code></td><td><code>dict[str, type]</code>, key = registered name such as <code>"rms_norm"</code></td><td>{{cite vllm/model_executor/custom_op.py:73}}, {{cite vllm/model_executor/custom_op.py:320}}</td></tr>
+    <tr><td><code>op_registry_oot</code></td><td><code>dict[str, type]</code>, key = class name such as <code>"RotaryEmbedding"</code></td><td>{{cite vllm/model_executor/custom_op.py:88}}, {{cite vllm/model_executor/custom_op.py:340}}</td></tr>
+    <tr><td><code>cls.name</code></td><td><code>str</code> class attribute; inherited by subclasses</td><td>{{cite vllm/model_executor/custom_op.py:72}}, {{cite vllm/model_executor/custom_op.py:318}}, {{cite vllm/model_executor/custom_op.py:339}}</td></tr>
+    <tr><td><code>cls._dynamic_arg_dims</code></td><td><code>dict[str, int | list[int]] | None</code></td><td>{{cite vllm/model_executor/custom_op.py:319}}</td></tr>
+    <tr><td><code>self._enforce_enable</code>, <code>self._forward_method</code></td><td><code>bool</code>, bound method or compiled function</td><td>{{cite vllm/model_executor/custom_op.py:130-131}}</td></tr>
+  </tbody>
+</table>
+<p>Both dicts are module globals, so each process has its own. A plugin must register in every process that builds a model: a general plugin does this ({{link concepts/plugin-loading}}). Because <code>name</code> is a class attribute, a subclass without its own <code>register</code> call uses the parent's name. <code>RotaryEmbedding</code> is such a subclass: the decorator is on <code>RotaryEmbeddingBase</code> ({{cite vllm/model_executor/layers/rotary_embedding/base.py:14-15}}, {{cite vllm/model_executor/layers/rotary_embedding/base.py:139}}).</p>
+</x-deepdive>
+
+<x-deepdive title="maybe_compile, line by line">
+<x-code file="vllm/model_executor/custom_op.py" lines="207-266" highlight="218-228,230-233,235-258,261-266" />
+<ol>
+  <li><strong>Lines 218-228.</strong> Return <code>fn</code> unchanged when compilation is off for this call, for the whole config (mode <code>NONE</code>), or with the <code>"eager"</code> backend.</li>
+  <li><strong>Lines 230-233.</strong> The backend is the platform's <code>simple_compile_backend</code> (<code>"inductor"</code> by default, {{cite vllm/platforms/interface.py:172}}), with graph partition off.</li>
+  <li><strong>Lines 235-258.</strong> With <code>dynamic_arg_dims</code>: <code>dynamic=False</code>, and each call marks the listed dimensions as dynamic. A negative index counts from the end (line 254). An argument that is not a tensor is skipped (line 251).</li>
+  <li><strong>Lines 261-266.</strong> Else <code>dynamic=True</code>.</li>
+</ol>
+<p>Example: <code>mla_decode_concat_quant_fp8</code> registers <code>dynamic_arg_dims={"decode_ql_nope": 0, "decode_q_pe": 0}</code> ({{cite vllm/model_executor/layers/attention/mla_attention.py:1561-1564}}): dimension 0 (tokens) of both tensors is dynamic.</p>
+</x-deepdive>
+
+<x-deepdive title="Processes and timing">
+<ul>
+  <li><strong>Import time.</strong> <code>register</code> runs when Python imports a layer module. <code>register_oot</code> runs when the plugin module is imported.</li>
+  <li><strong>Model build.</strong> <code>__new__</code>, <code>__init__</code> and <code>dispatch_forward</code> run once per layer object, inside <code>set_current_vllm_config</code>. A CustomOp built when no config is set raises <code>AssertionError</code> ({{cite vllm/config/vllm.py:3576-3586}}).</li>
+  <li><strong>Forward.</strong> <code>forward</code> only calls <code>_forward_method</code>. No config lookup happens per step.</li>
+  <li><strong>Threads.</strong> The registries have no lock. Registration happens at import and plugin time, before the model build. (Derived; the file has no comment about threads.)</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Duplicate <code>register</code> name</td><td><code>AssertionError</code> "Duplicate op name"</td><td>{{cite vllm/model_executor/custom_op.py:317}}, {{cite vllm/model_executor/custom_op.py:71}}</td></tr>
+    <tr><td>Duplicate OOT key</td><td><code>AssertionError</code></td><td>{{cite vllm/model_executor/custom_op.py:338}}, {{cite vllm/model_executor/custom_op.py:86}}</td></tr>
+    <tr><td><code>register_oot("X")</code></td><td><code>TypeError</code></td><td>{{cite vllm/model_executor/custom_op.py:354-356}}</td></tr>
+    <tr><td>Unregistered CustomOp subclass</td><td>WARNING once; base mode decides</td><td>{{cite vllm/model_executor/custom_op.py:273-280}}</td></tr>
+    <tr><td><code>+x</code> and <code>-x</code> both</td><td><code>ValueError</code></td><td>{{cite vllm/model_executor/custom_op.py:284-288}}</td></tr>
+    <tr><td>No or two base modes</td><td><code>ValueError</code></td><td>{{cite vllm/model_executor/custom_op.py:302-305}}</td></tr>
+    <tr><td>A <code>forward_cuda</code> or <code>forward_native</code> that the subclass does not define, when chosen</td><td><code>NotImplementedError</code> at the first forward</td><td>{{cite vllm/model_executor/custom_op.py:136-145}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Configuration that this file reads">
+<table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Set at</th><th>Effect here</th></tr></thead>
+  <tbody>
+    <tr><td><code>compilation_config.custom_ops</code></td><td><code>"none"</code> is added with Inductor + compile mode, else <code>"all"</code>; some code adds <code>+name</code> entries ({{link concepts/custom-ops}})</td><td>{{cite vllm/config/vllm.py:1819-1826}}</td><td><code>enabled()</code>, <code>default_on()</code></td></tr>
+    <tr><td><code>compilation_config.mode</code></td><td><code>VLLM_COMPILE</code> above O0; <code>NONE</code> with <code>--enforce-eager</code> or breakable CUDA graphs</td><td>{{cite vllm/config/vllm.py:1806-1810}}, {{cite vllm/config/vllm.py:1745-1746}}, {{cite vllm/config/vllm.py:849-851}}</td><td><code>maybe_compile</code> line 223</td></tr>
+    <tr><td><code>compilation_config.backend</code></td><td>platform's compile backend</td><td>{{cite vllm/config/compilation.py:1080-1081}}</td><td><code>maybe_compile</code> line 227</td></tr>
+  </tbody>
+</table>
+<p>No environment variable is read in this file.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/custom-ops}}: the switches, the default, the out-of-tree flow and the IR ops.</li>
+  <li>{{link concepts/platform-interface}}: <code>is_out_of_tree()</code> and the platform hooks that can change <code>custom_ops</code>.</li>
+  <li>{{link concepts/plugin-map}}: <code>register_oot</code> among the other extension points.</li>
+  <li>{{link concepts/compile-and-cuda-graphs}}: how <code>torch.compile</code> sees disabled ops.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which dict does <code>__new__</code> read, and with which key?
+    <x-a><p><code>op_registry_oot</code>, with <code>cls.__name__</code> ({{cite vllm/model_executor/custom_op.py:109}}, {{cite vllm/model_executor/custom_op.py:117-120}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">An enabled op runs on ROCm. The subclass defines only <code>forward_native</code> and <code>forward_cuda</code>. Which method runs?
+    <x-a><p><code>dispatch_forward</code> returns <code>forward_hip</code> ({{cite vllm/model_executor/custom_op.py:194-195}}). Its default body calls <code>forward_cuda</code> ({{cite vllm/model_executor/custom_op.py:147-149}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">What is the difference between <code>PluggableLayer</code> and <code>CustomOp</code>?
+    <x-a><p>Both swap the class in <code>__new__</code> through <code>op_registry_oot</code>. Only <code>CustomOp</code> has the <code>forward_*</code> methods and <code>dispatch_forward</code> ({{cite vllm/model_executor/custom_op.py:33-44}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">An op registered with <code>dynamic_arg_dims={"x": -1}</code> is disabled and built with <code>compile_native=True</code> under <code>VLLM_COMPILE</code>. What does a call with a 2-D tensor <code>x</code> do?
+    <x-a><p><code>maybe_compile</code> compiled <code>forward_native</code> with <code>dynamic=False</code>. The wrapper binds the arguments, turns <code>-1</code> into <code>x.ndim - 1 = 1</code>, calls <code>mark_dynamic(x, 1)</code>, then calls the compiled function ({{cite vllm/model_executor/custom_op.py:235-258}}).</p></x-a>
+  </x-q>
+</x-quiz>

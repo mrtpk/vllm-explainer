@@ -1,0 +1,206 @@
+---
+title: Out-of-tree models and the model registry
+nav_title: Out-of-tree models
+level: Intermediate
+prerequisites: concepts/plugin-loading, concepts/plugin-map, learn/hf-checkpoints
+related: concepts/model-interfaces, concepts/model-definition, concepts/plugin-loading, concepts/plugin-map, code/model-executor-models-registry, concepts/weight-loading, tours/build-a-toy-plugin
+summary: ModelRegistry maps the architecture name in config.json to a model class. A plugin adds or replaces an entry with register_model; a "module:Class" string keeps the import lazy, and a cached subprocess inspects the class.
+---
+<x-sentence>vLLM looks up the architecture name from config.json in ModelRegistry; a plugin adds its own class there with register_model.</x-sentence>
+
+<h2>The idea</h2>
+<p>A Hugging Face checkpoint names its model class in <code>config.json</code>, for example <code>"architectures": ["LlamaForCausalLM"]</code> ({{link learn/hf-checkpoints}}). vLLM does not use the Transformers class. It looks up the name in the {{term model-registry}}, a table from architecture name to a vLLM model class. At this commit the built-in table has 406 names.</p>
+<p>An {{term out-of-tree}} package adds a name to the table, or replaces one, with <code>ModelRegistry.register_model()</code>. It calls this function from a {{term general-plugin}}, so the call runs in every process ({{link concepts/plugin-loading}}). The package can give the class itself, or a string <code>"module:Class"</code>. The string makes a {{term lazy-registration | lazy entry}}: vLLM imports the module only in a process that needs the class.</p>
+<p>The front end must know what the model can do before any worker exists: is it generative, does it support pipeline parallelism or LoRA? So the registry <em>inspects</em> the class and keeps the answers in a {{term model-info}} record. For a lazy entry, the inspection runs in a separate Python process, and the result goes into a JSON cache on disk. The page {{link concepts/model-interfaces}} explains the answers.</p>
+<p><strong>An everyday comparison.</strong> Think of a library catalogue. Each card has a title and a shelf position, not the book itself. You fetch the book only when you want to read it. A catalogue clerk writes a summary of each book on the card once, and reuses it until the book changes. The comparison stops here. A vLLM "card" can also hold the book itself (the eager form). And a new card with the same title replaces the old one.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b4b_arch_resolution" alt="Panel 1: three sources of registry entries. The built-in tables (406 names in _VLLM_MODELS) become lazy entries. register_model with a module:Class string makes a lazy entry. register_model with a class makes an eager entry with the model info computed at once. Panel 2: the lookup order. Step 1: model_impl transformers or terratorch first; with auto, no registered name and no conversion, the Transformers fallback. Step 2: each architecture name in order, exact or normalized to a base name. Step 3: nothing found: Transformers fallback again, then ValueError with a message for removed models, models moved to plugins, or unknown models. Panel 3: inspection of a lazy entry. Cache file in modelinfos named after module and class, with an md5 hash of the source; on a miss a subprocess python -m vllm.model_executor.models.registry loads the general plugins, imports the module and returns the model info; later each worker imports the class and calls initialize_model with vllm_config and prefix." caption="Figure: where entries come from (panel 1), the order of the lookup (panel 2), and how the front end inspects a lazy entry without an import (panel 3)." />
+<p>Read panel 2 as the order of the code: the first step that returns a class wins. Panel 3 happens in the {{term front-end}} of <code>vllm serve</code>. The worker in the bottom right imports the class only to build the model.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the built-in tables</h3>
+<p><code>registry.py</code> holds ten tables, one per kind of model. Each value is a pair (module, class). A short module name means a file in <code>vllm/model_executor/models/</code>:</p>
+<x-code file="vllm/model_executor/models/registry.py" lines="73-83" highlight="75,83" />
+<p>The ten tables merge into <code>_VLLM_MODELS</code> ({{cite vllm/model_executor/models/registry.py:806-817}}). At the end of the file, every entry becomes a lazy entry:</p>
+<x-code file="vllm/model_executor/models/registry.py" lines="1556-1573" highlight="1562,1567-1570" caption="A module name that starts with <code>vllm.</code> stays as it is. Other names get the prefix <code>vllm.model_executor.models.</code>." />
+<table>
+  <thead><tr><th>Table</th><th>Lines</th><th>Entries</th></tr></thead>
+  <tbody>
+    <tr><td><code>_TEXT_GENERATION_MODELS</code></td><td>{{cite vllm/model_executor/models/registry.py:73-215}}</td><td>121</td></tr>
+    <tr><td><code>_EMBEDDING_MODELS</code></td><td>{{cite vllm/model_executor/models/registry.py:217-268}}</td><td>38 (33 written, plus 5 copied from the text table, lines 232-237)</td></tr>
+    <tr><td><code>_LATE_INTERACTION_MODELS</code></td><td>{{cite vllm/model_executor/models/registry.py:270-287}}</td><td>13</td></tr>
+    <tr><td><code>_REWARD_MODELS</code></td><td>{{cite vllm/model_executor/models/registry.py:289-293}}</td><td>3</td></tr>
+    <tr><td><code>_TOKEN_CLASSIFICATION_MODELS</code></td><td>{{cite vllm/model_executor/models/registry.py:295-316}}</td><td>8</td></tr>
+    <tr><td><code>_SEQUENCE_CLASSIFICATION_MODELS</code></td><td>{{cite vllm/model_executor/models/registry.py:318-346}}</td><td>11</td></tr>
+    <tr><td><code>_MULTIMODAL_MODELS</code></td><td>{{cite vllm/model_executor/models/registry.py:348-645}}</td><td>126</td></tr>
+    <tr><td><code>_SPECULATIVE_DECODING_MODELS</code></td><td>{{cite vllm/model_executor/models/registry.py:647-732}}</td><td>66</td></tr>
+    <tr><td><code>_TRANSFORMERS_SUPPORTED_MODELS</code></td><td>{{cite vllm/model_executor/models/registry.py:734-769}}</td><td>23</td></tr>
+    <tr><td><code>_TRANSFORMERS_BACKEND_MODELS</code></td><td>{{cite vllm/model_executor/models/registry.py:771-804}}</td><td>10</td></tr>
+    <tr><td><code>_VLLM_MODELS</code> (all)</td><td>{{cite vllm/model_executor/models/registry.py:806-817}}</td><td>406 names (the sum is 419; 13 names occur in two tables with the same value)</td></tr>
+  </tbody>
+</table>
+<p>The counts come from an evaluation of the dict literals at this commit (derived). Two more tables are not in the registry. One lists 50 removed architectures, each with the last vLLM version that had it ({{cite vllm/model_executor/models/registry.py:825-879}}). The other lists 5 architectures that moved to plugins, with the plugin URL ({{cite vllm/model_executor/models/registry.py:881-887}}). They only improve the error text (Step 4).</p>
+<p><strong>The second model tree.</strong> 36 of the 406 entries point to modules in <code>vllm/models/</code>, for example <code>("vllm.models.beam", "BeamForCausalLM")</code> ({{cite vllm/model_executor/models/registry.py:83}}). This tree has one package per model family, with sub-packages per vendor. The package <code>__init__.py</code> picks the implementation for <code>current_platform</code>, for example in <code>vllm/models/deepseek_v4</code> ({{cite vllm/models/deepseek_v4/__init__.py:14-48}}). For the registry, these are normal lazy entries. The only difference: the cache hash covers every file of the package (Step 5). This site does not explain the packages further ({{link learn/what-is-vllm}}).</p>
+
+<h3>Step 2: register_model(), eager or lazy</h3>
+<x-code file="vllm/model_executor/models/registry.py" lines="1160-1203" highlight="1170-1173,1179-1185,1187-1193,1194-1195,1203" />
+<ol>
+  <li><strong>Lines 1175-1177.</strong> The architecture name must be a <code>str</code>, else <code>TypeError</code>.</li>
+  <li><strong>Lines 1179-1185.</strong> A name that is already in the table is overwritten. vLLM logs this only at DEBUG level. So a plugin can also replace a built-in model, for example <code>LlamaForCausalLM</code>.</li>
+  <li><strong>Lines 1187-1193.</strong> A string must contain exactly one colon. <code>"pkg.mod:Cls"</code> becomes <code>_LazyRegisteredModel("pkg.mod", "Cls")</code>. Nothing is imported now. <code>"pkg.mod.Cls"</code> (dots only) raises <code>ValueError</code>.</li>
+  <li><strong>Lines 1194-1195.</strong> A subclass of <code>nn.Module</code> becomes a <code>_RegisteredModel</code>. Its constructor computes the model info at once, in this process ({{cite vllm/model_executor/models/registry.py:974-979}}).</li>
+  <li><strong>Lines 1196-1201.</strong> Anything else (an object, a function) raises <code>TypeError</code>.</li>
+</ol>
+<p><strong>Why lazy.</strong> The docstring gives the reason: a string avoids an import that starts CUDA, and so the error "Cannot re-initialize CUDA in forked subprocess" (lines 1170-1173). In <code>vllm serve</code> the CLI already uses <code>spawn</code> ({{cite vllm/entrypoints/common/startup.py:147-149}}), and <code>get_mp_context</code> switches to <code>spawn</code> when CUDA is already started ({{cite vllm/utils/system_utils.py:145-162}}). The lazy form still has a clear gain: a process that does not build the model does not import its module. A test checks that the inspection of a lazy entry does not start CUDA ({{cite tests/models/test_registry.py:150-158}}).</p>
+
+<h3>Step 3: a model plugin package</h3>
+<p>vLLM's test package <code>vllm_add_dummy_model</code> is the smallest complete example. Its <code>setup.py</code> publishes one general plugin:</p>
+<x-code file="tests/plugins/vllm_add_dummy_model/setup.py" lines="6-13" highlight="11" />
+<p>The function registers four architectures, two in each form:</p>
+<x-code file="tests/plugins/vllm_add_dummy_model/vllm_add_dummy_model/__init__.py" lines="4-27" highlight="9,12,20-24" />
+<ol>
+  <li><strong>Line 4.</strong> <code>from vllm import ModelRegistry</code> is a lazy package attribute ({{cite vllm/__init__.py:26}}).</li>
+  <li><strong>Line 9.</strong> The eager form needs the class, so the function imports <code>my_opt</code> inside the function, not at module level. A failed import here crashes start-up, because vLLM does not catch errors of a plugin function ({{cite vllm/plugins/__init__.py:89-90}}).</li>
+  <li><strong>Lines 11, 14, 20, 26.</strong> Each call checks <code>get_supported_archs()</code> first. The plugin function runs in several processes and must be safe to run again.</li>
+  <li><strong>Lines 20-24.</strong> The lazy form: only a string.</li>
+</ol>
+<p>The model class itself can be small. <code>MyOPTForCausalLM</code> subclasses the in-tree OPT model and changes only <code>compute_logits</code>, so token 0 always has the highest logit ({{cite tests/plugins/vllm_add_dummy_model/vllm_add_dummy_model/my_opt.py:11-18}}). A test sets <code>VLLM_PLUGINS=""</code>: the plugin does not load, and vLLM raises "are not supported for now" ({{cite tests/plugins_tests/test_oot_registration_offline.py:13-22}}).</p>
+
+<h3>Step 4: from config.json to a class</h3>
+<p>The front end inspects the architecture while it makes <code>ModelConfig</code> ({{cite vllm/config/model.py:703-706}}, {{cite vllm/config/model.py:741-744}}). The log line "Resolved architecture: ..." shows the result at INFO level. <code>inspect_model_cls</code> tries these steps in order:</p>
+<x-code file="vllm/model_executor/models/registry.py" lines="1351-1402" highlight="1362-1367,1368-1371,1374-1383,1385-1389,1392-1400,1402" />
+<ol>
+  <li><strong>Lines 1362-1367.</strong> With <code>--model-impl transformers</code>, the Transformers backend class comes first. See {{term model-impl}}.</li>
+  <li><strong>Lines 1368-1371.</strong> With <code>--model-impl terratorch</code>, the answer is always <code>"Terratorch"</code>.</li>
+  <li><strong>Lines 1374-1383.</strong> If no name of the list is registered, <code>model_impl</code> is <code>auto</code> and no conversion is set, try the Transformers backend.</li>
+  <li><strong>Lines 1385-1389.</strong> Try each name of <code>architectures</code> in order. <code>_normalize_arch</code> keeps a registered name. Otherwise it maps a name with a known suffix to a registered base name, for example <code>MyForSequenceClassification</code> to <code>MyForCausalLM</code> ({{cite vllm/model_executor/models/registry.py:1325-1349}}). The first name that inspects wins.</li>
+  <li><strong>Lines 1391-1400.</strong> The Transformers fallback again, now without the conversion condition.</li>
+  <li><strong>Line 1402.</strong> No answer: <code>_raise_for_unsupported</code> raises <code>ValueError</code>.</li>
+</ol>
+<p><code>resolve_model_cls</code> has the same order, but it imports the class ({{cite vllm/model_executor/models/registry.py:1404-1456}}). The worker calls it when it builds the model ({{cite vllm/model_executor/model_loader/utils.py:305-313}}). If the result is a Transformers backend class and <code>model_impl</code> is <code>auto</code>, vLLM warns "has no vLLM implementation, falling back to Transformers implementation" ({{cite vllm/model_executor/model_loader/utils.py:315-322}}).</p>
+<p>The four messages of <code>_raise_for_unsupported</code> tell you the cause ({{cite vllm/model_executor/models/registry.py:1205-1236}}):</p>
+<ul>
+  <li>"failed to be inspected": the name is registered, but the import or inspection failed. The traceback is in the log above it.</li>
+  <li>"was supported in vLLM until v...": the architecture was removed.</li>
+  <li>"is not supported in-tree anymore. Please install the plugin at ...": the architecture moved to a plugin.</li>
+  <li>"are not supported for now": the name is unknown. Your plugin did not load, or did not register this name.</li>
+</ul>
+
+<h3>Step 5: the inspection subprocess and its cache</h3>
+<p>A lazy entry inspects its class without an import in the calling process:</p>
+<x-code file="vllm/model_executor/models/registry.py" lines="1072-1118" highlight="1078-1085,1088-1091,1106-1109,1114-1116" />
+<ol>
+  <li><strong>Lines 1078-1085.</strong> Find the source file: directly for <code>vllm.model_executor.models.*</code>, else with <code>importlib.util.find_spec</code>. <code>find_spec</code> imports the parent package, not the module itself (Python rule).</li>
+  <li><strong>Lines 1088-1091.</strong> Hash the source and read the cache file. The hash is md5 (sha256 where md5 is not available) of the relative path and the bytes of the file ({{cite vllm/model_executor/models/registry.py:1004-1020}}, {{cite vllm/utils/hashing.py:118-121}}). For a package <code>__init__.py</code>, it covers every <code>.py</code> file of the package (lines 1005-1009).</li>
+  <li><strong>Lines 1106-1109.</strong> On a miss, run <code>_ModelInfo.from_model_cls(self.load_model_cls())</code> in a subprocess. The comment says why: "to avoid initializing CUDA".</li>
+  <li><strong>Lines 1114-1116.</strong> Save the result, only if a source file was found.</li>
+</ol>
+<p>The cache directory is <code>$VLLM_CACHE_ROOT/modelinfos</code> ({{cite vllm/model_executor/models/registry.py:996-997}}). <code>VLLM_CACHE_ROOT</code> defaults to <code>~/.cache/vllm</code>, or <code>$XDG_CACHE_HOME/vllm</code> ({{cite vllm/envs.py:713-718}}). The subprocess is <code>python -m vllm.model_executor.models.registry</code> ({{cite vllm/model_executor/models/registry.py:823}}). It loads the general plugins first, so your plugin's packages are ready:</p>
+<x-code file="vllm/model_executor/models/registry.py" lines="1578-1619" highlight="1587,1591-1593,1596-1602,1612,1614-1616" caption="The parent sends a cloudpickled function on stdin. The child writes the pickled result to a file in a temporary directory." />
+<p>This runs only on a cache miss, and also for built-in models, because they are lazy too. The page {{link concepts/plugin-loading}} counts the extra plugin run that a miss causes.</p>
+
+<h3>Step 6: what the class must look like</h3>
+<p>The worker builds the model with <code>initialize_model</code>. It checks the constructor signature by name:</p>
+<x-code file="vllm/model_executor/model_loader/utils.py" lines="96-112" highlight="98,101,105-112" />
+<p>A class without both <code>vllm_config</code> and <code>prefix</code> gets a <code>DeprecationWarning</code>, and vLLM guesses the old arguments (lines 114-136 of the same file). The registry also checks the structure when it inspects the class ({{link concepts/model-interfaces}}):</p>
+<ul>
+  <li><code>__init__</code> accepts the keyword <code>vllm_config</code>, the class has <code>embed_input_ids</code>, and <code>forward</code> accepts <code>input_ids</code> and <code>positions</code> ({{cite vllm/model_executor/models/interfaces_base.py:108-115}}).</li>
+  <li>A generative model also has <code>compute_logits</code> ({{cite vllm/model_executor/models/interfaces_base.py:140-147}}).</li>
+  <li>The default loader calls <code>model.load_weights(weights)</code> with an iterator of (name, tensor) pairs ({{cite vllm/model_executor/model_loader/default_loader.py:503}}). The registry does not check this method.</li>
+</ul>
+<p>The page {{link concepts/model-definition}} explains how to write these methods, with <code>llama.py</code> as the example.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: Llama on a fresh host, then with a plugin">
+<p>A fresh host runs <code>vllm serve meta-llama/Llama-3.1-8B-Instruct</code>. <code>config.json</code> says <code>"architectures": ["LlamaForCausalLM"]</code>. (The model is an example.)</p>
+<ol>
+  <li>The front end builds <code>ModelConfig</code>. <code>registry.is_text_generation_model</code> calls <code>inspect_model_cls(["LlamaForCausalLM"], ...)</code> ({{cite vllm/config/model.py:705}}).</li>
+  <li><code>model_impl</code> is <code>auto</code> and the name is registered, so the first fallback is skipped. Step 4 of the lookup finds the lazy entry <code>("vllm.model_executor.models.llama", "LlamaForCausalLM")</code>.</li>
+  <li>The source path is <code>vllm/model_executor/models/llama.py</code> (line 1079). The cache file is <code>~/.cache/vllm/modelinfos/vllm-model_executor-models-llama-LlamaForCausalLM.json</code>: module and class joined by "-", dots replaced by "-" ({{cite vllm/model_executor/models/registry.py:999-1001}}).</li>
+  <li>The file does not exist: DEBUG log "not found", then a subprocess. It loads the general plugins, imports <code>llama.py</code>, computes the 24 fields and returns them. The parent writes <code>{"hash": "...", "modelinfo": {...}}</code> ({{cite vllm/model_executor/models/registry.py:1054-1070}}).</li>
+  <li>The next start of the server finds the file with the same hash: no subprocess.</li>
+</ol>
+<p>Now the user installs a plugin that calls <code>register_model("LlamaForCausalLM", "acme.llama:FastLlama")</code> (a made-up package). The front end loads general plugins while it builds the CLI parser, before <code>ModelConfig</code> exists ({{cite vllm/engine/arg_utils.py:3243}}). So the lookup finds the new lazy entry. Its cache file is <code>acme-llama-FastLlama.json</code>, with the hash of <code>acme/llama.py</code>. Each worker loads the same plugin in <code>init_worker</code> and imports <code>acme.llama</code> in <code>resolve_model_cls</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Caches and how often each step runs">
+<ul>
+  <li><strong>Per process, per entry.</strong> <code>_try_inspect_model_cls</code> and <code>_try_load_model_cls</code> are module functions with <code>lru_cache(maxsize=128)</code>, keyed by (name, entry) ({{cite vllm/model_executor/models/registry.py:1125-1150}}). <code>ModelConfig</code> asks the registry several times, but the subprocess runs at most once per entry and process.</li>
+  <li><strong>Per model in the worker.</strong> <code>get_model_architecture</code> keeps a dict keyed by a hash of the model name, convert type, runner type, <code>trust_remote_code</code>, <code>model_impl</code> and architectures ({{cite vllm/model_executor/model_loader/utils.py:340-356}}).</li>
+  <li><strong>On disk.</strong> One JSON file per (module, class). The key is the source hash only. A change in a file that the model module imports does not change the hash (derived from lines 1004-1020). Delete <code>$VLLM_CACHE_ROOT/modelinfos</code> after you edit an imported mixin.</li>
+  <li><strong>Eager entries.</strong> No disk cache and no subprocess. The process computes the info at registration (line 1195). The front end, the engine core and every worker import the module, because each one runs the general plugin.</li>
+</ul>
+<p>The method <code>inspect_model_cls</code> of a lazy entry has the <code>@logtime</code> decorator: "Registry inspect model class: Elapsed time ..." at DEBUG level ({{cite vllm/model_executor/models/registry.py:1071}}, {{cite vllm/logging_utils/log_time.py:17-26}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The Transformers backend fallback in detail">
+<p><code>_try_resolve_transformers</code> decides if the Transformers backend can run a name ({{cite vllm/model_executor/models/registry.py:1250-1323}}):</p>
+<ol>
+  <li>A name from <code>_TRANSFORMERS_BACKEND_MODELS</code>, such as <code>TransformersForCausalLM</code>, is returned as it is (lines 1255-1256).</li>
+  <li>Else it loads the <code>auto_map</code> classes of a custom checkpoint, config class first (lines 1270-1280).</li>
+  <li>It looks for the name in the <code>transformers</code> package, then in <code>auto_map["AutoModel*"]</code> (lines 1282-1307). With nothing found: <code>None</code> for <code>auto</code>, <code>ValueError</code> for <code>transformers</code>.</li>
+  <li>The class must be backend-compatible, or able to set its attention implementation (lines 1309-1321).</li>
+  <li>It returns the name of the backend class from <code>ModelConfig._get_transformers_backend_cls()</code>: <code>Transformers</code> + <code>MultiModal</code> (nested config) + <code>MoE</code> + a suffix by task ({{cite vllm/config/model.py:1129-1157}}).</li>
+</ol>
+<p>The names in <code>_TRANSFORMERS_SUPPORTED_MODELS</code>, such as <code>OlmoForCausalLM</code>, are normal registry names. They map to a backend class directly, so the fallback is not needed for them ({{cite vllm/model_executor/models/registry.py:734-752}}).</p>
+<table>
+  <thead><tr><th><code>--model-impl</code></th><th>Effect on the lookup</th></tr></thead>
+  <tbody>
+    <tr><td><code>auto</code> (default, {{cite vllm/config/model.py:398}})</td><td>vLLM class first; Transformers backend only if no name is registered.</td></tr>
+    <tr><td><code>vllm</code></td><td>Registry only; no fallback.</td></tr>
+    <tr><td><code>transformers</code></td><td>Transformers backend first; then the registry.</td></tr>
+    <tr><td><code>terratorch</code></td><td>Always the <code>Terratorch</code> entry.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="model_class_overrides: a development hook">
+<p><code>--model-class-overrides</code> maps an architecture name to a <code>"module:Class"</code> target, the same format as <code>register_model</code>. The docstring says it is "for development and debugging purposes only" ({{cite vllm/config/model.py:351-357}}).</p>
+<x-code file="vllm/config/model.py" lines="1165-1193" highlight="1167,1177-1184,1186-1190,1191-1193" />
+<p>Every access to <code>ModelConfig.registry</code> registers the pending overrides first (line 1167). A module-level set makes it once per process (line 84 of the file), so a worker registers again in its own registry. vLLM logs a WARNING once. No plugin package is needed, but the target module must be importable in every process.</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables, flags and logs">
+<table>
+  <thead><tr><th>Name</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_CACHE_ROOT</code></td><td><code>~/.cache/vllm</code> or <code>$XDG_CACHE_HOME/vllm</code></td><td>{{cite vllm/model_executor/models/registry.py:997}}</td><td>Root of the <code>modelinfos</code> cache.</td></tr>
+    <tr><td><code>VLLM_PLUGINS</code></td><td>not set (all)</td><td>{{cite vllm/plugins/__init__.py:63-64}}</td><td>A list that does not name your model plugin hides the model.</td></tr>
+    <tr><td><code>--model-impl</code></td><td><code>auto</code></td><td>{{cite vllm/engine/arg_utils.py:1057}}</td><td>Lookup order (deep dive above).</td></tr>
+    <tr><td><code>--model-class-overrides</code></td><td><code>{}</code></td><td>{{cite vllm/engine/arg_utils.py:1029-1031}}</td><td>Development hook.</td></tr>
+    <tr><td><code>VLLM_LOGGING_LEVEL=DEBUG</code></td><td><code>INFO</code></td><td>{{cite vllm/envs.py:860}}</td><td>Shows cache hits, misses and overwrites.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="A string with dots only is not the lazy form">
+<p><code>register_model("MyArch", "my_pkg.model.MyModel")</code> raises <code>ValueError</code>: the string must be <code>"my_pkg.model:MyModel"</code> ({{cite vllm/model_executor/models/registry.py:1187-1191}}). Other vLLM settings, such as <code>scheduler_cls</code>, use dots only ({{link concepts/plugin-map}}).</p>
+</x-warning>
+<ul>
+  <li><strong>"failed to be inspected".</strong> The subprocess failed, for example because the module raises on import. vLLM wraps the child's stderr in a <code>RuntimeError</code> ({{cite vllm/model_executor/models/registry.py:1596-1602}}), logs it, and then raises the <code>ValueError</code> ({{cite vllm/model_executor/models/registry.py:1141-1150}}, {{cite vllm/model_executor/models/registry.py:1208-1212}}). Read the log above the error.</li>
+  <li><strong>Two plugins register the same name.</strong> The last call wins, with only a DEBUG log ({{cite vllm/model_executor/models/registry.py:1179-1185}}). The order of the plugin calls is the order of <code>entry_points()</code>.</li>
+  <li><strong>A stale cache after an edit of an imported file.</strong> See the deep dive on caches. The flags can be wrong until the model file changes or you delete the cache.</li>
+  <li><strong>An old-style constructor.</strong> A class with <code>__init__(self, config, ...)</code> works only through argument guessing, with a <code>DeprecationWarning</code> ({{cite vllm/model_executor/model_loader/utils.py:105-117}}).</li>
+  <li><strong>The class is not generative.</strong> If the class has no <code>embed_input_ids</code> or no <code>compute_logits</code>, <code>ModelConfig</code> raises "This model does not support <code>--runner generate</code>" ({{cite vllm/config/model.py:727-728}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> A model plugin is the usual way to serve a new architecture without a fork of vLLM. The registry decides the class in each process, and the cached model info decides which features start-up allows. Most model-plugin failures show up as one of the four registry messages.</p>
+
+<x-quiz>
+  <x-q level="easy">What is the difference between <code>register_model("A", MyModel)</code> and <code>register_model("A", "pkg.mod:MyModel")</code>?
+    <x-a><p>The class form makes a <code>_RegisteredModel</code> and computes the model info at once, in the calling process. The string form makes a <code>_LazyRegisteredModel</code>; vLLM imports the module only when a process needs the class ({{cite vllm/model_executor/models/registry.py:1187-1195}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Your plugin registers <code>"LlamaForCausalLM"</code>. What happens to the built-in Llama class?
+    <x-a><p>The plugin's entry replaces it. <code>register_model</code> overwrites an existing name and logs only at DEBUG level ({{cite vllm/model_executor/models/registry.py:1179-1185}}). The general plugins load before <code>ModelConfig</code> inspects the model, so the lookup finds the new entry.</p></x-a>
+  </x-q>
+  <x-q level="medium">The server starts with the message "Model architectures ['MyArch'] are not supported for now". Name a likely cause.
+    <x-a><p>The name is not in the registry. The plugin did not load (for example, <code>VLLM_PLUGINS</code> does not name it), or it does not register this name. A registered name whose inspection fails gives "failed to be inspected" instead ({{cite vllm/model_executor/models/registry.py:1205-1236}}).</p></x-a>
+  </x-q>
+  <x-q level="hard"><code>MyModel</code> in <code>my_pkg/model.py</code> inherits <code>MyBase</code> from <code>my_pkg/mixins.py</code>. You add <code>SupportsPP</code> to <code>MyBase</code> and change only <code>mixins.py</code>. The registration is <code>"my_pkg.model:MyModel"</code>. Why can <code>--pipeline-parallel-size 2</code> still fail?
+    <x-a><p>The cache key is the hash of <code>my_pkg/model.py</code> only ({{cite vllm/model_executor/models/registry.py:1004-1020}}). The hash did not change, so the front end reads the old <code>supports_pp=false</code> from <code>modelinfos</code> ({{cite vllm/model_executor/models/registry.py:1088-1098}}). <code>ModelConfig</code> then raises <code>NotImplementedError</code> ({{cite vllm/config/model.py:1569-1576}}). Delete the cache file, or change <code>model.py</code> too. (Derived from the hash code.)</p></x-a>
+  </x-q>
+</x-quiz>

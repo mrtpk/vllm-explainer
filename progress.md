@@ -50,6 +50,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
 
+- FINAL-PASS TODO (B4b FC): 'O2 gives VLLM_COMPILE' needs the exceptions (breakable-CUDA-graph default archs vllm.py:75-108, 825-851; --enforce-eager; TORCH_COMPILE_DISABLE=1) on learn/what-is-vllm ~96, learn/pytorch-for-serving ~118, ~146, reference/serve-flags ~65.
+
 - FINAL-PASS TODO (B3b FC): code/v1-core-kv-cache-manager ~132 'AsyncScheduler hashes it later when output of step 3 arrives' → the next step's allocate_slots hashes it; concepts/async-scheduling ~96 mechanism → num_tokens cap at allocation (kv_cache_manager.py:612-615).
 
 - FINAL-PASS TODO (B4a FC): kv-connectors, frontend-plugins, reference/extension-points must say connector registries are also read in the front end (class only); attention-backend-selection: register_backend string duplicate raises; custom-ops: forward_oot only for enabled ops; quantization-plugins: workers get the quant config object via pickled VllmConfig; compile-and-cuda-graphs / config-system: check_and_update_config 'late in' __post_init__.
@@ -118,11 +120,12 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-22 23:11 | B3a fact check | done ~23:40: ~260 claims, 25 defects; simulator verified |
 | 2026-10-22 23:41 | B3b writer | cut off by usage limit ~00:05, resumed 01:01, done ~01:30 |
 | 2026-10-23 01:31 | B3b fact check | done ~01:45: ~190 claims, 21 defects; explorer verified in 12 scenarios |
-| 2026-10-23 01:46 | B5 writer | running |
+| 2026-10-23 01:46 | B5 writer | running (sent CustomOp corrections) |
+| 2026-10-23 02:11 | B6a writer | running |
 | 2026-10-22 22:47 | B4a writer (plugin-map, platform-plugins, platform-interface + 2 modules + plugin timeline) | done ~23:25; 3 diagrams, b4a.json 5 terms |
 | 2026-10-22 23:26 | B4a fact check | done ~23:55: ~270 claims, 24 defects; OOT quant open question answered |
 | 2026-10-22 23:56 | B4b writer | cut off ~00:05, resumed 01:01, done ~01:45; 3 diagrams, b4b.json 11 terms |
-| 2026-10-23 01:46 | B4b fact check | running |
+| 2026-10-23 01:46 | B4b fact check | done ~02:10: ~190 claims, 37 defects; CustomOp default exceptions |
 | 2026-10-22 19:18 | 1b Tour 1 (t1) | done 19:45: 16 stops, 3 diagrams, request_stepper.js, t1.json (12 terms); not browser-checked by writer |
 | 2026-10-22 19:46 | Fact check t1 (+ browser check of stepper) | done ~20:00: ~230 claims, 38 defects (11 citation, 6 value, 9 logic, 3 default source, 9 other). Stepper OK at 1280/390, no overflow. |
 | 2026-10-22 19:49 | Fact check concepts/plugin-loading (+ folder descriptions) | done ~19:58: ~80 claims, 30 defects fixed (8 citation, 11 value/condition, 4 logic, 3 missing source, 5 glossary/folder). Open question answered (platform before general plugins in every process). |
