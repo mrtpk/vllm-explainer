@@ -41,28 +41,57 @@ Status tags: [W] = from a writer report, not yet fact-checked; [FC] = confirmed 
 - --enable-per-request-metrics off by default (entrypoints/common/cli_args.py:~150-151); with --disable-log-stats → ValueError (~536-542). Its time_to_first_token_ms = first_token_ts − scheduled_ts (generate/base/serving.py:~73-74) — the prefill interval, not histogram TTFT. Streaming: only in the final usage chunk (chat_completion/serving.py:~873-885). [FC b0]
 - vllm bench serve: entrypoints/cli/benchmark/serve.py:~10-21; time.perf_counter client timing (benchmarks/lib/endpoint_request_func.py:~443-501); benchmarks/serve.py: TPOT excludes 1-token requests (~654-660), goodput (~669-689), percentiles np.percentile (~782-806); --request-rate inf, --burstiness 1.0, --percentile-metrics ttft,tpot,itl, --metric-percentiles 99, --goodput keys ttft/tpot/e2el in ms (~1745-1879). [FC b0]
 
-## Plugins (from 1a foundation, concepts/plugin-loading)
-- vllm.logits_processors: MRV2 loads it in v1/worker/gpu/sample/logits_processor/loader.py:~37-74 with entry_points() directly (~46) → VLLM_PLUGINS ignored; import error → RuntimeError (~62-66); V1-interface class → ValueError (~67-72). Called from model_runner.py load_model (~463-466). Front end also loads it in InputProcessor.__init__ (input_processor.py:~58-62, ~93-107); validate_logits_processors_parameters IS called (input_processor.py:~109-112) — survey claim "no caller" was wrong. [W 1a]
-- Endpoint plugin factory errors logged and skipped (plugins/__init__.py:~137-141); required_tasks gate (~143-154). [W 1a]
-- Front end: general plugins first load while the CLI builds parsers (cli/main.py:~100-110 → cli/serve.py:~172 → common/cli_args.py:~466 → arg_utils.py:~3243). current_platform imported at module level in arg_utils.py:~122 → in the front end the platform resolves before general plugins (derived). [W 1a]
-- EngineCore loads plugins (core.py:~132) before the executor (~147). One GPU: uni executor, init_worker inside EngineCore process (uniproc_executor.py:~68). [W 1a]
-- Start method: CLI sets spawn (entrypoints/common/startup.py:~148-149, from cli/main.py:~67-68); env default fork (envs.py:~938-940); get_mp_context (utils/system_utils.py:~185-200), _maybe_force_spawn (~123-162); engine core procs (v1/engine/utils.py:~256), workers (multiproc_executor.py:~723). [W 1a]
-- VLLM_PLUGINS re-read on every access (envs.py:~2297-2298) until enable_envs_cache (~2308-2326). No space stripping in the comma split (derived). [W 1a]
-- General group logs at DEBUG, other groups INFO (plugins/__init__.py:~48-50); VLLM_LOGGING_LEVEL default INFO (envs.py:~860). [W 1a]
-- Platform detector exception → DEBUG log, plugin ignored (platforms/__init__.py:~255-265); the single active OOT detector is called again at ~278, outside try. [W 1a]
-- Built-in LoRA resolvers: filesystem resolver raises ValueError if VLLM_LORA_RESOLVER_CACHE_DIR is not a dir (plugins/lora_resolvers/filesystem_resolver.py:~51-57) → start-up stops; HF Hub resolver needs lora_hf_hub_resolver in VLLM_PLUGINS (hf_hub_resolver.py:~129-145). [W 1a]
-- IO processor: function error → warning; no usable plugin → ValueError (plugins/io_processors/__init__.py:~64-84). Stat logger not StatLoggerBase → TypeError (v1/metrics/loggers.py:~88-94). register_model overwrite → DEBUG log only (registry.py:~1179-1185). [W 1a]
-- docs/design/plugin_system.md:~7 says every process loads the plugin: only true for general + platform groups (FAQ). [W 1a]
+## Plugins (from 1a foundation, concepts/plugin-loading — fact-checked 2026-10-22)
+- vllm.logits_processors: MRV2 loads it in v1/worker/gpu/sample/logits_processor/loader.py:~37-74 with entry_points() directly (~46) → VLLM_PLUGINS ignored; import error → RuntimeError (~62-66); V1-interface class → ValueError (~67-72). Called from model_runner.py load_model (~463-466). Front end also loads it in InputProcessor.__init__ (input_processor.py:~58-62, ~93-107); validate_logits_processors_parameters IS called (input_processor.py:~109-112) — survey claim "no caller" was wrong. [FC 1a]
+- Endpoint plugin factory errors logged and skipped (plugins/__init__.py:~137-141); required_tasks gate (~143-154). [FC 1a]
+- Front end: general plugins first load while the CLI builds parsers (cli/main.py:~100-110 → cli/serve.py:~172 → common/cli_args.py:~466 → arg_utils.py:~3243). current_platform imported at module level in arg_utils.py:~122 → in the front end the platform resolves before general plugins (derived). [FC 1a]
+- EngineCore loads plugins (core.py:~132) before the executor (~147). One GPU: uni executor, init_worker inside EngineCore process (uniproc_executor.py:~68). [FC 1a]
+- Start method: CLI sets spawn (entrypoints/common/startup.py:~148-149, from cli/main.py:~67-68); env default fork (envs.py:~938-940); get_mp_context (utils/system_utils.py:~185-200), _maybe_force_spawn (~123-162); engine core procs (v1/engine/utils.py:~256), workers (multiproc_executor.py:~723). [FC 1a]
+- VLLM_PLUGINS re-read on every access (envs.py:~2297-2298) until enable_envs_cache (~2308-2326). No space stripping in the comma split (derived). [FC 1a]
+- General group logs at DEBUG, other groups INFO (plugins/__init__.py:~48-50); VLLM_LOGGING_LEVEL default INFO (envs.py:~860). [FC 1a]
+- Platform detector exception → DEBUG log, plugin ignored (platforms/__init__.py:~255-265); the single active OOT detector is called again at ~278, outside try. [FC 1a]
+- Built-in LoRA resolvers: filesystem resolver raises ValueError if VLLM_LORA_RESOLVER_CACHE_DIR is not a dir (plugins/lora_resolvers/filesystem_resolver.py:~51-57) → start-up stops; HF Hub resolver needs lora_hf_hub_resolver in VLLM_PLUGINS (hf_hub_resolver.py:~129-145). [FC 1a]
+- IO processor: function error → warning; no usable plugin → ValueError (plugins/io_processors/__init__.py:~64-84). Stat logger not StatLoggerBase → TypeError (v1/metrics/loggers.py:~88-94). register_model overwrite → DEBUG log only (registry.py:~1179-1185). [FC 1a]
+- docs/design/plugin_system.md:~7 says every process loads the plugin: only true for general + platform groups (FAQ). [FC 1a]
 
-## Online request path (from Tour 1 writer; being fact-checked)
-- Default online path: AsyncScheduler + step_with_batch_queue. Async scheduling on by default (config/vllm.py:~1664-1698); MRV2 max_concurrent_batches = pp_size+1 → 2 on one GPU (~587-597); batch queue → step_fn = step_with_batch_queue (core.py:~205-211, ~227-229); get_scheduler_cls → AsyncScheduler (config/scheduler.py:~231-238). [W t1]
-- engine_client.generate() only builds an async generator; StreamingResponse is returned before AsyncLLM.add_request runs → HTTP 200 before the engine sees the request (chat_completion/serving.py:~396-426; generate/base/serving.py _preflight docstring ~169-181). [W t1]
-- Request id: assign_request_id appends 8 random chars, keeps external_req_id (input_processor.py:~354-371); VLLM_DISABLE_REQUEST_ID_RANDOMIZATION turns it off (~364-369). [W t1]
-- Async placeholders: +1 on decode schedule (sched/async_scheduler.py:~45-47), −1 on token arrival (~71-73); used in running pass (scheduler.py:~759-763). MRV2 previous token from req_states.last_sampled_tokens on GPU (gpu/model_runner.py:~1493-1500), written in post_update (~1715-1726). [W t1]
-- Chat template + tokenize in a thread pool (renderers/hf.py:~1011-1013; renderers/base.py:~156-158); VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT default 30 s (envs.py:~817-818); HF template returns text, not ids (online_renderer.py:~774-781). [W t1]
-- gpu_memory_utilization default 0.92 (config/cache.py:~212). [W t1]
-- DP: non-MoE → independent EngineCoreProc per rank; MoE → DPEngineCoreProc (core.py:~1537-1543). One node DP=1 IPC uses ipc:// (v1/engine/utils.py:~1139-1151); engine identity = DP rank as 2 little-endian bytes (core_client.py:~749-751). [W t1]
-- check_stop order: EOS, stop token ids, max_model_len/max_tokens, min_tokens, repetition (sched/utils.py:~98-140). Prefix-cache hit ≤ num_tokens−1, full blocks only (kv_cache_manager.py:~289-300). Single API server runs in the CLI process (cli/serve.py:~154-156). [W t1]
+## Plugins — corrections from the plugin-loading fact check
+- VLLM_PLUGINS filters 5 of 6 groups: vllm.logits_processors ignores it; endpoint plugins load ONLY if named in VLLM_PLUGINS (unset → none). [FC 1a]
+- VLLM_TARGET_DEVICE=cpu skips the platform plugin group (platforms/__init__.py:~244-248). [FC 1a]
+- In EVERY serve process the platform resolves before general plugins: module-level `from vllm.platforms import current_platform` triggers PEP 562 __getattr__ (platforms/__init__.py:~299-300). Front end: cli/main.py:~43-51 imports → cli/serve.py:13 → cli_args.py:16 → arg_utils.py:122. Engine core: spawned child imports vllm.v1.engine.core (v1/engine/utils.py:~282-284) → core.py:24 → config/__init__.py:7 → compilation.py:22. Worker: multiproc_executor.py:46. Registry subprocess: registry.py:26. [FC 1a]
+- Model-registry inspection subprocess runs only on a modelinfo cache miss, for built-in models too (all lazy, registry.py:~1565-1573; cache ~1086-1109). [FC 1a]
+- Failing general-plugin function: engine core logs "EngineCore failed to start." and re-raises (core.py:~1570-1576); worker logs "WorkerProc failed to start." (multiproc_executor.py:~950-957). [FC 1a]
+- enable_envs_cache called at core.py:~243 and multiproc_executor.py:~710. Start method: use startup.py:~147-149; cli/main.py:~67-68 skips cli_env_setup for `vllm snapshot`; fork never applies in default serve unless the user sets VLLM_WORKER_MULTIPROC_METHOD. [FC 1a]
+- validate_logits_processors_parameters only on the MRV1 path (input_processor.py:~109-113, per request ~177); MRV2 uses build_custom_logits_processors_params_validator (~103-107). [FC 1a]
+- HF Hub LoRA resolver also needs VLLM_LORA_RESOLVER_HF_REPO_LIST (hf_hub_resolver.py:~135); filesystem resolver acts only if its cache dir var is set (~52). [FC 1a]
+- Endpoint loader reached via attach_endpoint_plugins (plugins/endpoint_plugins/interface.py:~108). Scheduler owns the KV cache manager (scheduler.py:~329). vllm/ir provider chosen by priority list with platform defaults (config/kernel.py:~458-475); providers vllm_c, aiter, oink, triton; Helion separate. [FC 1a]
+- Plugin-run counts: TP=4 → 6 general-plugin runs, TP=2 → 4, uni → 2 (+1 per registry subprocess on cache miss). [FC 1a]
+
+## Online request path (from Tour 1 — fact-checked 2026-10-22)
+- Default online path: AsyncScheduler + step_with_batch_queue. Async scheduling on by default (config/vllm.py:~1664-1698); MRV2 max_concurrent_batches = pp_size+1 → 2 on one GPU (~587-597); batch queue → step_fn = step_with_batch_queue (core.py:~205-211, ~227-229); get_scheduler_cls → AsyncScheduler (config/scheduler.py:~231-238). [FC t1]
+- engine_client.generate() only builds an async generator; StreamingResponse is returned before AsyncLLM.add_request runs → HTTP 200 before the engine sees the request (chat_completion/serving.py:~396-426; generate/base/serving.py _preflight docstring ~169-181). [FC t1]
+- Request id: assign_request_id appends 8 random chars, keeps external_req_id (input_processor.py:~354-371); VLLM_DISABLE_REQUEST_ID_RANDOMIZATION turns it off (~364-369). [FC t1]
+- Async placeholders: +1 on decode schedule (sched/async_scheduler.py:~45-47), −1 on token arrival (~71-73); used in running pass (scheduler.py:~759-763). MRV2 previous token from req_states.last_sampled_tokens on GPU (gpu/model_runner.py:~1493-1500), written in post_update (~1715-1726). [FC t1]
+- Chat template + tokenize in a thread pool (renderers/hf.py:~1011-1013; renderers/base.py:~156-158); VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT default 30 s (envs.py:~817-818); HF template returns text, not ids (online_renderer.py:~774-781). [FC t1]
+- gpu_memory_utilization default 0.92 (config/cache.py:~212). [FC t1]
+- DP: non-MoE → independent EngineCoreProc per rank; MoE → DPEngineCoreProc (core.py:~1537-1543). One node DP=1 IPC uses ipc:// (v1/engine/utils.py:~1139-1151); engine identity = DP rank as 2 little-endian bytes (core_client.py:~749-751). [FC t1]
+- check_stop order: EOS, stop token ids, max_model_len/max_tokens, min_tokens, repetition (sched/utils.py:~98-140). Prefix-cache hit ≤ num_tokens−1, full blocks only (kv_cache_manager.py:~289-300). Single API server runs in the CLI process (cli/serve.py:~154-156). [FC t1]
+
+## Added after the Tour 1 fact check (2026-10-22)
+- TP=1 `vllm serve` defaults: distributed_executor_backend None (parallel.py:~290-292) → "uni"; uni supports async scheduling (uniproc_executor.py:~156-158). [FC t1]
+- AsyncScheduler placeholders are added for every scheduled step that samples a token, incl. the last prefill chunk (async_scheduler.py:~32-47). [FC t1]
+- MRV2 execute_model/sample_tokens have no GPU→CPU wait for a default request; the only wait is copy_event.synchronize() in get_output(); gpu_sync_debug.py:~386-392 checks this; non_block only moves the wait into a future (uniproc_executor.py:~108-117). [FC t1]
+- CUDA graphs at O2 (FULL_AND_PIECEWISE): uniform 1-token decode batch ≤ largest captured size → FULL; other batches → PIECEWISE padded to a captured size; larger → eager (gpu/cudagraph_utils.py:~352-370, ~523-553); the attention backend can lower the mode at start-up (gpu/model_runner.py:~754-763). [FC t1]
+- Sampler default path: FlashInfer fused top-k/top-p when batch uses top-k/top-p, no greedy/seeded request, no processed logprobs, and hardware supports it (gpu/sample/sampler.py:~304-315, ~339-343); Gumbel is the fallback. [FC t1]
+- Prompt too long: renderer _token_len_check raises VLLMValidationError during tokenization → HTTP 400 (params.py:~518-538; register.py:~32; error_response.py:~43-46). [FC t1]
+- Last SSE chunk delta content is "" (EOS not detokenized, detokenizer.py:~107-111); chunks with exclude_unset=True show fields set to None as null (chat serving.py:~808-824). [FC t1]
+- DP LB score = max(client_count×in-flight, waiting+running) + waiting×6×max(0, kv_usage−0.5) (core_client.py:~1763-1789). Each front end detokenizes only its own requests (core.py:~1936-1943, ~2047-2052, ~2089-2091). with_cancellation runs the handler in its own task (api_utils.py:~93-109). [FC t1]
+
+## Reference data (from the generators, 2026-10-22)
+- 317 env vars (envs.py:~618 dict; TYPE_CHECKING block from ~14). 7 have no TYPE_CHECKING entry. 24 have no envs.* use in vllm/ (mostly build vars); VLLM_XLA_CHECK_RECOMPILATION (envs.py:~1086) is unused anywhere; VLLM_ROCM_SLEEP_MEM_CHUNK_SIZE read only in C++; VLLM_CHAT_TEMPLATE_FUEL only by the Rust frontend. [W gen]
+- Annotation vs read mismatch: VLLM_SKIP_P2P_CHECK annotated False (envs.py:~128) but read falls back to "1" → True (~1207) [S]; VLLM_DP_MASTER_IP "" vs "127.0.0.1" (~182, ~1503); VLLM_XGRAMMAR_CACHE_MB 0 vs 512 (~226, ~1689). [W gen]
+- 319 serve arguments in 19 groups. Default model Qwen/Qwen3-0.6B (config/model.py:~155). --optimization-level default O2. EnableDisableAction pairs --enable-x/--disable-x (argparse_utils.py:~131-158); other bools get --no-x. Deprecated flags (removed in v0.33.0): --disable-cascade-attn, --mamba-cache-mode, --log-config-file (arg_utils.py:~449-464). `vllm serve --help` does not list --model (arg_utils.py:~965). [W gen]
+- 42 @config classes, 543 fields; VllmConfig 34 attributes; quant_config is QuantizationConfig (not @config). [W gen]
+- 128 metrics (62 counters, 25 gauges, 41 histograms). show_hidden_metrics stored at v1/metrics/loggers.py:~494 and never read → --show-hidden-metrics-for-version has no effect [S]. Deprecated: vllm:kv_offload_total_bytes, _total_time, _size (offloading/metrics.py:~149-151), always registered. 4 kvcr metrics named in external package. [W gen]
 
 ## Added after the b0 fact check (2026-10-22)
 - Async scheduling on by default (config/vllm.py:~1664-1698) → engine core uses step_with_batch_queue (core.py:~227-229; vllm.py:~587-597), not step(). [FC b0]
@@ -75,6 +104,7 @@ Status tags: [W] = from a writer report, not yet fact-checked; [FC] = confirmed 
 - bench serve ranges: flags ~1745-1765, ~1847-1857, ~1858-1866, ~1867-1878; goodput ~669-692. [FC b0]
 
 ## Conflicts and resolutions (docs vs code — FAQ material)
+- docs/usage/metrics.md:~134-136: deprecated metrics hidden behind --show-hidden-metrics-for-version; code never reads the flag (loggers.py:~494) and exposes the deprecated offload metrics. [S]
 - docs/design/metrics.md:~69-70 calls ITL a wall-clock gap between streamed outputs; code uses engine-core monotonic timestamps per engine output (stats.py:~554-556); --stream-interval does not change Prometheus ITL. [FC b0]
 - docs/design/metrics.md:~212 says queue time runs to the "most recent SCHEDULED"; code keeps the first (stats.py:~576-578). Pages follow the code. [FC b0]
 - docs/design/metrics.md:~262-263 says arrival_time starts when tokenization begins; code sets it before the chat template. [FC b0]

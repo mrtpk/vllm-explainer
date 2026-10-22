@@ -5,10 +5,11 @@ Sources (vLLM at the pinned commit 3e44c0d):
   vllm/plugins/__init__.py:16-30      the five group names and the comments on where they load
   vllm/plugins/__init__.py:36-74      load_plugins_by_group: discover (:42), filter (:64), load (:69), errors (:71-72)
   vllm/plugins/__init__.py:77-90      load_general_plugins: guard (:83-85), call each function (:89-90)
+  vllm/platforms/__init__.py:244-248  VLLM_TARGET_DEVICE=cpu skips the platform plugin group
   vllm/engine/arg_utils.py:3243, :924 front end: add_cli_args, EngineArgs.__post_init__
   vllm/platforms/__init__.py:250      platform plugins, inside resolve_current_platform_cls_qualname (first current_platform access)
   vllm/v1/engine/async_llm.py:156     stat logger plugins (AsyncLLM.__init__)
-  vllm/entrypoints/launchers/app.py:51            endpoint plugins (build_app -> attach_endpoint_plugins)
+  vllm/entrypoints/launchers/app.py:51            endpoint plugins (build_app -> attach_endpoint_plugins, plugins/endpoint_plugins/interface.py:108)
   vllm/entrypoints/pooling/pooling/io_processor.py:51  IO processor plugins (get_io_processor)
   vllm/v1/engine/input_processor.py:107           logits processors (front-end validator, MRV2)
   vllm/v1/engine/core.py:132          engine core: EngineCore.__init__
@@ -48,7 +49,7 @@ lanes = [
         ("vllm.general_plugins", ["add_cli_args, EngineArgs.__post_init__", "engine/arg_utils.py:3243, :924"], EMERALD),
         ("vllm.platform_plugins", ["first current_platform access", "platforms/__init__.py:250"], EMERALD),
         ("vllm.stat_logger_plugins", ["AsyncLLM.__init__", "v1/engine/async_llm.py:156"], BLUE),
-        ("vllm.endpoint_plugins", ["build_app; only if VLLM_PLUGINS is set", "entrypoints/launchers/app.py:51"], BLUE),
+        ("vllm.endpoint_plugins", ["build_app; only if named in VLLM_PLUGINS", "entrypoints/launchers/app.py:51"], BLUE),
         ("vllm.io_processor_plugins", ["pooling model asks for a plugin", "pooling/pooling/io_processor.py:51"], BLUE),
         ("vllm.logits_processors", ["InputProcessor.__init__ (validator)", "v1/engine/input_processor.py:107"], VIOLET),
     ]),
@@ -93,7 +94,7 @@ for x, (n, title, rows) in zip(LX, cards):
 for i in range(2):
     d.arrow(LX[i] + LW + 2, cy + CH / 2, LX[i + 1] - 2, cy + CH / 2, BLUE)
 d.callout(40, cy + CH + 16, 1020, "load_general_plugins():",
-          "returns at once if plugins_loaded is True (:83-85); else sets it, then calls every function (:89-90). Errors are not caught.",
+          "returns at once if plugins_loaded is True (:83-84); else sets it (:85), then calls every function (:89-90). Errors are not caught.",
           AMBER, h=36)
 
 # ---- Panel 3: two special cases --------------------------------------------------------------
@@ -119,7 +120,7 @@ d.legend(30, y, [(EMERALD, "every process"), (BLUE, "front end only"), (VIOLET, 
                  (AMBER, "errors stop start-up")])
 y += 36
 y = d.footnotes(30, y, [
-    "Boxes in a lane are not in time order. Platform plugins load once per process, when code first reads current_platform.",
+    "Boxes in a lane are not in time order. Platform plugins load once per process, when code first reads current_platform (not with VLLM_TARGET_DEVICE=cpu).",
     "vllm.logits_processors does not use load_plugins_by_group() or VLLM_PLUGINS. Not shown: Ray, the DP coordinator, extra API servers.",
 ])
 d.save(height=y + 8)

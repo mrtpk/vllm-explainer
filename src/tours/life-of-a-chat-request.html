@@ -1,0 +1,578 @@
+---
+title: Tour: Life of a chat request
+nav_title: Life of a chat request
+level: Beginner
+prerequisites: learn/openai-api, learn/processes-and-ipc, learn/serving-metrics
+related: concepts/architecture-overview, concepts/engine-client, concepts/engine-core-loop, concepts/data-contracts, concepts/scheduler, concepts/async-scheduling, concepts/model-runner, concepts/openai-server, concepts/renderers-and-chat-templates, tours/serve-startup, tours/engine-step, tours/forward-pass, tours/multi-gpu-step
+summary: Follow one streaming POST /v1/chat/completions request through vllm serve in 16 stops: FastAPI route, chat template, AsyncLLM, ZMQ, engine core, scheduler, Model Runner V2, sampler, detokenizer and the SSE chunks.
+scripts: viz/request_stepper.js
+---
+<x-sentence>We follow one streaming chat request from the FastAPI route, through the engine core process and the GPU, to the last SSE chunk.</x-sentence>
+
+<h2>The idea</h2>
+<p><code>vllm serve</code> starts an {{term openai-compatible-server | OpenAI-compatible server}}. A client sends a chat request as JSON and gets the answer back as a stream of small pieces. This tour follows one such request through the code, from the HTTP route to the last piece, <code>data: [DONE]</code>.</p>
+<p>The request crosses two processes. The {{term front-end | front end}} is the API server process: FastAPI, the chat template, the tokenizer and {{term async-llm | AsyncLLM}}. The {{term engine-core | engine core}} process holds the scheduler and, with one GPU, also the {{term worker}} and the {{term model-runner | model runner}}. The two processes talk through {{term zmq | ZMQ}} sockets. The messages are {{term msgpack}} bytes.</p>
+<p>The engine core does not run one request from start to end. It runs <em>steps</em>. In each step it selects a batch of requests, runs the model once for all of them and adds one new token to each request. So our request goes through the engine step once for each output token. Each new token goes back to the front end and becomes one {{term sse | SSE}} chunk. The idea of steps and continuous batching is not new: see {{deepinfer learn/batching | Batching}}.</p>
+
+<p><strong>An everyday comparison.</strong> Think of a restaurant with a waiter and a kitchen. The waiter (the front end) writes the order on a ticket and passes it through a window (ZMQ). The kitchen (the engine core) cooks in rounds for all open orders. After each round, the waiter carries the new part of the dish to the table at once (streaming). The comparison stops being true in two places. A round adds only one token to each order, so an order needs hundreds of rounds. And the waiter must translate each part (token ids) into text before the guest can read it.</p>
+
+<h3>The example request</h3>
+<p>We start the server on one GPU with a chat model, and run the example client of the repository with <code>--stream</code>:</p>
+<pre><code class="language-bash">vllm serve Qwen/Qwen2.5-1.5B-Instruct          # any chat model; one GPU, default settings
+python examples/basic/online_serving/openai_chat_completion_client.py --stream</code></pre>
+<p>The client sends four messages: a system message, a user question, an assistant answer and a second user question ({{cite examples/basic/online_serving/openai_chat_completion_client.py:16-24}}). It calls <code>client.chat.completions.create(..., stream=args.stream)</code> ({{cite examples/basic/online_serving/openai_chat_completion_client.py:46-50}}). On the wire this is one HTTP request:</p>
+<pre><code class="language-json">POST /v1/chat/completions
+{"model": "Qwen/Qwen2.5-1.5B-Instruct", "stream": true,
+ "messages": [{"role": "system", "content": "You are a helpful assistant."},
+              {"role": "user", "content": "Who won the world series in 2020?"},
+              {"role": "assistant", "content": "The Los Angeles Dodgers won the World Series in 2020."},
+              {"role": "user", "content": "Where was it played?"}]}</code></pre>
+<x-simplified><p>The model name and all numbers in this tour (61 prompt tokens, 48 cached tokens, the token ids) are illustrative. The tour assumes a ChatML-style chat template, like the one in {{cite examples/template_chatml.jinja}}. Other models have other templates, so their prompts have other lengths.</p></x-simplified>
+
+<h3>What you will see</h3>
+<ul>
+  <li>Why the HTTP status 200 goes out <em>before</em> the request reaches the engine core (stops 1, 2 and 4).</li>
+  <li>Where the chat template runs, and why the tokenizer runs in a thread pool (stop 3).</li>
+  <li>The exact objects that cross the process boundary: <code>EngineCoreRequest</code> one way, <code>EngineCoreOutputs</code> the other way (stops 5, 6 and 14).</li>
+  <li>Three threads in the engine core process, and the busy loop in the middle (stops 7 to 9).</li>
+  <li>How the scheduler uses one {{term token-budget | token budget}} and the {{term prefix-caching | prefix cache}} for our prompt (stop 10).</li>
+  <li>How Model Runner V2 prepares the inputs, runs the forward pass and samples the token on the GPU (stops 11 to 13).</li>
+  <li>How a token id becomes text and then an SSE chunk (stops 15 and 16).</li>
+  <li>How async scheduling overlaps the CPU work of one step with the GPU work of the step before (<a href="#the-loop">the loop</a>).</li>
+</ul>
+
+<h2>The picture</h2>
+<x-diagram name="t1_processes" alt="Panel 1: three boxes from left to right. The front end (API server process) with FastAPI, OpenAIServingChat, the renderer, AsyncLLM, the input and output processors and the AsyncMPClient with a ROUTER and a PULL socket. The engine core process with an input thread, the busy loop with the scheduler, the UniProcExecutor, the worker and Model Runner V2, and an output thread. The GPU with weights, KV cache blocks and CUDA graphs. Requests go from the front end to the engine core as msgpack; outputs come back as msgpack. The engine core starts work on the GPU; token ids come back with an asynchronous copy. Panel 2: three cards for the three boundaries: HTTP with JSON and SSE, ZMQ with EngineCoreRequest and EngineCoreOutputs over ipc sockets, and a plain Python call between the engine core and the GPU. Panel 3: the asyncio tasks of the front end, the three threads of the engine core and the two CUDA streams of the GPU." caption="Figure: the two processes of vllm serve on one GPU, what crosses each boundary, and which threads do the work." />
+<p>Read the diagram from top to bottom. Blue is the front end, violet is the engine core process, green is the GPU and amber is a ZMQ message. With one GPU and TP = 1, there is no separate worker process. The executor is <code>"uni"</code> when <code>world_size == 1</code> ({{cite vllm/config/parallel.py:1099-1100}}). <code>UniProcExecutor</code> makes the worker object in its own process ({{cite vllm/v1/executor/uniproc_executor.py:51-69}}).</p>
+<x-diagram name="t1_path" alt="Panel 1: stops 1 to 6 in the front end: route handler, serving class, chat template and tokenizer, the stream starts in AsyncLLM.generate, EngineCoreRequest from the InputProcessor, register and send over ZMQ. Panel 2: stops 7 to 14 in the engine core process and on the GPU: input thread, busy loop, engine step, schedule, prepare inputs, forward pass, sample, update and send. A dashed arrow goes from stop 14 back to stop 9 for the next engine step. Panel 3: stops 15 and 16 in the front end: detokenize, SSE chunk, then the HTTP client." caption="Figure: the map of the 16 stops. Stops 9 to 16 repeat once for each output token." />
+<x-viz id="request-stepper" title="Step through the 16 stops" caption="Click <em>Next</em>, a stop number, or use the arrow keys. The process map shows where the code of the stop runs. Values are illustrative. <em>Read stop N</em> jumps to the full stop below." />
+
+<table>
+  <thead><tr><th>Stop</th><th>What happens</th><th>Where (file and function)</th><th>Runs in</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>The route receives the request</td><td><code>openai/chat_completion/api_router.py</code>: <code>create_chat_completion</code></td><td>front end</td></tr>
+    <tr><td>2</td><td>The serving class makes sampling parameters and a generator</td><td><code>openai/chat_completion/serving.py</code>: <code>_create_chat_completion</code></td><td>front end</td></tr>
+    <tr><td>3</td><td>The chat template and the tokenizer make token ids</td><td><code>renderers/base.py</code>: <code>render_chat_async</code>; <code>renderers/hf.py</code></td><td>front end, thread pool</td></tr>
+    <tr><td>4</td><td>The stream starts and calls <code>AsyncLLM.generate()</code></td><td><code>v1/engine/async_llm.py</code>: <code>generate</code></td><td>front end</td></tr>
+    <tr><td>5</td><td>The input processor makes an <code>EngineCoreRequest</code></td><td><code>v1/engine/input_processor.py</code>: <code>process_inputs</code></td><td>front end</td></tr>
+    <tr><td>6</td><td>The front end registers the request and sends it over ZMQ</td><td><code>async_llm.py</code>: <code>_add_request</code>; <code>core_client.py</code>: <code>add_request_async</code></td><td>front end</td></tr>
+    <tr><td>7</td><td>The input thread decodes the request</td><td><code>v1/engine/core.py</code>: <code>process_input_sockets</code></td><td>engine core, input thread</td></tr>
+    <tr><td>8</td><td>The busy loop gives it to the scheduler</td><td><code>core.py</code>: <code>run_busy_loop</code>; <code>Scheduler.add_request</code></td><td>engine core, main thread</td></tr>
+    <tr><td>9</td><td>One engine step with the batch queue</td><td><code>core.py</code>: <code>step_with_batch_queue</code></td><td>engine core, main thread</td></tr>
+    <tr><td>10</td><td>The scheduler gives tokens and KV blocks</td><td><code>v1/core/sched/scheduler.py</code>: <code>schedule</code></td><td>engine core, main thread</td></tr>
+    <tr><td>11</td><td>Model Runner V2 prepares the inputs</td><td><code>v1/worker/gpu/model_runner.py</code>: <code>execute_model</code></td><td>engine core and GPU</td></tr>
+    <tr><td>12</td><td>The forward pass</td><td><code>model_runner.py</code>: <code>execute_model</code></td><td>GPU</td></tr>
+    <tr><td>13</td><td>Logits, sampler and the copy back</td><td><code>model_runner.py</code>: <code>sample_tokens</code></td><td>GPU and engine core</td></tr>
+    <tr><td>14</td><td>The scheduler appends the token and checks for stop; the output thread sends it</td><td><code>scheduler.py</code>: <code>update_from_output</code>; <code>core.py</code>: <code>process_output_sockets</code></td><td>engine core</td></tr>
+    <tr><td>15</td><td>The front end detokenizes and fills the collector</td><td><code>async_llm.py</code>: <code>output_handler</code>; <code>v1/engine/output_processor.py</code></td><td>front end</td></tr>
+    <tr><td>16</td><td>The stream generator writes SSE chunks and <code>data: [DONE]</code></td><td><code>serving.py</code>: <code>chat_completion_stream_generator</code></td><td>front end</td></tr>
+  </tbody>
+</table>
+<p>All paths are under <code>vllm/</code>. Stops 1 to 8 run once. Stops 9 to 16 run once per output token.</p>
+
+<x-stop n="1" title="The route receives POST /v1/chat/completions">
+<p>We are in <code>vllm/entrypoints/openai/chat_completion/api_router.py</code>. With one API server, <code>vllm serve</code> runs the server in the CLI process itself (<code>uvloop.run(run_server(args))</code>, {{cite vllm/entrypoints/cli/serve.py:154-156}}). FastAPI parses the JSON body into a <code>ChatCompletionRequest</code> object and calls the route function:</p>
+<x-code file="vllm/entrypoints/openai/chat_completion/api_router.py" lines="57-85" highlight="57,67,82-85" />
+<ol>
+  <li>Line 57: <code>@with_cancellation</code> runs the handler as an asyncio task and watches for a client disconnect at the same time (see <a href="#deep-dive">Deep dive</a>, cancellation).</li>
+  <li>Line 63: <code>chat(raw_request)</code> returns <code>app.state.openai_serving_chat</code> ({{cite vllm/entrypoints/openai/chat_completion/api_router.py:35-36}}). The server makes this <code>OpenAIServingChat</code> object at start-up, if the model supports the <code>"generate"</code> task ({{cite vllm/entrypoints/generate/api_router.py:149-151}}).</li>
+  <li>Line 67: the serving class returns one of three things: an <code>ErrorResponse</code>, a full <code>ChatCompletionResponse</code> (no streaming), or an async generator of strings (streaming).</li>
+  <li>Lines 82-85: for our request it is a generator. The route wraps it in a <code>StreamingResponse</code> with the media type <code>text/event-stream</code>.</li>
+</ol>
+<p><strong>What the data looks like now</strong> (illustrative):</p>
+<pre><code class="language-python">request.messages      # 4 messages
+request.stream        # True
+request.request_id    # "3f9c...e1" (a random uuid, default_factory)
+raw_request           # the Starlette Request (headers, app.state)</code></pre>
+<x-deepdive title="Stop 1 in detail: decorators, keep-alive and the request id">
+<ul>
+  <li><code>@load_aware_call</code> counts requests in <code>app.state.server_load_metrics</code>, but only when server load tracking is on ({{cite vllm/entrypoints/serve/utils/api_utils.py:186-230}}).</li>
+  <li><code>with_sse_keep_alive</code> returns the generator unchanged when the interval is not positive. Else it sends an SSE comment when no chunk comes in <code>interval</code> seconds ({{cite vllm/entrypoints/serve/utils/sse_keep_alive.py:21-33}}). The route reads the interval from <code>args.sse_keep_alive_interval</code>, with 0 as the fallback ({{cite vllm/entrypoints/openai/chat_completion/api_router.py:80-81}}).</li>
+  <li>The request id field has a default: <code>default_factory=random_uuid</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:403-410}}). An <code>X-Request-Id</code> header wins over it ({{cite vllm/entrypoints/serve/engine/serving.py:133-143}}).</li>
+  <li>The streaming response format is OpenAPI-documented as SSE events whose <code>data</code> is a JSON chunk, a JSON error or <code>"[DONE]"</code> ({{cite vllm/entrypoints/serve/utils/api_utils.py:117-142}}).</li>
+</ul>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="2" title="OpenAIServingChat makes the sampling parameters and a generator">
+<p>We are in <code>vllm/entrypoints/openai/chat_completion/serving.py</code>, in <code>OpenAIServingChat._create_chat_completion</code>. It renders the prompt (stop 3), makes the request id, computes <code>max_tokens</code> and the <code>SamplingParams</code>, and asks the engine client for a result generator:</p>
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="314-322" highlight="314,320-322" />
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="349-369" highlight="349,366" />
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="396-426" highlight="396,415-416" />
+<ol>
+  <li>Line 314: <code>render_chat_request</code> first checks the model name and runs <code>_preflight</code>, then calls the renderer ({{cite vllm/entrypoints/openai/chat_completion/serving.py:278-285}}).</li>
+  <li>Lines 320-322: the request id is <code>"chatcmpl-" + request_id</code>.</li>
+  <li>Line 349: <code>get_max_tokens</code> takes the smallest of <code>max_model_len - prompt_len</code>, the request value (or the server default), an optional override and a platform limit ({{cite vllm/entrypoints/serve/utils/api_utils.py:253-270}}). The client sends no <code>max_tokens</code>. So, if the generation config of the model sets no default either, the model length limits the answer.</li>
+  <li>Line 366: <code>to_sampling_params</code> sets <code>output_kind = DELTA</code> because <code>stream</code> is true ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:797-799}}). DELTA means: each output carries only the new tokens.</li>
+  <li>Line 396: <code>self.engine_client.generate(...)</code> is <code>AsyncLLM.generate</code>. It is an async generator function, so this call <em>does not run it</em>. It only makes the generator object.</li>
+  <li>Lines 415-416: the serving class returns another generator, <code>chat_completion_stream_generator</code>, which wraps the first one.</li>
+</ol>
+<x-warning title="The 200 status goes out before the engine sees the request">
+<p><code>AsyncLLM.generate()</code> has not run yet. (Only the admission check of <code>_preflight</code> has asked the engine client.) The route returns the <code>StreamingResponse</code>, and the HTTP response starts. The request reaches the engine only when the stream pulls its first chunk (stop 4). So errors after this point arrive as <code>data:</code> chunks, not as HTTP error codes. The docstring of <code>_preflight</code> gives this reason for its early checks ({{cite vllm/entrypoints/generate/base/serving.py:169-181}}).</p>
+</x-warning>
+<p><strong>What the data looks like now</strong> (illustrative):</p>
+<pre><code class="language-python">request_id       = "chatcmpl-3f9c...e1"
+sampling_params  = SamplingParams(temperature=..., top_p=..., max_tokens=32707,   # 32768 - 61
+                                  output_kind=RequestOutputKind.DELTA, ...)
+result_generator = &lt;async_generator AsyncLLM.generate&gt;    # not started</code></pre>
+<x-deepdive title="Stop 2 in detail: where the sampling defaults come from">
+<p>For each sampling field, <code>to_sampling_params</code> uses the request value, then the server default, then the OpenAI default: "Priority: user -&gt; server default -&gt; OpenAI default" ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:740-748}}). Server-default stop token ids are merged with the request stop ids ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:754-764}}). The request can ask for a larger stream interval with <code>stream_interval</code>. The field description says values below the server setting are clamped up to it ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:543-551}}). The server default <code>--stream-interval</code> is 1 ({{cite vllm/config/scheduler.py:216}}).</p>
+<p><code>_preflight</code> raises the engine's dead error if the engine has failed, and calls <code>check_admission</code> ({{cite vllm/entrypoints/generate/base/serving.py:179-181}}). Admission control rejects a request with HTTP 503 when <code>max_num_queued_reqs</code> or <code>max_num_queued_tokens</code> is set and full ({{cite vllm/v1/engine/async_llm.py:325-383}}).</p>
+<p>The example in the code block uses <code>max_model_len = 32768</code>. That value comes from the model config, not from vLLM, so it is illustrative.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="3" title="The chat template and the tokenizer make token ids">
+<p>The model reads one sequence of token ids, not a list of messages. The {{term chat-template | chat template}} (a Jinja template from the tokenizer files) writes the messages into one text, with special marker tokens. Then the tokenizer cuts the text into ids. Tokens and tokenizers are explained in {{deepinfer learn/tokens | Tokens and tokenizers}}.</p>
+<p>We are in the renderer. <code>OnlineRenderer.preprocess_chat</code> calls <code>renderer.render_chat_async</code> ({{cite vllm/renderers/online_renderer.py:805-808}}). For a Hugging Face tokenizer, it asks the template for text, not ids: <code>tokenize</code> is true only for Mistral tokenizers or prompt embeddings ({{cite vllm/renderers/online_renderer.py:774-781}}).</p>
+<x-code file="vllm/renderers/base.py" lines="1380-1411" highlight="1380,1386,1396,1404" />
+<ol>
+  <li>Line 1380: <code>arrival_time</code> is set here. The {{term ttft | TTFT}} metric of vLLM starts at this moment (see Deep dive, timing).</li>
+  <li>Line 1386: <code>render_messages_async</code> applies the chat template.</li>
+  <li>Line 1396: <code>tokenize_prompts_async</code> turns the text into ids.</li>
+  <li>Line 1404: <code>process_for_engine_async</code> makes the engine input and stores <code>arrival_time</code> in it ({{cite vllm/renderers/base.py:1255-1276}}).</li>
+</ol>
+<p>Both blocking jobs run in a thread pool, so they do not block the asyncio event loop. The HF renderer wraps <code>safe_apply_chat_template</code> with <code>make_async</code> ({{cite vllm/renderers/hf.py:1011-1013}}) and calls it with a timeout:</p>
+<x-code file="vllm/renderers/hf.py" lines="1213-1220" />
+<p>The tokenizer call goes to the same kind of pool: <code>_tokenize_prompt_async = make_async(self._tokenize_prompt, executor=self._executor)</code> ({{cite vllm/renderers/base.py:156-158}}). <code>_tokenize_prompt</code> calls <code>tokenizer(prompt["prompt"], **kwargs)</code> ({{cite vllm/renderers/base.py:663-678}}).</p>
+<p><strong>What the data looks like now</strong> (illustrative, ChatML template):</p>
+<pre><code class="language-python">"&lt;|im_start|&gt;system\nYou are a helpful assistant.&lt;|im_end|&gt;\n"
+"&lt;|im_start|&gt;user\nWho won the world series in 2020?&lt;|im_end|&gt;\n"
+"&lt;|im_start|&gt;assistant\nThe Los Angeles Dodgers won the World Series in 2020.&lt;|im_end|&gt;\n"
+"&lt;|im_start|&gt;user\nWhere was it played?&lt;|im_end|&gt;\n"
+"&lt;|im_start|&gt;assistant\n"                    # add_generation_prompt: the model answers next
+engine_input = {"type": "token", "prompt_token_ids": [...61 ids...],
+                "prompt": "&lt;|im_start|&gt;system...", "arrival_time": 1761140000.12}</code></pre>
+<x-deepdive title="Stop 3 in detail: template resolution, timeout and errors">
+<ul>
+  <li><code>safe_apply_chat_template</code> resolves the template from the request, the server flag or the tokenizer. With no template it raises <code>ChatTemplateResolutionError</code> ({{cite vllm/renderers/hf.py:836-847}}).</li>
+  <li>A <code>developer</code> message becomes a <code>system</code> message when the template does not know that role ({{cite vllm/renderers/hf.py:848-856}}).</li>
+  <li>The render timeout is <code>VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT</code>, default 30 seconds ({{cite vllm/envs.py:817-818}}). On a timeout the renderer replaces its thread pool, because the stuck thread cannot be stopped ({{cite vllm/renderers/hf.py:1038-1056}}).</li>
+  <li>The pool size is <code>model_config.renderer_num_workers</code>. Multimodal work has its own one-thread pool, so tokenization never waits behind image processing ({{cite vllm/renderers/base.py:140-150}}).</li>
+  <li>The ChatML example template adds <code>&lt;|im_end|&gt;</code> after each message and <code>&lt;|im_start|&gt;assistant</code> at the end when <code>add_generation_prompt</code> is true ({{cite examples/template_chatml.jinja:1-2}}).</li>
+</ul>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="4" title="The stream starts: AsyncLLM.generate()">
+<p>Starlette now iterates the body of the <code>StreamingResponse</code>. The SSE generator asks for its first chunk. That pulls on the result generator from stop 2 (<code>async for res in result_generator</code>, {{cite vllm/entrypoints/openai/chat_completion/serving.py:568}}). Now <code>AsyncLLM.generate</code> runs for the first time. We are in <code>vllm/v1/engine/async_llm.py</code>:</p>
+<x-code file="vllm/v1/engine/async_llm.py" lines="771-802" highlight="773,795,802" />
+<ol>
+  <li>Line 773: <code>add_request</code> processes the input and sends it to the engine core (stops 5 and 6). It returns a {{term request-output-collector | RequestOutputCollector}}, here called <code>q</code>.</li>
+  <li>Line 795: the loop takes the next output from the collector. <code>get_nowait()</code> avoids a task switch when an output is already there.</li>
+  <li>Line 802: each <code>RequestOutput</code> goes up to the SSE generator (stop 16). The loop ends when an output has <code>finished = True</code>.</li>
+</ol>
+<p>The code that fills <code>q</code> is not in this task. A separate background task, <code>output_handler</code>, does it (stop 15). The docstring says the same: "A separate output_handler loop runs in a background AsyncIO task" ({{cite vllm/v1/engine/async_llm.py:752-754}}).</p>
+<x-deepdive title="Stop 4 in detail: how generate() ends">
+<p><code>generate()</code> has one <code>except</code> branch per kind of failure ({{cite vllm/v1/engine/async_llm.py:807-851}}):</p>
+<table>
+  <thead><tr><th>Exception</th><th>What generate() does</th></tr></thead>
+  <tbody>
+    <tr><td><code>CancelledError</code>, <code>GeneratorExit</code> (client gone)</td><td>aborts the request in the front end and in the engine core, then raises again</td></tr>
+    <tr><td><code>EngineDeadError</code></td><td>raises; no abort, because the engine is gone</td></tr>
+    <tr><td><code>VLLMClientError</code>, <code>GracefulHTTPError</code>, <code>GenerationError</code></td><td>aborts, then raises</td></tr>
+    <tr><td><code>InputStreamError</code></td><td>aborts, then raises the cause</td></tr>
+    <tr><td>any other <code>Exception</code></td><td>aborts, then raises <code>EngineGenerateError</code></td></tr>
+  </tbody>
+</table>
+<p>In all cases the <code>finally</code> block calls <code>q.close()</code> ({{cite vllm/v1/engine/async_llm.py:852-854}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="5" title="add_request: the input processor makes an EngineCoreRequest">
+<p>The engine core needs a small, fixed object that it can send as bytes. This is the {{term engine-core-request | EngineCoreRequest}}. <code>AsyncLLM.add_request</code> gets a rendered engine input (a dict with a <code>"type"</code> key). So it calls the synchronous <code>process_inputs</code> of the {{term input-processor | input processor}}. No tokenization is left to do ({{cite vllm/v1/engine/async_llm.py:481-496}}).</p>
+<x-code file="vllm/v1/engine/input_processor.py" lines="538-555" highlight="539-543" />
+<p><code>process_inputs</code> also does the last checks and fills in defaults:</p>
+<ul>
+  <li>It clones the sampling parameters, so a shared object of the caller does not change ({{cite vllm/v1/engine/input_processor.py:447-449}}).</li>
+  <li>It adds the generation config and the EOS token id of the model to the sampling parameters ({{cite vllm/v1/engine/input_processor.py:489-494}}).</li>
+  <li>It takes <code>arrival_time</code> from the engine input of stop 3 ({{cite vllm/v1/engine/input_processor.py:403-404}}).</li>
+</ul>
+<p>Then <code>add_request</code> makes the request id unique. It keeps the client id as <code>external_req_id</code> and adds 8 random characters:</p>
+<x-code file="vllm/v1/engine/input_processor.py" lines="363-371" highlight="363,371" />
+<p><strong>What the data looks like now</strong> (illustrative):</p>
+<pre><code class="language-python">EngineCoreRequest(                      # msgspec.Struct, array_like=True
+    request_id="chatcmpl-3f9c...e1-a1b2c3d4",
+    external_req_id="chatcmpl-3f9c...e1",
+    prompt_token_ids=[...61 ids...],
+    sampling_params=SamplingParams(..., output_kind=DELTA, eos_token_id=...),
+    arrival_time=1761140000.12, mm_features=None, lora_request=None,
+    cache_salt=None, data_parallel_rank=None, priority=0)</code></pre>
+<x-deepdive title="Stop 5 in detail: the struct and its encoding">
+<p><code>EngineCoreRequest</code> is a <code>msgspec.Struct</code> with <code>array_like=True</code>, <code>omit_defaults=True</code> and <code>gc=False</code> ({{cite vllm/v1/engine/__init__.py:113-118}}). <code>array_like</code> means that msgpack writes the fields as an array in field order, without field names. So the message is short. The fields are listed in {{cite vllm/v1/engine/__init__.py:119-165}}. The ones that matter for this tour:</p>
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Our value</th></tr></thead>
+  <tbody>
+    <tr><td><code>request_id</code></td><td><code>str</code></td><td>internal id with 8 random characters</td></tr>
+    <tr><td><code>prompt_token_ids</code></td><td><code>list[int] | None</code></td><td>61 ids</td></tr>
+    <tr><td><code>sampling_params</code></td><td><code>SamplingParams | None</code></td><td>DELTA output, <code>max_tokens</code> from stop 2</td></tr>
+    <tr><td><code>arrival_time</code></td><td><code>float</code></td><td>wall-clock time from stop 3</td></tr>
+    <tr><td><code>client_index</code></td><td><code>int</code></td><td>0 (one API server)</td></tr>
+    <tr><td><code>data_parallel_rank</code></td><td><code>int | None</code></td><td>None (from the <code>X-data-parallel-rank</code> header if present)</td></tr>
+    <tr><td><code>external_req_id</code></td><td><code>str | None</code></td><td>the client-visible id</td></tr>
+  </tbody>
+</table>
+<p>If <code>max_tokens</code> is still <code>None</code>, <code>process_inputs</code> sets it to <code>max_model_len - prompt_len</code> ({{cite vllm/v1/engine/input_processor.py:476-481}}). The env var <code>VLLM_DISABLE_REQUEST_ID_RANDOMIZATION</code> turns off the random suffix, with a warning about duplicate ids ({{cite vllm/v1/engine/input_processor.py:364-369}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="6" title="Register the request, then send it over ZMQ">
+<p>Before the request leaves the process, the front end must be ready for its outputs. <code>add_request</code> starts the output handler task (only once, {{cite vllm/v1/engine/async_llm.py:856-859}}) and makes the collector:</p>
+<x-code file="vllm/v1/engine/async_llm.py" lines="521-536" highlight="526,529,535" />
+<p><code>_add_request</code> registers the request in the {{term output-processor | OutputProcessor}} first and sends it after that. The comment gives the reason: "Register locally before the first await so concurrent tasks see this request."</p>
+<x-code file="vllm/v1/engine/async_llm.py" lines="575-584" highlight="581,584" />
+<p>The {{term engine-core-client | engine core client}} for one engine is <code>AsyncMPClient</code> ({{cite vllm/v1/engine/core_client.py:158-173}}). It sets <code>client_index</code>, then sends a multipart ZMQ message: the engine identity, one type byte and the msgpack frames:</p>
+<x-code file="vllm/v1/engine/core_client.py" lines="1275-1294" highlight="1284,1294" />
+<x-code file="vllm/v1/engine/core_client.py" lines="1333-1336" highlight="1335" />
+<p><strong>What the data looks like now</strong> (illustrative):</p>
+<pre><code class="language-python">output_processor.request_states["chatcmpl-...-a1b2c3d4"] = RequestState(detokenizer=..., queue=q)
+frames = [b"\x00\x00",            # engine identity: DP rank 0 as 2 little-endian bytes
+          b"\x00",                # EngineCoreRequestType.ADD
+          &lt;msgpack bytes of EngineCoreRequest&gt;]</code></pre>
+<x-deepdive title="Stop 6 in detail: the sockets and the encoder">
+<ul>
+  <li>The front end binds a ZMQ <code>ROUTER</code> socket for input and a <code>PULL</code> socket for output ({{cite vllm/v1/engine/core_client.py:670-682}}). With all engines on this machine, the addresses are <code>ipc://</code> paths; else they are TCP ({{cite vllm/v1/engine/utils.py:1139-1151}}).</li>
+  <li>The engine identity is the DP rank as 2 little-endian bytes ({{cite vllm/v1/engine/core_client.py:749-751}}). The ROUTER socket uses the first frame to select the engine.</li>
+  <li>The request types are single bytes: <code>ADD = b"\x00"</code>, <code>ABORT = b"\x01"</code>, <code>UTILITY = b"\x03"</code> ({{cite vllm/v1/engine/__init__.py:300-313}}).</li>
+  <li><code>MsgpackEncoder.encode</code> returns a list of buffers. The first is the msgpack message. Large tensors and arrays go as extra frames without a copy ({{cite vllm/v1/serial_utils.py:135-177}}). Our request has no tensors, so it is one frame.</li>
+  <li>The front end uses <code>MsgpackEncoder</code> for requests and <code>MsgpackDecoder(EngineCoreOutputs)</code> for outputs ({{cite vllm/v1/engine/core_client.py:731-732}}).</li>
+  <li>The output processor makes a <code>RequestState</code> with an incremental detokenizer and the collector queue ({{cite vllm/v1/engine/output_processor.py:663-693}}).</li>
+</ul>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="7" title="The engine core input thread decodes the request">
+<p>We are now in the engine core process, <code>vllm/v1/engine/core.py</code>. <code>EngineCoreProc</code> has two I/O threads beside the main thread. The comment explains why: socket I/O and (de)serialization then overlap with the GPU work ({{cite vllm/v1/engine/core.py:1238-1263}}). The input thread connects a <code>DEALER</code> socket to the ROUTER of the front end ({{cite vllm/v1/engine/core.py:1935-1942}}) and waits:</p>
+<x-code file="vllm/v1/engine/core.py" lines="1977-1993" highlight="1980,1991,1993" />
+<x-code file="vllm/v1/engine/core.py" lines="2027-2028" />
+<ol>
+  <li>Line 1980: one message: the type frame and the data frames.</li>
+  <li>Line 1991: <code>add_request_decoder</code> is a <code>MsgpackDecoder(EngineCoreRequest)</code> ({{cite vllm/v1/engine/core.py:1930-1932}}), so the result is a typed struct again.</li>
+  <li>Line 1993: <code>preprocess_add_request</code> makes the engine's own <code>Request</code> object in this thread, so it runs in parallel with the model ({{cite vllm/v1/engine/core.py:1114-1136}}).</li>
+  <li>Line 2028: the thread puts <code>(ADD, (request, wave))</code> into <code>input_queue</code> for the main thread.</li>
+</ol>
+<p>The <code>Request</code> starts as <code>WAITING</code> with <code>num_computed_tokens = 0</code> ({{cite vllm/v1/request.py:100}}, {{cite vllm/v1/request.py:184}}). At the end of <code>__init__</code> it computes the hashes of its full blocks for the prefix cache ({{cite vllm/v1/request.py:225-230}}).</p>
+<p><strong>What the data looks like now</strong> (illustrative, block size 16):</p>
+<pre><code class="language-python">Request(request_id="chatcmpl-...-a1b2c3d4", status=WAITING,
+        num_prompt_tokens=61, num_computed_tokens=0, max_tokens=32707,
+        block_hashes=[h0, h1, h2])     # 61 // 16 = 3 full blocks; the last 13 tokens have no hash yet</code></pre>
+<x-deepdive title="Stop 7 in detail: hashes, failures and the ready message">
+<ul>
+  <li>The block hasher exists when prefix caching is on or a KV connector is set. Prefix caching is on by default for a decoder-only generative model: the engine arguments use <code>model_config.is_prefix_caching_supported</code> ({{cite vllm/engine/arg_utils.py:3062-3063}}, {{cite vllm/config/model.py:2289-2291}}). The hash algorithm is <code>prefix_caching_hash_algo</code>, default <code>"sha256"</code> ({{cite vllm/config/cache.py:256}}, {{cite vllm/v1/engine/core.py:216-225}}).</li>
+  <li>The default block size is 16 (<code>DEFAULT_BLOCK_SIZE</code>, {{cite vllm/config/cache.py:182}}). The attention backend can choose another size ({{cite vllm/platforms/interface.py:771-781}}).</li>
+  <li>If preprocessing fails, the thread does not crash. A validation error and any other error each have a handler, and the thread continues with the next message ({{cite vllm/v1/engine/core.py:1999-2008}}).</li>
+  <li>At start-up each input socket first sends a ready message. The ROUTER of the front end can only send to a DEALER that it has heard from ({{cite vllm/v1/engine/core.py:1961-1968}}).</li>
+  <li>An ABORT message goes into <code>aborts_queue</code> and also into <code>input_queue</code>, so an abort can act early and still stay in order ({{cite vllm/v1/engine/core.py:2020-2025}}).</li>
+</ul>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="8" title="The busy loop gives the request to the scheduler">
+<p>The main thread of the engine core process runs the {{term busy-loop | busy loop}} for its whole life:</p>
+<x-code file="vllm/v1/engine/core.py" lines="1609-1620" highlight="1613,1617" />
+<p><code>_process_input_queue</code> blocks on <code>input_queue</code> while there is no work, and then handles all queued messages ({{cite vllm/v1/engine/core.py:1635-1664}}). For ADD it calls <code>EngineCore.add_request</code> ({{cite vllm/v1/engine/core.py:1745-1749}}), which checks the request and calls <code>self.scheduler.add_request(request)</code> ({{cite vllm/v1/engine/core.py:548}}). The scheduler puts it into the waiting queue and into its <code>requests</code> dict ({{cite vllm/v1/core/sched/scheduler.py:2730-2734}}).</p>
+<p>Now <code>has_work()</code> is true, so the loop calls <code>_process_engine_step</code>. That runs <code>self.step_fn()</code> and puts each output into <code>output_queue</code> ({{cite vllm/v1/engine/core.py:1666-1676}}).</p>
+<x-deepdive title="Stop 8 in detail: which step function">
+<p><code>step_fn</code> is <code>self.step</code> without a batch queue, and <code>self.step_with_batch_queue</code> with one ({{cite vllm/v1/engine/core.py:227-229}}). The batch queue exists when <code>max_concurrent_batches &gt; 1</code> ({{cite vllm/v1/engine/core.py:205-211}}). With async scheduling and Model Runner V2, <code>max_concurrent_batches</code> is <code>pp_size + 1</code>, so 2 on one GPU ({{cite vllm/config/vllm.py:587-597}}).</p>
+<p>Async scheduling is on by default: when the flag is not set and nothing is incompatible, the config sets it to <code>True</code> ({{cite vllm/config/vllm.py:1664-1698}}). The uniproc executor supports it ({{cite vllm/v1/executor/uniproc_executor.py:156-158}}). With async scheduling, the scheduler class is <code>AsyncScheduler</code> ({{cite vllm/config/scheduler.py:231-238}}). So the default path of our request is <code>step_with_batch_queue</code> and <code>AsyncScheduler</code>.</p>
+<p><code>has_work()</code> is also true while the batch queue is not empty ({{cite vllm/v1/engine/core.py:1596-1602}}). So the loop keeps stepping until the last in-flight step is processed.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="9" title="One engine step: step_with_batch_queue">
+<p>An engine step has three parts: schedule, execute and update. With {{term async-scheduling | async scheduling}}, the engine uses the {{term batch-queue | batch queue}}. This version does not wait for a step right after it starts it. It starts the next step first:</p>
+<x-code file="vllm/v1/engine/core.py" lines="724-759" highlight="725,727-729,743-745,753,759" />
+<x-code file="vllm/v1/engine/core.py" lines="767-783" highlight="768,773,783" />
+<ol>
+  <li>Line 725: the scheduler makes a {{term scheduler-output | SchedulerOutput}} (stop 10).</li>
+  <li>Lines 727-729: the executor runs <code>execute_model</code> with <code>non_block=True</code> (stops 11 and 12). The uniproc executor runs the CPU part of the model runner at once, in this thread. The GPU work only goes into the CUDA queue. <code>non_block</code> only moves the wait for the GPU result into a future ({{cite vllm/v1/executor/uniproc_executor.py:108-117}}).</li>
+  <li>Lines 743-745: the executor runs <code>sample_tokens</code>, also non-blocking (stop 13).</li>
+  <li>Lines 753 and 759: the step goes into the queue. If the queue is not full, the function returns with no outputs.</li>
+  <li>Lines 768-773: else it takes the <em>oldest</em> step and waits for its result.</li>
+  <li>Line 783: <code>update_from_output</code> turns that result into outputs (stop 14).</li>
+</ol>
+<p>For our request: the first call schedules and starts step 1 and returns. The second call schedules and starts step 2, then waits for step 1. So the first token is processed while step 2 is already on the GPU. The overlap works because the Model Runner V2 code of <code>execute_model</code> and <code>sample_tokens</code> does not wait for the GPU. The only wait is <code>copy_event.synchronize()</code> in <code>get_output()</code> (stop 13). A debug mode can report any other GPU-to-CPU wait in these two worker methods ({{cite vllm/utils/gpu_sync_debug.py:386-392}}, {{cite vllm/v1/worker/gpu_worker.py:1316-1327}}). <a href="#the-loop">The loop</a> shows this in a diagram.</p>
+<x-note title="Without async scheduling">
+<p><code>EngineCore.step</code> does the same three parts in order and waits for each step: schedule, execute, <code>future.result()</code>, sample, update ({{cite vllm/v1/engine/core.py:657-687}}). The engine uses it with <code>--no-async-scheduling</code>.</p>
+</x-note>
+</x-stop>
+
+<x-stop n="10" title="Scheduler.schedule(): token budget, prefix cache and blocks">
+<p>We are in <code>vllm/v1/core/sched/scheduler.py</code>. The vLLM scheduler has no prefill phase and no decode phase. The comment at the top of <code>schedule()</code> explains the single rule:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="622-642" highlight="624-633,642" />
+<p>So every request has two numbers: <code>num_computed_tokens</code> (tokens with KV in the cache) and the number of tokens it has. The scheduler gives each request tokens until the first number catches up with the second. The total per step is the token budget, <code>max_num_scheduled_tokens</code> (line 642). Prefill and decode are explained in {{deepinfer learn/prefill-decode | Prefill and decode}}.</p>
+<p>The scheduler first serves the running requests, then the waiting ones. Our request is new, so it is in the waiting pass. There it looks for a prefix cache hit:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1016-1024" highlight="1024" />
+<p>The KV cache manager returns only full, cached blocks, and never the whole prompt: "we must recompute the last token to obtain logits" ({{cite vllm/v1/core/kv_cache_manager.py:289-300}}). Then the scheduler computes the tokens to run, takes the smaller of that and the budget, and allocates KV blocks:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1191" />
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1231" />
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1320-1325" highlight="1320" />
+<p>If <code>allocate_slots</code> returns <code>None</code>, there are not enough free blocks, and the waiting pass stops ({{cite vllm/v1/core/sched/scheduler.py:1339-1346}}). For us it succeeds, and the request becomes <code>RUNNING</code>:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1435-1439" />
+<p>The KV cache and its blocks are explained in {{deepinfer learn/kv-cache | The KV cache}}. At the end, <code>schedule()</code> builds the <code>SchedulerOutput</code> ({{cite vllm/v1/core/sched/scheduler.py:1588-1591}}) and advances <code>num_computed_tokens</code> by the scheduled tokens ({{cite vllm/v1/core/sched/scheduler.py:1714-1716}}).</p>
+<p><strong>What the data looks like now</strong> (illustrative: an earlier turn of the same chat left 3 blocks in the cache):</p>
+<pre><code class="language-python">num_new_local_computed_tokens = 48            # 3 cached blocks x 16 tokens
+num_new_tokens                = 61 - 48 = 13  # well below a token budget of 8192
+SchedulerOutput(
+    scheduled_new_reqs=[NewRequestData(req_id=..., prompt_token_ids=[61 ids],
+                                       block_ids=([7, 3, 12, 40],), num_computed_tokens=48, ...)],
+    num_scheduled_tokens={"chatcmpl-...-a1b2c3d4": 13},
+    total_num_scheduled_tokens=13, finished_req_ids=set(), ...)
+request.num_computed_tokens   = 61            # advanced in _update_after_schedule</code></pre>
+<x-deepdive title="Stop 10 in detail: budget defaults, chunking and the async placeholders">
+<ul>
+  <li><strong>Budget default.</strong> For <code>vllm serve</code> on a GPU with 70 GiB or more (not an A100 and not a GB10), the defaults are <code>max_num_batched_tokens = 8192</code> and <code>max_num_seqs = 1024</code>. On a GPU with 160 GiB or more they are 16384 and 1024. On other GPUs they are 2048 and 256 ({{cite vllm/engine/arg_utils.py:2960-2993}}). <code>--performance-mode throughput</code> doubles the values that you did not set ({{cite vllm/engine/arg_utils.py:3171-3175}}).</li>
+  <li><strong>Chunked prefill.</strong> It is on by default for a generative model that is not encoder-decoder: the engine arguments use <code>model_config.is_chunked_prefill_supported</code> ({{cite vllm/engine/arg_utils.py:3031-3035}}, {{cite vllm/config/model.py:2229-2236}}). A long prompt then gets only the rest of the budget in this step (line 1231), and the rest in the next steps. With chunked prefill off, a prompt that does not fit stops the waiting pass ({{cite vllm/v1/core/sched/scheduler.py:1220-1229}}).</li>
+  <li><strong>Running requests.</strong> In later steps our request is in the running pass. There, <code>num_new_tokens = num_tokens_with_spec + num_output_placeholders - num_computed_tokens</code> ({{cite vllm/v1/core/sched/scheduler.py:759-763}}).</li>
+  <li><strong>Placeholders.</strong> <code>AsyncScheduler</code> adds one {{term output-placeholder | placeholder}} for each token in flight. It does this after it schedules a step that samples a token: a decode step, or the last chunk of a prefill ({{cite vllm/v1/core/sched/async_scheduler.py:32-47}}). It removes the placeholder when the token arrives ({{cite vllm/v1/core/sched/async_scheduler.py:71-73}}). So the next step can schedule one token before the CPU knows the token of this step.</li>
+  <li><strong>Preemption.</strong> If a running request cannot get blocks, the scheduler preempts the last running request (FCFS) or the lowest-priority one ({{cite vllm/v1/core/sched/scheduler.py:850-858}}). See {{term preemption}} and {{link concepts/scheduler}}.</li>
+</ul>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="11" title="Model Runner V2 prepares the inputs and the attention metadata">
+<p>The executor calls the worker in the same process. <code>UniProcExecutor.execute_model</code> runs <code>collective_rpc("execute_model", ...)</code> ({{cite vllm/v1/executor/uniproc_executor.py:119-132}}), which calls the method directly on the worker object ({{cite vllm/v1/executor/uniproc_executor.py:108-111}}). <code>Worker.execute_model</code> calls <code>self.model_runner.execute_model</code> ({{cite vllm/v1/worker/gpu_worker.py:1350-1353}}). The model runner is Model Runner V2, in <code>vllm/v1/worker/gpu/model_runner.py</code>.</p>
+<p>First the runner updates its own copy of the request states from the <code>SchedulerOutput</code>. Our request is new, so <code>add_requests</code> stores its prompt and block ids:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1753-1760" highlight="1756-1759" />
+<p>Then it picks a CUDA-graph mode for the batch shape (<code>dispatch_cg_and_sync_dp</code>, {{cite vllm/v1/worker/gpu/model_runner.py:1806-1822}}) and fills the input buffers and the attention inputs:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1835-1838" highlight="1835,1838" />
+<p><code>prepare_inputs</code> builds <code>query_start_loc</code>, the positions and the sequence lengths, and copies the prompt tokens of a prefill ({{cite vllm/v1/worker/gpu/model_runner.py:1446-1489}}). For a decode step, the input token comes from <code>last_sampled_tokens</code>, a tensor that stays on the GPU:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1491-1500" highlight="1493,1496" />
+<p><code>prepare_attn</code> gathers the block tables and computes the slot mappings: the cache slot of each new token ({{cite vllm/v1/worker/gpu/model_runner.py:1577-1597}}). Then the model state builds the attention metadata for each layer group ({{cite vllm/v1/worker/gpu/model_runner.py:1940-1950}}). These packed varlen inputs are the same idea as in {{deepinfer concepts/input-metadata | Input metadata}}.</p>
+<p><strong>What the data looks like now</strong> (step 1, illustrative):</p>
+<pre><code class="language-python">input_ids        int32 [13 (+ padding)]   # prompt tokens 48..60
+positions        int64 [13 (+ padding)] = [48, 49, ..., 60]
+query_start_loc  int32 [2]  = [0, 13]
+seq_lens         int32 [1]  = [61]
+slot_mappings    [num_kv_cache_groups, 13 (+ padding)]   # block 40 holds positions 48..60
+logits_indices   [1] = [12]                   # only the last position is sampled</code></pre>
+<x-deepdive title="Stop 11 in detail: what runs on the CPU and what on the GPU">
+<p>The runner keeps the request states as tensors on the GPU (for example <code>req_states.num_computed_tokens.gpu</code> and <code>req_states.last_sampled_tokens</code>). It copies small CPU arrays to the GPU without a wait (<code>async_tensor_h2d</code>, {{cite vllm/v1/worker/gpu/model_runner.py:1455-1456}}). Prefill tokens, positions and the sampled-token merge are GPU functions that read these states ({{cite vllm/v1/worker/gpu/model_runner.py:1469-1500}}). This is why the scheduler does not need the real token of the last step (stop 10, placeholders).</p>
+<p>The tour {{link tours/forward-pass}} follows the attention metadata into the layers. The page {{link concepts/model-runner}} explains the persistent request states of MRV2.</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="12" title="The forward pass: CUDA graph or eager">
+<p>Now the model runs on the GPU. The runner chooses one of three ways, by the CUDA-graph mode of the batch:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="2024-2070" highlight="2032,2041,2065,2070" />
+<ol>
+  <li>Line 2032: <code>FULL</code> mode replays a captured {{term cuda-graph | CUDA graph}} of the whole model. The comment says the inputs are already in the graph's input buffers.</li>
+  <li>Line 2041: the other modes run inside <code>set_forward_context(...)</code>. The {{term forward-context | forward context}} gives each attention layer its metadata and slot mapping.</li>
+  <li>Line 2065: <code>PIECEWISE</code> runs a graph with the attention parts outside of it.</li>
+  <li>Line 2070: <code>NONE</code> calls the model eagerly.</li>
+</ol>
+<p>CUDA graphs remove the CPU cost of many kernel launches: see {{deepinfer concepts/cuda-graphs | CUDA graphs}}. In step 1 our batch has 13 query tokens of one prefill. In later steps it has 1 query token (a decode). The default optimization level is O2 ({{cite vllm/config/vllm.py:434}}), and O2 sets <code>cudagraph_mode = FULL_AND_PIECEWISE</code> ({{cite vllm/config/vllm.py:310}}). With this mode the runner picks the graph by the batch shape ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:523-553}}):</p>
+<ul>
+  <li>A uniform decode batch gets a FULL graph, if it has no more tokens than the largest captured size. In such a batch every request has exactly 1 query token (no spec decoding). Our decode steps are of this kind.</li>
+  <li>Another batch, for example our 13-token prefill, gets a PIECEWISE graph, padded to the next captured size ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:352-370}}).</li>
+  <li>A batch with more tokens than the largest captured size runs eagerly (NONE).</li>
+</ul>
+<p>At start-up the attention backend can lower the mode, if it does not support FULL graphs ({{cite vllm/v1/worker/gpu/model_runner.py:754-763}}). See {{link concepts/compile-and-cuda-graphs}}.</p>
+<p>The result is <code>hidden_states</code>, one vector per token. The runner stores it in <code>execute_model_state</code> and returns <code>None</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2088-2111}}). Sampling is a separate call (stop 13).</p>
+<p><strong>What the data looks like now</strong> (step 1, illustrative):</p>
+<pre><code class="language-python">hidden_states   bfloat16 [13 (+ padding), hidden_size]
+KV cache        keys and values of positions 48..60 written into block 40</code></pre>
+<x-simplified><p>This stop treats the model as one call. The tour {{link tours/forward-pass}} goes inside it: the layers, the attention backend and the KV cache writes. Kernel code is out of scope.</p></x-simplified>
+</x-stop>
+
+<x-stop n="13" title="sample_tokens: logits, the sampler and the copy back">
+<p>The engine core calls <code>sample_tokens</code> on the executor right after <code>execute_model</code> (stop 9). The worker passes it to the runner ({{cite vllm/v1/worker/gpu_worker.py:1318-1321}}). The runner computes logits only for the rows that need a token, and calls the sampler:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1637-1638" />
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1659-1665" highlight="1665" />
+<p>The sampler applies the logits processors, temperature and min-p, when a request needs them ({{cite vllm/v1/worker/gpu/sample/sampler.py:238-268}}). Then it draws the token. A fused FlashInfer kernel can do top-k/top-p and the draw in one call. It does so when the batch uses top-k or top-p, has no greedy or seeded request and needs no processed logprobs ({{cite vllm/v1/worker/gpu/sample/sampler.py:304-315}}, {{cite vllm/v1/worker/gpu/sample/sampler.py:339-343}}). This sampler is on by default where the hardware supports it ({{cite vllm/envs.py:883-890}}). Else the sampler applies top-k/top-p and draws with a Gumbel sample ({{cite vllm/v1/worker/gpu/sample/sampler.py:346-359}}). The sampling steps are explained in {{deepinfer learn/sampling | Sampling}}.</p>
+<p>Then the runner starts the copy of the result to the CPU and returns without a wait:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="2209-2218" highlight="2210" />
+<x-code file="vllm/v1/worker/gpu/async_utils.py" lines="137-140" highlight="140" />
+<p><code>AsyncOutput</code> copies on a separate copy stream and records an event ({{cite vllm/v1/worker/gpu/async_utils.py:171}}). <code>postprocess_sampled</code> writes the new token into <code>last_sampled_tokens</code> on the GPU, for the next step ({{cite vllm/v1/worker/gpu/model_runner.py:1715-1726}}). The engine core waits only later, in <code>get_output()</code>, which synchronizes the event and makes Python lists ({{cite vllm/v1/worker/gpu/async_utils.py:173-184}}). In the uniproc executor, <code>AsyncOutputFuture.result()</code> calls <code>get_output()</code> ({{cite vllm/v1/executor/uniproc_executor.py:32-47}}).</p>
+<p><strong>What the data looks like now</strong> (step 1, illustrative):</p>
+<pre><code class="language-python">logits             [1, vocab_size]
+sampled_token_ids  [1, 1] = [[785]]           # "The"
+ModelRunnerOutput(req_ids=["chatcmpl-...-a1b2c3d4"], sampled_token_ids=[[785]], ...)   # after get_output()</code></pre>
+</x-stop>
+
+<x-stop n="14" title="update_from_output: append, check for stop, send back">
+<p>Back in the busy loop, the engine core takes the result of the oldest step (stop 9) and calls <code>Scheduler.update_from_output</code>. For each request with new tokens it appends them and checks the stop conditions:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="2258-2262" highlight="2260" />
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="2598-2611" highlight="2599,2603" />
+<p><code>check_stop</code> tests the last token in a fixed order: EOS, a stop token id, the model length and <code>max_tokens</code>, then <code>min_tokens</code> and repetition:</p>
+<x-code file="vllm/v1/core/sched/utils.py" lines="98-119" highlight="105,109,114-118" />
+<p>If the request stopped, the scheduler frees it, and its blocks go back to the {{term block-pool | block pool}} ({{cite vllm/v1/core/sched/scheduler.py:2316-2323}}). Then it adds one <code>EngineCoreOutput</code> for the request, under the index of its front end:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="2357-2363" highlight="2361-2362" />
+<p>The outputs are grouped into one {{term engine-core-outputs | EngineCoreOutputs}} per client ({{cite vllm/v1/core/sched/scheduler.py:2487-2490}}). The busy loop puts them into <code>output_queue</code> (stop 8). The output thread encodes them with msgpack and sends them on a <code>PUSH</code> socket to the <code>PULL</code> socket of the front end:</p>
+<x-code file="vllm/v1/engine/core.py" lines="2064-2072" />
+<x-code file="vllm/v1/engine/core.py" lines="2087-2091" highlight="2088" />
+<p><strong>What the data looks like now</strong> (after step 1, illustrative):</p>
+<pre><code class="language-python">request.output_token_ids = [785];  request.status = RUNNING
+EngineCoreOutputs(engine_index=0, timestamp=&lt;monotonic&gt;,
+    outputs=[EngineCoreOutput(request_id="chatcmpl-...-a1b2c3d4", new_token_ids=[785],
+                              finish_reason=None, events=[QUEUED, SCHEDULED], ...)],
+    scheduler_stats=SchedulerStats(...))</code></pre>
+<x-deepdive title="Stop 14 in detail: finish reasons and the last step">
+<p><code>FinishReason</code> is an integer enum, for a shorter message: <code>STOP = 0</code>, <code>LENGTH = 1</code>, <code>ABORT = 2</code>, <code>ERROR = 3</code>, <code>REPETITION = 4</code> ({{cite vllm/v1/engine/__init__.py:49-68}}). The request status gives the reason: <code>FINISHED_STOPPED</code> for EOS or a stop token, <code>FINISHED_LENGTH_CAPPED</code> for the length limits ({{cite vllm/v1/core/sched/utils.py:105-119}}).</p>
+<p>If the step produced more tokens than allowed (with spec decoding), <code>_update_request_with_output</code> trims the tokens after the stop and corrects <code>num_computed_tokens</code> ({{cite vllm/v1/core/sched/scheduler.py:2604-2610}}).</p>
+<p>Stop <em>strings</em> are not checked here. The engine core has no text. The detokenizer in the front end checks them (stop 15).</p>
+<p><code>EngineCoreOutputs.timestamp</code> is <code>time.monotonic()</code> in the engine core process, set when the object is made ({{cite vllm/v1/engine/__init__.py:295-297}}). The front end uses it for the inter-token latency (Deep dive, timing).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="15" title="The front end detokenizes and fills the collector">
+<p>We are back in the API server process. A background task, <code>EngineCoreOutputQueueTask</code>, reads the <code>PULL</code> socket, decodes the msgpack and puts the <code>EngineCoreOutputs</code> into an asyncio queue ({{cite vllm/v1/engine/core_client.py:1208-1213}}, {{cite vllm/v1/engine/core_client.py:1253-1254}}). The <code>output_handler</code> task of <code>AsyncLLM</code> takes it from there:</p>
+<x-code file="vllm/v1/engine/async_llm.py" lines="876-912" highlight="880,884,905" />
+<p><code>OutputProcessor.process_outputs</code> is the only loop over all outputs of a step, as its docstring says ({{cite vllm/v1/engine/output_processor.py:747-754}}). For our request it detokenizes ({{term incremental-detokenization | incremental detokenization}}) and checks stop strings:</p>
+<x-code file="vllm/v1/engine/output_processor.py" lines="823-833" highlight="825" />
+<p>Then it makes a {{term request-output | RequestOutput}} and puts it into the collector of our request:</p>
+<x-code file="vllm/v1/engine/output_processor.py" lines="849-863" highlight="863" />
+<p>The {{term chat-template | template}} tokens are already in the decoder: the fast detokenizer primes a <code>tokenizers</code> <code>DecodeStream</code> with the prompt ids ({{cite vllm/v1/engine/detokenizer.py:195-198}}). Each new id then gives the next piece of text ({{cite vllm/v1/engine/detokenizer.py:118-123}}). With DELTA output, the <code>CompletionOutput</code> carries only the new text ({{cite vllm/v1/engine/output_processor.py:484-487}}).</p>
+<p>The collector wakes up the <code>generate()</code> loop of stop 4. If the producer is faster than the consumer, <code>put()</code> merges DELTA outputs into one, so no token gets lost ({{cite vllm/v1/engine/output_processor.py:69-81}}).</p>
+<p><strong>What the data looks like now</strong> (after step 1, illustrative):</p>
+<pre><code class="language-python">RequestOutput(request_id="chatcmpl-3f9c...e1",            # the external id again
+              prompt="&lt;|im_start|&gt;system...", prompt_token_ids=[61 ids],
+              outputs=[CompletionOutput(index=0, text="The", token_ids=[785],
+                                        finish_reason=None)],
+              finished=False, num_cached_tokens=48)</code></pre>
+<x-deepdive title="Stop 15 in detail: stop strings, aborts and chunking">
+<ul>
+  <li>If the detokenizer finds a stop string, the finish reason becomes <code>STOP</code> and surplus tokens are trimmed ({{cite vllm/v1/engine/output_processor.py:828-833}}). The engine core does not know this yet, so the request id goes into <code>reqs_to_abort</code> ({{cite vllm/v1/engine/output_processor.py:876-882}}), and the output handler sends an ABORT ({{cite vllm/v1/engine/async_llm.py:918-922}}).</li>
+  <li>The handler processes at most <code>VLLM_V1_OUTPUT_PROC_CHUNK_SIZE</code> outputs (default 128) at a time, and yields the event loop between chunks ({{cite vllm/envs.py:1474-1476}}, {{cite vllm/v1/engine/async_llm.py:887-893}}, {{cite vllm/v1/engine/async_llm.py:914-916}}).</li>
+  <li>With <code>stream_interval &gt; 1</code>, <code>make_request_output</code> returns <code>None</code> until enough tokens are there, except for the first and the last output ({{cite vllm/v1/engine/output_processor.py:379-398}}).</li>
+  <li>An output for a request that is already aborted is ignored ({{cite vllm/v1/engine/output_processor.py:760-764}}).</li>
+</ul>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="16" title="The stream generator writes SSE chunks and data: [DONE]">
+<p>The <code>generate()</code> loop yields the <code>RequestOutput</code> to <code>chat_completion_stream_generator_raw</code> in <code>serving.py</code>. On the first output it sends one chunk with <code>delta = {"role": "assistant", "content": ""}</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:590-596}}). Then, for each output, it skips empty outputs, runs the stream processor and builds a <code>ChatCompletionStreamResponse</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:775-814}}):</p>
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="694-710" highlight="703,705" />
+<p>Without a tool or reasoning parser, the stream processor only wraps the text: <code>DeltaMessage(content=delta_text)</code> ({{cite vllm/entrypoints/openai/chat_completion/stream_processor.py:73-74}}). The outer generator turns each chunk into one SSE event and ends with <code>[DONE]</code>:</p>
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="485-508" highlight="500-503,508" />
+<p>Starlette writes each string to the HTTP response at once. So the client sees one SSE event per engine step. Then stops 9 to 16 repeat for the next token, until an output has a finish reason.</p>
+<p><strong>What the client sees</strong> (illustrative ids and times; "..." stands for the <code>object</code>, <code>created</code> and <code>model</code> fields of the first chunk):</p>
+<pre><code class="language-none">data: {"id":"chatcmpl-3f9c...e1","object":"chat.completion.chunk","created":1761140000,"model":"Qwen/Qwen2.5-1.5B-Instruct","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}],"prompt_token_ids":null,"prompt_text":null}
+
+data: {"id":"chatcmpl-3f9c...e1",...,"choices":[{"index":0,"delta":{"content":"The"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+...
+
+data: {"id":"chatcmpl-3f9c...e1",...,"choices":[{"index":0,"delta":{"content":""},"logprobs":null,"finish_reason":"stop","stop_reason":null,"token_ids":null,"weight_versions":null}],"system_fingerprint":"vllm-&lt;version&gt;-&lt;hash8&gt;"}
+
+data: [DONE]</code></pre>
+<p>The last chunk has empty content: the detokenizer does not decode the EOS token that stopped the request ({{cite vllm/v1/engine/detokenizer.py:107-111}}). The first chunk sets <code>prompt_token_ids</code> and <code>prompt_text</code> to <code>None</code> explicitly ({{cite vllm/entrypoints/openai/chat_completion/serving.py:602-614}}). The last chunk gets <code>system_fingerprint</code> when the server has one and usage is off ({{cite vllm/entrypoints/openai/chat_completion/serving.py:819-824}}).</p>
+<x-deepdive title="Stop 16 in detail: usage chunk and the id the client sees">
+<ul>
+  <li>The chunk <code>id</code> is the <code>"chatcmpl-..."</code> id of stop 2, not the internal id with the random suffix. The output processor puts the external id back into <code>RequestOutput</code> ({{cite vllm/v1/engine/output_processor.py:402}}, {{cite vllm/v1/engine/output_processor.py:460}}).</li>
+  <li>With <code>stream_options: {"include_usage": true}</code> (or <code>--enable-force-include-usage</code>), one more chunk with <code>choices: []</code> and <code>usage</code> comes before <code>[DONE]</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:854-903}}).</li>
+  <li>The final chunk has <code>finish_reason</code> and <code>stop_reason</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:790-795}}). For an EOS token, <code>stop_reason</code> is <code>None</code>; for a stop token id, it is that id ({{cite vllm/v1/core/sched/utils.py:105-112}}). A finish reason <code>"error"</code> raises <code>GenerationError</code> ({{cite vllm/entrypoints/generate/base/serving.py:200-207}}), which becomes an error chunk ({{cite vllm/entrypoints/openai/chat_completion/serving.py:937-940}}).</li>
+  <li>The serialization is <code>model_dump_json(exclude_unset=True, exclude_none=not chunk.choices)</code> (lines 500-502). So only the fields that the code sets appear, and a field set to <code>None</code> (for example <code>token_ids</code>) appears as <code>null</code> in chunks with choices.</li>
+</ul>
+</x-deepdive>
+</x-stop>
+
+<h2 id="the-loop">The loop: one engine step per output token</h2>
+<p>Stops 9 to 16 repeat. Our request gets one step for the prompt (or more with chunked prefill) and then one step per new token. Each step gives one SSE chunk. The prefill step already samples the first token, so a request with 40 output tokens (EOS included) needs 40 engine steps. With async scheduling, one more step for the request is often already scheduled when it stops; the scheduler ignores its result.</p>
+<x-diagram name="t1_loop" alt="Panel 1: three boxes. Step 1 runs the prompt: 61 tokens, 48 of them from the prefix cache, so 13 are scheduled; it samples token 1 and sends the role chunk and the first text. Steps 2 to N-1 schedule one token each, read the last sampled token and send one chunk each. Step N samples EOS or reaches max_tokens, check_stop finishes the request, blocks go back to the pool, the last chunk and data: [DONE] go out. Panel 2: a timeline with the engine core main thread and the GPU. The CPU schedules and starts step 1, then schedules and starts step 2, then waits for step 1 and updates it, while the GPU already runs step 2. Panel 3: a table of the scheduler counters computed, placeholders and num_tokens for the first three schedule events and two update events." caption="Figure: one engine step per token, and how async scheduling overlaps the CPU work of step k+1 with the GPU work of step k." />
+<p><strong>The overlap.</strong> With async scheduling, the engine core does not wait between steps. It schedules and starts step k+1 first, and only then waits for the token of step k (stop 9). The scheduler can plan step k+1 because <code>AsyncScheduler</code> counts a placeholder for the token in flight (panel 3). The model runner then reads the real token from <code>last_sampled_tokens</code> on the GPU (stop 11). So the CPU work of scheduling and output handling hides behind the GPU work. DeepInfer uses the same idea: see {{deepinfer concepts/zero-overhead-scheduling | Zero-overhead scheduling}}. The page {{link concepts/async-scheduling}} explains the vLLM version in full.</p>
+<x-simplified>
+<p>The diagram shows one request. In a real server, every step holds many requests, and new requests join while ours runs. Durations are not to scale. With spec decoding a step can add more than one token; with <code>stream_interval &gt; 1</code> a chunk can carry more than one token.</p>
+</x-simplified>
+
+<h2 id="deep-dive">Deep dive</h2>
+<x-deepdive title="Data types at each boundary">
+<table>
+  <thead><tr><th>#</th><th>Object</th><th>Made in</th><th>Where it goes</th><th>Format</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>request JSON</td><td>client</td><td>FastAPI → <code>ChatCompletionRequest</code> (pydantic)</td><td>HTTP body, JSON</td></tr>
+    <tr><td>2</td><td>rendered prompt (text)</td><td><code>safe_apply_chat_template</code> ({{cite vllm/renderers/hf.py:872-876}})</td><td>tokenizer</td><td><code>str</code></td></tr>
+    <tr><td>3</td><td>token ids + <code>arrival_time</code></td><td><code>render_chat_async</code> ({{cite vllm/renderers/base.py:1380-1411}})</td><td><code>AsyncLLM.generate</code></td><td><code>EngineInput</code> dict, <code>list[int]</code></td></tr>
+    <tr><td>4</td><td><code>EngineCoreRequest</code></td><td><code>InputProcessor.process_inputs</code> ({{cite vllm/v1/engine/input_processor.py:538-555}})</td><td>engine core process</td><td>msgspec struct → msgpack over ZMQ ROUTER/DEALER</td></tr>
+    <tr><td>5</td><td><code>Request</code></td><td><code>Request.from_engine_core_request</code> ({{cite vllm/v1/request.py:244-270}})</td><td>scheduler</td><td>Python object (engine core only)</td></tr>
+    <tr><td>6</td><td><code>SchedulerOutput</code></td><td><code>Scheduler.schedule</code> ({{cite vllm/v1/core/sched/scheduler.py:1588-1608}})</td><td>executor → worker → model runner</td><td>dataclass; plain call with TP = 1</td></tr>
+    <tr><td>7</td><td><code>AsyncOutput</code> → <code>ModelRunnerOutput</code></td><td><code>sample_tokens</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2195-2218}})</td><td><code>Scheduler.update_from_output</code></td><td>GPU tensors → async copy → <code>list[list[int]]</code></td></tr>
+    <tr><td>8</td><td><code>EngineCoreOutputs</code></td><td><code>update_from_output</code> ({{cite vllm/v1/core/sched/scheduler.py:2487-2490}})</td><td>front end</td><td>msgspec struct → msgpack over ZMQ PUSH/PULL</td></tr>
+    <tr><td>9</td><td><code>RequestOutput</code></td><td><code>OutputProcessor.process_outputs</code> ({{cite vllm/v1/engine/output_processor.py:849-863}})</td><td><code>generate()</code> → SSE generator</td><td>Python object in a <code>RequestOutputCollector</code></td></tr>
+    <tr><td>10</td><td>SSE event</td><td><code>chat_completion_stream_generator</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:497-508}})</td><td>client</td><td><code>data: {JSON}\n\n</code>, then <code>data: [DONE]\n\n</code></td></tr>
+  </tbody>
+</table>
+<p>The fields of <code>SchedulerOutput</code> are in {{cite vllm/v1/core/sched/output.py:232-313}}. A new request travels as <code>NewRequestData</code> with its prompt and block ids ({{cite vllm/v1/core/sched/output.py:41-56}}). In later steps it is in <code>CachedRequestData</code>, which carries only new block ids and counts ({{cite vllm/v1/core/sched/output.py:138-152}}). <code>EngineCoreOutput</code> carries <code>new_token_ids</code>, never text ({{cite vllm/v1/engine/__init__.py:203-247}}). The page {{link concepts/data-contracts}} explains each contract.</p>
+</x-deepdive>
+
+<x-deepdive title="Timing: where TTFT and ITL are measured">
+<p>The {{term ttft | time to first token}} and the {{term itl | inter-token latency}} metrics of vLLM are measured in the front end, in <code>IterationStats.update_from_output</code>:</p>
+<x-code file="vllm/v1/metrics/stats.py" lines="521-527" highlight="525" />
+<x-code file="vllm/v1/metrics/stats.py" lines="551-558" highlight="555" />
+<ol>
+  <li><strong>TTFT start:</strong> <code>arrival_time = time.time()</code> in <code>render_chat_async</code> (stop 3, {{cite vllm/renderers/base.py:1380}}). So it does not include the HTTP transfer, the JSON parse and the model check before rendering.</li>
+  <li><strong>TTFT end:</strong> <code>iteration_timestamp</code>, the wall-clock time when the output handler makes the <code>IterationStats</code> object for a batch of outputs ({{cite vllm/v1/metrics/stats.py:477-478}}, {{cite vllm/v1/engine/async_llm.py:883-885}}). That is after ZMQ, before detokenization and before the SSE write.</li>
+  <li><strong>ITL:</strong> the difference between the <code>EngineCoreOutputs.timestamp</code> values of two outputs. These are <code>time.monotonic()</code> values from the engine core process ({{cite vllm/v1/engine/__init__.py:295-297}}).</li>
+</ol>
+<p>A client measures TTFT from its own send time to the first content chunk. Its value is larger: it adds the network, the HTTP parse, the work before <code>arrival_time</code> (model check, <code>_preflight</code>), the detokenization and the SSE write. Remember also that the first SSE chunk only has the role; the first text comes in the same RequestOutput (stop 16). The page {{link learn/serving-metrics}} defines the metrics, and {{link concepts/metrics-and-observability}} lists the Prometheus names.</p>
+<p>The stats exist only when <code>log_stats</code> is true. <code>disable_log_stats</code> is <code>False</code> by default ({{cite vllm/engine/arg_utils.py:624}}).</p>
+</x-deepdive>
+
+<x-deepdive title="What changes with TP &gt; 1">
+<p>With <code>--tensor-parallel-size 2</code>, the world size is 2, so the executor is <code>"mp"</code> on one node ({{cite vllm/config/parallel.py:1055-1096}}). Each GPU gets its own worker process. Stops 1 to 10 and 14 to 16 do not change. Stop 11 changes: the engine core does not call the worker directly. <code>MultiprocExecutor.execute_model</code> sends the call to all workers through a shared-memory message queue (<code>rpc_broadcast_mq.enqueue</code>, {{cite vllm/v1/executor/multiproc_executor.py:342-353}}, {{cite vllm/v1/executor/multiproc_executor.py:428}}). Only one worker replies, the first TP rank of the last PP stage ({{cite vllm/v1/executor/multiproc_executor.py:549-560}}). The workers exchange activations with all-reduce inside the forward pass ({{term tensor-parallel | tensor parallelism}}). The tour {{link tours/multi-gpu-step}} follows this path.</p>
+</x-deepdive>
+
+<x-deepdive title="What changes with DP &gt; 1">
+<p>With <code>--data-parallel-size 2</code>, there are two engine core processes, one per DP rank. The front end then uses <code>DPLBAsyncMPClient</code> (internal load balancing) or <code>DPAsyncMPClient</code> (external load balancer) ({{cite vllm/v1/engine/core_client.py:158-169}}). For each new request, <code>DPLBAsyncMPClient</code> picks the engine with the lowest score. The score is the larger of two counts: waiting plus running requests, and the in-flight requests of this client. Waiting requests add a penalty when the KV cache usage is above 50% ({{cite vllm/v1/engine/core_client.py:1763-1789}}). An <code>X-data-parallel-rank</code> header can force a rank ({{cite vllm/entrypoints/generate/base/serving.py:215-227}}). For a dense model the DP ranks are independent. For an MoE model the engine core is a <code>DPEngineCoreProc</code>, which keeps the ranks in step ({{cite vllm/v1/engine/core.py:1537-1547}}). See {{link concepts/data-parallel-serving}} and {{link tours/multi-gpu-step}}.</p>
+</x-deepdive>
+
+<x-deepdive title="What changes with more API servers">
+<p>By default <code>api_server_count</code> is the DP size with internal load balancing. It is the local DP size with hybrid load balancing, and 1 with an external load balancer ({{cite vllm/entrypoints/cli/serve.py:113-130}}). With more than one, <code>run_multi_api_server</code> starts several front-end processes that share one listen socket with <code>reuse_port</code> ({{cite vllm/entrypoints/cli/serve.py:269}}, {{cite vllm/entrypoints/cli/serve.py:298}}). So stops 1 to 6 and 15 to 16 run in one of N processes. The engine core opens one input socket and one output socket for each front end ({{cite vllm/v1/engine/core.py:1936-1943}}, {{cite vllm/v1/engine/core.py:2047-2052}}). It sends each output to the socket of the client that sent the request: <code>client_index</code> selects the socket ({{cite vllm/v1/engine/core.py:2089-2091}}). So each front end detokenizes only its own requests, and N processes share this work.</p>
+</x-deepdive>
+
+<x-deepdive title="Cancellation: when the client disconnects">
+<p>The client can close the connection at any time. Two mechanisms find out:</p>
+<ol>
+  <li>Before the route returns, <code>with_cancellation</code> runs the handler and <code>listen_for_disconnect</code> as two tasks and cancels the other when one ends ({{cite vllm/entrypoints/serve/utils/api_utils.py:93-109}}).</li>
+  <li>After the route returns a <code>StreamingResponse</code>, the response itself listens for the disconnect. The docstring of <code>with_cancellation</code> says this ({{cite vllm/entrypoints/serve/utils/api_utils.py:85-87}}). The stream generator is then stopped.</li>
+</ol>
+<p>When the stream stops, <code>AsyncLLM.generate()</code> gets <code>CancelledError</code> or <code>GeneratorExit</code> and calls <code>abort(q.request_id, internal=True)</code> ({{cite vllm/v1/engine/async_llm.py:807-812}}). <code>abort</code> removes the request from the output processor and sends ABORT to the engine core ({{cite vllm/v1/engine/async_llm.py:948-956}}, {{cite vllm/v1/engine/core_client.py:1338-1340}}). In the engine core, <code>abort_requests</code> calls <code>finish_requests(..., FINISHED_ABORTED)</code>, which frees the blocks ({{cite vllm/v1/engine/core.py:554-560}}). The engine core also checks <code>aborts_queue</code> before each <code>update_from_output</code>, so an abort that arrives during the forward pass acts at once ({{cite vllm/v1/engine/core.py:780-782}}).</p>
+<x-simplified><p>The exact way Starlette stops the generator (a cancelled task, or a closed generator) is Starlette code and is not in this repository. Both cases reach the same <code>except</code> branch in <code>generate()</code>.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Errors">
+<table>
+  <thead><tr><th>When</th><th>What happens</th><th>What the client gets</th></tr></thead>
+  <tbody>
+    <tr><td>Invalid JSON or fields</td><td>FastAPI <code>RequestValidationError</code></td><td>HTTP 400 ({{cite vllm/entrypoints/serve/exception_handling/register.py:29}})</td></tr>
+    <tr><td>Wrong model name, bad template, bad tool choice</td><td>the serving class returns an <code>ErrorResponse</code></td><td>JSON error with its code ({{cite vllm/entrypoints/openai/chat_completion/api_router.py:69-72}})</td></tr>
+    <tr><td>Prompt longer than <code>max_model_len</code></td><td>the length check of the renderer raises <code>VLLMValidationError</code> when it tokenizes the prompt (stop 3, {{cite vllm/renderers/params.py:518-538}})</td><td>HTTP 400, by the <code>VLLMError</code> handler ({{cite vllm/entrypoints/serve/exception_handling/register.py:32}}, {{cite vllm/entrypoints/serve/exception_handling/error_response.py:43-46}})</td></tr>
+    <tr><td>Queue full (<code>max_num_queued_reqs</code>)</td><td><code>QueueOverflowError</code> in <code>check_admission</code></td><td>HTTP 503 ({{cite vllm/v1/engine/async_llm.py:328-329}})</td></tr>
+    <tr><td>Error after the stream started</td><td>the raw generator catches it and yields an <code>ErrorResponse</code></td><td>a <code>data: {error JSON}</code> chunk, then <code>data: [DONE]</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:941-943}}, {{cite vllm/entrypoints/openai/chat_completion/serving.py:497-498}}, {{cite vllm/entrypoints/openai/chat_completion/serving.py:508}})</td></tr>
+    <tr><td>Request-level error in the engine (finish reason <code>error</code>)</td><td><code>_raise_if_error</code> raises <code>GenerationError</code></td><td>an error chunk with its status code ({{cite vllm/entrypoints/openai/chat_completion/serving.py:937-940}})</td></tr>
+    <tr><td>Engine core process dies</td><td>the output task puts the exception in the queue; <code>output_handler</code> sends it to every collector ({{cite vllm/v1/engine/core_client.py:1255-1258}}, {{cite vllm/v1/engine/output_processor.py:593-597}})</td><td>every open stream gets an error chunk; new requests fail in <code>_preflight</code></td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="An HTTP 200 does not mean that the request worked">
+<p>A streaming response starts before the engine sees the request (stop 2). Clients must read the error chunks in the stream, not only the status code ({{cite vllm/entrypoints/openai/chat_completion/serving.py:937-943}}, {{cite vllm/entrypoints/openai/chat_completion/serving.py:497-503}}).</p>
+</x-warning>
+<ul>
+  <li><strong>Slow first token under load.</strong> The new request waits in the waiting queue until running requests leave room in the token budget and the KV cache (stop 10). Watch the waiting count and the cache usage; see {{link concepts/tuning}}.</li>
+  <li><strong>A long prompt delays all streams.</strong> With chunked prefill, a long prompt takes a large part of the token budget for several steps. Every running request then gets its next token later. <code>long_prefill_token_threshold</code> limits the tokens of one prompt per step ({{cite vllm/v1/core/sched/scheduler.py:764-765}}).</li>
+  <li><strong>Preemption.</strong> When blocks run out, the scheduler preempts a running request and computes it again later ({{cite vllm/v1/core/sched/scheduler.py:850-858}}). The stream of that request pauses.</li>
+  <li><strong>Chat template timeout.</strong> A very slow template fails after <code>VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT</code> seconds (default 30, {{cite vllm/renderers/hf.py:1044-1056}}).</li>
+  <li><strong>Prompt too long.</strong> HTTP 400 "This model's maximum context length is ... tokens. However, your prompt contains ... input tokens" ({{cite vllm/renderers/params.py:524-538}}).</li>
+  <li><strong>Busy front end.</strong> One front end does rendering, detokenization and JSON for all streams in one event loop. At high load it can be the bottleneck; more API servers share this work (Deep dive).</li>
+</ul>
+<p><strong>Why it matters.</strong> Most questions about a slow or broken stream start with "which stop is it?". A slow first token is often a scheduling question (stop 10). A slow stream with a fast GPU can be the front end (stops 15 and 16). A missing token can be a stop-string question (stop 15). With the map of this tour you can open the right file at once.</p>
+
+<x-quiz>
+  <x-q level="easy">In which process does the chat template run, and in which thread?
+    <x-a><p>In the API server process (the front end), in a thread pool. <code>HfRenderer</code> wraps <code>safe_apply_chat_template</code> with <code>make_async(..., executor=self._executor)</code> ({{cite vllm/renderers/hf.py:1011-1013}}). So the template does not block the asyncio event loop.</p></x-a>
+  </x-q>
+  <x-q level="easy">Which two objects cross the ZMQ sockets, and how are they encoded?
+    <x-a><p><code>EngineCoreRequest</code> goes from the front end to the engine core, and <code>EngineCoreOutputs</code> comes back. Both are <code>msgspec</code> structs with <code>array_like=True</code>, encoded as msgpack ({{cite vllm/v1/engine/__init__.py:113-118}}, {{cite vllm/v1/engine/__init__.py:266-271}}, {{cite vllm/v1/engine/core_client.py:731-732}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">The client gets HTTP 200, but the stream holds only an error and <code>data: [DONE]</code>. How can this happen?
+    <x-a><p>The route returns the <code>StreamingResponse</code> before <code>AsyncLLM.generate()</code> runs, because <code>engine_client.generate(...)</code> only makes an async generator (stop 2). The status line is already sent when the request reaches the engine. Later errors become <code>data:</code> chunks, followed by <code>data: [DONE]</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:937-943}}, {{cite vllm/entrypoints/openai/chat_completion/serving.py:497-508}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With async scheduling, how can the scheduler schedule the next decode step of our request before it knows the token of the current step? And where does the model runner get that token?
+    <x-a><p><code>AsyncScheduler</code> adds a placeholder per token in flight (<code>num_output_placeholders</code>, {{cite vllm/v1/core/sched/async_scheduler.py:45-47}}). The running pass computes <code>num_new_tokens = num_tokens_with_spec + num_output_placeholders - num_computed_tokens</code>, which is 1 ({{cite vllm/v1/core/sched/scheduler.py:759-763}}). The model runner reads the real token from <code>req_states.last_sampled_tokens</code> on the GPU in <code>combine_sampled_and_draft_tokens</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1493-1500}}). <code>postprocess_sampled</code> wrote it there in the step before ({{cite vllm/v1/worker/gpu/model_runner.py:1715-1726}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A user measures TTFT in the client as 180 ms, but the vLLM TTFT metric says 120 ms. Name three parts of the 60 ms that the vLLM metric does not include.
+    <x-a><p>The vLLM metric starts at <code>arrival_time = time.time()</code> in <code>render_chat_async</code> ({{cite vllm/renderers/base.py:1380}}) and ends when the output handler makes <code>IterationStats</code> for the batch with the first token ({{cite vllm/v1/metrics/stats.py:525}}, {{cite vllm/v1/engine/async_llm.py:883-885}}). It leaves out the network and the HTTP parse before the route, and the model check before rendering. It also leaves out the work after that moment: detokenization (stop 15), the JSON and the SSE write (stop 16), and the network.</p></x-a>
+  </x-q>
+</x-quiz>

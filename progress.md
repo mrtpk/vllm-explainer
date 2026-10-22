@@ -1,7 +1,7 @@
 # vLLM Explainer — Progress
 
 Last update: 2026-10-22 19:10
-Current phase: **1b Samples** — plan approved ("go", 2026-10-22 19:13). Running (4/4): foundation agent, reference-generators agent, 1b basics samples (learn/ml-basics-recap, learn/serving-metrics), 1b Tour 1 (tours/life-of-a-chat-request + request_stepper visual). The two 1b writers started early, in parallel with 1a (they may need small fixes after STYLE.md lands).
+Current phase: **1b/1c Samples + fact checks** (after 19:56: max 2 agents) — plan approved ("go", 2026-10-22 19:13). Running (4/4): foundation agent, reference-generators agent, 1b basics samples (learn/ml-basics-recap, learn/serving-metrics), 1b Tour 1 (tours/life-of-a-chat-request + request_stepper visual). The two 1b writers started early, in parallel with 1a (they may need small fixes after STYLE.md lands).
 
 This file is the memory of the project. A new session must be able to continue from it alone.
 
@@ -44,12 +44,14 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
 
+- FINAL-PASS TODO: no page may say VLLM_PLUGINS filters all groups, or that the registry subprocess is OOT-only/always runs (sent to home writer for plugins-init.html). Later pages: platform-plugins, oot-models, plugin-map, life-of-a-plugin.
+
 - FINAL-PASS TODO: every page that states a default (chunked prefill, prefix caching, max_num_seqs, max_num_batched_tokens, cudagraph mode, async scheduling) must cite the EngineArgs/arg_utils override, not only the config dataclass. Source of truth: notes/facts.md "Processes and defaults".
 - FINAL-PASS TODO: pages that say the engine loop is EngineCore.step() → default is step_with_batch_queue (async scheduling). Check Tour 1 (being fact-checked), home, engine-core-loop.
 - FACT-CHECK FOCUS (all batches): b0 defect rate was ~41% (39/95). Brief every writer: check arg_utils overrides for defaults; FlashInfer sampler default; async scheduling default.
 
 - DECISION 1a questions: site/ is committed (as DeepInfer) at stage ends; code/v1-attention-backend merges backend.py + selector.py (OK); nav titles OK.
-- QUEUE (after 19:56, max 2 running): fact check concepts/plugin-loading; env-vars reference page (after generators); fact check home + plugins-init; fact check env-vars; then full build B1...
+- QUEUE (after 19:56, max 2 running): fact check home + plugins-init; fact check r1 reference pages; then full build B1 ... (plan §12).
 
 - FAQ material from b0: docs/design/metrics.md queue-time wording, arrival_time wording, TPOT formula differ from code (see notes/facts.md Conflicts).
 
@@ -66,9 +68,11 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-22 | Survey: model execution | done, notes/survey/model-execution.md |
 | 2026-10-22 | Survey: serving/config/distributed | done, notes/survey/serving-config-distributed.md |
 | 2026-10-22 19:15 | 1a Foundation | done 19:44; committed b383713. Supervisor checked screenshot + diagram: good. Added 6 core terms (request, engine-step, prefill, decode, batch, scheduler). |
-| 2026-10-22 19:15 | Reference generators (tools/gen_*.py) | running |
+| 2026-10-22 19:15 | Reference generators (tools/gen_*.py) | done 19:48; committed 24a9b2d. 4 tools, --check OK; 10/10 spot checks each. |
+| 2026-10-22 19:50 | Reference pages env-vars, serve-flags, config-classes, metrics (r1) | running |
 | 2026-10-22 19:18 | 1b basics samples (b0) | done 19:34: learn/ml-basics-recap, learn/serving-metrics, diagram b0_serving_timeline, glossary b0.json (7 terms) |
 | 2026-10-22 19:35 | Fact check b0 | done 19:47: ~95 claims, 39 defects fixed (14 citation, 6 value, 13 logic, 6 missing source). Main lesson: defaults cited to config dataclasses are overridden in arg_utils. |
 | 2026-10-22 19:47 | 1b home page + code/plugins-init (c1) | running |
 | 2026-10-22 19:18 | 1b Tour 1 (t1) | done 19:45: 16 stops, 3 diagrams, request_stepper.js, t1.json (12 terms); not browser-checked by writer |
-| 2026-10-22 19:46 | Fact check t1 (+ browser check of stepper) | running |
+| 2026-10-22 19:46 | Fact check t1 (+ browser check of stepper) | done ~20:00: ~230 claims, 38 defects (11 citation, 6 value, 9 logic, 3 default source, 9 other). Stepper OK at 1280/390, no overflow. |
+| 2026-10-22 19:49 | Fact check concepts/plugin-loading (+ folder descriptions) | done ~19:58: ~80 claims, 30 defects fixed (8 citation, 11 value/condition, 4 logic, 3 missing source, 5 glossary/folder). Open question answered (platform before general plugins in every process). |
