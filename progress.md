@@ -50,6 +50,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
 
+- FINAL-PASS TODO (B4a FC): kv-connectors, frontend-plugins, reference/extension-points must say connector registries are also read in the front end (class only); attention-backend-selection: register_backend string duplicate raises; custom-ops: forward_oot only for enabled ops; quantization-plugins: workers get the quant config object via pickled VllmConfig; compile-and-cuda-graphs / config-system: check_and_update_config 'late in' __post_init__.
+
 - FINAL-PASS TODO (B2b FC): 'slow load hits VLLM_ENGINE_READY_TIMEOUT_S' without the >1-API-server condition on concepts/architecture-overview ~161, learn/processes-and-ipc ~140, reference/env-vars ~86; architecture-overview 'uni only when TP=PP=DP=1' → add 'by default' and PCP; async-off lists missing the CPU case (reference pages, t1 glossary async-scheduling); 'engine core calls get_output()' without the mp worker-thread case (Tour 1); any 'sleep level 2 discards all GPU memory'.
 
 - FINAL-PASS TODO: reference/serve-flags must describe --quantization fp8 as deprecated (warn → fp8_per_tensor), not as an error. Later pages lora-serving, quantization-plugins, weight-loading: no FP8 raise, no unload open question, 92.4 MB/slot.
@@ -114,7 +116,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-22 23:11 | B3a fact check | done ~23:40: ~260 claims, 25 defects; simulator verified |
 | 2026-10-22 23:41 | B3b writer | running |
 | 2026-10-22 22:47 | B4a writer (plugin-map, platform-plugins, platform-interface + 2 modules + plugin timeline) | done ~23:25; 3 diagrams, b4a.json 5 terms |
-| 2026-10-22 23:26 | B4a fact check | running |
+| 2026-10-22 23:26 | B4a fact check | done ~23:55: ~270 claims, 24 defects; OOT quant open question answered |
+| 2026-10-22 23:56 | B4b writer | running |
 | 2026-10-22 19:18 | 1b Tour 1 (t1) | done 19:45: 16 stops, 3 diagrams, request_stepper.js, t1.json (12 terms); not browser-checked by writer |
 | 2026-10-22 19:46 | Fact check t1 (+ browser check of stepper) | done ~20:00: ~230 claims, 38 defects (11 citation, 6 value, 9 logic, 3 default source, 9 other). Stepper OK at 1280/390, no overflow. |
 | 2026-10-22 19:49 | Fact check concepts/plugin-loading (+ folder descriptions) | done ~19:58: ~80 claims, 30 defects fixed (8 citation, 11 value/condition, 4 logic, 3 missing source, 5 glossary/folder). Open question answered (platform before general plugins in every process). |

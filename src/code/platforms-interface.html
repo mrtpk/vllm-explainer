@@ -1,0 +1,322 @@
+---
+title: platforms/interface.py: the Platform base class
+nav_title: platforms/interface.py
+level: Advanced
+prerequisites: concepts/platform-interface, concepts/platform-plugins
+related: concepts/platform-interface, concepts/platform-plugins, concepts/plugin-map, code/platforms-init, concepts/attention-backend-selection, concepts/custom-ops
+summary: vllm/platforms/interface.py defines Platform, the base class of every hardware platform, with 12 class attributes and 90 methods, plus PlatformEnum, CpuArchEnum, DeviceCapability, the device-id helpers and UnspecifiedPlatform.
+---
+<h2>Purpose</h2>
+<p><code>vllm/platforms/interface.py</code> defines the contract that every hardware {{term platform}} implements: the base class <code>Platform</code> with a default for almost every method.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/platforms/interface.py</code>, 1495 lines of Python. Three small types, three module functions, the class <code>Platform</code> (lines 137-1490) and <code>UnspecifiedPlatform</code>.</td></tr>
+    <tr><th>Main class</th><td><code>Platform</code> ({{cite vllm/platforms/interface.py:137}}): 12 class attributes and 90 methods, 84 of them without a leading underscore. Most methods are class methods.</td></tr>
+    <tr><th>Runs in</th><td>Every vLLM process, through its <code>current_platform</code> object. The methods run on the CPU, in the thread of the caller. They must not start a device context unless their job needs one.</td></tr>
+    <tr><th>Called by</th><td>vLLM code all over the tree, through <code>current_platform</code>: the config code in the front end, the engine core, the workers, the layers and the compiler (see the hook table on {{link concepts/platform-interface}}).</td></tr>
+    <tr><th>Calls</th><td><code>torch</code> (dtypes, <code>torch.&lt;device_type&gt;</code>), <code>os.environ</code> for the device-control variable, and lazy imports of attention backends, KV cache specs and config classes inside some methods.</td></tr>
+    <tr><th>Not in this file</th><td>The detection of the platform (<code>__init__.py</code>, page {{link code/platforms-init}}) and the vendor classes (<code>cuda.py</code>, <code>rocm.py</code>, <code>cpu.py</code>, <code>xpu.py</code>, <code>tpu.py</code>, <code>zen_cpu.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/platform-interface}} explains the hooks in start-up order. This page maps the file and reads its most important methods.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b4a_platform_hooks" alt="Three columns for vllm serve with TP = 2, with numbered Platform hook calls: in the API server, platform detection, pre_register_and_update twice, validate_environ, apply_config_platform_defaults, check_and_update_config, then the start of the engine core; in the engine core, detection, the start of the workers and get_kv_cache_config_builder_cls; in each worker, detection, register_triton_kernel_overrides, get_device_communicator_cls, get_attn_backend_cls, opaque_attention_op and update_block_size_for_backend." caption="Figure: where the methods of this file are called during a <code>vllm serve</code> start-up with TP = 2." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>The config code (front end).</strong> <code>EngineArgs</code> calls <code>pre_register_and_update</code> and <code>validate_environ</code> ({{cite vllm/engine/arg_utils.py:2246-2250}}). <code>VllmConfig.__post_init__</code> calls <code>apply_config_platform_defaults</code> and <code>check_and_update_config</code> ({{cite vllm/config/vllm.py:1804}}, {{cite vllm/config/vllm.py:2046}}).</li>
+  <li><strong>The executors.</strong> They call <code>update_block_size_for_backend</code> after the model is loaded ({{cite vllm/v1/executor/multiproc_executor.py:702}}, {{cite vllm/v1/executor/uniproc_executor.py:75}}).</li>
+  <li><strong>Component builders.</strong> The attention selector ({{cite vllm/v1/attention/selector.py:218}}), the process groups ({{cite vllm/distributed/parallel_state.py:551}}), the LoRA wrapper selector ({{cite vllm/lora/punica_wrapper/punica_selector.py:14}}), the compiler ({{cite vllm/compilation/backends.py:691}}, {{cite vllm/compilation/backends.py:876}}) and the KV cache planner ({{cite vllm/v1/core/kv_cache_config_builder.py:101}}).</li>
+  <li><strong>Subclasses.</strong> Vendor classes call <code>super()</code> for some methods, for example ROCm for <code>import_kernels</code> ({{cite vllm/platforms/rocm.py:654}}) and XPU for <code>update_block_size_for_backend</code> ({{cite vllm/platforms/xpu.py:477}}).</li>
+  <li><strong>The worker process.</strong> It calls <code>set_assigned_physical_gpu_ids</code> when the config has assigned GPU ids ({{cite vllm/v1/executor/multiproc_executor.py:889-895}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>torch.&lt;device_type&gt;</code> in the fallback <code>__getattr__</code> ({{cite vllm/platforms/interface.py:1306-1312}}).</li>
+  <li>The device-control variable, for example <code>CUDA_VISIBLE_DEVICES</code>, in the device-id helpers ({{cite vllm/platforms/interface.py:307-313}}).</li>
+  <li>Attention backend classes inside the block size methods ({{cite vllm/platforms/interface.py:678-697}}) and the MLA prefill registry ({{cite vllm/platforms/interface.py:453-456}}).</li>
+  <li><code>vllm.envs.environment_variables</code> in <code>validate_environ</code> ({{cite vllm/platforms/interface.py:1457-1460}}).</li>
+  <li>Kernel libraries: <code>vllm._C</code> ({{cite vllm/platforms/interface.py:369}}) and <code>vllm.kernels</code> ({{cite vllm/platforms/interface.py:264}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<h3>Map of the file</h3>
+<table>
+  <thead><tr><th>Lines</th><th>Section</th></tr></thead>
+  <tbody>
+    <tr><td>{{cite vllm/platforms/interface.py:1-35}}</td><td>Imports; type-only imports of config, attention and request types.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:37-62}}</td><td><code>_assigned_physical_gpu_ids</code> with <code>set_assigned_physical_gpu_ids</code> (raises on a conflicting second call) and <code>get_assigned_physical_gpu_ids</code>.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:65-68}}</td><td><code>in_wsl()</code>, cached: "microsoft" in <code>platform.uname()</code>.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:71-90}}</td><td><code>PlatformEnum</code> (CUDA, ROCM, TPU, XPU, CPU, OOT, UNSPECIFIED) and <code>CpuArchEnum</code>.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:93-134}}</td><td><code>DeviceCapability(major, minor)</code> with ordering and <code>to_int()</code> (for example 9.0 → 90).</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:137-181}}</td><td><code>Platform</code>: identity class attributes.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:183-244}}</td><td>Properties and the <code>is_*</code> checks.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:246-264}}</td><td>Compile pickers and <code>import_ir_kernels</code>.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:266-363}}</td><td>Device ids: logical, visible and physical.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:365-386}}</td><td>Kernel hooks.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:388-514}}</td><td>Attention pickers: decoder, vision encoder, MLA prefill.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:516-636}}</td><td>Device queries: capability, name, memory, device setting, seeds.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:638-676}}</td><td>Config hooks.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:678-1134}}</td><td>Block size: the common size for all backends, hybrid (Mamba) and mixed-dtype alignment.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:1136-1298}}</td><td>Checks and feature flags: KV specs, model and quantization checks, CPU architecture, memory, LoRA wrapper, communicator, FP8, collectives, request check.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:1300-1326}}</td><td>The <code>__getattr__</code> fallback and the global graph pool.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:1328-1490}}</td><td>Graph wrapper, process groups, more feature flags, NIXL, IR priority, <code>validate_environ</code>, KV cache config builder.</td></tr>
+    <tr><td>{{cite vllm/platforms/interface.py:1493-1495}}</td><td><code>UnspecifiedPlatform</code>: <code>_enum = UNSPECIFIED</code>, <code>device_type = ""</code>.</td></tr>
+  </tbody>
+</table>
+
+<h3>Every public method of Platform</h3>
+<p>One row per method, in file order. "Picker" means a {{term component-picker}}; "config hook" and "kernel hook" are the groups of {{link concepts/platform-interface}}. The private helpers (<code>_find_non_ssm_backends</code>, <code>_preferred_block_size_for_backends</code>, <code>_check_aligned_block_size</code> and two alignment methods) are in the walk-through and the deep dive.</p>
+<table>
+  <thead><tr><th>Name</th><th>Kind</th><th>Lines</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>log_warnings</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:153-154}}</td><td>Logs platform diagnostics after logging is configured. Default: nothing.</td></tr>
+    <tr><td><code>pass_key</code></td><td>property</td><td>{{cite vllm/platforms/interface.py:184-186}}</td><td>Property: the Inductor config key for the custom pass manager (<code>post_grad_custom_post_pass</code>).</td></tr>
+    <tr><td><code>supported_dtypes</code></td><td>property</td><td>{{cite vllm/platforms/interface.py:189-194}}</td><td>Property: model dtypes the device supports; the first one is the fallback for <code>auto</code>.</td></tr>
+    <tr><td><code>is_cuda</code></td><td>method</td><td>{{cite vllm/platforms/interface.py:196-197}}</td><td>True for <code>PlatformEnum.CUDA</code>.</td></tr>
+    <tr><td><code>is_rocm</code></td><td>method</td><td>{{cite vllm/platforms/interface.py:199-200}}</td><td>True for <code>PlatformEnum.ROCM</code>.</td></tr>
+    <tr><td><code>is_tpu</code></td><td>method</td><td>{{cite vllm/platforms/interface.py:202-203}}</td><td>True for <code>PlatformEnum.TPU</code>.</td></tr>
+    <tr><td><code>is_xpu</code></td><td>method</td><td>{{cite vllm/platforms/interface.py:205-206}}</td><td>True for <code>PlatformEnum.XPU</code>.</td></tr>
+    <tr><td><code>is_cpu</code></td><td>method</td><td>{{cite vllm/platforms/interface.py:208-209}}</td><td>True for <code>PlatformEnum.CPU</code>.</td></tr>
+    <tr><td><code>uses_host_device_handling</code></td><td>method</td><td>{{cite vllm/platforms/interface.py:211-213}}</td><td>Whether vLLM leaves <code>DeviceConfig.device</code> unset (TPU only by default).</td></tr>
+    <tr><td><code>is_zen_cpu</code></td><td>method</td><td>{{cite vllm/platforms/interface.py:215-216}}</td><td>True only on <code>ZenCpuPlatform</code>; default <code>False</code>.</td></tr>
+    <tr><td><code>is_out_of_tree</code></td><td>method</td><td>{{cite vllm/platforms/interface.py:218-219}}</td><td>True for <code>PlatformEnum.OOT</code>; selects <code>forward_oot</code> in an enabled <code>CustomOp</code>.</td></tr>
+    <tr><td><code>is_unspecified</code></td><td>method</td><td>{{cite vllm/platforms/interface.py:221-222}}</td><td>True for <code>UnspecifiedPlatform</code>.</td></tr>
+    <tr><td><code>get_max_output_tokens</code></td><td>method</td><td>{{cite vllm/platforms/interface.py:224-225}}</td><td>Upper limit of output tokens for a prompt length; default <code>sys.maxsize</code>.</td></tr>
+    <tr><td><code>is_cuda_alike</code></td><td>method</td><td>{{cite vllm/platforms/interface.py:227-229}}</td><td>True for CUDA and ROCm, without a CUDA call.</td></tr>
+    <tr><td><code>is_sleep_mode_available</code></td><td>method</td><td>{{cite vllm/platforms/interface.py:231-236}}</td><td>True for CUDA, ROCm and XPU.</td></tr>
+    <tr><td><code>is_cumem_allocator_available</code></td><td>method</td><td>{{cite vllm/platforms/interface.py:238-244}}</td><td>True when <code>vllm.device_allocator.cumem</code> imports and reports it is available.</td></tr>
+    <tr><td><code>get_pass_manager_cls</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:247-251}}</td><td>Picker: dotted name of the post-grad pass manager.</td></tr>
+    <tr><td><code>get_compile_backend</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:254-256}}</td><td>Picker: the compile backend for simple functions; default <code>simple_compile_backend</code>.</td></tr>
+    <tr><td><code>import_ir_kernels</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:259-264}}</td><td>Kernel hook: imports <code>vllm.kernels</code> (IR op implementations).</td></tr>
+    <tr><td><code>device_control_id_to_physical_device_id</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:267-275}}</td><td>Turns one entry of the device-control variable into an int; non-integers raise <code>ValueError</code>.</td></tr>
+    <tr><td><code>device_id_to_physical_device_id</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:288-315}}</td><td>Logical (local rank) id to physical id, through assigned ids or the device-control variable.</td></tr>
+    <tr><td><code>logical_device_id_to_visible_device_id</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:318-341}}</td><td>Logical id to the ordinal that <code>torch.device</code> uses in this process.</td></tr>
+    <tr><td><code>visible_device_id_to_physical_device_id</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:344-363}}</td><td>Visible ordinal back to a physical id.</td></tr>
+    <tr><td><code>import_kernels</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:366-373}}</td><td>Kernel hook: imports <code>vllm._C</code> and the optional MoE library.</td></tr>
+    <tr><td><code>register_triton_kernel_overrides</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:376-386}}</td><td>Kernel hook: replaces core Triton kernels; default does nothing.</td></tr>
+    <tr><td><code>get_attn_backend_cls</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:389-396}}</td><td>Picker: dotted name of the attention backend; default <code>""</code>.</td></tr>
+    <tr><td><code>get_supported_vit_attn_backends</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:399-402}}</td><td>Vision-encoder attention backends that the platform allows; default <code>[TORCH_SDPA]</code>.</td></tr>
+    <tr><td><code>get_vit_attn_backend</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:405-432}}</td><td>Picks the vision-encoder attention backend; default <code>TORCH_SDPA</code>.</td></tr>
+    <tr><td><code>get_mla_prefill_backend_cls</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:435-514}}</td><td>Picks the MLA prefill backend class from a capability-based priority list.</td></tr>
+    <tr><td><code>get_device_capability</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:517-528}}</td><td><code>(major, minor)</code> without a CUDA context; default <code>None</code>.</td></tr>
+    <tr><td><code>has_device_capability</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:531-551}}</td><td>True when the capability is at least the given one; <code>False</code> when unknown.</td></tr>
+    <tr><td><code>is_device_capability</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:554-574}}</td><td>True when the capability is exactly the given one.</td></tr>
+    <tr><td><code>is_device_capability_family</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:577-588}}</td><td>True when the major version matches (for example any 10.x).</td></tr>
+    <tr><td><code>get_device_name</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:591-593}}</td><td>Device name; base raises <code>NotImplementedError</code>.</td></tr>
+    <tr><td><code>get_device_uuid</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:596-598}}</td><td>Device UUID; base raises <code>NotImplementedError</code>.</td></tr>
+    <tr><td><code>get_device_total_memory</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:601-603}}</td><td>Total device memory in bytes; base raises <code>NotImplementedError</code>.</td></tr>
+    <tr><td><code>get_all_gpu_pci_bus_ids</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:606-616}}</td><td>Device index to PCI bus id, for <code>VLLM_GPU_NIC_PCIE_MAPPING</code>; base raises.</td></tr>
+    <tr><td><code>inference_mode</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:619-626}}</td><td>Context manager; default <code>torch.inference_mode(True)</code>.</td></tr>
+    <tr><td><code>set_device</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:629-631}}</td><td>Sets the current device; base raises <code>NotImplementedError</code>.</td></tr>
+    <tr><td><code>manual_seed_all</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:634-636}}</td><td>Seeds all devices; base raises <code>NotImplementedError</code>.</td></tr>
+    <tr><td><code>pre_register_and_update</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:639-651}}</td><td>Config hook: before the flags are parsed (and again in <code>create_engine_config</code>).</td></tr>
+    <tr><td><code>apply_config_platform_defaults</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:654-664}}</td><td>Config hook: platform defaults in <code>VllmConfig.__post_init__</code>.</td></tr>
+    <tr><td><code>check_and_update_config</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:667-676}}</td><td>Config hook: check or change <code>VllmConfig</code>; sets <code>worker_cls</code>.</td></tr>
+    <tr><td><code>update_block_size_for_backend</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:750-794}}</td><td>Config hook after model load: a block size that all attention backends accept.</td></tr>
+    <tr><td><code>register_custom_kv_cache_specs</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1137-1139}}</td><td>Registers platform KV cache spec classes; default nothing.</td></tr>
+    <tr><td><code>verify_model_arch</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1142-1150}}</td><td>Raises or warns for an unsupported architecture; default accepts all.</td></tr>
+    <tr><td><code>verify_quantization</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1153-1158}}</td><td>Raises <code>ValueError</code> if <code>supported_quantization</code> is set and lacks the method.</td></tr>
+    <tr><td><code>get_cpu_architecture</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1161-1178}}</td><td><code>CpuArchEnum</code> from <code>platform.machine()</code>.</td></tr>
+    <tr><td><code>is_pin_memory_available</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1181-1194}}</td><td>True, except under WSL (warning, <code>False</code>).</td></tr>
+    <tr><td><code>get_current_memory_usage</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1197-1201}}</td><td>Memory in use in bytes; base raises <code>NotImplementedError</code>.</td></tr>
+    <tr><td><code>get_punica_wrapper</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1204-1206}}</td><td>Picker: LoRA kernel wrapper class; base raises <code>NotImplementedError</code>.</td></tr>
+    <tr><td><code>get_infinity_values</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1209-1211}}</td><td>The values that stand for minus and plus infinity for a dtype.</td></tr>
+    <tr><td><code>can_update_inplace</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1214-1216}}</td><td>Whether in-place memory updates are allowed; default <code>True</code>.</td></tr>
+    <tr><td><code>get_device_communicator_cls</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1219-1221}}</td><td>Picker: device communicator class; default <code>DeviceCommunicatorBase</code>.</td></tr>
+    <tr><td><code>is_integrated_gpu</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1224-1232}}</td><td>Whether the GPU shares system memory (UMA); default <code>False</code>.</td></tr>
+    <tr><td><code>enable_multi_stream_overlap</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1235-1242}}</td><td>Whether to overlap auxiliary streams; default <code>False</code>.</td></tr>
+    <tr><td><code>supports_mx</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1245-1247}}</td><td>MX formats supported; default <code>False</code>.</td></tr>
+    <tr><td><code>supports_fp8</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1250-1252}}</td><td>FP8 supported; default <code>False</code>.</td></tr>
+    <tr><td><code>is_fp8_fnuz</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1255-1265}}</td><td>Whether the preferred FP8 type is FNUZ; default <code>False</code>.</td></tr>
+    <tr><td><code>fp8_dtype</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1268-1273}}</td><td>Preferred FP8 dtype; default <code>torch.float8_e4m3fn</code>.</td></tr>
+    <tr><td><code>use_all_gather</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1276-1278}}</td><td>Whether the logits processor gathers logits with all-gather; default <code>True</code>.</td></tr>
+    <tr><td><code>use_custom_allreduce</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1281-1283}}</td><td>Whether vLLM's custom all-reduce is supported; default <code>False</code>.</td></tr>
+    <tr><td><code>opaque_attention_op</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1286-1290}}</td><td>Whether attention is one opaque custom op for <code>torch.compile</code>; default <code>False</code>.</td></tr>
+    <tr><td><code>validate_request</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1293-1298}}</td><td>Raises for a request that the platform cannot serve; default accepts all.</td></tr>
+    <tr><td><code>__getattr__</code></td><td>method</td><td>{{cite vllm/platforms/interface.py:1300-1319}}</td><td>Fallback: an unknown name is looked up in <code>torch.&lt;device_type&gt;</code>; else warning and <code>None</code>.</td></tr>
+    <tr><td><code>get_global_graph_pool</code></td><td>method</td><td>{{cite vllm/platforms/interface.py:1321-1326}}</td><td>One graph memory pool per platform class, made on first use.</td></tr>
+    <tr><td><code>get_static_graph_wrapper_cls</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1329-1331}}</td><td>Picker: the static graph (CUDA graph) wrapper class.</td></tr>
+    <tr><td><code>stateless_init_device_torch_dist_pg</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1334-1343}}</td><td>Makes a device process group without global state; base raises.</td></tr>
+    <tr><td><code>check_if_supports_dtype</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1346-1348}}</td><td>Raises for an unsupported dtype; base raises <code>NotImplementedError</code>.</td></tr>
+    <tr><td><code>support_hybrid_kv_cache</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1351-1353}}</td><td>Hybrid KV cache supported; default <code>False</code>.</td></tr>
+    <tr><td><code>support_static_graph_mode</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1356-1358}}</td><td>Graph mode supported; default <code>False</code>.</td></tr>
+    <tr><td><code>check_runner_kv_caches_multi_layer</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1361-1374}}</td><td>Raises unless the runner handles two attention layers with one layer index.</td></tr>
+    <tr><td><code>support_deep_gemm</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1377-1379}}</td><td>DeepGEMM supported; default <code>False</code>.</td></tr>
+    <tr><td><code>use_custom_op_collectives</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1382-1387}}</td><td>Use <code>torch.ops.vllm.*</code> collectives; default <code>False</code>.</td></tr>
+    <tr><td><code>use_sync_weight_loader</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1390-1392}}</td><td>Whether the weight loader must synchronize; default <code>False</code>.</td></tr>
+    <tr><td><code>make_synced_weight_loader</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1395-1406}}</td><td>Wraps a weight loader with <code>torch._sync</code> when the line above is true.</td></tr>
+    <tr><td><code>get_nixl_supported_devices</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1409-1413}}</td><td>NIXL buffer devices per device type; default <code>{}</code>.</td></tr>
+    <tr><td><code>get_nixl_memory_type</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1416-1418}}</td><td>NIXL memory type; default <code>None</code>.</td></tr>
+    <tr><td><code>check_max_model_len</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1421-1423}}</td><td>May lower <code>max_model_len</code>; default returns it unchanged.</td></tr>
+    <tr><td><code>set_additional_forward_context</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1426-1428}}</td><td>Extra forward-context fields; default <code>{}</code>.</td></tr>
+    <tr><td><code>num_compute_units</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1431-1437}}</td><td>Number of SMs, CUs or EUs; base raises <code>NotImplementedError</code>.</td></tr>
+    <tr><td><code>get_default_ir_op_priority</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1440-1447}}</td><td>Default IR op provider priority; default <code>["native"]</code>.</td></tr>
+    <tr><td><code>is_arch_support_pdl</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1450-1452}}</td><td>Programmatic Dependent Launch supported; default <code>False</code>.</td></tr>
+    <tr><td><code>validate_environ</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1455-1468}}</td><td>Warns (or raises) for unknown <code>VLLM_*</code> variables.</td></tr>
+    <tr><td><code>get_kv_cache_config_builder_cls</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:1471-1490}}</td><td>Picker: KV cache config builder class (experimental).</td></tr>
+  </tbody>
+</table>
+<p>Class attributes (not in the table): <code>_enum</code>, <code>device_name</code>, <code>device_type</code>, <code>dispatch_key</code>, <code>ray_device_key</code>, <code>device_control_env_var</code>, <code>ray_noset_device_env_vars</code>, <code>simple_compile_backend</code>, <code>dist_backend</code>, <code>supported_quantization</code>, <code>additional_env_vars</code> and <code>_global_graph_pool</code> ({{cite vllm/platforms/interface.py:138-181}}).</p>
+
+<h2>Walk through the main methods</h2>
+
+<h3>The three config hooks</h3>
+<x-code file="vllm/platforms/interface.py" lines="638-676" highlight="644-646,656-660,669-674" />
+<ol>
+  <li><strong>Lines 639-651.</strong> <code>pre_register_and_update</code> gets the CLI parser, or <code>None</code>. The docstring names the use case: an out-of-tree quantization config. It is called twice by <code>vllm serve</code> ({{cite vllm/engine/arg_utils.py:3257}}, {{cite vllm/engine/arg_utils.py:2246}}).</li>
+  <li><strong>Lines 654-664.</strong> <code>apply_config_platform_defaults</code> runs "after parsing cli arguments" and can change defaults, for example <code>custom_ops</code>.</li>
+  <li><strong>Lines 667-676.</strong> <code>check_and_update_config</code> can raise or change the config "in place". All three return <code>None</code>; their effect is the change to the object.</li>
+</ol>
+
+<h3><code>update_block_size_for_backend</code>: one block size for all backends</h3>
+<x-code file="vllm/platforms/interface.py" lines="749-794" highlight="760-765,771-781,786-787,792-794" />
+<ol>
+  <li><strong>Lines 760-765.</strong> Return early with no model config, or with no attention backend except SSM ones. <code>_find_non_ssm_backends</code> reads the backend of each attention layer, so the model must be built first ({{cite vllm/platforms/interface.py:678-697}}).</li>
+  <li><strong>Lines 771-781.</strong> Phase 1, only when the user did not set <code>--block-size</code>: pick a size that every backend accepts, with the default 16 (<code>CacheConfig.DEFAULT_BLOCK_SIZE</code>) as the start value (next section). Log at INFO when the result is not the default.</li>
+  <li><strong>Lines 785-787.</strong> Phase 2, hybrid models (attention + Mamba): align the block and Mamba page sizes. The comment says that this may override the user's setting.</li>
+  <li><strong>Lines 792-794.</strong> Phase 3, KV cache dtype skip layers: align pages of mixed dtypes. Then check that the aligned size is still valid for every backend ({{cite vllm/platforms/interface.py:796-823}}).</li>
+</ol>
+
+<h3><code>_preferred_block_size_for_backends</code>: the common size</h3>
+<x-code file="vllm/platforms/interface.py" lines="716-747" highlight="721-722,723-724,726-736,737-739,740" />
+<ol>
+  <li><strong>Lines 721-722.</strong> One backend: ask it for its preferred size.</li>
+  <li><strong>Lines 723-724.</strong> All backends accept the default: use it.</li>
+  <li><strong>Lines 726-736.</strong> Take one supported size per backend (the base of a <code>MultipleOf</code>, or a fixed size; no sizes means 1). Every combination gives one candidate, the least common multiple. Sort the candidates.</li>
+  <li><strong>Lines 737-739.</strong> Return the first candidate that every backend accepts.</li>
+  <li><strong>Line 740.</strong> None fits: <code>ValueError</code> with each backend's sizes.</li>
+</ol>
+
+<h3>Device ids: logical to physical</h3>
+<x-code file="vllm/platforms/interface.py" lines="287-315" highlight="296-303,307-313,314-315" />
+<ol>
+  <li><strong>Lines 296-303.</strong> If the worker set assigned GPU ids, the logical id (a local rank) indexes that list. An id past its end raises <code>IndexError</code>.</li>
+  <li><strong>Lines 307-313.</strong> Else, if the device-control variable is set and not empty, the logical id indexes its comma list. Example: <code>CUDA_VISIBLE_DEVICES=4,5</code> and local rank 1 give physical device 5.</li>
+  <li><strong>Lines 314-315.</strong> Else the ids are the same.</li>
+</ol>
+<p>The comment above the method names three id spaces: logical, visible and physical ({{cite vllm/platforms/interface.py:277-285}}). <code>torch.device("cuda:N")</code> needs a visible id; NVML needs a physical id.</p>
+
+<h3>Kernel hooks</h3>
+<x-code file="vllm/platforms/interface.py" lines="365-386" highlight="368-371,372-373,386" />
+<ol>
+  <li><strong>Lines 368-371.</strong> A failed import of <code>vllm._C</code> logs a warning once and does not raise.</li>
+  <li><strong>Lines 372-373.</strong> The MoE library is optional: its import error is ignored.</li>
+  <li><strong>Line 386.</strong> <code>register_triton_kernel_overrides</code> does nothing by default. The docstring says that it runs "during model runner init, before any kernel launch"; the caller is <code>init_worker</code> ({{cite vllm/v1/worker/worker_base.py:286-290}}).</li>
+</ol>
+
+<h3><code>get_mla_prefill_backend_cls</code>: a default with a priority list</h3>
+<x-code file="vllm/platforms/interface.py" lines="458-496" highlight="459-460,462-473,481-482,486-495" />
+<ol>
+  <li><strong>Lines 459-460.</strong> No device capability (the base class): FlashAttention.</li>
+  <li><strong>Lines 462-480.</strong> Blackwell (major 10): TRT-LLM ragged first for one head layout (192 + 64 / 256), else FlashAttention first.</li>
+  <li><strong>Lines 481-482.</strong> Hopper and older: FlashAttention only.</li>
+  <li><strong>Lines 486-495.</strong> Return the first backend that imports and accepts the config. If none does, the method raises <code>ValueError</code> with all reasons ({{cite vllm/platforms/interface.py:498-514}}).</li>
+</ol>
+<p>This is one of few pickers with real logic in the base class. A platform with one MLA prefill backend can override it and return that class.</p>
+
+<h3><code>__getattr__</code>: the fallback to torch</h3>
+<x-code file="vllm/platforms/interface.py" lines="1300-1326" highlight="1303-1304,1306-1312,1314-1319,1324-1325" />
+<ol>
+  <li><strong>Lines 1303-1304.</strong> Dunder names raise at once, so pickle does not get <code>None</code> for <code>__getstate__</code>.</li>
+  <li><strong>Lines 1306-1312.</strong> Look up the name in <code>torch.&lt;device_type&gt;</code>; return it when it is not <code>None</code>.</li>
+  <li><strong>Lines 1314-1319.</strong> Else warn once and return <code>None</code>.</li>
+  <li><strong>Lines 1324-1325.</strong> <code>get_global_graph_pool</code> uses the fallback: <code>graph_pool_handle</code> is not a <code>Platform</code> method, so on CUDA it is <code>torch.cuda.graph_pool_handle</code>. The pool is stored on the class, so all objects of one platform class share it.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types in and out">
+<table>
+  <thead><tr><th>Value</th><th>Type</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>picker results</td><td><code>str</code>, a dotted class path; the caller imports it with <code>resolve_obj_by_qualname</code></td><td>for example {{cite vllm/v1/attention/selector.py:218-227}}</td></tr>
+    <tr><td><code>DeviceCapability</code></td><td><code>NamedTuple(major: int, minor: int)</code>; <code>to_int()</code> asserts <code>minor &lt; 10</code></td><td>{{cite vllm/platforms/interface.py:93-134}}</td></tr>
+    <tr><td><code>has_device_capability(90)</code></td><td><code>bool</code>; an int argument is compared with <code>to_int()</code>, a tuple with tuple order</td><td>{{cite vllm/platforms/interface.py:544-551}}</td></tr>
+    <tr><td><code>supported_dtypes</code></td><td><code>list[torch.dtype]</code>, default <code>[bfloat16, float16, float32]</code></td><td>{{cite vllm/platforms/interface.py:188-194}}</td></tr>
+    <tr><td><code>get_infinity_values(dtype)</code></td><td><code>tuple[float, float]</code>, default <code>(-inf, inf)</code></td><td>{{cite vllm/platforms/interface.py:1208-1211}}</td></tr>
+    <tr><td><code>fp8_dtype()</code></td><td><code>torch.dtype</code>, default <code>torch.float8_e4m3fn</code></td><td>{{cite vllm/platforms/interface.py:1267-1273}}</td></tr>
+    <tr><td><code>get_default_ir_op_priority</code></td><td><code>IrOpPriorityConfig</code>, default <code>with_default(["native"])</code></td><td>{{cite vllm/platforms/interface.py:1439-1447}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="A worked example: block size with two backends">
+<p>Two made-up attention backends are in one model. Backend A declares <code>MultipleOf(16)</code>. Backend B declares the fixed sizes <code>[64, 128]</code>. The user did not set <code>--block-size</code>, so the default is 16.</p>
+<ol>
+  <li>Two backends, so the single-backend shortcut (line 721) does not apply.</li>
+  <li>B does not accept 16, so line 723 fails.</li>
+  <li>Per-backend sizes: A gives <code>[16]</code> (the base of <code>MultipleOf</code>), B gives <code>[64, 128]</code> (lines 726-733).</li>
+  <li>Candidates: lcm(16, 64) = 64 and lcm(16, 128) = 128, sorted <code>[64, 128]</code> (lines 734-736).</li>
+  <li>64 is a multiple of 16 and is in B's list, so both accept it. The result is 64 (lines 737-739), and line 776 logs "Setting kv cache block size to 64".</li>
+</ol>
+<p>(The acceptance test is each backend's <code>supports_block_size</code>; this example assumes that it accepts the multiples and the listed sizes. The real rules of each backend are on {{link concepts/attention-backend-selection}}.)</p>
+</x-deepdive>
+
+<x-deepdive title="Processes and threads">
+<p>The class has no lock and almost no state. The state that exists:</p>
+<ul>
+  <li><code>_assigned_physical_gpu_ids</code>: a module global, set once per worker process; a second call with other ids raises <code>RuntimeError</code> ({{cite vllm/platforms/interface.py:50-58}}). The docstring expects a single thread ({{cite vllm/platforms/interface.py:49}}).</li>
+  <li><code>_global_graph_pool</code>: a class attribute, so one pool per platform class and process ({{cite vllm/platforms/interface.py:1321-1326}}).</li>
+  <li><code>supported_quantization</code>: a class-level list. <code>register_quantization_config</code> appends to it when it is not empty ({{cite vllm/model_executor/layers/quantization/__init__.py:98-100}}). The base list is one object shared by every subclass that does not set its own. (Derived.)</li>
+</ul>
+<p>Which process calls which method is in the hook table of {{link concepts/platform-interface}}: config hooks in the front end, pickers in the workers and the engine core.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>A required device method is not overridden (<code>get_device_name</code>, <code>set_device</code>, <code>get_punica_wrapper</code>, ...)</td><td><code>NotImplementedError</code></td><td>for example {{cite vllm/platforms/interface.py:590-593}}</td></tr>
+    <tr><td>An unknown attribute</td><td>WARNING once, returns <code>None</code></td><td>{{cite vllm/platforms/interface.py:1314-1319}}</td></tr>
+    <tr><td>A non-integer device id in the device-control variable</td><td><code>ValueError</code></td><td>{{cite vllm/platforms/interface.py:269-275}}</td></tr>
+    <tr><td>A logical id that is not visible</td><td><code>RuntimeError</code></td><td>{{cite vllm/platforms/interface.py:335-340}}</td></tr>
+    <tr><td>No common block size</td><td><code>ValueError</code></td><td>{{cite vllm/platforms/interface.py:740-747}}</td></tr>
+    <tr><td>An aligned block size that a backend rejects</td><td><code>ValueError</code></td><td>{{cite vllm/platforms/interface.py:819-823}}</td></tr>
+    <tr><td>No valid MLA prefill backend</td><td><code>ValueError</code></td><td>{{cite vllm/platforms/interface.py:511-514}}</td></tr>
+    <tr><td>Quantization not in a non-empty <code>supported_quantization</code></td><td><code>ValueError</code></td><td>{{cite vllm/platforms/interface.py:1155-1158}}</td></tr>
+    <tr><td>An unknown <code>VLLM_*</code> variable</td><td>WARNING; <code>ValueError</code> with <code>hard_fail</code></td><td>{{cite vllm/platforms/interface.py:1459-1468}}</td></tr>
+    <tr><td>Two layers share a layer index</td><td><code>NotImplementedError</code> unless the platform overrides the check</td><td>{{cite vllm/platforms/interface.py:1371-1374}}</td></tr>
+    <tr><td>WSL detected</td><td>WARNING; pinned memory off</td><td>{{cite vllm/platforms/interface.py:1183-1193}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td>the platform's <code>device_control_env_var</code> (for CUDA <code>CUDA_VISIBLE_DEVICES</code>, {{cite vllm/platforms/cuda.py:233}})</td><td>{{cite vllm/platforms/interface.py:307-311}}, {{cite vllm/platforms/interface.py:327}}, {{cite vllm/platforms/interface.py:352}}</td><td>Maps logical and visible ids to physical ids. An empty value counts as not set.</td></tr>
+    <tr><td>every <code>VLLM_*</code> name</td><td>{{cite vllm/platforms/interface.py:1459-1460}}</td><td>Checked against <code>envs.environment_variables</code> by <code>validate_environ</code>.</td></tr>
+  </tbody>
+</table>
+<p>The file reads no <code>VLLM_*</code> setting itself. The variables that choose the platform are read in <code>__init__.py</code> ({{link code/platforms-init}}).</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/platform-interface}}: the hooks in start-up order, and <code>CudaPlatform</code> as the reference.</li>
+  <li>{{link concepts/platform-plugins}}: how a process chooses its platform class.</li>
+  <li>{{link concepts/attention-backend-selection}}: what happens with the name that <code>get_attn_backend_cls</code> returns.</li>
+  <li>{{link concepts/custom-ops}}: how <code>is_out_of_tree()</code> selects <code>forward_oot</code>.</li>
+  <li>{{link code/platforms-init}}: the detection and <code>current_platform</code>.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which three class attributes have no default, and why must a subclass set them?
+    <x-a><p><code>_enum</code>, <code>device_name</code> and <code>device_type</code> are only annotated ({{cite vllm/platforms/interface.py:138-140}}). The <code>is_*</code> checks read <code>_enum</code> ({{cite vllm/platforms/interface.py:196-222}}), and the fallback <code>__getattr__</code> reads <code>device_type</code> ({{cite vllm/platforms/interface.py:1306}}).</p></x-a>
+  </x-q>
+  <x-q level="medium"><code>CUDA_VISIBLE_DEVICES=2,3</code> is set and no assigned ids exist. What does <code>device_id_to_physical_device_id(1)</code> return?
+    <x-a><p>3. The method splits the variable at commas and takes index 1, then converts <code>"3"</code> to an int ({{cite vllm/platforms/interface.py:307-313}}, {{cite vllm/platforms/interface.py:267-270}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A platform does not define <code>Stream</code>, and its <code>device_type</code> is <code>"privateuseone"</code>. What does <code>current_platform.Stream</code> give, if <code>torch.privateuseone</code> does not exist?
+    <x-a><p><code>None</code>, with a one-time warning "Current platform privateuseone does not have 'Stream' attribute". <code>getattr(torch, "privateuseone", None)</code> is <code>None</code>, so the method skips the lookup and returns <code>None</code> ({{cite vllm/platforms/interface.py:1306-1319}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A model has two attention backends: one declares <code>MultipleOf(16)</code>, the other the fixed sizes <code>[64, 128]</code>. The user does not set <code>--block-size</code>. Which block size does vLLM pick, and in which process is it computed with TP = 2?
+    <x-a><p>64: the smallest least common multiple that both accept (the worked example in the deep dive; {{cite vllm/platforms/interface.py:726-739}}). Each of the 2 worker processes computes it after <code>load_model</code> ({{cite vllm/v1/executor/multiproc_executor.py:701-702}}).</p></x-a>
+  </x-q>
+</x-quiz>

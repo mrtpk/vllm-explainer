@@ -1,0 +1,167 @@
+---
+title: Platform plugins and current_platform
+nav_title: Platform plugins
+level: Intermediate
+prerequisites: concepts/plugin-loading, learn/python-entry-points
+related: concepts/platform-interface, concepts/plugin-loading, concepts/plugin-map, concepts/custom-ops, code/platforms-init, code/platforms-interface, tours/life-of-a-plugin
+summary: Each vLLM process makes one Platform object, current_platform, the first time code reads it. Five built-in detectors and the out-of-tree detectors from vllm.platform_plugins decide its class; one out-of-tree platform wins over the built-in ones.
+---
+<x-sentence>Each vLLM process makes one Platform object on first use. Built-in and out-of-tree detectors decide its class, and an out-of-tree platform wins.</x-sentence>
+
+<h2>The idea</h2>
+<p>vLLM runs on NVIDIA and AMD GPUs, on CPUs, on Intel XPUs and on other hardware. Much of its code must ask: which device do I run on, which attention backend can I use, which communicator do I use for collectives? vLLM puts all these answers into one object, the {{term platform}}. Code reads it as <code>current_platform</code>. Its class is a subclass of <code>Platform</code>, for example <code>CudaPlatform</code>.</p>
+<p>vLLM must choose the class before it can use it. A {{term platform-detector}} is a small function that checks for one kind of hardware. It returns the dotted name of a <code>Platform</code> subclass when the hardware is there, and <code>None</code> when it is not. vLLM has five built-in detectors. A hardware vendor adds a sixth one as a {{term plugin}} in the group <code>vllm.platform_plugins</code>. When exactly one {{term out-of-tree}} detector answers, it wins over the built-in ones.</p>
+<p>The choice happens late, on the first read of <code>current_platform</code>, not when Python imports <code>vllm.platforms</code>. The reason: an out-of-tree platform must import the <code>Platform</code> base class from vLLM before vLLM chooses a platform. Each process of <code>vllm serve</code> makes this choice again, because each process has its own Python objects.</p>
+<p><strong>An everyday comparison.</strong> Think of a universal remote control. The first time that you press a button, it tests which television is in the room. Then it uses the codes for that television for as long as it runs. A vendor can add a code card for a new television, and a code card always wins over the built-in codes. The comparison stops here. If two code cards answer, vLLM stops with an error. And each process of vLLM is a separate remote control that tests the room again.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b4a_platform_detection" alt="Panel 1: three steps. Step 1, the lazy trigger: the module __getattr__ runs when code imports current_platform and _current_platform is None (lines 303-319). Step 2, the CPU short-circuit: if VLLM_TARGET_DEVICE is cpu, cpu_platform_plugin runs and no plugin group is loaded (lines 244-248). Step 3: load vllm.platform_plugins, filtered by VLLM_PLUGINS, and run every detector: tpu, cuda, rocm, xpu, cpu, then the out-of-tree ones; an exception gives a DEBUG log and the detector counts as not active (lines 250, 254-265). Panel 2: the decision. Two or more active out-of-tree detectors raise RuntimeError; exactly one is called again and wins with an INFO log (272-279). If there is none, two or more active built-in detectors raise RuntimeError; exactly one wins with a DEBUG log (280-289). If none is active, the class is UnspecifiedPlatform (290-292). Panel 3: three machines. A GPU host gives CudaPlatform. A GPU host with the made-up acme_hw plugin gives the acme_hw class. The same host with VLLM_TARGET_DEVICE=cpu gives CpuPlatform with no detector loop." caption="Figure: the first read of <code>current_platform</code> runs the detection once per process (panel 1). The out-of-tree count is checked first (panel 2). Three example machines (panel 3)." />
+<p>Read panel 1 from left to right: this is the code path of one process. Panel 2 is the decision after all detectors have run. Note the order: the code looks at the out-of-tree detectors first, so the built-in count does not matter when one out-of-tree detector is active.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: current_platform is made on first use</h3>
+<p><code>vllm/platforms/__init__.py</code> has no variable named <code>current_platform</code>. It has a module-level <code>__getattr__</code> function. Since Python 3.7 (PEP 562), Python calls such a function when code reads a name that the module does not have:</p>
+<x-code file="vllm/platforms/__init__.py" lines="296-326" highlight="303-304,317-321" caption="The comment (lines 306-315) gives the two reasons for the lazy load. Lines 317-321 run once per process: detect, import the class, make one object." />
+<ol>
+  <li><strong>Line 296.</strong> <code>_current_platform</code> starts as <code>None</code> in each process.</li>
+  <li><strong>Lines 299-300.</strong> The name exists only for type checkers. At run time it is not a module attribute, so the import <code>from vllm.platforms import current_platform</code> calls <code>__getattr__</code>.</li>
+  <li><strong>Line 318.</strong> The detection returns a dotted class name, for example <code>"vllm.platforms.cuda.CudaPlatform"</code>.</li>
+  <li><strong>Line 319.</strong> <code>resolve_obj_by_qualname</code> imports the module and gets the class ({{cite vllm/utils/import_utils.py:119-123}}). The <code>()</code> makes the one object.</li>
+  <li><strong>Lines 320-321.</strong> <code>_init_trace</code> keeps the stack of the first read. A test prints it when a platform resolves too early ({{cite tests/plugins_tests/test_platform_plugins.py:28-34}}).</li>
+</ol>
+<p>The comment gives the reason for the late choice. An out-of-tree platform needs <code>from vllm.platforms import Platform</code> to define its subclass. If the import of <code>vllm.platforms</code> chose the platform, the plugin could not load first. A test checks that <code>import vllm</code> alone does not resolve the platform ({{cite tests/plugins_tests/test_platform_plugins.py:37-48}}).</p>
+
+<h3>Step 2: resolve_current_platform_cls_qualname, part 1</h3>
+<p>The first part handles the CPU target and runs every detector:</p>
+<x-code file="vllm/platforms/__init__.py" lines="240-265" highlight="244-248,250,254,257-259,260-265" />
+<ol>
+  <li><strong>Lines 244-248.</strong> If <code>VLLM_TARGET_DEVICE</code> is <code>cpu</code>, the function returns the CPU class at once. It does not load the plugin group and does not run any other detector. The comment says why: CPU-only test jobs run on hosts with accelerators. The default value is <code>cuda</code> ({{cite vllm/envs.py:622}}).</li>
+  <li><strong>Line 250.</strong> <code>load_plugins_by_group</code> imports the detectors of <code>vllm.platform_plugins</code>. <code>VLLM_PLUGINS</code> filters them, as for the other groups ({{cite vllm/plugins/__init__.py:63-64}}).</li>
+  <li><strong>Line 254.</strong> The loop runs the five built-in detectors first, then the out-of-tree ones.</li>
+  <li><strong>Lines 257-259.</strong> A detector is <em>active</em> when it returns a name, not <code>None</code>.</li>
+  <li><strong>Lines 260-265.</strong> An exception in a detector is logged at DEBUG level, and the detector counts as not active.</li>
+</ol>
+
+<h3>Step 3: resolve_current_platform_cls_qualname, part 2</h3>
+<x-code file="vllm/platforms/__init__.py" lines="267-293" highlight="272-276,277-279,280-284,285-289,290-292" />
+<ol>
+  <li><strong>Lines 267-270.</strong> The active names are split into built-in and out-of-tree. The split uses sets, so the order of the names in the error text can vary.</li>
+  <li><strong>Lines 272-276.</strong> Two or more active out-of-tree detectors: <code>RuntimeError</code>.</li>
+  <li><strong>Lines 277-279.</strong> Exactly one: vLLM calls the detector again to get the name, and logs "Platform plugin ... is activated" at INFO level. The built-in detectors do not matter here.</li>
+  <li><strong>Lines 280-284.</strong> No out-of-tree detector and two or more built-in ones: <code>RuntimeError</code>.</li>
+  <li><strong>Lines 285-289.</strong> Exactly one built-in detector: it is called again, with a DEBUG log.</li>
+  <li><strong>Lines 290-292.</strong> No active detector: <code>UnspecifiedPlatform</code>, with a DEBUG log only.</li>
+</ol>
+<p>{{term unspecified-platform}} has <code>device_type = ""</code> ({{cite vllm/platforms/interface.py:1493-1495}}). Most methods of the base class raise <code>NotImplementedError</code> or return a default, so start-up fails later with a less clear error.</p>
+
+<h3>Step 4: the five built-in detectors</h3>
+<p>The dict <code>builtin_platform_plugins</code> maps a name to each detector ({{cite vllm/platforms/__init__.py:231-237}}). Each detector checks for its hardware without starting a device context:</p>
+<table>
+  <thead><tr><th>Name</th><th>It returns a class when</th><th>Class</th><th>Lines</th></tr></thead>
+  <tbody>
+    <tr><td><code>tpu</code></td><td><code>VLLM_TPU_USING_PATHWAYS</code> is true, or <code>import libtpu</code> works</td><td><code>tpu_inference.platforms.tpu_platform.TpuPlatform</code>, or <code>vllm.platforms.tpu.TpuPlatform</code></td><td>{{cite vllm/platforms/__init__.py:33-54}}</td></tr>
+    <tr><td><code>cuda</code></td><td>NVML counts at least one GPU and the vLLM version does not contain "cpu"; or the host is a Jetson</td><td><code>vllm.platforms.cuda.CudaPlatform</code></td><td>{{cite vllm/platforms/__init__.py:57-105}}</td></tr>
+    <tr><td><code>rocm</code></td><td><code>amdsmi</code> finds at least one GPU; under WSL also through PyTorch</td><td><code>vllm.platforms.rocm.RocmPlatform</code></td><td>{{cite vllm/platforms/__init__.py:108-140}}</td></tr>
+    <tr><td><code>xpu</code></td><td><code>torch.xpu.is_available()</code></td><td><code>vllm.platforms.xpu.XPUPlatform</code></td><td>{{cite vllm/platforms/__init__.py:143-162}}</td></tr>
+    <tr><td><code>cpu</code></td><td><code>VLLM_TARGET_DEVICE=cpu</code>, a vLLM version with "cpu", or macOS</td><td><code>ZenCpuPlatform</code> on AMD Zen with zentorch, else <code>CpuPlatform</code></td><td>{{cite vllm/platforms/__init__.py:174-228}}</td></tr>
+  </tbody>
+</table>
+<p>Even the built-in TPU platform lives in another package. <code>vllm/platforms/tpu.py</code> only imports <code>TpuPlatform</code> from <code>tpu_inference</code>, and logs an error if that package is missing ({{cite vllm/platforms/tpu.py:9-20}}).</p>
+
+<h3>Step 5: the platform comes before the general plugins</h3>
+<p>In every process of <code>vllm serve</code>, the platform resolves before the first general plugin runs. A module-level <code>from vllm.platforms import current_platform</code> in the import chain triggers <code>__getattr__</code> early, for example in <code>vllm/engine/arg_utils.py</code> ({{cite vllm/engine/arg_utils.py:122}}) and in <code>vllm/config/compilation.py</code> ({{cite vllm/config/compilation.py:22}}). The page {{link concepts/plugin-loading#deep-dive}} traces the chain for the front end, the engine core and the workers. So a general plugin cannot change which platform vLLM detects. A platform package that needs general setup publishes a second entry point (Step 6).</p>
+
+<h3>Step 6: what a platform plugin package looks like</h3>
+<p>vLLM's test platform is the smallest complete example. Its <code>setup.py</code> publishes two entry points:</p>
+<x-code file="tests/plugins/vllm_add_dummy_platform/setup.py" lines="6-18" highlight="11-13,14-16" caption="One detector in <code>vllm.platform_plugins</code>, and one function in <code>vllm.general_plugins</code> that registers custom ops in each process." />
+<p>The detector returns the dotted name of the class. This test detector always answers, because it runs only in a test environment:</p>
+<x-code file="tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/__init__.py" lines="5-13" highlight="9,12-13" />
+<p>The class sets the identity fields and overrides two hooks. <code>_enum = PlatformEnum.OOT</code> makes <code>is_out_of_tree()</code> true ({{cite vllm/platforms/interface.py:218-219}}):</p>
+<x-code file="tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_platform.py" lines="15-32" highlight="16-19,22-23,26-32" />
+<p>A real detector checks for its device and returns <code>None</code> when the device is missing. The design doc says the same ({{cite docs/design/plugin_system.md:50}}). The page {{link concepts/platform-interface}} explains which methods a real platform must override, for example <code>check_and_update_config</code>, which must set <code>worker_cls</code>.</p>
+
+<h3>Step 7: out-of-tree platforms named in the repository</h3>
+<ul>
+  <li><strong>tpu_inference.</strong> The TPU detector returns a class from the external <code>tpu_inference</code> package when <code>JAX_PLATFORMS</code> contains "proxy" (Pathways) ({{cite vllm/platforms/__init__.py:36-39}}, {{cite vllm/envs.py:1594-1596}}). Without Pathways, <code>vllm/platforms/tpu.py</code> re-exports the class of that package ({{cite vllm/platforms/tpu.py:9-14}}).</li>
+  <li><strong>Other hardware plugins.</strong> The docs list "Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more" as hardware plugins ({{cite docs/README.md:64}}). The code of these plugins is not in this repository, so this site does not describe them.</li>
+</ul>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The detection algorithm as numbered steps">
+<p>For one process, the first read of <code>current_platform</code> does this ({{cite vllm/platforms/__init__.py:240-322}}):</p>
+<ol>
+  <li>If <code>_current_platform</code> is not <code>None</code>, return it. Stop.</li>
+  <li>If <code>envs.VLLM_TARGET_DEVICE == "cpu"</code> (the value is lower-cased, {{cite vllm/envs.py:622}}), run <code>cpu_platform_plugin()</code>. It must return a name (an <code>assert</code>). Go to step 8.</li>
+  <li>Load <code>vllm.platform_plugins</code> through <code>load_plugins_by_group</code>: filter by <code>VLLM_PLUGINS</code>, import each object, log and skip an import error ({{cite vllm/plugins/__init__.py:36-74}}).</li>
+  <li>For each built-in name, then each plugin name: assert that the object is callable, and call it. Mark it active if the result is not <code>None</code>. Catch any exception, log it at DEBUG level and go on.</li>
+  <li>Count the active out-of-tree names. Two or more: raise <code>RuntimeError</code>. One: call it again and use the result.</li>
+  <li>Else count the active built-in names. Two or more: raise <code>RuntimeError</code>. One: call it again and use the result.</li>
+  <li>Else use <code>"vllm.platforms.interface.UnspecifiedPlatform"</code>.</li>
+  <li>Import the class from the dotted name, call it with no arguments, keep the object in <code>_current_platform</code>, and save the stack in <code>_init_trace</code>.</li>
+</ol>
+<p><strong>Worked example.</strong> A host has 8 NVIDIA GPUs and the packages <code>acme_hw</code> (a made-up platform plugin) and vLLM. <code>VLLM_PLUGINS</code> is not set. Step 4 calls six detectors: <code>tpu</code> (<code>None</code>, no libtpu), <code>cuda</code> (active, NVML counts 8), <code>rocm</code> (<code>None</code>), <code>xpu</code> (<code>None</code>), <code>cpu</code> (<code>None</code>), <code>acme_hw</code> (active). Step 5 finds one out-of-tree name, calls <code>acme_hw</code> a second time and logs "Platform plugin acme_hw is activated". The CUDA answer is ignored. With <code>VLLM_PLUGINS=acme_admin</code>, step 3 filters out <code>acme_hw</code>, and the process uses <code>CudaPlatform</code> with no warning.</p>
+</x-deepdive>
+
+<x-deepdive title="Edge cases: detectors run more than once, and can fail">
+<ul>
+  <li><strong>Every detector runs, even when an out-of-tree platform wins.</strong> The loop calls all of them before the decision (line 254). So the CUDA detector calls NVML on a host where your plugin wins. A detector must be cheap and must not start a device context.</li>
+  <li><strong>The winner runs twice.</strong> Line 278 (out-of-tree) or line 286 (built-in) calls the winning detector again, outside the <code>try</code> block. A detector must return the same answer each time, and an exception in the second call is not caught.</li>
+  <li><strong>Detectors can have side effects.</strong> The XPU detector sets <code>XPUPlatform.dist_backend = "xccl"</code> when XCCL is available, even when XPU is not the result ({{cite vllm/platforms/__init__.py:149-154}}).</li>
+  <li><strong>The CUDA detector raises some errors.</strong> It raises again any exception whose class name does not contain "nvml" ({{cite vllm/platforms/__init__.py:85-89}}). The loop catches it (line 260), so CUDA is then "not active" with only a DEBUG log. One such error: the vLLM package metadata is missing, so <code>vllm_version_matches_substr</code> raises <code>PackageNotFoundError</code> after a warning ({{cite vllm/platforms/__init__.py:18-30}}).</li>
+  <li><strong>Jetson.</strong> When NVML fails with an NVML error, the CUDA detector checks two Tegra files and still answers CUDA on a Jetson ({{cite vllm/platforms/__init__.py:91-101}}).</li>
+  <li><strong>Only <code>cpu</code> is a short-circuit.</strong> <code>VLLM_TARGET_DEVICE=rocm</code> does not skip detection: the function checks only for <code>"cpu"</code> (line 244).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="One object per process, and how to replace it">
+<p><code>_current_platform</code> is a module global, so each Python process has its own ({{cite vllm/platforms/__init__.py:296}}). With the <code>spawn</code> start method that <code>vllm serve</code> uses, each child runs the detection again ({{cite vllm/entrypoints/common/startup.py:147-149}}). A child inherits the environment variables of its parent, so it normally gets the same answer. (Derived.)</p>
+<p>The module also defines a function named <code>__setattr__</code> ({{cite vllm/platforms/__init__.py:329-336}}). Python does not call a module-level <code>__setattr__</code>: PEP 562 adds only <code>__getattr__</code> and <code>__dir__</code> for modules. So <code>vllm.platforms.current_platform = x</code> makes a normal module attribute. Later reads find that attribute and do not call <code>__getattr__</code>. <code>_current_platform</code> keeps the old object, and modules that imported the old object keep it. vLLM does such an assignment once: for <code>vllm bench</code>, when the platform is <code>UnspecifiedPlatform</code> ({{cite vllm/entrypoints/cli/main.py:80-83}}). (Derived from Python semantics; the code has no comment about it.)</p>
+<p>The methods of <code>Platform</code> are mostly class methods. An attribute that the class does not have goes to <code>Platform.__getattr__</code>, which forwards to <code>torch.&lt;device_type&gt;</code> ({{cite vllm/platforms/interface.py:1300-1319}}). The page {{link concepts/platform-interface}} explains this fallback.</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables and logs">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_TARGET_DEVICE</code></td><td><code>cuda</code> ({{cite vllm/envs.py:622}})</td><td>{{cite vllm/platforms/__init__.py:244}}, {{cite vllm/platforms/__init__.py:176}}</td><td><code>cpu</code>: CPU platform, no detection, no platform plugins.</td></tr>
+    <tr><td><code>VLLM_PLUGINS</code></td><td>not set (load all)</td><td>{{cite vllm/plugins/__init__.py:40}}</td><td>A list that does not name your platform plugin hides it.</td></tr>
+    <tr><td><code>VLLM_TPU_USING_PATHWAYS</code></td><td>true when <code>JAX_PLATFORMS</code> contains "proxy" ({{cite vllm/envs.py:1594-1596}})</td><td>{{cite vllm/platforms/__init__.py:37}}</td><td>The TPU detector answers with the <code>tpu_inference</code> class.</td></tr>
+    <tr><td><code>VLLM_LOGGING_LEVEL</code></td><td><code>INFO</code></td><td>{{cite vllm/envs.py:860}}</td><td>Set <code>DEBUG</code> to see each detector's result and the reason when a detector fails.</td></tr>
+  </tbody>
+</table>
+<p>At the default INFO level, the log shows "Platform plugin ... is activated" only for an out-of-tree winner (line 279). A built-in winner and <code>UnspecifiedPlatform</code> are logged at DEBUG level (lines 287-292).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="An allowlist can hide your platform">
+<p>If you set <code>VLLM_PLUGINS</code> and do not list your platform plugin, vLLM does not load it. It then uses a built-in platform or <code>UnspecifiedPlatform</code>, and it gives no warning ({{cite vllm/plugins/__init__.py:63-64}}, {{cite vllm/platforms/__init__.py:285-292}}).</p>
+</x-warning>
+<ul>
+  <li><strong>Two platform plugins are installed.</strong> If both detectors answer, start-up stops with "Only one platform plugin can be activated" ({{cite vllm/platforms/__init__.py:272-276}}). Uninstall one, or make its detector return <code>None</code>.</li>
+  <li><strong>Your detector raises.</strong> vLLM logs it only at DEBUG level and uses another platform ({{cite vllm/platforms/__init__.py:260-265}}). Run with <code>VLLM_LOGGING_LEVEL=DEBUG</code> to see the traceback.</li>
+  <li><strong>The platform resolves too early.</strong> If code reads <code>current_platform</code> during <code>import vllm</code>, the detection runs the platform plugins against a half-imported vLLM. A test checks this ({{cite tests/plugins_tests/test_platform_plugins.py:37-48}}). Another test prints <code>_init_trace</code> to find the first read ({{cite tests/plugins_tests/test_platform_plugins.py:28-34}}).</li>
+  <li><strong>No platform is found.</strong> <code>UnspecifiedPlatform</code> has an empty <code>device_type</code> ({{cite vllm/platforms/interface.py:1493-1495}}). The first device call then fails far from the cause.</li>
+  <li><strong>libtpu without tpu_inference.</strong> The TPU detector answers <code>vllm.platforms.tpu.TpuPlatform</code>, but that module defines the name only when <code>tpu_inference</code> imports ({{cite vllm/platforms/tpu.py:9-20}}). The import of the class then fails. (Derived.)</li>
+</ul>
+<p><strong>Why it matters.</strong> The platform decides the attention backend, the communicator, the worker class and many defaults. A wrong platform gives errors that look like model or kernel bugs. Check the platform first: look for the "activated" line, or log at DEBUG level.</p>
+
+<x-quiz>
+  <x-q level="easy">When does vLLM choose the platform of a process?
+    <x-a><p>On the first read of <code>vllm.platforms.current_platform</code> in that process. The module <code>__getattr__</code> runs the detection when <code>_current_platform</code> is still <code>None</code> ({{cite vllm/platforms/__init__.py:303-319}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Why is the choice lazy, and not made at <code>import vllm.platforms</code>?
+    <x-a><p>An out-of-tree platform plugin needs <code>from vllm.platforms import Platform</code> to define its class. The platform can only be chosen after the plugins load. The comment at {{cite vllm/platforms/__init__.py:306-315}} gives this reason.</p></x-a>
+  </x-q>
+  <x-q level="medium">A host has an NVIDIA GPU and two platform plugin packages. Both detectors return a class name. What happens?
+    <x-a><p>Start-up stops with <code>RuntimeError</code>: two or more active out-of-tree detectors are not allowed ({{cite vllm/platforms/__init__.py:272-276}}). The active CUDA detector does not change this, because the out-of-tree count is checked first.</p></x-a>
+  </x-q>
+  <x-q level="medium">You set <code>VLLM_TARGET_DEVICE=cpu</code> on a GPU host that has your platform plugin. Is your detector called?
+    <x-a><p>No. The function returns the CPU class before it loads <code>vllm.platform_plugins</code> ({{cite vllm/platforms/__init__.py:244-250}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Your detector opens a device handle each time that it runs, and it is the only active out-of-tree detector. With <code>vllm serve</code> and TP = 2, how many times does it run? Ignore the model registry subprocess.
+    <x-a><p>Eight times. In each process it runs twice: once in the loop (line 257) and once more to get the name (line 278) ({{cite vllm/platforms/__init__.py:254-279}}). Four processes detect: the front end, the engine core and the 2 workers. Each is a spawned process with its own <code>_current_platform</code> ({{cite vllm/entrypoints/common/startup.py:147-149}}). So 2 × 4 = 8 calls. (Derived from the lines above.)</p></x-a>
+  </x-q>
+</x-quiz>

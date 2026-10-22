@@ -1,0 +1,214 @@
+---
+title: All the ways to extend vLLM
+nav_title: Plugin map
+level: Intermediate
+prerequisites: concepts/plugin-loading, learn/python-entry-points
+related: concepts/plugin-loading, concepts/platform-plugins, concepts/platform-interface, concepts/oot-models, concepts/custom-ops, concepts/attention-backend-selection, concepts/quantization-plugins, concepts/kv-connectors, concepts/frontend-plugins, concepts/engine-hooks, tours/life-of-a-plugin, tours/build-a-toy-plugin, reference/extension-points
+summary: vLLM has about twenty extension points of three kinds - six entry-point groups, a dozen registries that a general plugin fills, and config fields that name your class. This page maps each one to its process and its page.
+scripts: viz/plugin_timeline.js
+---
+<x-sentence>vLLM has three kinds of extension points: entry-point groups that vLLM reads, registries that your plugin fills, and config fields that name your class.</x-sentence>
+
+<h2>The idea</h2>
+<p>An {{term extension-point}} is a place where code from outside the vLLM repository can change what vLLM does. Such code is {{term out-of-tree}} (OOT). vLLM has about twenty extension points. They come in three kinds, and each kind reaches your code in a different way.</p>
+<ol>
+  <li><strong>Entry-point groups.</strong> Your package publishes an {{term entry-point}} under a {{term plugin-group}}, for example <code>vllm.platform_plugins</code>. vLLM finds it with no help from you. There are six groups. The page {{link concepts/plugin-loading}} explains how and when each process loads them.</li>
+  <li><strong>Registries.</strong> vLLM keeps tables of models, layers, attention backends, quantization methods, connectors and more. A function such as <code>ModelRegistry.register_model</code> adds your class to one table. You call these functions from a {{term general-plugin}}, so that the call runs in every process.</li>
+  <li><strong>Config hooks.</strong> A config field or a CLI flag names your class or your module, for example <code>--scheduler-cls my_pkg.MyScheduler</code>. vLLM imports the name when it needs the class. No entry point is necessary.</li>
+</ol>
+<p>The three kinds work together. A typical plugin package publishes one general plugin. Its function calls several register functions. A {{term platform}} plugin also sets config fields, for example <code>worker_cls</code>, in its <code>check_and_update_config</code> hook.</p>
+<p><strong>An everyday comparison.</strong> Think of a large office building. The entry-point groups are the front desk: it has a list of named visitors, and it calls each one at a fixed time. The registries are the notice boards on each floor: a visitor pins a card there, and the staff on that floor read it. The config hooks are an order form: you write the name of a contractor, and the building calls that contractor. The comparison stops here. In vLLM each process is its own building with its own notice boards. A card that you pin in the API server is not visible in a worker.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b4a_plugin_map" alt="Three columns, one per process of vllm serve. API server column: the entry-point groups general, platform, stat logger, endpoint, IO processor and logits processors (check), then the registries ModelRegistry (inspect), custom quantization config, LoRAResolverRegistry and the KV connector factory (class check), then the tool and reasoning parser plugin flags. Engine core column: general and platform plugins, scheduler_cls, the KV and EC connector factories in the scheduler role, and the reasoning parser plugin. Worker column: general and platform plugins, worker_cls and worker_extension_cls, logits processors, ModelRegistry (resolve), CustomOp and PluggableLayer replacements, register_backend, register_model_loader, the KV connector in the worker role, and SleepModeBackendFactory. Each item shows the file and line that reads it. A callout says that one general plugin runs once in each process and fills the registries of that process." caption="Figure: each extension point in the process that reads it. Green items are entry-point groups, blue items are registries, violet items are config fields or flags." />
+<p>Read the diagram column by column. Each item names the line that <em>reads</em> the extension point, so it shows where your code must be visible. Green and violet items need no extra work in that process. A blue item works only if a general plugin (or your platform) has filled the registry in that same process.</p>
+<p>The interactive timeline below shows the order of the start-up. Choose the settings, and read which plugin groups and Platform hooks run in each process.</p>
+<x-viz id="plugin-timeline" title="Start-up timeline: plugins and Platform hooks per process" caption="Press a button to change a setting (Tab, then Enter or Space). The numbers give the start-up order across the three processes. Crossed-out items do not run. acme_hw, acme_admin and acme_metrics are made-up packages." />
+<x-simplified>
+<p>The timeline is a simplified model. It shows one API server, no data parallelism, no Ray and no model registry subprocess. The machine has NVIDIA GPUs. It uses these rules from the code:</p>
+<ol>
+  <li><strong>R1.</strong> Each process resolves <code>current_platform</code> on its first use ({{cite vllm/platforms/__init__.py:303-319}}).</li>
+  <li><strong>R2.</strong> <code>VLLM_TARGET_DEVICE=cpu</code> selects the CPU platform and does not load <code>vllm.platform_plugins</code> ({{cite vllm/platforms/__init__.py:244-248}}).</li>
+  <li><strong>R3.</strong> Exactly one active out-of-tree platform wins over the built-in ones ({{cite vllm/platforms/__init__.py:272-279}}).</li>
+  <li><strong>R4.</strong> <code>VLLM_PLUGINS</code> is one allowlist for five groups; the match is on the entry-point name ({{cite vllm/plugins/__init__.py:63-64}}).</li>
+  <li><strong>R5.</strong> General plugins run at most once per process ({{cite vllm/plugins/__init__.py:82-90}}).</li>
+  <li><strong>R6.</strong> The CLI loads the general plugins, then calls <code>pre_register_and_update(parser)</code> ({{cite vllm/engine/arg_utils.py:3243}}, {{cite vllm/engine/arg_utils.py:3257}}).</li>
+  <li><strong>R7.</strong> <code>create_engine_config</code> calls <code>pre_register_and_update()</code> and <code>validate_environ()</code> ({{cite vllm/engine/arg_utils.py:2246-2250}}). <code>VllmConfig.__post_init__</code> calls <code>apply_config_platform_defaults</code> and <code>check_and_update_config</code> ({{cite vllm/config/vllm.py:1804}}, {{cite vllm/config/vllm.py:2046}}).</li>
+  <li><strong>R8.</strong> The executor is <code>uni</code> when the world size is 1 ({{cite vllm/config/parallel.py:1099-1100}}). The CPU platform changes <code>uni</code> to <code>mp</code> ({{cite vllm/platforms/cpu.py:346-353}}) and turns async scheduling off ({{cite vllm/platforms/cpu.py:343}}).</li>
+  <li><strong>R9.</strong> <code>check_and_update_config</code> sets <code>worker_cls</code>: CUDA ({{cite vllm/platforms/cuda.py:330-331}}), CPU ({{cite vllm/platforms/cpu.py:355-356}}).</li>
+  <li><strong>R10.</strong> Stat logger plugins load in <code>AsyncLLM.__init__</code> ({{cite vllm/v1/engine/async_llm.py:155-156}}).</li>
+  <li><strong>R11.</strong> <code>vllm.logits_processors</code> ignores <code>VLLM_PLUGINS</code> ({{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:46}}). The front end loads it for a request check ({{cite vllm/v1/engine/input_processor.py:103-107}}). The CPU model runner of Model Runner V2 is a subclass of the GPU one ({{cite vllm/v1/worker/cpu/model_runner.py:10}}). So a CPU worker loads the group in the same <code>load_model</code> ({{cite vllm/v1/worker/gpu/model_runner.py:463-466}}).</li>
+  <li><strong>R12.</strong> The engine core loads the general plugins, makes the executor, plans the KV cache and then picks the scheduler class ({{cite vllm/v1/engine/core.py:132}}, {{cite vllm/v1/engine/core.py:147}}, {{cite vllm/v1/engine/core.py:160}}, {{cite vllm/v1/engine/core.py:164}}).</li>
+  <li><strong>R13.</strong> A worker loads the general plugins, lets the platform replace Triton kernels and resolves <code>worker_cls</code> ({{cite vllm/v1/worker/worker_base.py:284-296}}). It asks for a device communicator only when its group has more than one rank ({{cite vllm/distributed/parallel_state.py:549-552}}). It sets the block size after <code>load_model</code> ({{cite vllm/v1/executor/multiproc_executor.py:688-702}}, {{cite vllm/v1/executor/uniproc_executor.py:74-75}}).</li>
+  <li><strong>R14.</strong> Endpoint plugins load only when <code>VLLM_PLUGINS</code> names them ({{cite vllm/plugins/__init__.py:122-131}}). <code>build_app</code> attaches them ({{cite vllm/entrypoints/launchers/app.py:51}}).</li>
+  <li><strong>R15.</strong> The CLI sets the start method to <code>spawn</code> ({{cite vllm/entrypoints/common/startup.py:147-149}}), so each child is a new interpreter.</li>
+  <li><strong>R16.</strong> With no <code>scheduler_cls</code>, the class is <code>AsyncScheduler</code> when async scheduling is on, else <code>Scheduler</code> ({{cite vllm/config/scheduler.py:231-239}}).</li>
+</ol>
+<p>The order between processes is simplified. The engine core step "start the workers" is one step that waits until all workers are ready. Not shown: <code>import_kernels</code>, the compile pickers and LoRA. The page {{link concepts/platform-interface}} lists every Platform hook.</p>
+</x-simplified>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the six entry-point groups</h3>
+<p>Five group names are constants in <code>vllm/plugins/__init__.py</code>. The sixth group is in the sampler code:</p>
+<x-code file="vllm/plugins/__init__.py" lines="16-30" highlight="18,20,23,26,30" />
+<p>The table gives the short form. The page {{link concepts/plugin-loading}} has the full detail for each group: the loader, the filter and the error handling.</p>
+<table>
+  <thead><tr><th>Group</th><th>Your entry point gives</th><th>Loaded at</th><th>Process, when</th><th>It can change</th><th>Page</th></tr></thead>
+  <tbody>
+    <tr><td><code>vllm.general_plugins</code></td><td>a function with no arguments</td><td>{{cite vllm/plugins/__init__.py:77-90}}</td><td>every process, early in start-up</td><td>anything; usually it calls the register functions of Step 2</td><td>{{link concepts/plugin-loading}}</td></tr>
+    <tr><td><code>vllm.platform_plugins</code></td><td>a detector that returns a <code>Platform</code> class name or <code>None</code></td><td>{{cite vllm/platforms/__init__.py:250}}</td><td>every process, first read of <code>current_platform</code></td><td>the whole hardware layer</td><td>{{link concepts/platform-plugins}}</td></tr>
+    <tr><td><code>vllm.stat_logger_plugins</code></td><td>a <code>StatLoggerBase</code> subclass</td><td>{{cite vllm/v1/metrics/loggers.py:84-98}}</td><td>front end, <code>AsyncLLM.__init__</code></td><td>where metrics go</td><td>{{link concepts/frontend-plugins}}</td></tr>
+    <tr><td><code>vllm.endpoint_plugins</code></td><td>a factory that returns an <code>EndpointPlugin</code></td><td>{{cite vllm/plugins/__init__.py:93-159}}</td><td>front end, <code>build_app</code>; only when named in <code>VLLM_PLUGINS</code></td><td>HTTP routes and app state</td><td>{{link concepts/frontend-plugins}}</td></tr>
+    <tr><td><code>vllm.io_processor_plugins</code></td><td>a function that returns an IO processor class name or <code>None</code></td><td>{{cite vllm/plugins/io_processors/__init__.py:42-61}}</td><td>front end, only for a pooling model that names a plugin ({{cite vllm/plugins/io_processors/__init__.py:52-54}})</td><td>input and output of pooling requests</td><td>{{link concepts/frontend-plugins}}</td></tr>
+    <tr><td><code>vllm.logits_processors</code></td><td>a Model Runner V2 <code>LogitsProcessor</code> subclass</td><td>{{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:37-74}}</td><td>workers (<code>load_model</code>) and front end (request check); ignores <code>VLLM_PLUGINS</code></td><td>the logits of a batch</td><td>{{link concepts/sampling-and-logits-processors}}</td></tr>
+  </tbody>
+</table>
+
+<h3>Step 2: registries that a general plugin fills</h3>
+<p>Most extension points are registries. A registry is a module-level table plus a register function. The KV connector factory is a short example:</p>
+<x-code file="vllm/distributed/kv_transfer/kv_connector/factory.py" lines="27-40" highlight="31,33-34,40" caption="The register function stores a loader, not the class. The module is imported only when a config selects the name. A name that exists already raises <code>ValueError</code>." />
+<p>vLLM reads the table later, in the process that builds the part. So the register call must run in that process before the read. A general plugin does this, because each process runs it (Step 1). The table lists the registries.</p>
+<table>
+  <thead><tr><th>Registry</th><th>Register with</th><th>Read at</th><th>Process</th><th>It can change</th><th>Page</th></tr></thead>
+  <tbody>
+    <tr><td>Model registry</td><td><code>ModelRegistry.register_model(arch, cls or "module:Class")</code> ({{cite vllm/model_executor/models/registry.py:1160-1203}})</td><td>inspect {{cite vllm/config/model.py:741}}; resolve {{cite vllm/model_executor/model_loader/utils.py:310}}</td><td>front end (inspect), workers (build)</td><td>add or replace a model architecture</td><td>{{link concepts/oot-models}}</td></tr>
+    <tr><td>Out-of-tree ops and layers</td><td><code>@MyOp.register_oot</code> on a subclass of a <code>CustomOp</code> or <code>PluggableLayer</code> ({{cite vllm/model_executor/custom_op.py:335-356}}, {{cite vllm/model_executor/custom_op.py:82-99}})</td><td><code>__new__</code> swaps the class ({{cite vllm/model_executor/custom_op.py:117-126}}, {{cite vllm/model_executor/custom_op.py:56-65}})</td><td>workers, when layers are made</td><td>the kernel of one layer, or the whole layer</td><td>{{link concepts/custom-ops}}</td></tr>
+    <tr><td>Attention backends</td><td><code>register_backend(enum or "NAME", class_path)</code> ({{cite vllm/v1/attention/backends/registry.py:348-420}})</td><td><code>get_path</code> ({{cite vllm/v1/attention/backends/registry.py:210}})</td><td>workers</td><td>replace a backend, or add a new name</td><td>{{link concepts/attention-backend-selection}}</td></tr>
+    <tr><td>Quantization methods</td><td><code>@register_quantization_config("name")</code> ({{cite vllm/model_executor/layers/quantization/__init__.py:61-109}})</td><td><code>get_quantization_config</code> ({{cite vllm/model_executor/layers/quantization/__init__.py:112-114}})</td><td>front end: it checks the name and makes the config object ({{cite vllm/config/vllm.py:1586-1589}}); a worker gets that object inside the pickled <code>VllmConfig</code></td><td>a new <code>--quantization</code> value</td><td>{{link concepts/quantization-plugins}}</td></tr>
+    <tr><td>Model loaders</td><td><code>@register_model_loader("format")</code> ({{cite vllm/model_executor/model_loader/__init__.py:69-120}})</td><td><code>get_model_loader</code> ({{cite vllm/model_executor/model_loader/__init__.py:123-128}})</td><td>workers</td><td>a new <code>--load-format</code></td><td>{{link concepts/weight-loading}}</td></tr>
+    <tr><td>KV connectors</td><td><code>KVConnectorFactory.register_connector(name, module, class)</code> ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:31-40}})</td><td>scheduler role {{cite vllm/v1/core/sched/scheduler.py:177-181}}; worker role {{cite vllm/distributed/kv_transfer/kv_transfer_state.py:88-92}}; class checks {{cite vllm/config/vllm.py:2243}}, {{cite vllm/v1/metrics/loggers.py:132}}</td><td>front end (class only), engine core and workers</td><td>where KV blocks go (offload, transfer)</td><td>{{link concepts/kv-connectors}}</td></tr>
+    <tr><td>Encoder-cache (EC) connectors</td><td><code>ECConnectorFactory.register_connector</code> ({{cite vllm/distributed/ec_transfer/ec_connector/factory.py:23-33}})</td><td>{{cite vllm/v1/core/sched/scheduler.py:203}}; {{cite vllm/distributed/ec_transfer/ec_transfer_state.py:37}}; metrics {{cite vllm/v1/metrics/loggers.py:134}}</td><td>front end (class only), engine core and workers</td><td>transfer of encoder outputs</td><td>{{link concepts/kv-connectors}}</td></tr>
+    <tr><td>Tool and reasoning parsers</td><td><code>ToolParserManager.register_module</code> ({{cite vllm/tool_parsers/abstract_tool_parser.py:327-370}}), <code>ReasoningParserManager.register_module</code> ({{cite vllm/reasoning/abs_reasoning_parsers.py:330-368}})</td><td><code>--tool-call-parser</code>, <code>--reasoning-parser</code> names</td><td>front end; reasoning also engine core</td><td>how model text becomes tool calls or reasoning</td><td>{{link concepts/tool-and-reasoning-parsers}}</td></tr>
+    <tr><td>LoRA resolvers</td><td><code>LoRAResolverRegistry.register_resolver</code> ({{cite vllm/lora/resolver.py:52-72}})</td><td>{{cite vllm/entrypoints/openai/models/serving.py:113-117}}</td><td>front end</td><td>where an unknown adapter name is found</td><td>{{link concepts/frontend-plugins}}</td></tr>
+    <tr><td>Sleep-mode backends</td><td><code>SleepModeBackendFactory.register_backend</code> ({{cite vllm/device_allocator/sleep_mode_backend.py:170-180}})</td><td>{{cite vllm/v1/worker/gpu_worker.py:256-258}}</td><td>workers</td><td>how memory sleeps and wakes</td><td>{{link concepts/engine-hooks}}</td></tr>
+    <tr><td>KV cache dtypes</td><td><code>@register_kv_cache_dtype("name")</code> ({{cite vllm/config/cache.py:111-155}})</td><td><code>KV_CACHE_DTYPES</code>, <code>STR_DTYPE_TO_TORCH_DTYPE</code> ({{cite vllm/config/cache.py:147-152}})</td><td>every process that reads the dtype</td><td>a new <code>--kv-cache-dtype</code></td><td>{{link concepts/quantization-plugins}}</td></tr>
+  </tbody>
+</table>
+<x-note title="Two registries without an entry point of their own">
+<p>The docstring of <code>SleepModeBackendFactory</code> says that third-party backends register "from a <code>vllm.general_plugins</code> entry point" ({{cite vllm/device_allocator/sleep_mode_backend.py:160-166}}). The docstring of <code>register_kv_cache_dtype</code> says that it runs "at platform activation time" ({{cite vllm/config/cache.py:112-116}}). No code in <code>vllm/</code> calls <code>register_kv_cache_dtype</code>; only tests do ({{cite tests/config/test_kv_cache_dtype.py:35}}).</p>
+</x-note>
+
+<h3>Step 3: config hooks that name your class</h3>
+<p>A config hook is a field of <code>VllmConfig</code> (or a CLI flag) that holds the name of your class or module. The front end parses it. The other processes get it inside the pickled <code>VllmConfig</code>, because the start method is <code>spawn</code> and the config is a process argument ({{cite vllm/v1/engine/utils.py:256-287}}). The scheduler hook shows the pattern:</p>
+<x-code file="vllm/config/scheduler.py" lines="231-256" highlight="232,243-253,256" caption="No value: vLLM picks its own class. A value outside <code>vllm.</code>: a warning, then <code>resolve_obj_by_qualname</code> imports the class from a dotted name." />
+<table>
+  <thead><tr><th>Field or flag</th><th>Defined at</th><th>Read at</th><th>Process</th><th>It can change</th><th>Page</th></tr></thead>
+  <tbody>
+    <tr><td><code>scheduler_cls</code> (<code>--scheduler-cls</code>)</td><td>{{cite vllm/config/scheduler.py:177}}</td><td>{{cite vllm/v1/engine/core.py:164}}</td><td>engine core</td><td>the scheduling policy</td><td>{{link concepts/engine-hooks}}</td></tr>
+    <tr><td><code>worker_cls</code> (<code>--worker-cls</code>)</td><td>{{cite vllm/config/parallel.py:306}}</td><td>{{cite vllm/v1/worker/worker_base.py:292-296}}</td><td>workers</td><td>the whole worker class; a platform sets it when it is <code>"auto"</code></td><td>{{link concepts/platform-interface}}</td></tr>
+    <tr><td><code>worker_extension_cls</code> (<code>--worker-extension-cls</code>)</td><td>{{cite vllm/config/parallel.py:309}}</td><td>{{cite vllm/v1/worker/worker_base.py:304-331}}</td><td>workers</td><td>extra methods for <code>collective_rpc</code></td><td>{{link concepts/engine-hooks}}</td></tr>
+    <tr><td><code>--tool-parser-plugin</code></td><td>{{cite vllm/entrypoints/common/cli_args.py:126}}</td><td>{{cite vllm/entrypoints/common/cli_args.py:579-580}}</td><td>front end</td><td>imports a module or a file that registers a tool parser</td><td>{{link concepts/tool-and-reasoning-parsers}}</td></tr>
+    <tr><td><code>--reasoning-parser-plugin</code></td><td>{{cite vllm/config/structured_outputs.py:37}}</td><td>{{cite vllm/entrypoints/common/cli_args.py:582-583}}; {{cite vllm/v1/structured_output/__init__.py:100-104}}</td><td>front end and engine core</td><td>imports a module or a file that registers a reasoning parser</td><td>{{link concepts/tool-and-reasoning-parsers}}</td></tr>
+    <tr><td><code>kv_connector_module_path</code> (in <code>--kv-transfer-config</code>)</td><td>{{cite vllm/config/kv_transfer.py:81}}</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:103-115}}</td><td>engine core and workers</td><td>loads a connector class with no registration; it wins over the registry</td><td>{{link concepts/kv-connectors}}</td></tr>
+  </tbody>
+</table>
+<p>Two more fields name classes. <code>logits_processors</code> takes classes or <code>"module:Class"</code> strings ({{cite vllm/config/model.py:407}}, {{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:77-105}}). <code>model_class_overrides</code> registers a model class in every process, but its docstring says it is "for development and debugging purposes only" ({{cite vllm/config/model.py:351-357}}, {{cite vllm/config/model.py:1170-1193}}).</p>
+
+<h3>Step 4: which one do I need?</h3>
+<p>Start from your goal. Each line names the extension point and the page that explains it.</p>
+<ul>
+  <li><strong>New hardware.</strong> Write a platform plugin (<code>vllm.platform_plugins</code>) with a <code>Platform</code> subclass. Set <code>worker_cls</code> in <code>check_and_update_config</code>, and add a general plugin for your custom ops. See {{link concepts/platform-plugins}} and {{link concepts/platform-interface}}.</li>
+  <li><strong>New model architecture.</strong> Call <code>ModelRegistry.register_model("MyArch", "my_pkg.model:MyModel")</code> from a general plugin. See {{link concepts/oot-models}}.</li>
+  <li><strong>A faster kernel for one op.</strong> Subclass the in-tree <code>CustomOp</code> and decorate it with <code>register_oot</code>. On an out-of-tree platform, an enabled op calls <code>forward_oot</code> ({{cite vllm/model_executor/custom_op.py:183}}, {{cite vllm/model_executor/custom_op.py:202-203}}). See {{link concepts/custom-ops}}.</li>
+  <li><strong>New quantization format.</strong> Use <code>@register_quantization_config("my_quant")</code> in a general plugin. See {{link concepts/quantization-plugins}}.</li>
+  <li><strong>A custom HTTP route.</strong> Write an endpoint plugin (<code>vllm.endpoint_plugins</code>), and name it in <code>VLLM_PLUGINS</code>. See {{link concepts/frontend-plugins}}.</li>
+  <li><strong>A custom metrics sink.</strong> Publish a <code>StatLoggerBase</code> subclass in <code>vllm.stat_logger_plugins</code>. See {{link concepts/frontend-plugins}}.</li>
+  <li><strong>KV offload to your storage.</strong> Write a KV connector. Register it with <code>KVConnectorFactory.register_connector</code>, or name its module in <code>kv_connector_module_path</code>. See {{link concepts/kv-connectors}}.</li>
+  <li><strong>A different scheduling policy.</strong> Subclass the scheduler and set <code>--scheduler-cls</code>. See {{link concepts/engine-hooks}}.</li>
+</ul>
+<p>The tours {{link tours/life-of-a-plugin}} and {{link tours/build-a-toy-plugin}} follow one plugin through these steps. The page {{link reference/extension-points}} will hold the full reference table.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Registries live in one process">
+<p>Each registry is a Python object at module level: a dict or a list in a module or a class. Examples: <code>KVConnectorFactory._registry</code> ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:28}}), <code>_ATTN_OVERRIDES</code> ({{cite vllm/v1/attention/backends/registry.py:344}}), <code>_CUSTOMIZED_METHOD_TO_QUANT_CONFIG</code> ({{cite vllm/model_executor/layers/quantization/__init__.py:58}}). A spawned child is a new interpreter, so it starts with the built-in entries only. (Derived from the start method, {{cite vllm/entrypoints/common/startup.py:147-149}}.)</p>
+<p>So the place of the register call matters:</p>
+<ol>
+  <li>A general plugin function runs in each process ({{cite vllm/v1/engine/core.py:132}}, {{cite vllm/v1/worker/worker_base.py:284}}). Its register calls reach every registry. This is the normal way.</li>
+  <li>A platform module can register at import time, or in a hook. The test platform uses a second entry point in <code>vllm.general_plugins</code> to import its custom ops ({{cite tests/plugins/vllm_add_dummy_platform/setup.py:10-17}}).</li>
+  <li>Code in your own launch script runs only in that process. With <code>vllm serve</code> the workers never see it.</li>
+</ol>
+<p>Config hooks do not have this problem. The value is a string in <code>VllmConfig</code>, and each process imports the class itself. For example, a worker resolves <code>worker_cls</code> with <code>resolve_obj_by_qualname</code> ({{cite vllm/v1/worker/worker_base.py:293-296}}).</p>
+<p><strong>Worked example.</strong> One general plugin function registers a model, a quantization method and a KV connector. You run <code>vllm serve</code> with TP = 2. The function runs 4 times: front end, engine core, worker 0, worker 1. The front end uses the model entry for <code>inspect_model_cls</code> and the quantization entry to make the quantization config object. It uses the connector entry to check the connector class. The engine core uses the connector in the scheduler role. Each worker uses the model entry and the connector entry. It gets the quantization config as an object inside the pickled <code>VllmConfig</code>; Python imports the module of its class by name when it unpickles it. (Derived from the read lines in Step 2. A model registry subprocess, if one runs, is one more process.)</p>
+</x-deepdive>
+
+<x-deepdive title="What a second registration does, per registry">
+<p>A general plugin runs in each process once. But two packages can use the same name, or a name can collide with a built-in entry. The registries do not agree on what happens then:</p>
+<table>
+  <thead><tr><th>Register function</th><th>Name exists already</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>ModelRegistry.register_model</code></td><td>overwrites; DEBUG log</td><td>{{cite vllm/model_executor/models/registry.py:1179-1185}}</td></tr>
+    <tr><td><code>CustomOp.register_oot</code>, <code>PluggableLayer.register_oot</code></td><td><code>AssertionError</code> ("Duplicate op name" or "Duplicate layer name")</td><td>{{cite vllm/model_executor/custom_op.py:338}}, {{cite vllm/model_executor/custom_op.py:86}}</td></tr>
+    <tr><td><code>register_backend</code></td><td>an enum member: overwrites the override, no log; a new string name that exists already: <code>ValueError</code></td><td>{{cite vllm/v1/attention/backends/registry.py:406-418}}, {{cite vllm/v1/attention/backends/registry.py:180-185}}</td></tr>
+    <tr><td><code>register_quantization_config</code></td><td>overwrites; DEBUG log</td><td>{{cite vllm/model_executor/layers/quantization/__init__.py:89-95}}, {{cite vllm/model_executor/layers/quantization/__init__.py:106}}</td></tr>
+    <tr><td><code>register_model_loader</code></td><td>overwrites; WARNING log</td><td>{{cite vllm/model_executor/model_loader/__init__.py:101-107}}</td></tr>
+    <tr><td><code>KVConnectorFactory.register_connector</code>, <code>ECConnectorFactory.register_connector</code></td><td><code>ValueError</code></td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:33-34}}, {{cite vllm/distributed/ec_transfer/ec_connector/factory.py:26-27}}</td></tr>
+    <tr><td><code>ToolParserManager.register_module(module=...)</code></td><td>overwrites when <code>force=True</code> (the default); <code>KeyError</code> when <code>force=False</code></td><td>{{cite vllm/tool_parsers/abstract_tool_parser.py:307-311}}</td></tr>
+    <tr><td><code>ReasoningParserManager.register_module(module=...)</code></td><td>same rule as the tool parser manager</td><td>{{cite vllm/reasoning/abs_reasoning_parsers.py:310-314}}</td></tr>
+    <tr><td><code>LoRAResolverRegistry.register_resolver</code></td><td>overwrites; WARNING log</td><td>{{cite vllm/lora/resolver.py:64-72}}</td></tr>
+    <tr><td><code>SleepModeBackendFactory.register_backend</code></td><td><code>ValueError</code></td><td>{{cite vllm/device_allocator/sleep_mode_backend.py:173-174}}</td></tr>
+    <tr><td><code>register_kv_cache_dtype</code></td><td>overwrites the handler; WARNING log</td><td>{{cite vllm/config/cache.py:139-152}}</td></tr>
+  </tbody>
+</table>
+<p>A <code>ValueError</code> or an <code>AssertionError</code> inside a general plugin function stops the start-up of that process, because <code>load_general_plugins()</code> does not catch it ({{cite vllm/plugins/__init__.py:89-90}}).</p>
+<p><code>register_quantization_config</code> has one more effect. A new name is added to <code>QUANTIZATION_METHODS</code>. It is also added to <code>current_platform.supported_quantization</code>, but only when that list is not empty ({{cite vllm/model_executor/layers/quantization/__init__.py:96-100}}). An empty list means "no limit" in <code>verify_quantization</code> ({{cite vllm/platforms/interface.py:1153-1158}}). The module imports <code>current_platform</code> at module level ({{cite vllm/model_executor/layers/quantization/__init__.py:11}}), so its import resolves the platform, if no code has done so before.</p>
+</x-deepdive>
+
+<x-deepdive title="Name formats: dots, colons and paths">
+<p>The extension points do not use one format for a class name. Use the right one, or the import fails.</p>
+<table>
+  <thead><tr><th>Where</th><th>Format</th><th>Parsed by</th></tr></thead>
+  <tbody>
+    <tr><td>Platform detector result, <code>worker_cls</code>, <code>worker_extension_cls</code>, <code>scheduler_cls</code>, <code>register_backend(class_path=...)</code></td><td><code>pkg.module.Class</code> (dots only)</td><td><code>resolve_obj_by_qualname</code>: split at the last dot ({{cite vllm/utils/import_utils.py:119-123}})</td></tr>
+    <tr><td><code>register_model</code>, <code>logits_processors</code>, <code>model_class_overrides</code></td><td><code>pkg.module:Class</code> (one colon)</td><td>split at <code>":"</code>; other counts raise <code>ValueError</code> ({{cite vllm/model_executor/models/registry.py:1187-1193}}, {{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:99-104}})</td></tr>
+    <tr><td>KV and EC connectors</td><td>module path and class name as two strings</td><td><code>importlib.import_module</code> and <code>getattr</code> ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:36-38}})</td></tr>
+    <tr><td><code>--tool-parser-plugin</code>, <code>--reasoning-parser-plugin</code></td><td>a module name, or a path to a <code>.py</code> file</td><td><code>import_plugin</code>: a module first; if no such module exists, a file. A failure of the file import is logged, not raised ({{cite vllm/utils/import_utils.py:81-98}})</td></tr>
+  </tbody>
+</table>
+<p>The parser plugin flags have one more rule: vLLM imports the value only when it is longer than 3 characters ({{cite vllm/entrypoints/common/cli_args.py:579}}, {{cite vllm/entrypoints/common/cli_args.py:582}}). The code does not say why.</p>
+<p><strong>Module path versus registry.</strong> The KV and EC connector factories use the two sources in the opposite order. For KV connectors, <code>kv_connector_module_path</code> wins over the registry ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:106-108}}). For EC connectors, the registry wins, and <code>ec_connector_module_path</code> is the fallback ({{cite vllm/distributed/ec_transfer/ec_connector/factory.py:66-73}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Lazy registration: why many registries store strings">
+<p>Several registries store a name or a loader, not a class:</p>
+<ul>
+  <li><code>register_model</code> with a <code>"module:Class"</code> string makes a lazy entry. The docstring says that this avoids "Cannot re-initialize CUDA in forked subprocess" ({{cite vllm/model_executor/models/registry.py:1165-1174}}).</li>
+  <li>The connector factories and the sleep-mode factory store a function that imports the module later ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:36-40}}, {{cite vllm/device_allocator/sleep_mode_backend.py:176-180}}).</li>
+  <li>The decorator form of <code>ToolParserManager.register_module</code> stores only the module path and the class name ({{cite vllm/tool_parsers/abstract_tool_parser.py:352-368}}).</li>
+  <li><code>register_backend</code> stores a dotted path ({{cite vllm/v1/attention/backends/registry.py:406-418}}).</li>
+</ul>
+<p>The general plugin runs in the front end too, where no model runs. A lazy entry keeps heavy imports (CUDA code, kernels) out of the front end. Only the process that uses the entry imports the module.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="A name collision stops start-up">
+<p>The KV and EC connector factories and the sleep-mode factory raise <code>ValueError</code> for a name that exists already. vLLM registers its own connectors when the factory module is imported, for example <code>NixlConnector</code> ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:177-181}}). Choose a name that vLLM does not use.</p>
+</x-warning>
+<ul>
+  <li><strong>The registry is empty in a worker.</strong> You registered from a launch script or from code that runs only in the front end. Register from a general plugin instead (first deep dive).</li>
+  <li><strong>An allowlist filters your general plugin.</strong> <code>VLLM_PLUGINS</code> applies to general plugins too ({{cite vllm/plugins/__init__.py:63-64}}). Then no register call runs, with no error. Use the timeline above with <code>VLLM_PLUGINS=acme_admin</code> to see it.</li>
+  <li><strong>A short parser plugin value is ignored.</strong> A value of 3 characters or fewer is not imported ({{cite vllm/entrypoints/common/cli_args.py:579}}). A path that fails to import only writes an ERROR log ({{cite vllm/utils/import_utils.py:94-98}}).</li>
+  <li><strong>A custom scheduler loses async scheduling.</strong> vLLM warns: if you subclass <code>Scheduler</code> instead of <code>AsyncScheduler</code>, async scheduling is off and performance drops ({{cite vllm/config/scheduler.py:247-253}}).</li>
+  <li><strong>A worker extension hides a method.</strong> If the worker class already has an attribute of the extension, an <code>assert</code> stops start-up ({{cite vllm/v1/worker/worker_base.py:310-319}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> The right extension point depends on the process that must see your code. An entry-point group or a config hook reaches its process by itself. A registry reaches only the process where your register call ran. Most "it works in the front end but not in the worker" problems come from this difference.</p>
+
+<x-quiz>
+  <x-q level="easy">What are the three kinds of extension points, and which kind needs a general plugin?
+    <x-a><p>Entry-point groups, registries and config hooks. Registries need a general plugin (or another way to run the register call in each process). Each registry is a module-level object of one process. The general plugin runs in every process ({{cite vllm/plugins/__init__.py:77-90}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">You want a new HTTP route. Which extension point do you use, and what must you also set?
+    <x-a><p>An endpoint plugin in <code>vllm.endpoint_plugins</code>. You must also name it in <code>VLLM_PLUGINS</code>, because endpoint plugins load only when the list names them ({{cite vllm/plugins/__init__.py:122-131}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Your general plugin calls <code>KVConnectorFactory.register_connector("NixlConnector", ...)</code>. What happens at start-up?
+    <x-a><p>vLLM already registers a connector with this name when the factory module loads ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:177-181}}). The register function raises <code>ValueError</code> for a name that exists ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:33-34}}). The plugin function does not catch it, so start-up stops ({{cite vllm/plugins/__init__.py:89-90}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You set <code>--scheduler-cls my_pkg.sched:MySched</code>. Why does it fail, and what is the right form?
+    <x-a><p><code>scheduler_cls</code> is parsed by <code>resolve_obj_by_qualname</code>, which splits at the last dot ({{cite vllm/config/scheduler.py:256}}, {{cite vllm/utils/import_utils.py:119-123}}). The colon form is for <code>register_model</code>. Write <code>my_pkg.sched.MySched</code>.</p></x-a>
+  </x-q>
+  <x-q level="hard">You serve with TP = 2. You set <code>kv_connector_module_path</code> and also register a connector with the same class name through a general plugin. Which class runs, and in which processes is it made?
+    <x-a><p>The class from <code>kv_connector_module_path</code>: for KV connectors the module path wins over the registry ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:106-108}}). It is made in the engine core, in the scheduler role ({{cite vllm/v1/core/sched/scheduler.py:177-181}}), and in each of the 2 workers, in the worker role ({{cite vllm/distributed/kv_transfer/kv_transfer_state.py:88-92}}). The front end only gets the class, for config checks ({{cite vllm/config/vllm.py:2243}}). For EC connectors the order is the opposite ({{cite vllm/distributed/ec_transfer/ec_connector/factory.py:66-73}}).</p></x-a>
+  </x-q>
+</x-quiz>

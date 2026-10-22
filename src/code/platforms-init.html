@@ -1,0 +1,195 @@
+---
+title: platforms/__init__.py: platform detection and current_platform
+nav_title: platforms/__init__.py
+level: Intermediate
+prerequisites: concepts/platform-plugins, concepts/plugin-loading
+related: concepts/platform-plugins, concepts/platform-interface, concepts/plugin-loading, concepts/plugin-map, code/platforms-interface, code/plugins-init
+summary: vllm/platforms/__init__.py holds the five built-in platform detectors, the detection function that also runs the out-of-tree platform plugins, and the lazy module attribute current_platform.
+---
+<h2>Purpose</h2>
+<p><code>vllm/platforms/__init__.py</code> decides which <code>Platform</code> subclass a process uses, and gives the one object of that class to the rest of vLLM as <code>current_platform</code>.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/platforms/__init__.py</code>, 346 lines of Python. Ten functions (five of them detectors), the dict <code>builtin_platform_plugins</code> and two module globals.</td></tr>
+    <tr><th>Main functions</th><td><code>resolve_current_platform_cls_qualname</code> ({{cite vllm/platforms/__init__.py:240}}), <code>__getattr__</code> ({{cite vllm/platforms/__init__.py:303}}), and the detectors <code>tpu_platform_plugin</code>, <code>cuda_platform_plugin</code>, <code>rocm_platform_plugin</code>, <code>xpu_platform_plugin</code>, <code>cpu_platform_plugin</code>. There is no class: the classes are in <code>interface.py</code>, <code>cuda.py</code>, <code>rocm.py</code> and the other files of the folder.</td></tr>
+    <tr><th>Runs in</th><td>Every Python process of vLLM, on the CPU, in the thread of the first reader of <code>current_platform</code>. With <code>vllm serve</code>: the {{term front-end}}, the {{term engine-core}} process, each {{term worker}} process and the model registry subprocess.</td></tr>
+    <tr><th>Called by</th><td>Any module that reads <code>current_platform</code>: 584 files in <code>vllm/</code> use the name (from <code>git grep</code> at this commit). The first such read in a process runs the detection.</td></tr>
+    <tr><th>Calls</th><td><code>load_plugins_by_group</code> for <code>vllm.platform_plugins</code> ({{cite vllm/platforms/__init__.py:10}}), <code>resolve_obj_by_qualname</code> ({{cite vllm/platforms/__init__.py:11}}), hardware libraries inside the detectors (pynvml, amdsmi, libtpu, torch), and <code>envs.VLLM_TARGET_DEVICE</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The <code>Platform</code> base class and <code>UnspecifiedPlatform</code> (<code>interface.py</code>, page {{link code/platforms-interface}}), the vendor classes, and the plugin loader (<code>vllm/plugins/__init__.py</code>, page {{link code/plugins-init}}).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/platform-plugins}} explains the detection from the reader's side, with a worked example. This page reads the file from top to bottom.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b4a_platform_detection" alt="Panel 1: three steps of the first read of current_platform: the lazy trigger in __getattr__ (lines 303-319), the CPU short-circuit (244-248), and the loop that loads vllm.platform_plugins and runs every detector (250, 254-265). Panel 2: the decision: two or more out-of-tree detectors raise RuntimeError, exactly one wins (272-279); then the same rule for built-in detectors (280-289); none gives UnspecifiedPlatform (290-292). Panel 3: three example machines: a GPU host gives CudaPlatform, a GPU host with the made-up acme_hw plugin gives the acme_hw class, and VLLM_TARGET_DEVICE=cpu gives CpuPlatform." caption="Figure: the detection flow in this file. All line numbers refer to <code>vllm/platforms/__init__.py</code>." />
+<p>The file has three layers. At the bottom are the five detectors (lines 33-228). In the middle, <code>resolve_current_platform_cls_qualname</code> runs them and the out-of-tree detectors, and picks one name (lines 240-293). At the top, <code>__getattr__</code> turns the name into the one object, once per process (lines 303-326).</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Every reader of <code>current_platform</code>.</strong> Most files import it at module level, for example <code>vllm/engine/arg_utils.py</code> ({{cite vllm/engine/arg_utils.py:122}}) and <code>vllm/config/compilation.py</code> ({{cite vllm/config/compilation.py:22}}). The first import in a process runs <code>__getattr__</code> and the detection. The page {{link concepts/plugin-loading#deep-dive}} traces this first import in each process of <code>vllm serve</code>.</li>
+  <li><strong>Platform classes.</strong> <code>cuda.py</code> and the other vendor files import <code>Platform</code> and <code>PlatformEnum</code> from <code>.interface</code> ({{cite vllm/platforms/cuda.py:33}}). This file re-exports them ({{cite vllm/platforms/__init__.py:13}}, {{cite vllm/platforms/__init__.py:339-346}}), so an out-of-tree platform can write <code>from vllm.platforms import Platform</code> without a detection.</li>
+  <li><strong>Tests.</strong> A test reads <code>_init_trace</code> to report the first read ({{cite tests/plugins_tests/test_platform_plugins.py:28-34}}). Another test calls <code>resolve_current_platform_cls_qualname</code> and <code>_is_amd_zen_cpu</code> directly ({{cite tests/test_zen_cpu_platform_detection.py:12-14}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>load_plugins_by_group(PLATFORM_PLUGINS_GROUP)</code>: imports the out-of-tree detectors, filtered by <code>VLLM_PLUGINS</code> ({{cite vllm/platforms/__init__.py:250}}).</li>
+  <li><code>resolve_obj_by_qualname</code>: imports the chosen class from its dotted name ({{cite vllm/platforms/__init__.py:319}}, {{cite vllm/utils/import_utils.py:119-123}}).</li>
+  <li>Hardware probes inside the detectors: pynvml through <code>import_pynvml</code> ({{cite vllm/platforms/__init__.py:61-64}}), <code>amdsmi</code> ({{cite vllm/platforms/__init__.py:112-116}}), <code>libtpu</code> ({{cite vllm/platforms/__init__.py:48}}), <code>torch.xpu</code> ({{cite vllm/platforms/__init__.py:156}}), <code>/proc/cpuinfo</code> and <code>zentorch</code> ({{cite vllm/platforms/__init__.py:165-171}}, {{cite vllm/platforms/__init__.py:205-212}}).</li>
+  <li><code>importlib.metadata.version("vllm")</code>, to see if this is a CPU build ({{cite vllm/platforms/__init__.py:18-30}}).</li>
+  <li>The standard <code>logging</code> module through <code>logging.getLogger(__name__)</code> ({{cite vllm/platforms/__init__.py:15}}), not vLLM's <code>init_logger</code>.</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>vllm_version_matches_substr(substr)</code></td><td>{{cite vllm/platforms/__init__.py:18-30}}</td><td>True if the installed vLLM version string contains <code>substr</code>; raises <code>PackageNotFoundError</code> after a warning if vLLM has no package metadata.</td></tr>
+    <tr><td><code>tpu_platform_plugin()</code></td><td>{{cite vllm/platforms/__init__.py:33-54}}</td><td>Pathways → the <code>tpu_inference</code> class; <code>import libtpu</code> works → <code>vllm.platforms.tpu.TpuPlatform</code>; else <code>None</code>.</td></tr>
+    <tr><td><code>cuda_platform_plugin()</code></td><td>{{cite vllm/platforms/__init__.py:57-105}}</td><td>NVML counts GPUs and the build is not a CPU build → <code>CudaPlatform</code>; Jetson fallback when NVML fails.</td></tr>
+    <tr><td><code>rocm_platform_plugin()</code></td><td>{{cite vllm/platforms/__init__.py:108-140}}</td><td><code>amdsmi</code> finds processors → <code>RocmPlatform</code>; under WSL also a PyTorch HIP check.</td></tr>
+    <tr><td><code>xpu_platform_plugin()</code></td><td>{{cite vllm/platforms/__init__.py:143-162}}</td><td><code>torch.xpu.is_available()</code> → <code>XPUPlatform</code>; sets <code>XPUPlatform.dist_backend</code> to <code>xccl</code> when XCCL exists.</td></tr>
+    <tr><td><code>_is_amd_zen_cpu()</code></td><td>{{cite vllm/platforms/__init__.py:165-171}}</td><td>True when <code>/proc/cpuinfo</code> has both <code>AuthenticAMD</code> and <code>avx512</code>.</td></tr>
+    <tr><td><code>cpu_platform_plugin()</code></td><td>{{cite vllm/platforms/__init__.py:174-228}}</td><td><code>VLLM_TARGET_DEVICE=cpu</code>, a CPU build or macOS → <code>CpuPlatform</code>, or <code>ZenCpuPlatform</code> with zentorch.</td></tr>
+    <tr><td><code>builtin_platform_plugins</code></td><td>{{cite vllm/platforms/__init__.py:231-237}}</td><td>Dict from name to detector, in loop order: tpu, cuda, rocm, xpu, cpu.</td></tr>
+    <tr><td><code>resolve_current_platform_cls_qualname()</code></td><td>{{cite vllm/platforms/__init__.py:240-293}}</td><td>The detection: CPU short-circuit, run all detectors, pick one name.</td></tr>
+    <tr><td><code>_current_platform</code>, <code>_init_trace</code></td><td>{{cite vllm/platforms/__init__.py:296-297}}</td><td>The one object of this process (or <code>None</code>), and the stack of the first read.</td></tr>
+    <tr><td><code>__getattr__(name)</code></td><td>{{cite vllm/platforms/__init__.py:303-326}}</td><td>PEP 562 hook: makes <code>current_platform</code> on first read; returns other globals; raises <code>AttributeError</code> for unknown names.</td></tr>
+    <tr><td><code>__setattr__(name, value)</code></td><td>{{cite vllm/platforms/__init__.py:329-336}}</td><td>A function with this name; Python does not call a module-level <code>__setattr__</code> (see the deep dive).</td></tr>
+    <tr><td><code>__all__</code></td><td>{{cite vllm/platforms/__init__.py:339-346}}</td><td>The public names, including <code>current_platform</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>cuda_platform_plugin</code>: a detector with error rules</h3>
+<x-code file="vllm/platforms/__init__.py" lines="57-105" highlight="63-64,71-74,84,87-89,99-101,105" />
+<ol>
+  <li><strong>Lines 63-64.</strong> Import pynvml and start NVML. This does not start a CUDA context.</li>
+  <li><strong>Lines 71-74.</strong> CUDA is active when NVML counts at least one GPU and the vLLM version does not contain "cpu". The comment (lines 66-70) gives the reason: a CPU build of vLLM on a GPU host must not pick CUDA.</li>
+  <li><strong>Line 84.</strong> <code>nvmlShutdown</code> runs in a <code>finally</code> block.</li>
+  <li><strong>Lines 87-89.</strong> An exception whose class name does not contain "nvml" is raised again. The caller catches it and logs it at DEBUG level ({{cite vllm/platforms/__init__.py:260-265}}).</li>
+  <li><strong>Lines 94-101.</strong> An NVML error on a Jetson (one of two Tegra files exists) still gives CUDA.</li>
+  <li><strong>Line 105.</strong> The result is a dotted class name or <code>None</code>. <code>vllm.platforms.cuda.CudaPlatform</code> is itself an alias that <code>cuda.py</code> sets to the NVML or the non-NVML class ({{cite vllm/platforms/cuda.py:1040-1054}}).</li>
+</ol>
+
+<h3><code>cpu_platform_plugin</code>: three ways to say CPU</h3>
+<x-code file="vllm/platforms/__init__.py" lines="174-204" highlight="176,184,193,202-203" />
+<ol>
+  <li><strong>Line 176.</strong> <code>VLLM_TARGET_DEVICE == "cpu"</code> is enough.</li>
+  <li><strong>Line 184.</strong> Else a vLLM version string with "cpu" (a CPU build).</li>
+  <li><strong>Line 193.</strong> Else macOS (<code>sys.platform</code> starts with <code>darwin</code>).</li>
+  <li><strong>Lines 202-203.</strong> None of these: <code>None</code>.</li>
+</ol>
+<p>The rest of the function (lines 205-228) returns <code>ZenCpuPlatform</code> on an AMD CPU with AVX-512 when <code>zentorch</code> imports. An <code>ImportError</code> falls back to <code>CpuPlatform</code> with a DEBUG log; an <code>OSError</code> (a build that does not match torch) falls back with a WARNING ({{cite vllm/platforms/__init__.py:205-228}}).</p>
+
+<h3><code>resolve_current_platform_cls_qualname</code>: the decision</h3>
+<x-code file="vllm/platforms/__init__.py" lines="250-293" highlight="250,254-259,267-270,272,277-279,280,285-286,291" />
+<ol>
+  <li><strong>Line 250.</strong> The out-of-tree detectors, as a dict from entry-point name to function. Lines 240-248 before it return early for <code>VLLM_TARGET_DEVICE=cpu</code>.</li>
+  <li><strong>Lines 254-259.</strong> <code>chain</code> runs the built-in dict first, then the plugin dict. A name is active when its function returns a value that is not <code>None</code>.</li>
+  <li><strong>Lines 267-270.</strong> Set intersections split the active names. A plugin with the same name as a built-in one (for example <code>cuda</code>) would count in both sets. (Derived from the set logic; no test covers it.)</li>
+  <li><strong>Lines 272-279.</strong> Out-of-tree first: two or more raise; one is called again and wins.</li>
+  <li><strong>Lines 280-289.</strong> Then built-in: two or more raise; one is called again and wins.</li>
+  <li><strong>Line 291.</strong> The fallback name of <code>UnspecifiedPlatform</code>.</li>
+</ol>
+
+<h3><code>__getattr__</code>: the lazy object</h3>
+<x-code file="vllm/platforms/__init__.py" lines="303-326" highlight="304,317-321,323-324,326" />
+<ol>
+  <li><strong>Line 304.</strong> Only the name <code>current_platform</code> gets the special path.</li>
+  <li><strong>Lines 317-321.</strong> First read: detect, import the class, call it with no arguments, keep the object, and keep the stack in <code>_init_trace</code>. Later reads return the same object.</li>
+  <li><strong>Lines 323-324.</strong> Other names that exist in the module globals are returned as they are.</li>
+  <li><strong>Line 326.</strong> Unknown names raise <code>AttributeError</code>, as a normal module does.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types in and out">
+<table>
+  <thead><tr><th>Value</th><th>Type</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>a detector result</td><td><code>str | None</code>: a dotted class name such as <code>"vllm.platforms.rocm.RocmPlatform"</code></td><td>{{cite vllm/platforms/__init__.py:140}}</td></tr>
+    <tr><td><code>platform_plugins</code></td><td><code>dict[str, Callable]</code>, entry-point name to detector</td><td>{{cite vllm/platforms/__init__.py:250}}</td></tr>
+    <tr><td><code>activated_plugins</code></td><td><code>list[str]</code> of active names</td><td>{{cite vllm/platforms/__init__.py:252}}</td></tr>
+    <tr><td>return of <code>resolve_current_platform_cls_qualname</code></td><td><code>str</code>, never <code>None</code></td><td>{{cite vllm/platforms/__init__.py:240}}, {{cite vllm/platforms/__init__.py:293}}</td></tr>
+    <tr><td><code>_current_platform</code></td><td>an instance of a <code>Platform</code> subclass, or <code>None</code> before the first read</td><td>{{cite vllm/platforms/__init__.py:296}}, {{cite vllm/platforms/__init__.py:319}}</td></tr>
+    <tr><td><code>_init_trace</code></td><td><code>str</code>: the formatted stack of the first read</td><td>{{cite vllm/platforms/__init__.py:297}}, {{cite vllm/platforms/__init__.py:321}}</td></tr>
+  </tbody>
+</table>
+<p>Note the name format: a detector returns <code>module.Class</code> with dots only, because <code>resolve_obj_by_qualname</code> splits at the last dot ({{cite vllm/utils/import_utils.py:121}}). The <code>"module:Class"</code> form of <code>register_model</code> does not work here.</p>
+</x-deepdive>
+
+<x-deepdive title="Processes, threads and the module __setattr__">
+<p>The file has no lock. <code>__getattr__</code> checks <code>_current_platform is None</code> and then assigns it (lines 317-319), so two threads that read the name for the first time at the same moment could both run the detection. In <code>vllm serve</code> the first read happens during imports, before vLLM starts its threads. (Derived; the code has no comment about threads.)</p>
+<p>Each process has its own <code>_current_platform</code>. With the <code>spawn</code> start method ({{cite vllm/entrypoints/common/startup.py:147-149}}), each child starts with <code>None</code> and detects again. With <code>fork</code>, a child would get a copy of the parent's object, if the parent had made it. (Derived from the semantics of fork.)</p>
+<p><strong>The function named <code>__setattr__</code>.</strong> PEP 562 lets a module define <code>__getattr__</code> and <code>__dir__</code>. It does not add <code>__setattr__</code>, so Python does not call the function at lines 329-336 when code assigns <code>vllm.platforms.current_platform = x</code>. The assignment makes a normal module attribute, and later reads find it without <code>__getattr__</code>. <code>_current_platform</code> keeps its old value. (Derived from Python semantics; no comment in the code says why the function exists.)</p>
+<p>vLLM makes such an assignment once. For <code>vllm bench</code>, the CLI replaces an <code>UnspecifiedPlatform</code> with a <code>CpuPlatform</code> object ({{cite vllm/entrypoints/cli/main.py:72-86}}). The rule above applies to it: the function at lines 329-336 does not run.</p>
+</x-deepdive>
+
+<x-deepdive title="A worked example: a CPU build on a GPU host">
+<p>A CI job installs a CPU wheel of vLLM, whose version is for example <code>"0.x.y+cpu"</code>, on a host with 4 NVIDIA GPUs and pynvml installed. <code>VLLM_TARGET_DEVICE</code> is not set, so its value is <code>"cuda"</code> ({{cite vllm/envs.py:622}}). (The version string is an example.)</p>
+<ol>
+  <li>No short-circuit: the value is not <code>cpu</code> (line 244).</li>
+  <li><code>tpu</code>: <code>import libtpu</code> fails → <code>None</code>, DEBUG log.</li>
+  <li><code>cuda</code>: NVML counts 4 GPUs, but the version contains "cpu", so <code>is_cuda</code> is <code>False</code> → <code>None</code> (lines 71-74, 77-80).</li>
+  <li><code>rocm</code>, <code>xpu</code>: <code>None</code>.</li>
+  <li><code>cpu</code>: the version contains "cpu" → <code>"vllm.platforms.cpu.CpuPlatform"</code> (lines 184-189).</li>
+  <li>One built-in name is active → <code>cpu_platform_plugin()</code> runs again, DEBUG log "Automatically detected platform cpu." (lines 285-289).</li>
+</ol>
+<p>The comment at lines 241-243 describes the case that the short-circuit is for: CPU-only jobs that reuse an <em>accelerator</em> wheel. There, <code>VLLM_TARGET_DEVICE=cpu</code> makes the CPU detector answer (line 176). The CUDA detector answers too, because the version has no "cpu". Without the short-circuit, lines 280-284 would raise <code>RuntimeError</code>. (Derived.)</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>A detector raises</td><td>DEBUG log with traceback; not active</td><td>{{cite vllm/platforms/__init__.py:260-265}}</td></tr>
+    <tr><td>A plugin object is not callable</td><td>the <code>assert</code> fails inside <code>try</code>: DEBUG log; not active</td><td>{{cite vllm/platforms/__init__.py:255-256}}</td></tr>
+    <tr><td>Two or more out-of-tree detectors active</td><td><code>RuntimeError</code></td><td>{{cite vllm/platforms/__init__.py:272-276}}</td></tr>
+    <tr><td>No out-of-tree, two or more built-in active</td><td><code>RuntimeError</code></td><td>{{cite vllm/platforms/__init__.py:280-284}}</td></tr>
+    <tr><td>The winner raises on its second call</td><td>not caught; the read of <code>current_platform</code> fails</td><td>{{cite vllm/platforms/__init__.py:278}}, {{cite vllm/platforms/__init__.py:286}}</td></tr>
+    <tr><td>No detector active</td><td><code>UnspecifiedPlatform</code>, DEBUG log</td><td>{{cite vllm/platforms/__init__.py:290-292}}</td></tr>
+    <tr><td>vLLM has no package metadata</td><td>WARNING, then <code>PackageNotFoundError</code>. The CUDA detector raises it again and the loop catches it; the CPU detector catches it itself (DEBUG log)</td><td>{{cite vllm/platforms/__init__.py:22-29}}, {{cite vllm/platforms/__init__.py:87-89}}, {{cite vllm/platforms/__init__.py:199-200}}</td></tr>
+    <tr><td><code>zentorch</code> fails with <code>OSError</code></td><td>WARNING; <code>CpuPlatform</code></td><td>{{cite vllm/platforms/__init__.py:218-226}}</td></tr>
+    <tr><td>An unknown attribute of the module</td><td><code>AttributeError</code></td><td>{{cite vllm/platforms/__init__.py:325-326}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_TARGET_DEVICE</code></td><td><code>"cuda"</code>, lower-cased ({{cite vllm/envs.py:622}})</td><td>{{cite vllm/platforms/__init__.py:176}}, {{cite vllm/platforms/__init__.py:244}}</td><td><code>cpu</code>: CPU platform with no detection loop.</td></tr>
+    <tr><td><code>VLLM_TPU_USING_PATHWAYS</code></td><td>true if <code>JAX_PLATFORMS</code> contains "proxy" ({{cite vllm/envs.py:1594-1596}})</td><td>{{cite vllm/platforms/__init__.py:37}}</td><td>The TPU detector returns the <code>tpu_inference</code> class at once.</td></tr>
+    <tr><td><code>VLLM_PLUGINS</code></td><td>not set</td><td>through <code>load_plugins_by_group</code> ({{cite vllm/plugins/__init__.py:40}})</td><td>Filters the out-of-tree detectors.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/platform-plugins}}: the same detection from the reader's side, with the plugin package layout.</li>
+  <li>{{link concepts/platform-interface}}: what the chosen object must do.</li>
+  <li>{{link concepts/plugin-loading}}: how <code>load_plugins_by_group</code> finds and filters the plugins, and why the platform resolves before the general plugins.</li>
+  <li>{{link concepts/plugin-map}}: all extension points.</li>
+  <li>{{link code/platforms-interface}} and {{link code/plugins-init}}: the neighbour modules.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which function returns the dotted class name of the platform, and which code makes the object?
+    <x-a><p><code>resolve_current_platform_cls_qualname()</code> returns the name ({{cite vllm/platforms/__init__.py:240-293}}). The module <code>__getattr__</code> imports the class and calls it once per process ({{cite vllm/platforms/__init__.py:318-319}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A CPU build of vLLM runs on a GPU host. Why does the CUDA detector not answer?
+    <x-a><p>It answers only when NVML counts GPUs <em>and</em> <code>vllm_version_matches_substr("cpu")</code> is false ({{cite vllm/platforms/__init__.py:71-74}}). A CPU build has "cpu" in its version, so the detector returns <code>None</code>, and the CPU detector answers ({{cite vllm/platforms/__init__.py:184}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">An out-of-tree plugin object in <code>vllm.platform_plugins</code> is a string, not a function. What happens?
+    <x-a><p><code>assert callable(func)</code> fails inside the <code>try</code> block, so the loop logs it at DEBUG level and treats it as not active ({{cite vllm/platforms/__init__.py:255-265}}). Detection goes on with the other detectors.</p></x-a>
+  </x-q>
+  <x-q level="hard">A test runs <code>vllm.platforms.current_platform = MyPlatform()</code>. Does <code>_current_platform</code> change, and what do modules that imported <code>current_platform</code> earlier see?
+    <x-a><p>No. Python does not call a module-level <code>__setattr__</code> (PEP 562 covers only <code>__getattr__</code> and <code>__dir__</code>), so the function at {{cite vllm/platforms/__init__.py:329-336}} does not run. The assignment makes a normal module attribute; new reads of <code>vllm.platforms.current_platform</code> get <code>MyPlatform()</code>. Modules that ran <code>from vllm.platforms import current_platform</code> before keep their own reference to the old object. (Derived from Python semantics; see the deep dive.)</p></x-a>
+  </x-q>
+</x-quiz>

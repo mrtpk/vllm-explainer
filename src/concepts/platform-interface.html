@@ -1,0 +1,193 @@
+---
+title: The Platform interface
+nav_title: Platform interface
+level: Advanced
+prerequisites: concepts/platform-plugins, concepts/plugin-loading
+related: concepts/platform-plugins, concepts/plugin-map, concepts/attention-backend-selection, concepts/custom-ops, concepts/distributed-groups, concepts/compile-and-cuda-graphs, code/platforms-interface, code/platforms-init
+summary: The Platform class is the contract between vLLM and a hardware vendor. Identity attributes describe the device; config hooks change VllmConfig in the front end; component pickers name the classes to use; kernel hooks load kernels. CudaPlatform is the reference implementation.
+---
+<x-sentence>The <code>Platform</code> class is the contract for a hardware vendor: vLLM reads its attributes and calls its hooks at fixed points of the start-up.</x-sentence>
+
+<h2>The idea</h2>
+<p>The page {{link concepts/platform-plugins}} explains how a process chooses its {{term platform}}. This page explains what the chosen object must do. <code>Platform</code> in <code>vllm/platforms/interface.py</code> is a class with 90 methods (84 without a leading underscore) and 12 class attributes. Most have a default. A vendor subclass overrides the ones that differ on its hardware.</p>
+<p>The members fall into four groups:</p>
+<ol>
+  <li><strong>Identity attributes.</strong> Values that describe the device: its name, its PyTorch device type, its {{term dispatch-key}}, its distributed backend, and more.</li>
+  <li><strong>Config hooks.</strong> A {{term platform-hook}} that vLLM calls while it builds <code>VllmConfig</code>. The platform can check the config, change defaults, or reject a setting. <code>check_and_update_config</code> is the most important one: it sets the worker class.</li>
+  <li><strong>Component pickers.</strong> A {{term component-picker}} returns the dotted name of a class: the {{term attention-backend}}, the device communicator, the LoRA kernel wrapper, the graph wrapper. vLLM calls it where it builds that component.</li>
+  <li><strong>Kernel hooks.</strong> Methods that import kernel libraries or replace Triton kernels.</li>
+</ol>
+<p>Anything that the class does not define goes to a fallback: <code>Platform.__getattr__</code> looks for the name in <code>torch.&lt;device_type&gt;</code>, for example <code>torch.cuda</code>.</p>
+<p><strong>An everyday comparison.</strong> Think of a franchise manual. Head office writes the chapters and a default answer for each one. A local shop rewrites only the chapters that differ in its country. Head office reads each chapter at a fixed moment: the opening checklist before the shop opens, the staff chapter when it hires. The comparison stops here. In vLLM each process reads its own copy of the manual. The front end reads the config chapters; a worker reads the chapters about the model and the GPU.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b4a_platform_hooks" alt="Three columns for vllm serve with TP = 2. API server column, steps 1 to 7: detect the platform at the import of arg_utils.py line 122; pre_register_and_update(parser) at arg_utils.py 3257; pre_register_and_update() at 2246; validate_environ at 2250; apply_config_platform_defaults at config/vllm.py 1804; check_and_update_config at config/vllm.py 2046; start the engine core at async_llm.py 193. Engine core column: step 8 detect the platform; step 9 start the workers at core.py 147; step 16 get_kv_cache_config_builder_cls. Worker column (two workers): step 10 detect the platform; step 11 register_triton_kernel_overrides at worker_base.py 290; step 12 get_device_communicator_cls at parallel_state.py 551; step 13 get_attn_backend_cls at selector.py 218; step 14 opaque_attention_op at attention.py 440; step 15 update_block_size_for_backend at multiproc_executor.py 702. A callout says that with TP = 1 the uni executor runs steps 11 and 13 to 15 inside the engine core process and step 12 does not run." caption="Figure: the Platform hooks of a <code>vllm serve</code> start-up with TP = 2, numbered in order. Config hooks (violet) run in the front end; component pickers (blue) run where the component is built." />
+<p>Read the numbers in order. Steps 1-6 run once, in the front end, and shape the <code>VllmConfig</code>. The engine core and the workers get that config through pickling, and they detect the platform again for themselves. The pickers in the worker column run in each worker.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: identity attributes</h3>
+<x-code file="vllm/platforms/interface.py" lines="137-181" highlight="138-140,145,150,160,175,177" caption="The class attributes. <code>_enum</code>, <code>device_name</code> and <code>device_type</code> have no default: a subclass must set them." />
+<p>The table compares the defaults with CUDA ({{cite vllm/platforms/cuda.py:226-236}}):</p>
+<table>
+  <thead><tr><th>Attribute</th><th>Default</th><th>CUDA</th><th>Used for</th></tr></thead>
+  <tbody>
+    <tr><td><code>_enum</code></td><td>none</td><td><code>PlatformEnum.CUDA</code></td><td><code>is_cuda()</code>, <code>is_out_of_tree()</code> and the other checks ({{cite vllm/platforms/interface.py:196-222}}). An out-of-tree class uses <code>PlatformEnum.OOT</code>.</td></tr>
+    <tr><td><code>device_name</code></td><td>none</td><td><code>"cuda"</code></td><td>log and error texts; for an out-of-tree platform also the <code>torch.device</code> name of a process group ({{cite vllm/distributed/parallel_state.py:540-543}})</td></tr>
+    <tr><td><code>device_type</code></td><td>none</td><td><code>"cuda"</code></td><td>the <code>DeviceConfig</code> device ({{cite vllm/engine/arg_utils.py:2248}}) and the <code>torch.&lt;device_type&gt;</code> fallback</td></tr>
+    <tr><td><code>dispatch_key</code></td><td><code>"CPU"</code></td><td><code>"CUDA"</code></td><td>the PyTorch dispatcher key of the device; the comment says "CPU" is a fallback for unregistered platforms</td></tr>
+    <tr><td><code>ray_device_key</code></td><td><code>""</code> (no Ray)</td><td><code>"GPU"</code></td><td>the Ray resource name</td></tr>
+    <tr><td><code>device_control_env_var</code></td><td>a placeholder name</td><td><code>"CUDA_VISIBLE_DEVICES"</code></td><td>the mapping of logical, visible and physical device ids ({{cite vllm/platforms/interface.py:287-315}})</td></tr>
+    <tr><td><code>dist_backend</code></td><td><code>""</code></td><td><code>"nccl"</code></td><td>the <code>torch.distributed</code> backend</td></tr>
+    <tr><td><code>supported_quantization</code></td><td><code>[]</code> (no limit)</td><td>not set (no limit)</td><td><code>verify_quantization</code> ({{cite vllm/platforms/interface.py:1153-1158}}); ROCm and XPU set a list ({{cite vllm/platforms/rocm.py:625}}, {{cite vllm/platforms/xpu.py:113}})</td></tr>
+  </tbody>
+</table>
+
+<h3>Step 2: config hooks, and when each one runs</h3>
+<p>Four hooks change the config. Three of them run in the front end, while <code>vllm serve</code> parses the flags and builds <code>VllmConfig</code>:</p>
+<ol>
+  <li><strong><code>pre_register_and_update(parser)</code></strong> runs in <code>AsyncEngineArgs.add_cli_args</code>, after the general plugins and after the parser has its flags ({{cite vllm/engine/arg_utils.py:3243-3257}}). The docstring names the use: register an out-of-tree quantization config ({{cite vllm/platforms/interface.py:638-651}}). It runs a second time, with no parser, at the start of <code>create_engine_config</code> ({{cite vllm/engine/arg_utils.py:2246}}).</li>
+  <li><strong><code>apply_config_platform_defaults(vllm_config)</code></strong> runs in <code>VllmConfig.__post_init__</code> ({{cite vllm/config/vllm.py:1804}}). It changes defaults, for example the list of custom ops. ROCm uses it to turn on custom ops for its AITER kernels ({{cite vllm/platforms/rocm.py:1074-1084}}).</li>
+  <li><strong><code>check_and_update_config(vllm_config)</code></strong> runs late in <code>VllmConfig.__post_init__</code> ({{cite vllm/config/vllm.py:2046}}). The method goes on after it, to line 2318 ({{cite vllm/config/vllm.py:2318}}). It can raise for a setting that the hardware does not support, or change the config. Its most important job is <code>worker_cls</code>. CUDA shows the pattern:</li>
+</ol>
+<x-code file="vllm/platforms/cuda.py" lines="325-345" highlight="330-331" caption="The default of <code>worker_cls</code> is <code>&quot;auto&quot;</code> ({{cite vllm/config/parallel.py:306}}). The platform replaces it only when the user did not set a class." />
+<p>The fourth config hook, <code>update_block_size_for_backend</code>, runs later, after the model is loaded, because it needs the attention backends of the layers ({{cite vllm/platforms/interface.py:749-794}}). With worker processes, each worker calls it ({{cite vllm/v1/executor/multiproc_executor.py:701-702}}). With the <code>uni</code> executor, the engine core process calls it ({{cite vllm/v1/executor/uniproc_executor.py:74-75}}). When the user did not set <code>--block-size</code>, it picks a block size that all attention backends accept. That is the preferred size of a single backend, else the default 16 if all accept it, else the smallest common size ({{cite vllm/platforms/interface.py:771-781}}, {{cite vllm/platforms/interface.py:721-739}}).</p>
+<p>The front end also calls <code>validate_environ</code>, which warns about unknown <code>VLLM_*</code> variables ({{cite vllm/engine/arg_utils.py:2250}}, {{cite vllm/platforms/interface.py:1454-1468}}).</p>
+
+<h3>Step 3: component pickers</h3>
+<p>A picker returns a dotted class name, and the caller imports it with <code>resolve_obj_by_qualname</code>. The attention selector is the main example:</p>
+<x-code file="vllm/v1/attention/selector.py" lines="206-228" highlight="218-222,223-226,227" caption="<code>@cache</code> keeps one answer per argument set. An empty string from the platform raises <code>ValueError</code>; the base class returns an empty string ({{cite vllm/platforms/interface.py:388-396}})." />
+<p>The table lists every picker that this page covers, with its caller.</p>
+<table>
+  <thead><tr><th>Hook</th><th>Called from</th><th>Process</th><th>When in start-up</th><th>Default</th></tr></thead>
+  <tbody>
+    <tr><td><code>get_attn_backend_cls</code></td><td>{{cite vllm/v1/attention/selector.py:218}}</td><td>worker</td><td><code>load_model</code>: each attention layer asks in its <code>__init__</code> ({{cite vllm/model_executor/layers/attention/attention.py:350}})</td><td><code>""</code> (error)</td></tr>
+    <tr><td><code>get_device_communicator_cls</code></td><td>{{cite vllm/distributed/parallel_state.py:549-552}}</td><td>worker</td><td><code>init_device</code>, for each group with more than one rank</td><td><code>DeviceCommunicatorBase</code> ({{cite vllm/platforms/interface.py:1218-1221}})</td></tr>
+    <tr><td><code>get_punica_wrapper</code></td><td>{{cite vllm/lora/punica_wrapper/punica_selector.py:13-16}}</td><td>worker</td><td>only with LoRA, when the LoRA model manager is made ({{cite vllm/lora/model_manager.py:208}})</td><td><code>NotImplementedError</code> ({{cite vllm/platforms/interface.py:1203-1206}})</td></tr>
+    <tr><td><code>get_static_graph_wrapper_cls</code></td><td>{{cite vllm/compilation/backends.py:690-692}}</td><td>worker</td><td>compilation: wraps each piecewise graph</td><td><code>AbstractStaticGraphWrapper</code> ({{cite vllm/platforms/interface.py:1328-1331}})</td></tr>
+    <tr><td><code>get_pass_manager_cls</code>, <code>pass_key</code></td><td>{{cite vllm/compilation/backends.py:875-878}}</td><td>worker</td><td><code>VllmBackend.__init__</code> (compilation)</td><td><code>PostGradPassManager</code> ({{cite vllm/platforms/interface.py:246-251}})</td></tr>
+    <tr><td><code>get_compile_backend</code></td><td>{{cite vllm/config/compilation.py:1080-1081}}; {{cite vllm/compilation/backends.py:122-126}}</td><td>front end (config); worker (compiler)</td><td>when <code>backend</code> is empty; when the backend is not <code>inductor</code> or <code>eager</code></td><td><code>simple_compile_backend</code> = <code>"inductor"</code> ({{cite vllm/platforms/interface.py:253-256}})</td></tr>
+    <tr><td><code>get_kv_cache_config_builder_cls</code></td><td>{{cite vllm/v1/core/kv_cache_config_builder.py:98-103}}</td><td>engine core</td><td>KV cache planning ({{cite vllm/v1/engine/core.py:311}} through {{cite vllm/v1/core/kv_cache_planning.py:1497}})</td><td><code>DefaultKVCacheConfigBuilder</code> ({{cite vllm/platforms/interface.py:1470-1490}})</td></tr>
+    <tr><td><code>opaque_attention_op</code></td><td>{{cite vllm/model_executor/layers/attention/attention.py:440}}</td><td>worker</td><td>attention layer <code>__init__</code></td><td><code>False</code> ({{cite vllm/platforms/interface.py:1285-1290}})</td></tr>
+  </tbody>
+</table>
+<p><code>opaque_attention_op</code> is a yes/no question, not a class name, but it picks a path too. <code>True</code> means that vLLM registers attention as one opaque custom op for <code>torch.compile</code>. <code>False</code> means that the layer calls the backend directly, and <code>torch.compile</code> traces it ({{cite vllm/model_executor/layers/attention/attention.py:436-440}}).</p>
+
+<h3>Step 4: kernel hooks</h3>
+<ul>
+  <li><strong><code>import_kernels</code></strong> imports the compiled kernel libraries. The default imports <code>vllm._C</code> and, if present, <code>vllm._moe_C_stable_libtorch</code> ({{cite vllm/platforms/interface.py:365-373}}). It runs when Python imports <code>vllm._custom_ops</code>, at module level ({{cite vllm/_custom_ops.py:21}}). CUDA imports its own set ({{cite vllm/platforms/cuda.py:238-250}}).</li>
+  <li><strong><code>register_triton_kernel_overrides</code></strong> lets a platform replace core Triton kernels. The worker calls it right after the general plugins, before it makes the worker class ({{cite vllm/v1/worker/worker_base.py:286-290}}). The default does nothing ({{cite vllm/platforms/interface.py:375-386}}). The CPU platform registers C++ versions, but only when Triton is missing ({{cite vllm/platforms/cpu.py:690-705}}).</li>
+  <li><strong><code>import_ir_kernels</code></strong> imports <code>vllm.kernels</code>, the IR op implementations. The docstring says that an out-of-tree platform should override it ({{cite vllm/platforms/interface.py:258-264}}). The kernel config calls it ({{cite vllm/config/kernel.py:54}}).</li>
+</ul>
+
+<h3>Step 5: the fallback to torch.&lt;device_type&gt;</h3>
+<x-code file="vllm/platforms/interface.py" lines="1300-1319" highlight="1303-1304,1306-1312,1314-1319" />
+<ol>
+  <li><strong>Lines 1303-1304.</strong> Dunder names raise <code>AttributeError</code> at once. The comment says why: pickle looks for names such as <code>__getstate__</code>.</li>
+  <li><strong>Lines 1306-1312.</strong> The method looks up <code>torch.cuda</code> (for CUDA) and returns the attribute, if it is not <code>None</code>.</li>
+  <li><strong>Lines 1314-1319.</strong> Otherwise it logs a warning once and returns <code>None</code>. It does not raise.</li>
+</ol>
+<p>So <code>current_platform.synchronize</code> is <code>torch.cuda.synchronize</code> on CUDA, and the forward context checks for <code>None</code> before the call ({{cite vllm/forward_context.py:368-370}}). <code>CudaPlatform</code> does not define <code>synchronize</code> itself; the fallback finds it. (Derived from the method list of <code>cuda.py</code>.)</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Every hook with its caller, process and start-up moment">
+<p>This table covers the hooks that shape the start-up of <code>vllm serve</code>. "Front end" means the process that parses the flags and builds <code>VllmConfig</code>.</p>
+<table>
+  <thead><tr><th>Hook</th><th>Called from</th><th>Process</th><th>When</th></tr></thead>
+  <tbody>
+    <tr><td><code>log_warnings</code></td><td>{{cite vllm/logger.py:295-303}}</td><td>each process that configures logging</td><td>when the process configures logging, and only when the logging config changed ({{cite vllm/logger.py:287-292}}, {{cite vllm/logger.py:306-309}}); for example at {{cite vllm/engine/arg_utils.py:2244}}</td></tr>
+    <tr><td><code>pre_register_and_update(parser)</code></td><td>{{cite vllm/engine/arg_utils.py:3257}}</td><td>front end</td><td>while the CLI builds its parser, before it parses the flags</td></tr>
+    <tr><td><code>pre_register_and_update()</code></td><td>{{cite vllm/engine/arg_utils.py:2246}}</td><td>front end</td><td>start of <code>create_engine_config</code>, after the flags are parsed</td></tr>
+    <tr><td><code>validate_environ</code></td><td>{{cite vllm/engine/arg_utils.py:2250}}</td><td>front end</td><td><code>create_engine_config</code></td></tr>
+    <tr><td><code>check_max_model_len</code></td><td>{{cite vllm/config/model.py:2653}}</td><td>front end</td><td>while <code>ModelConfig</code> computes <code>max_model_len</code></td></tr>
+    <tr><td><code>verify_quantization</code></td><td>{{cite vllm/config/model.py:1470}}</td><td>front end</td><td>while <code>ModelConfig</code> checks the quantization method</td></tr>
+    <tr><td><code>apply_config_platform_defaults</code></td><td>{{cite vllm/config/vllm.py:1804}}</td><td>front end</td><td><code>VllmConfig.__post_init__</code>, before the compilation mode is set (lines 1806-1810)</td></tr>
+    <tr><td><code>check_and_update_config</code></td><td>{{cite vllm/config/vllm.py:2046}}</td><td>front end</td><td>late in <code>VllmConfig.__post_init__</code></td></tr>
+    <tr><td><code>validate_request</code></td><td>{{cite vllm/v1/engine/input_processor.py:430}}</td><td>front end</td><td>for each request</td></tr>
+    <tr><td><code>register_triton_kernel_overrides</code></td><td>{{cite vllm/v1/worker/worker_base.py:290}}</td><td>worker</td><td><code>init_worker</code></td></tr>
+    <tr><td><code>get_device_communicator_cls</code></td><td>{{cite vllm/distributed/parallel_state.py:551}}</td><td>worker</td><td><code>init_device</code></td></tr>
+    <tr><td><code>verify_model_arch</code></td><td>{{cite vllm/model_executor/models/registry.py:1132}}</td><td>where the model class is checked</td><td>model inspection</td></tr>
+    <tr><td><code>get_attn_backend_cls</code>, <code>opaque_attention_op</code></td><td>{{cite vllm/v1/attention/selector.py:218}}, {{cite vllm/model_executor/layers/attention/attention.py:440}}</td><td>worker</td><td><code>load_model</code></td></tr>
+    <tr><td><code>update_block_size_for_backend</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:702}}, {{cite vllm/v1/executor/uniproc_executor.py:75}}</td><td>worker (mp) or engine core (uni)</td><td>after <code>load_model</code></td></tr>
+    <tr><td><code>register_custom_kv_cache_specs</code></td><td>{{cite vllm/v1/core/single_type_kv_cache_manager.py:2719}}</td><td>where KV cache specs are registered</td><td>KV cache spec registration</td></tr>
+    <tr><td><code>get_kv_cache_config_builder_cls</code></td><td>{{cite vllm/v1/core/kv_cache_config_builder.py:101}}</td><td>engine core (also MRV2 workers, {{cite vllm/v1/worker/gpu/cudagraph_utils.py:1045}})</td><td>KV cache planning</td></tr>
+  </tbody>
+</table>
+<p><strong>Not every hook runs once.</strong> <code>pre_register_and_update</code> runs twice in the front end of <code>vllm serve</code> (the two lines above). <code>check_and_update_config</code> and <code>apply_config_platform_defaults</code> run again whenever code makes a new <code>VllmConfig</code>. vLLM's <code>replace()</code> helper does that: it calls the class again with the old fields ({{cite vllm/config/utils.py:121-129}}). For example, the EAGLE drafter loader in a worker calls it when the draft load config differs ({{cite vllm/v1/worker/gpu/spec_decode/eagle/utils.py:90-91}}). So these hooks must give the same result when they run again on a config that they have already changed.</p>
+</x-deepdive>
+
+<x-deepdive title="CudaPlatform as the reference implementation">
+<p><code>cuda.py</code> has two classes and picks one when the module loads. If <code>pynvml.nvmlInit()</code> works, <code>CudaPlatform</code> is <code>NvmlCudaPlatform</code>; otherwise (for example on Jetson) it is <code>NonNvmlCudaPlatform</code> ({{cite vllm/platforms/cuda.py:1040-1054}}). Both subclass <code>CudaPlatformBase</code> ({{cite vllm/platforms/cuda.py:226}}). The module docstring says that the code may use pynvml but must not start a CUDA context ({{cite vllm/platforms/cuda.py:3-5}}).</p>
+<p><strong><code>get_attn_backend_cls</code>, step by step</strong> ({{cite vllm/platforms/cuda.py:419-518}}):</p>
+<ol>
+  <li>Read the device capability, for example <code>(9, 0)</code> on H100.</li>
+  <li>If the user selected a backend (<code>--attention-backend</code>), validate only that one. An import error or an invalid configuration raises <code>ValueError</code>; there is no fallback (lines 430-449).</li>
+  <li>Else get the priority list for the case (MLA or not, capability, head count, KV cache dtype) and validate each backend in order (<code>get_valid_backends</code>, {{cite vllm/platforms/cuda.py:377-417}}).</li>
+  <li>No valid backend: <code>ValueError</code> with every reason (lines 471-475).</li>
+  <li>Pick the valid backend with the smallest priority number (lines 479-485).</li>
+  <li>If the user set <code>--block-size</code> and that excluded a better backend, warn (lines 489-506).</li>
+  <li>Log the choice once and return the dotted class path (lines 508-518).</li>
+</ol>
+<p><strong>Other CUDA answers.</strong></p>
+<table>
+  <thead><tr><th>Hook</th><th>CUDA answer</th><th>Lines</th></tr></thead>
+  <tbody>
+    <tr><td><code>check_and_update_config</code></td><td><code>worker_cls</code> = <code>vllm.v1.worker.gpu_worker.Worker</code>; forces <code>disable_chunked_mm_input</code> for some multimodal models; a WSL warning</td><td>{{cite vllm/platforms/cuda.py:325-366}}</td></tr>
+    <tr><td><code>get_device_communicator_cls</code></td><td><code>CudaCommunicator</code></td><td>{{cite vllm/platforms/cuda.py:580-584}}</td></tr>
+    <tr><td><code>get_punica_wrapper</code></td><td><code>PunicaWrapperGPU</code></td><td>{{cite vllm/platforms/cuda.py:576-578}}</td></tr>
+    <tr><td><code>get_static_graph_wrapper_cls</code></td><td><code>CUDAGraphWrapper</code></td><td>{{cite vllm/platforms/cuda.py:598-600}}</td></tr>
+    <tr><td><code>opaque_attention_op</code></td><td><code>True</code></td><td>{{cite vllm/platforms/cuda.py:594-596}}</td></tr>
+    <tr><td><code>import_kernels</code></td><td><code>_C_stable_libtorch</code>, optional <code>_moe_C_stable_libtorch</code> and <code>_qutlass_C</code></td><td>{{cite vllm/platforms/cuda.py:238-250}}</td></tr>
+  </tbody>
+</table>
+<p>CUDA does not override <code>apply_config_platform_defaults</code> or <code>pre_register_and_update</code>; ROCm overrides both ({{cite vllm/platforms/rocm.py:1064-1084}}). ROCm's <code>pre_register_and_update</code> sets an environment variable with <code>os.environ.setdefault</code>, so a second call does nothing new ({{cite vllm/platforms/rocm.py:1072}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The minimum for a new platform">
+<p>The design doc lists the members that a platform must implement at least: <code>_enum</code>, <code>device_type</code>, <code>device_name</code>, <code>check_and_update_config</code> (which must set <code>worker_cls</code>), <code>get_attn_backend_cls</code> and <code>get_device_communicator_cls</code> ({{cite docs/design/plugin_system.md:100-108}}). The code shows why each one matters:</p>
+<ul>
+  <li><code>_enum = PlatformEnum.OOT</code> makes an enabled <code>CustomOp</code> call <code>forward_oot</code> ({{cite vllm/model_executor/custom_op.py:183}}, {{cite vllm/model_executor/custom_op.py:202-203}}).</li>
+  <li>If <code>worker_cls</code> stays <code>"auto"</code>, the worker passes <code>"auto"</code> to <code>resolve_obj_by_qualname</code>, which cannot split it at a dot ({{cite vllm/v1/worker/worker_base.py:293-296}}, {{cite vllm/utils/import_utils.py:121}}). Start-up fails in the worker. (Derived.)</li>
+  <li>The base <code>get_attn_backend_cls</code> returns <code>""</code>, and the selector raises "Invalid attention backend" ({{cite vllm/v1/attention/selector.py:223-226}}).</li>
+  <li>The base communicator class is generic. It is used only for groups with more than one rank ({{cite vllm/distributed/parallel_state.py:549}}).</li>
+</ul>
+<p>The test platform overrides only <code>check_and_update_config</code> (it sets <code>custom_ops = ["all"]</code>) and <code>get_attn_backend_cls</code> ({{cite tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_platform.py:15-32}}). It leaves <code>worker_cls</code> as it is, because the tests do not start real workers on it. (Derived.)</p>
+</x-deepdive>
+
+<x-deepdive title="Docs and docstrings that do not match the code">
+<ul>
+  <li>The docstring of <code>pre_register_and_update</code> says that it is called "before global VllmConfig is initialized or cli arguments are parsed" ({{cite vllm/platforms/interface.py:644-645}}). This is true for the call in <code>add_cli_args</code>. The second call, in <code>create_engine_config</code>, runs after the flags are parsed ({{cite vllm/engine/arg_utils.py:2246}}).</li>
+  <li>The design doc says that "triton ops" cannot use the custom way "now" ({{cite docs/design/plugin_system.md:143-144}}). The code now has <code>register_triton_kernel_overrides</code> for platforms that replace core Triton kernels ({{cite vllm/platforms/interface.py:375-386}}).</li>
+  <li>The design doc calls <code>check_and_update_config</code> "very early" in the start-up ({{cite docs/design/plugin_system.md:105}}). In the code it runs late in <code>VllmConfig.__post_init__</code>, after the platform detection, the general plugins and both <code>pre_register_and_update</code> calls (Step 2).</li>
+</ul>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="A config hook changes only the config object">
+<p><code>check_and_update_config</code> runs in the process that builds <code>VllmConfig</code> (for <code>vllm serve</code>, the front end). A change to a Python object outside the config (a module global, a registry) does not reach the engine core or the workers. Change only fields of <code>vllm_config</code>: those reach the other processes inside the pickled config ({{cite vllm/v1/engine/utils.py:256-287}}).</p>
+</x-warning>
+<ul>
+  <li><strong>A missing method returns <code>None</code>.</strong> <code>Platform.__getattr__</code> logs "does not have ... attribute" once and returns <code>None</code> ({{cite vllm/platforms/interface.py:1314-1319}}). The caller then fails later with a <code>TypeError</code> if it calls the value. (Derived.)</li>
+  <li><strong>LoRA on a new platform.</strong> The base <code>get_punica_wrapper</code> raises <code>NotImplementedError</code> ({{cite vllm/platforms/interface.py:1203-1206}}). Implement it, or do not use <code>--enable-lora</code>.</li>
+  <li><strong>A selected backend is invalid.</strong> On CUDA, <code>--attention-backend</code> with an invalid backend raises <code>ValueError</code>; vLLM does not fall back ({{cite vllm/platforms/cuda.py:430-446}}).</li>
+  <li><strong>The block sizes do not fit together.</strong> When the attention backends share no block size, <code>update_block_size_for_backend</code> raises <code>ValueError</code> ({{cite vllm/platforms/interface.py:740-747}}).</li>
+  <li><strong>A quantization method is not supported.</strong> If the platform sets <code>supported_quantization</code> and the method is not in it, <code>verify_quantization</code> raises <code>ValueError</code> ({{cite vllm/platforms/interface.py:1153-1158}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> A vendor port of vLLM is mostly a <code>Platform</code> subclass plus a worker class. Knowing which hook runs in which process, and when, tells you where to put each change and where to look when start-up fails.</p>
+
+<x-quiz>
+  <x-q level="easy">Which Platform hook sets the worker class, and in which process does it run?
+    <x-a><p><code>check_and_update_config</code>. CUDA sets <code>worker_cls</code> to <code>vllm.v1.worker.gpu_worker.Worker</code> when it is <code>"auto"</code> ({{cite vllm/platforms/cuda.py:330-331}}). It runs in <code>VllmConfig.__post_init__</code> ({{cite vllm/config/vllm.py:2046}}), in the front end for <code>vllm serve</code>.</p></x-a>
+  </x-q>
+  <x-q level="easy">Your platform class has no <code>synchronize</code> method, and its <code>device_type</code> is <code>"cuda"</code>. What does <code>current_platform.synchronize</code> return?
+    <x-a><p><code>torch.cuda.synchronize</code>. <code>Platform.__getattr__</code> looks up the name in <code>torch.&lt;device_type&gt;</code> ({{cite vllm/platforms/interface.py:1306-1312}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With TP = 1, which process calls <code>get_attn_backend_cls</code>, and is <code>get_device_communicator_cls</code> called?
+    <x-a><p>The engine core process: the <code>uni</code> executor runs the worker there and loads the model ({{cite vllm/v1/executor/uniproc_executor.py:68-75}}). <code>get_device_communicator_cls</code> is not called, because the code asks for it only when the group has more than one rank ({{cite vllm/distributed/parallel_state.py:549-552}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Your <code>check_and_update_config</code> appends <code>"+my_op"</code> to <code>compilation_config.custom_ops</code> each time it runs. Why can the list get the entry twice, and what is the fix?
+    <x-a><p><code>check_and_update_config</code> runs in every <code>VllmConfig.__post_init__</code> ({{cite vllm/config/vllm.py:2046}}). vLLM's <code>replace()</code> makes a new <code>VllmConfig</code> from the old fields, so <code>__post_init__</code> runs again on a list that already has the entry ({{cite vllm/config/utils.py:121-129}}). An example is the EAGLE drafter loader ({{cite vllm/v1/worker/gpu/spec_decode/eagle/utils.py:90-91}}). Append only when the entry is missing, as the CPU platform does for <code>+gelu</code> ({{cite vllm/platforms/cpu.py:394-399}}). (Derived: the new config shares the old <code>compilation_config</code> object, because <code>replace()</code> passes the same field values.)</p></x-a>
+  </x-q>
+</x-quiz>
