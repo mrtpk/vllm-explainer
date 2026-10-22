@@ -583,7 +583,65 @@ def render_project(ctx: Ctx, page: Page, arg: str, label: str | None, where: str
     return esc(values[key])
 
 
-INLINE_KINDS = {"cite": render_cite, "term": render_term, "link": render_link, "project": render_project}
+# {{deepinfer <page-id> | text}}: a link to a page of the sibling site "DeepInfer Explained".
+# URL = <deepinfer_url>/<page-id>.html (explainer.json). The page id is checked against the nav files of the
+# sibling explainer folder (optional key deepinfer_path, default ../deepinfer-explainer). If that folder is
+# missing, the build only warns.
+DEEPINFER_URL = (CFG.get("deepinfer_url") or "").rstrip("/")
+DEEPINFER_SRC = (ROOT / CFG.get("deepinfer_path", "../deepinfer-explainer")).resolve()
+_DEEPINFER: dict = {}
+
+
+def deepinfer_pages() -> dict[str, str] | None:
+    """Page id -> title of every page in the DeepInfer nav files. None if the nav files are not there."""
+    if "pages" not in _DEEPINFER:
+        nav_files = sorted((DEEPINFER_SRC / "src" / "nav").glob("*.json"))
+        pages: dict[str, str] | None = None
+        if nav_files:
+            pages = {"index": "Home"}
+            for f in nav_files:
+                try:
+                    data = json.loads(f.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as e:
+                    R.error(str(f), f"cannot read DeepInfer nav file: {e}")
+                    continue
+                entries = list(data.get("pages", []))
+                for g in data.get("groups", []):
+                    entries += g.get("pages", [])
+                for e in entries:
+                    if isinstance(e, dict) and e.get("id"):
+                        pages[e["id"]] = e.get("title", e["id"])
+        _DEEPINFER["pages"] = pages
+    return _DEEPINFER["pages"]
+
+
+def render_deepinfer(ctx: Ctx, page: Page, arg: str, label: str | None, where: str) -> str:
+    pid, _, anchor = arg.strip().partition("#")
+    if not DEEPINFER_URL:
+        R.error(where, "{{deepinfer ...}} needs the key 'deepinfer_url' in explainer.json")
+        return label or esc(pid)
+    if not re.fullmatch(r"[a-z0-9][a-z0-9/_-]*", pid):
+        R.error(where, f"deepinfer: bad page id {pid!r}; use a DeepInfer page id such as learn/kv-cache")
+        return label or esc(pid)
+    pages = deepinfer_pages()
+    title = None
+    if pages is None:
+        if not _DEEPINFER.get("warned"):
+            _DEEPINFER["warned"] = True
+            R.warn(where, f"deepinfer: {DEEPINFER_SRC}/src/nav/*.json not found; DeepInfer page ids are not checked")
+    elif pid not in pages:
+        R.error(where, f"deepinfer: no page {pid!r} in the DeepInfer nav files{suggest(pid, pages)}")
+    else:
+        title = pages[pid]
+    url = f"{DEEPINFER_URL}/{pid}.html" + (f"#{anchor}" if anchor else "")
+    text = label if label else esc(title or pid)
+    tip = f"DeepInfer Explained: {title}" if title else "DeepInfer Explained"
+    return (f'<a class="ext-link deepinfer-link" href="{esc(url)}" target="_blank" rel="noopener" '
+            f'title="{esc(tip)}">{text}<span class="ext-mark" aria-hidden="true">↗</span></a>')
+
+
+INLINE_KINDS = {"cite": render_cite, "term": render_term, "link": render_link, "project": render_project,
+                "deepinfer": render_deepinfer}
 
 
 def submodule_pins() -> list[tuple[str, str, str]]:

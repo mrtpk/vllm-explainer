@@ -1,7 +1,7 @@
 # vLLM Explainer — Progress
 
 Last update: 2026-10-22 19:10
-Current phase: **0 Plan** — base decisions approved; waiting for the user's plan changes.
+Current phase: **1a Foundation** — plan approved ("go", 2026-10-22 19:13). Running (4/4): foundation agent, reference-generators agent, 1b basics samples (learn/ml-basics-recap, learn/serving-metrics), 1b Tour 1 (tours/life-of-a-chat-request + request_stepper visual). The two 1b writers started early, in parallel with 1a (they may need small fixes after STYLE.md lands).
 
 This file is the memory of the project. A new session must be able to continue from it alone.
 
@@ -10,12 +10,18 @@ This file is the memory of the project. A new session must be able to continue f
 | Phase | Status | Notes |
 |---|---|---|
 | 0a Survey | done | 4 surveys in `notes/survey/` (core-engine, plugins, model-execution, serving-config-distributed); spot-checked |
-| 0b Plan approval | open | `plan.md` draft |
-| 1 Foundation + samples | not started | |
+| 0b Plan approval | done | approved 2026-10-22 ("go"); committed dd25917 |
+| 1 Foundation + samples | running | 1a foundation agent (STYLE, nav, core glossary, {{deepinfer}} tag, concepts/plugin-loading); generators agent (tools/gen_env_vars, gen_serve_flags, gen_config_classes, gen_metrics → notes/generated/*.json) |
 | Full build (plan §12) | not started | |
 | F Final pass | not started | |
 
 ## Done
+
+- 2026-10-22 19:20: USER INSTRUCTION: "You dont need to stop for me. RUn unattented. This is okay because I already approve deepinfer explainer strcuture and coloring" → no Phase 1 stop; run the full build unattended; still no push.
+
+- 2026-10-22 19:18: DECISION: start the basics and Tour 1 sample writers in parallel with 1a to use the 4-agent window before 19:56. Fixed all page ids (sent to the foundation agent). Risk: pages may need small STYLE.md fixes later.
+
+- 2026-10-22 19:13: USER DECISION: plan approved ("go"). Starter kit copied, explainer.json filled, git init (author Thomas Paul, repo-local), first build 0 errors, commit dd25917.
 
 - 2026-10-22: USER DECISION: Model Runner V2 only. Supervisor verified V2 is the default (config/vllm.py:713-748) and V1 is deprecated; V1 fallback = one cited note on concepts/model-runner.
 
@@ -30,13 +36,16 @@ This file is the memory of the project. A new session must be able to continue f
 
 ## Next step
 
-Get user answers on plan §2 "Proposed" rows and the size option (§4 full vs §4.6 focused). Then Phase 1a.
+Wait for the foundation + generators agents. Review, build, commit Phase 1a. Then Phase 1b samples (plan §11): max 4 parallel before 19:56, else max 2. After 1b: fact checks (1c), supervisor review, then continue straight into the full build (plan §12) — no user stop (user instruction 19:20).
 
 ## Questions for the user
 
 See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
+
+- TODO (supervisor): add core glossary terms request, step, prefill, decode, batch, scheduler to src/glossary/core.json AFTER the foundation agent finishes (b0 writer request).
+- FAQ material from b0: docs/design/metrics.md queue-time wording, arrival_time wording, TPOT formula differ from code (see notes/facts.md Conflicts).
 
 - 2026-10-22 (survey): docs/design/custom_op.md:11, :285 show `@CustomOp.register_oot("name")` → TypeError (custom_op.py:354-356). FAQ material.
 - 2026-10-22 (survey): docs/design/plugin_system.md gaps (logits_processors group missing; OOT-wins rule missing). FAQ material.
@@ -50,3 +59,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-22 | Survey: plugins | done, notes/survey/plugins.md |
 | 2026-10-22 | Survey: model execution | done, notes/survey/model-execution.md |
 | 2026-10-22 | Survey: serving/config/distributed | done, notes/survey/serving-config-distributed.md |
+| 2026-10-22 19:15 | 1a Foundation | running |
+| 2026-10-22 19:15 | Reference generators (tools/gen_*.py) | running |
+| 2026-10-22 19:18 | 1b basics samples (b0) | done 19:34: learn/ml-basics-recap, learn/serving-metrics, diagram b0_serving_timeline, glossary b0.json (7 terms) |
+| 2026-10-22 19:35 | Fact check b0 | running |
+| 2026-10-22 19:18 | 1b Tour 1 (t1) | running |

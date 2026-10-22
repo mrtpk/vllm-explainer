@@ -36,7 +36,7 @@ Three focus areas (user, 2026-10-22):
 | Hosting | local first; published later like DeepInfer (CDN libraries OK). |
 | Location | `test-harness/vllm-explainer/` (this folder). `../vllm` stays unchanged. |
 | Name | "vLLM Explained". |
-| Checkpoint | Stop after Phase 1 for a review of the sample pages. |
+| Checkpoint | **Changed 2026-10-22: no stop.** User: "You dont need to stop for me. RUn unattented. This is okay because I already approve deepinfer explainer strcuture and coloring". Phase 1 samples are reviewed by the supervisor, then the full build continues without a user gate. Push/publish still only on request. |
 
 User answers 2026-10-22: full size (~100 pages); same base decisions as DeepInfer (reader, depth, ASD-STE100, look, local first, stop after Phase 1); git per stage with author Thomas Paul <contact@thomaspaul.dev>, no push. Plan changes requested before Phase 1 (pending).
 | Git | commit per stage, push only on request, author `Thomas Paul <contact@thomaspaul.dev>` (as in DeepInfer), repo-local. |
@@ -199,7 +199,7 @@ Writer → separate fact checker → commit per batch. `progress.md` updated aft
 | 1a | Starter kit, `explainer.json`, STYLE.md, nav with all pages, core glossary, `{{deepinfer}}` tag; sample concept page **concepts/plugin-loading** | 1 subagent |
 | 1b | Samples (≤4 parallel): (i) home + process-map stepper + code tree + module page `plugins/__init__.py`; (ii) basics `learn/ml-basics-recap` + `learn/serving-metrics`; (iii) Tour 1 "Life of a chat request"; (iv) generated `reference/env-vars` | 4 subagents (or 2 after 19:56) |
 | 1c | Fact check of all samples; site check | fact checkers + supervisor |
-| 1d | **Stop. User reviews the samples.** | supervisor |
+| 1d | ~~Stop for user review~~ — removed 2026-10-22 (user: run unattended). Supervisor reviews samples and continues. | supervisor |
 
 ## 12. Full build (after approval) — batches
 | Batch | Pages |

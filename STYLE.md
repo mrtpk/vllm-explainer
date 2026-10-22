@@ -1,15 +1,13 @@
-# <Project> Explained — Writer's guide
-
-> Template note: replace `<Project>`, `<project>`, the sample page names, the vocabulary table (section 6)
-> and the out-of-scope list (section 7, rule 5) for your project. Keep the rest.
+# vLLM Explained — Writer's guide
 
 This guide is for everyone who writes pages, glossary entries or diagrams for the site.
 Read all of it before you write your first page. Then copy the sample page
-`src/concepts/example-concept.html` (replace it with the Phase 1 reference page) — it uses every part of this guide.
+`src/concepts/plugin-loading.html` ("How vLLM finds and loads plugins") — it uses every part of this guide.
+Read section 1.1 (project rules) first: they are user decisions and they override everything else.
 
 Contents
 
-1. Quick start
+1. Quick start (1.1 Project rules)
 2. Files, folders and ownership (how parallel writers avoid conflicts)
 3. Page source format (front matter)
 4. Page templates (concept, basics, tour, code map, reference)
@@ -27,7 +25,7 @@ Contents
 ## 1. Quick start
 
 ```bash
-cd <project>-explainer
+cd vllm-explainer
 python3 build.py                 # build site/ (runs stale diagram scripts first)
 python3 build.py --strict        # also fail on warnings (use before hand-in)
 python3 build.py --force-diagrams
@@ -37,15 +35,71 @@ python3 tools/gen_folder_tree.py   # update the code-map folder tree (src/code/i
 
 Open `site/index.html` with a double-click. The site works from disk (`file://`).
 
-- Source repo (READ ONLY): `repo_path` in `explainer.json`, pinned to the commit `sha` in `explainer.json`.
-  The build stops if the repo is at another commit.
+- Source repo (READ ONLY): `../vllm` (`repo_path` in `explainer.json`), pinned to commit
+  `3e44c0db26f3530d674d255dafabaedcf0e3d742` (`sha` in `explainer.json`). The build stops if the repo is at
+  another commit. Never change, check out or build anything in `../vllm`.
+- `../vllm` is on a slow Windows mount. Use `git -C ../vllm grep`, `sed -n 'a,bp'` and reads of single
+  files. Do not `cat`, `wc` or `find` the whole tree.
 - Python 3 standard library only. No `pip install`.
 - Never edit `site/` or `build/`. The build deletes and rewrites `site/` on every run.
+
+### 1.1 Project rules (user decisions; they override the rest of this guide)
+
+1. **Latest code only.** The site explains vLLM at the pinned commit. Do not explain legacy code or
+   history ("in V0 ...", "before version ..."). V0 is gone; only some aliases remain. Explain the V1 engine
+   (`vllm/v1/`) and **Model Runner V2** (`vllm/v1/worker/gpu/`), which is the default.
+   Model Runner V1 (`vllm/v1/worker/gpu_model_runner.py`) gets exactly one cited note, on
+   `concepts/model-runner`, as "the fallback". Other pages do not explain it.
+2. **Online serving is the main path.** The reader must become proficient in online serving with
+   `vllm serve` (the OpenAI-compatible API server, `AsyncLLM`, the engine core process, the workers).
+   Examples, tours and diagrams follow an HTTP request. The offline `LLM` class is a side note only
+   (one short `<x-note>` when it behaves differently).
+3. **Basics already taught on DeepInfer Explained: one-line recap + a `{{deepinfer}}` link. Never
+   explain them again.** The reader has read DeepInfer Explained (https://explaindeepinfer.projects.thomaspaul.dev)
+   or knows the basics. When a page needs one of the basics in the table below, write ONE sentence that
+   recaps the idea, then link it with `{{deepinfer <id> | text}}` (section 5.13). Then explain only what
+   vLLM does differently. Source of the list: `basics-covered.md`.
+
+   | Basic | DeepInfer page id |
+   |---|---|
+   | What an LLM does; generation loop; what an engine adds | `learn/what-an-llm-does` |
+   | Tokens, tokenizers, BPE, special tokens | `learn/tokens` |
+   | Transformer layers: embedding, attention + MLP, norms, RoPE | `learn/transformer` |
+   | Attention: Q/K/V, softmax, MHA/GQA/MQA/MLA, causal mask | `learn/attention` |
+   | Prefill and decode; compute-bound vs memory-bound | `learn/prefill-decode` |
+   | KV cache, KV size math, blocks and block tables, preemption, cache sizing | `learn/kv-cache` |
+   | Sampling: temperature, top-k, top-p, seeds | `learn/sampling` |
+   | Batching: continuous batching, varlen batches, chunked prefill | `learn/batching` |
+   | GPUs, kernels, launches, roofline, streams, CUDA graphs (the idea) | `learn/gpus-kernels` |
+   | Parallelism ideas: DP, TP, PP, CP, EP; collectives | `learn/parallelism` |
+   | Mixture of Experts: router, top-k, shared experts | `learn/moe` |
+   | Number formats: BF16, FP16, FP8, FP4, block scales | `learn/number-formats` |
+   | Engine step loop, request lifecycle | `concepts/engine-step-loop`, `concepts/request-lifecycle` |
+   | Scheduler with preemption and chunked prefill (the idea) | `concepts/scheduler` |
+   | Paged KV cache and block manager (the idea) | `concepts/paged-kv-cache` |
+   | Varlen input metadata | `concepts/input-metadata` |
+   | CUDA graph capture and replay | `concepts/cuda-graphs` |
+   | CPU/GPU overlap (the async scheduling idea) | `concepts/zero-overhead-scheduling` |
+   | Speculative decoding: draft, verify, accept/reject | `concepts/speculative-decoding` |
+   | Structured outputs: token masks | `concepts/structured-outputs` |
+   | Determinism and batch invariance | `concepts/determinism` |
+   | Expert parallelism (dispatch/combine), EPLB | `concepts/expert-parallelism`, `concepts/eplb` |
+   | Weight loading from Hugging Face checkpoints | `concepts/weight-loading` |
+
+   Not covered there (explain them fully on this site): TP and PP in practice, how prefix caching
+   works, the OpenAI server, `AsyncLLM` and the multi-process engine core, the model registry and LoRA
+   adapters, quantization methods as plugins, attention backends, KV transfer / disaggregated prefill,
+   `torch.compile` integration.
+
+   Example: *"The KV cache keeps the keys and values of earlier tokens, so decode does not compute them
+   again ({{deepinfer learn/kv-cache | The KV cache}}). vLLM splits it into blocks of `block_size` tokens ..."*
+4. **Scope.** See section 7, rule 5: kernel internals, legacy V0 aliases and Model Runner V1 are out of
+   scope; the Rust frontend and `vllm/models/` get one paragraph each.
 
 ## 2. Files, folders and ownership
 
 ```
-<project>-explainer/
+vllm-explainer/
   explainer.json         project name, target repo path and URL, pinned commit (owner: supervisor)
   build.py               the generator (owner: foundation; do not edit without asking the supervisor)
   STYLE.md               this guide
@@ -74,17 +128,18 @@ Open `site/index.html` with a double-click. The site works from disk (`file://`)
 **How parallel writers avoid editing the same file**
 
 - **Pages.** Each page is its own file. The page id is the path without `.html`
-  (`src/concepts/request-flow.html` → id `concepts/request-flow`). Write only the pages you own.
+  (`src/concepts/scheduler.html` → id `concepts/scheduler`). Write only the pages you own.
 - **Navigation.** All planned pages are already listed in `src/nav/*.json`, with fixed ids.
   When you create a file with a listed id, its sidebar entry becomes live. You do **not** need to edit
   the nav file. If you must add a page that is not listed, do not edit another writer's nav file:
   put `nav_after: <existing id>` in your page front matter (section 9).
 - **Glossary.** The build merges every `src/glossary/*.json` file. Each writer owns one file, for
-  example `src/glossary/b1.json`, `src/glossary/b3a.json` (one file per batch).
+  example `src/glossary/b1.json`, `src/glossary/b3.json` (one file per batch of `plan.md` §12).
   `core.json` (general terms) already exists and belongs to the supervisor. Search all glossary files before you
   add a term. A duplicate id stops the build. If an existing definition is wrong, tell the supervisor;
   do not redefine it.
-- **Diagrams.** One script per diagram, named after its page or topic (`diagrams/b3a_request_flow.py`).
+- **Diagrams.** One script per diagram, named after its page or topic (`diagrams/b3_scheduler_budget.py`;
+  the sample page uses `diagrams/c_plugin_loading.py`).
   Use a prefix that belongs to you, so two writers never pick the same name.
 - **Links to pages that do not exist yet** are allowed. They render as grey "coming soon" text and give
   a warning, not an error. So you can link to pages that another writer writes at the same time.
@@ -95,12 +150,12 @@ A page is an HTML fragment with a front matter block at the top:
 
 ```html
 ---
-title: The request flow: from the API call to the result
-nav_title: The request flow
+title: How vLLM finds and loads plugins
+nav_title: Plugin loading
 level: Intermediate
-prerequisites: learn/example-basics
-related: tours/example-tour, code/engine
-summary: One request goes through four parts of <Project>. This page shows each part and the file that implements it.
+prerequisites: learn/python-entry-points, learn/processes-and-ipc
+related: concepts/plugin-map, concepts/platform-plugins, code/plugins-init
+summary: vLLM finds plugins through Python entry points. Each process loads the plugin groups that it needs, at its own time.
 ---
 <x-sentence>...</x-sentence>
 <h2>The idea</h2>
@@ -109,7 +164,7 @@ summary: One request goes through four parts of <Project>. This page shows each 
 
 | Key | Required | Meaning |
 |---|---|---|
-| `title` | yes | Page title (h1 and browser tab: "Title · <Project> Explained"). |
+| `title` | yes | Page title (h1 and browser tab: "Title · vLLM Explained"). |
 | `summary` | yes | One or two sentences. Used by search, related-page cards and `<meta description>`. |
 | `level` | learn, concepts, tours | `Beginner`, `Intermediate` or `Advanced`. Optional elsewhere. |
 | `prerequisites` | template pages | Comma-separated page ids, or `none`. Makes the "Before you read" box. |
@@ -118,7 +173,7 @@ summary: One request goes through four parts of <Project>. This page shows each 
 | `nav_after` | no | Only for pages that are not in a nav file: insert after this id. |
 | `prev`, `next` | no | Override the previous/next buttons (page id or `none`). Normally they follow the nav order. |
 | `checks` | no | `off` turns off the template warnings (use only with a reason). |
-| `scripts` | no | Comma-separated JS files inside `assets/`, for example `viz/example_stepper.js`. Loaded with `defer` on this page only (section 5.9). |
+| `scripts` | no | Comma-separated JS files inside `assets/`, for example `viz/process_map.js`. Loaded with `defer` on this page only (section 5.9). |
 
 One `key: value` per line. Values are one line. Unknown keys stop the build.
 
@@ -129,7 +184,8 @@ to headings; write `id="..."` yourself only when you link to the heading.
 
 ## 4. Page templates
 
-Starter files: `src/_templates/concept.html`, `src/_templates/tour.html`.
+Starter files: `src/_templates/concept.html`, `src/_templates/tour.html`. The model concept page is
+`src/concepts/plugin-loading.html`.
 
 ### 4.1 Concept and basics pages (sections `concepts`, `learn`)
 
@@ -142,7 +198,7 @@ Use these parts in this order. Use the `<h2>` texts exactly as shown, so every p
 | 3 | In one sentence | `<x-sentence>` — max 25 words |
 | 4 | **The idea** | `<h2>The idea</h2>` — plain explanation, then one everyday comparison (analogy). Say where the analogy stops being true. |
 | 5 | **The picture** | `<h2>The picture</h2>` + `<x-diagram>` + 2-3 sentences on how to read it |
-| 6 | **In the code** | `<h2>In the code</h2>` — `<h3>Step N: ...</h3>` sub-sections, each with real excerpts (`<x-code>`) and citations (`{{cite}}`). Basics pages (`learn/`) use `<h2>In <Project></h2>` instead: a short section at the end with 1–3 cited pointers into the code and links to concept pages. |
+| 6 | **In the code** | `<h2>In the code</h2>` — `<h3>Step N: ...</h3>` sub-sections, each with real excerpts (`<x-code>`) and citations (`{{cite}}`). Basics pages (`learn/`) use `<h2>In vLLM</h2>` instead: a short section at the end with 1–3 cited pointers into the code and links to concept pages. |
 | 7 | **Deep dive** | `<h2>Deep dive</h2>` + one or more `<x-deepdive>` blocks. FULL detail (see below). |
 | 8 | **What can go wrong** | `<h2>What can go wrong</h2>` — failure modes with citations, then **Why it matters.** |
 | 9 | Check yourself | `<x-quiz>` with 3-5 questions: mix easy, medium and hard. The heading is automatic. |
@@ -157,7 +213,7 @@ technical detail, not a longer summary:
 - edge cases and error paths (what raises, what only warns);
 - related environment variables and config fields, with defaults and the line that reads them;
 - design trade-offs (why this way, what the alternative costs), only if the code or docs support it;
-- numbers from `doc/` (cite the line);
+- numbers from `docs/` (cite the line);
 - long code read line by line: show the excerpt, then a numbered list "Line 13. ...".
 
 Split long detail into several `<x-deepdive>` blocks, one topic each, with a clear title. A deep dive
@@ -169,9 +225,9 @@ Same front matter and the same first parts (sentence, idea, picture). Then numbe
 "In the code":
 
 ```html
-<x-stop n="1" title="The user calls llm.generate()">
+<x-stop n="1" title="The client sends POST /v1/chat/completions">
   <p>Where we are, and why this step exists.</p>
-  <x-code file="pkg/api.py" lines="100-120" highlight="110" />
+  <x-code file="vllm/entrypoints/openai/chat_completion/api_router.py" lines="43-59" highlight="43" />
   <p>What the excerpt does.</p>
   <x-deepdive title="Stop 1 in detail"> ... </x-deepdive>
 </x-stop>
@@ -182,7 +238,9 @@ Stops run in code order. Each stop names the file and function where the reader 
 
 ### 4.3 Code map pages (section `code`)
 
-The model page is `src/code/llm-engine.html`. Copy its structure.
+The model page is `src/code/plugins-init.html` (written in Phase 1b). Copy its structure. Module page
+ids are `code/<path>`: drop `vllm/` and `.py`, write `__init__` as `init`, and replace `/`, `_` and `.` with `-`
+(`vllm/v1/engine/async_llm.py` → `code/v1-engine-async-llm`; `vllm/plugins/__init__.py` → `code/plugins-init`).
 
 Front matter: `title: <path>: <main thing>`, `nav_title: <short path>`, `level`, `prerequisites`,
 `related`, `summary`.
@@ -219,13 +277,13 @@ General rules for all custom tags:
 
 ### 5.1 Code excerpt — `<x-code>`
 
-The build reads the REAL lines from the target repo checkout. Line numbers in the block match the file. The
+The build reads the REAL lines from `../vllm`. Line numbers in the block match the file. The
 header shows `path:start-end` and links to GitHub at the pinned commit.
 
 ```html
-<x-code file="pkg/engine.py" lines="222-227" />
-<x-code file="pkg/engine.py" lines="55-83" highlight="57-58,63,80-82" caption="Short note on what to look at." />
-<x-code file="native/queue.hpp" lines="26-32" title="The queue" lang="cpp" />
+<x-code file="vllm/plugins/__init__.py" lines="77-90" />
+<x-code file="vllm/plugins/__init__.py" lines="36-74" highlight="40,64,68-72" caption="Short note on what to look at." />
+<x-code file="pyproject.toml" lines="45-47" title="vLLM's own general plugins" lang="toml" />
 ```
 
 | Attribute | Required | Meaning |
@@ -237,7 +295,8 @@ header shows `path:start-end` and links to GitHub at the pinned commit.
 | `title` | no | Short bold label before the path. |
 | `lang` | no | Override the language (`python`, `cpp`, `bash`, `json`, `none`). Default from the file extension. |
 
-**Comments in another language** (set `comment_language` in `explainer.json`). Add translations as children. They show under the code:
+**Comments in another language** (set `comment_language` in `explainer.json`). vLLM comments are in English, so you
+normally do not need this. Add translations as children. They show under the code:
 
 ```html
 <x-code file="pkg/__init__.py" lines="9-32" highlight="15">
@@ -249,26 +308,26 @@ header shows `path:start-end` and links to GitHub at the pinned commit.
 For a single comment in running text, write: `Translated: <em>"..."</em> ({{cite path:line}})`.
 
 For example commands that are not in the repo, use a plain block:
-`<pre><code class="language-bash">python3 examples/quickstart.py</code></pre>`.
+`<pre><code class="language-bash">vllm serve Qwen/Qwen3-0.6B --max-model-len 4096</code></pre>`.
 
 ### 5.2 Citation — `{{cite ...}}`
 
 ```html
-{{cite pkg/engine.py:223}}                 → link "pkg/engine.py:223"
-{{cite pkg/engine.py:222-227}}             → link to a line range
-{{cite pkg/engine.py:222 | Engine.step()}} → custom link text
-{{cite pkg/backends/}}                     → link to a folder (no line)
+{{cite vllm/plugins/__init__.py:33}}                          → link "vllm/plugins/__init__.py:33"
+{{cite vllm/plugins/__init__.py:82-85}}                       → link to a line range
+{{cite vllm/plugins/__init__.py:77 | load_general_plugins()}} → custom link text
+{{cite vllm/plugins/}}                                        → link to a folder (no line)
 {{cite .gitmodules}}                          → link to a whole file
 ```
 
 The build fails if the file does not exist or the lines are out of range. Put citations in
-parentheses after the claim: `... uses a thread pool ({{cite pkg/engine.py:89}}).`
+parentheses after the claim: `... calls each plugin function ({{cite vllm/plugins/__init__.py:89-90}}).`
 
 ### 5.3 Glossary term — `{{term ...}}`
 
 ```html
-{{term kv-store}}              → shows the glossary "term" text ("KV store"), with a tooltip
-{{term kernel | kernels}}      → custom text (plural, other case)
+{{term entry-point}}               → shows the glossary "term" text ("entry point"), with a tooltip
+{{term plugin | plugins}}          → custom text (plural, other case)
 ```
 
 The id must exist in `src/glossary/*.json` (the build suggests close matches). Link a term at its
@@ -277,9 +336,9 @@ The id must exist in `src/glossary/*.json` (the build suggests close matches). L
 ### 5.4 Internal link — `{{link ...}}`
 
 ```html
-{{link concepts/request-flow}}                  → link text = that page's title
-{{link concepts/request-flow | the flow}}      → custom text
-{{link concepts/request-flow#the-picture}}     → link to a heading id (checked)
+{{link concepts/plugin-loading}}                  → link text = that page's title
+{{link concepts/plugin-loading | plugin loading}} → custom text
+{{link concepts/plugin-loading#the-picture}}      → link to a heading id (checked)
 ```
 
 Never write `<a href="../concepts/x.html">` by hand; `{{link}}` makes the right relative path.
@@ -288,7 +347,7 @@ Never write `<a href="../concepts/x.html">` by hand; `{{link}}` makes the right 
 ### 5.5 Diagram — `<x-diagram>`
 
 ```html
-<x-diagram name="example_flow" alt="Text description for screen readers." caption="Figure: what the reader must see." />
+<x-diagram name="c_plugin_loading" alt="Text description for screen readers." caption="Figure: what the reader must see." />
 ```
 
 `name` is the script name in `diagrams/` without `.py`. `alt` is required. The SVG is put inline on
@@ -304,9 +363,9 @@ a white card. Click opens it at full size; "Open full size" opens the SVG file.
 
 <x-simplified><p>What is simplified, and what the full truth is (or where to read it).</p></x-simplified>
 
-<x-warning title="Set MYPROJECT_HOME before you start"><p>...</p></x-warning>
+<x-warning title="VLLM_PLUGINS is one list for all groups"><p>...</p></x-warning>
 
-<x-deepdive title="Engine.__init__, line by line">
+<x-deepdive title="load_plugins_by_group(), line by line">
   <p>...</p>
 </x-deepdive>
 ```
@@ -320,8 +379,8 @@ a white card. Click opens it at full size; "Open full size" opens the SVG file.
 
 ```html
 <x-quiz>
-  <x-q level="easy">Which function starts the main loop?
-    <x-a><p><code>Engine.run()</code> in <code>pkg/engine.py</code>.</p></x-a>
+  <x-q level="easy">Which function loads the general plugins?
+    <x-a><p><code>load_general_plugins()</code> in <code>vllm/plugins/__init__.py</code>.</p></x-a>
   </x-q>
   <x-q level="hard">Question that needs two facts from the code?
     <x-a><p>Answer, with citations.</p></x-a>
@@ -371,7 +430,7 @@ not exist. Section 10 tells how to write the script.
 Use an image only when a diagram script cannot show the same thing (for example a chart from the repo's docs).
 
 ```html
-<x-img repo="docs/images/architecture.png" alt="Text description." caption="What it shows." width="900" />
+<x-img repo="docs/assets/design/hierarchy.png" alt="Text description." caption="What it shows." width="900" />
 <x-img src="img/my_picture.png" alt="Text description." />
 ```
 
@@ -401,6 +460,25 @@ Only for the home page section `#code-version`. The build writes the commit tabl
 the table of pinned git submodules (read with `git ls-tree` and `.gitmodules`) and a note that line
 numbers belong to this commit.
 
+### 5.13 Link to DeepInfer Explained — `{{deepinfer ...}}`
+
+Use it for the one-line recap of a basic that DeepInfer Explained already teaches (rule 3 in section 1.1).
+
+```html
+{{deepinfer learn/kv-cache | The KV cache}}     → external link to <deepinfer_url>/learn/kv-cache.html
+{{deepinfer learn/kv-cache}}                    → link text = the DeepInfer page title
+{{deepinfer concepts/scheduler#the-idea | ...}} → with an anchor (the anchor is not checked)
+```
+
+- The base URL is `deepinfer_url` in `explainer.json` (https://explaindeepinfer.projects.thomaspaul.dev).
+- The build checks the page id against `../deepinfer-explainer/src/nav/*.json` (`index` is also allowed).
+  An unknown id is an error, with close-match suggestions. If that folder is missing, the build warns once
+  and does not check the ids.
+- The link opens in a new tab and shows a small "↗" after the text, like the GitHub links.
+- Never write a hand-made `<a href="https://explaindeepinfer...">`. The tag keeps one form, so every
+  recap link can be checked.
+- Do not use it for vLLM pages (use `{{link}}`). Link one basic only once per page.
+
 ## 6. Writing rules (ASD-STE100)
 
 All site text uses ASD-STE100 Simplified Technical English. Code, file names, identifiers and
@@ -425,15 +503,34 @@ technical names stay as they are.
 
 **Technical words.** Technical names and well-known terms of the domain are allowed, but you must
 define each one at its first use on the page, and link it with `{{term}}`. Use the same word for the
-same thing on every page. Fill in this table for your project (the rows are examples from an ML
-inference engine; replace them):
+same thing on every page:
 
 | Use | Do not use (for this meaning) |
 |---|---|
-| request (what a user sends) / sequence (the engine object for it) | job, query, prompt (for the object) |
-| step (one main-loop iteration) | iteration, tick, round |
-| rank (one process) / device (one GPU) | worker, node, card (for these meanings) |
-| block (one cache block) | page, chunk (for this meaning) |
+| **request** (what a client sends; the engine core object is `Request`, `vllm/v1/request.py`) | job, query, sequence (V1 has no sequence object) |
+| **step** (one `EngineCore.step()`: schedule, execute, update) | iteration, tick, round (except "speculative round") |
+| **front end** (noun) / **front-end** (adjective): the API server process with FastAPI and `AsyncLLM` | frontend, client process, process 0 |
+| **API server** (the FastAPI/uvicorn app of `vllm serve`) / **OpenAI-compatible server** (its OpenAI routes) | web server, HTTP engine |
+| **`AsyncLLM`** (the front-end engine object of `vllm serve`) | async engine, `AsyncLLMEngine` (an alias) |
+| **engine core client** (`EngineCoreClient` and its subclasses, in the front end) | engine proxy |
+| **`EngineCore`** (the class) / **engine core process** (`EngineCoreProc`, one per DP rank) | engine (alone), backend, `LLMEngine` |
+| **executor** (starts and drives the workers: uniproc, multiproc, Ray) | launcher |
+| **worker** (one process or object that owns one GPU) / **rank** (its index in a process group) | node (a node is a machine), card |
+| **model runner** (Model Runner V2, `vllm/v1/worker/gpu/model_runner.py`) | GPU model runner (that is V1) |
+| **Model Runner V2 (MRV2)** / **Model Runner V1** (the fallback) | new runner / old runner |
+| **block** (one KV cache block of `block_size` tokens) | page, chunk (for this meaning) |
+| **KV cache group** (layers that share one block table; `KVCacheGroupSpec`) | KV group, cache layer group |
+| **block pool** (all free and used blocks; `BlockPool`) | block manager (that is DeepInfer's name) |
+| **token budget** (`max_num_batched_tokens` per step) | batch size (for this meaning) |
+| **platform** / **`current_platform`** (the one `Platform` object of a process) | device backend, hardware layer |
+| **`CustomOp`** (a layer class that picks `forward_cuda`, `forward_native`, ...) | custom kernel |
+| **kernel** (a device program) | op, function (for this meaning) |
+| **attention backend** (the classes that implement attention: FlashAttention, FlashInfer, ...) | attention kernel (for the backend) |
+| **plugin** (code in an entry-point group that vLLM loads) / **extension point** (any place where outside code can plug in, with or without an entry point) | hook (alone), add-on, extension |
+| **entry point** (two words: Python packaging metadata) / `vllm/entrypoints/` (the folder with the CLI and API server) | entrypoint (one word) in prose |
+| **out-of-tree (OOT)** (code that is not in the vLLM repository) | external, third-party (for plugins) |
+| **online serving** (`vllm serve`) / **offline inference** (the `LLM` class) | server mode / batch mode |
+| **`VllmConfig`** (the whole engine configuration) | the settings, the args (for this object) |
 
 **Word substitutions**
 
@@ -460,10 +557,10 @@ inference engine; replace them):
 
 | Before | After (STE) |
 |---|---|
-| The engine object is lazily instantiated upon first attribute access in order to ensure that initialization is deferred until the configuration has been loaded. | The package makes the engine object on first use. This happens after the configuration is loaded. |
-| In order to leverage the fast path, the buffer should be pinned. | Pin the buffer. Pinned memory makes copies faster. |
-| If you want to run the server you need to remember to export the home variable and also make sure the port variable matches. | Export `MYPROJECT_HOME`. Then set `MYPROJECT_PORT`. |
-| Utilizing the queue, messages are being exchanged between workers. | The queue moves messages between workers. |
+| The platform object is lazily instantiated upon first attribute access in order to ensure that out-of-tree plugins have been loaded. | The package makes the platform object on first use. So the platform plugins can load first. |
+| In order to leverage plugins, VLLM_PLUGINS should be configured. | Set `VLLM_PLUGINS`. It lists the plugins to load. |
+| If you want to serve on two GPUs you need to remember to set the tensor parallel size and also make sure both GPUs are visible. | Set `CUDA_VISIBLE_DEVICES=0,1`. Then add `--tensor-parallel-size 2`. |
+| Utilizing ZMQ sockets, requests are being exchanged between the API server and the engine core. | ZMQ sockets move requests between the API server and the engine core. |
 | It's kind of like a plug adapter, right? | Think of a travel plug adapter. |
 
 **Tone.** Short and calm. Say what the code does, then why. Prefer a concrete example with real
@@ -474,19 +571,32 @@ numbers over an abstract sentence.
 1. **Every claim about the code has a source**: a `{{cite path:line}}` or an `<x-code>` excerpt.
    No source, no claim. "It probably ..." is not allowed; leave it out or mark it as an open question
    for the supervisor.
-2. Read the code yourself. Notes, surveys and fact sheets are only a guide. (Example: a survey said
-   an `__init__.py` dispatches kernels. It was empty. Another file dispatched.)
+2. Read the code yourself. Notes, surveys (`notes/survey/*.md`) and `notes/facts.md` are only a guide.
+   (Example: a survey said that no code calls `validate_logits_processors_parameters`. The input
+   processor calls it, `vllm/v1/engine/input_processor.py:109-112`.)
 3. Cite the **narrowest** line range that proves the claim.
 4. Mark each simplification with `<x-simplified>` and say what the full truth is.
-5. **Out-of-scope code** (list it here: vendored libraries, git submodules that are not checked out,
-   third-party frameworks). Explain only how <Project> calls them (arguments, shapes, which
-   function, when). Do not describe their insides.
-6. Numbers from `doc/` and `README.md` are allowed; cite the line.
+5. **Out-of-scope code.** Explain only how vLLM selects and calls it (arguments, shapes, which
+   function, when). Do not describe its insides:
+   - kernel internals: `csrc/` (C++/CUDA), and Triton, CUDA, CuTe and Helion kernel code anywhere
+     (for example `vllm/kernels/`, the kernel files in `vllm/model_executor/layers/fused_moe/`,
+     `vllm/vllm_flash_attn/`, `vllm/third_party/`);
+   - legacy code: V0 aliases and old names that only forward to V1 (for example `AsyncLLMEngine`);
+   - Model Runner V1 (`vllm/v1/worker/gpu_model_runner.py`), except the one cited fallback note on
+     `concepts/model-runner`;
+   - external libraries (PyTorch, FlashAttention, FlashInfer, NCCL, Ray, ZMQ, FastAPI, uvicorn, xgrammar ...);
+   - **one paragraph only** (on `learn/what-is-vllm`, or on the page where it matters): the experimental
+     Rust frontend (`rust/`, `VLLM_USE_RUST_FRONTEND`) and the per-family model packages in `vllm/models/`;
+   - the special code of single model families in `vllm/model_executor/models/*` (use `llama.py` as the
+     one model example).
+6. Numbers from `docs/` and `README.md` are allowed; cite the line. For behaviour, cite the code, not the
+   docs: the docs are sometimes stale (for example `docs/design/custom_op.md:11`).
 7. **Comments in another language**: translate them when they help. Always say they are translated
    (`<x-tr>` does this automatically).
 8. General knowledge that is not about this repo (what CUDA is, what a CTA is) needs no citation,
    but must be correct and short. If you are not sure, leave it out.
-9. When code and docs disagree, describe the code, and mention the difference.
+9. When code and docs disagree, describe the code, and mention the difference. Tell the supervisor, so that
+   the FAQ "Where do docs and code disagree?" gets the item.
 
 ## 8. Glossary
 
@@ -495,17 +605,17 @@ Files: `src/glossary/*.json`. One JSON object; keys are term ids.
 ```json
 {
   "_about": "Who owns this file. Keys that start with _ are comments.",
-  "kv-store": {
-    "term": "KV store",
-    "short": "A store that keeps values under keys. You put a value with a key, and get it back with the same key.",
-    "long": "Optional extra HTML. Inline tags work: {{cite pkg/store.py:58}}.",
-    "aliases": ["key-value store"],
-    "page": "concepts/request-flow"
+  "entry-point": {
+    "term": "entry point",
+    "short": "A name that a Python package publishes in its metadata, under a group. Other code finds it with importlib.metadata.",
+    "long": "Optional extra HTML. Inline tags work: {{cite vllm/plugins/__init__.py:42}}.",
+    "aliases": ["entry points"],
+    "page": "learn/python-entry-points"
   }
 }
 ```
 
-- Ids: lower-case letters, digits and `-` (`kv-store`, `request-flow`).
+- Ids: lower-case letters, digits and `-` (`entry-point`, `kv-cache-group`).
 - `term` and `short` are required. `short` is the tooltip: one or two STE sentences, under 220 characters.
 - `page` (optional) links "Read more" to the page that explains the term. A planned page is fine.
 - `aliases` help search.
@@ -613,7 +723,7 @@ The build prints every problem with `file:line` and stops on errors. Common mess
 
 | Message | Fix |
 |---|---|
-| `x-code: file '...' does not exist in the repo` | Check the path from the repo root (for example `pkg/...`). |
+| `x-code: file '...' does not exist in the repo` | Check the path from the repo root (`vllm/...`, `tests/...`, `docs/...`). |
 | `x-code: <file> has N lines; a-b is out of range` | Open the file and fix the range. |
 | `x-code: highlight '...' is outside lines a-b` | Highlight lines must be inside `lines`. |
 | `citation: ...` | Same as above, for `{{cite}}`. |
@@ -631,7 +741,8 @@ The build prints every problem with `file:line` and stops on errors. Common mess
 | `duplicate id(s) on the page` | Two headings or two quizzes make the same id. Add `id="..."` to one heading, or `heading="none"` to the second quiz. |
 | `x-viz ...: the page has no 'scripts:'` / `scripts: assets/... does not exist` | Add `scripts: viz/<name>.js` to the front matter, and check the file in `assets/viz/`. |
 | `x-img: ... does not exist` / `needs alt` | Fix the `repo=` or `src=` path; add `alt="..."`. |
-| `repo is at ..., pinned to <sha>` | Do not change the repo checkout. Ask the supervisor. |
+| `repo is at ..., pinned to 3e44c0d` | Do not change the repo checkout. Ask the supervisor. |
+| `deepinfer: no page '...' in the DeepInfer nav files` | Use an id from the table in section 1.1 (or from `../deepinfer-explainer/src/nav/*.json`). |
 
 Warnings (the build still succeeds, `--strict` turns them into errors):
 
@@ -649,7 +760,7 @@ Warnings (the build still succeeds, `--strict` turns them into errors):
 - [ ] Each new term is defined at first use and linked with `{{term}}`; new glossary ids are in your own file.
 - [ ] STE: sentences ≤ 20 words (instructions) / ≤ 25 words (descriptions), active voice, paragraphs ≤ 6 sentences.
 - [ ] Simplifications are marked with `<x-simplified>`. Comments in another language are translated and marked.
-- [ ] No internals of out-of-scope code.
+- [ ] No internals of out-of-scope code. No legacy code; online serving first; DeepInfer basics only as a one-line recap + `{{deepinfer}}` link (section 1.1).
 - [ ] Deep dives give shapes, dtypes, layouts, steps, edge cases, env vars — with numbers.
 - [ ] 3-5 quiz questions, at least one easy and one hard; answers cite the code.
 - [ ] Your diagram passes `instructions-svg.md` section 11, and has `alt` text.
