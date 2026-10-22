@@ -50,6 +50,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
 
+- 2026-10-22 22:23 (hourly check): 3 unknown 'fork' subagents found running (not started by the supervisor). Asked each for its task and files; flagged to the user. Not stopped yet (may be user-started). Watch for file conflicts with the B1b/B2b fact checkers.
+
 - LESSON: fact checkers can also be wrong (B2a 'last-slice abort bug' was an indentation misread). Supervisor verifies any 'bug in vLLM' claim before it reaches a page or the FAQ.
 
 - FINAL-PASS TODO: tours/life-of-a-chat-request ~537 errors table: validator errors (stream_options, tool_choice) go through the VLLMError handler, not RequestValidationError. Any page citing the `priority` docstring or saying continuous_usage_stats works alone. architecture-overview ~153: total 18 with CLI supervisor (B2a FC may fix).
@@ -98,10 +100,12 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-22 20:16 | Fact check r1 | done ~20:35: ~235 claims, ~40 defects; generators unchanged except gen_metrics † text; --check OK |
 | 2026-10-22 20:26 | B1a writer (what-is-vllm, openai-api, processes-and-ipc, python-entry-points, pytorch-for-serving) | done ~20:50; 5 diagrams, b1a.json 11 terms |
 | 2026-10-22 20:51 | B1a fact check | done ~21:20: ~250 claims, 38 defects (21 logic, 6 value, 7 citation, 4 missing) |
-| 2026-10-22 21:21 | B1b writer | running |
+| 2026-10-22 21:21 | B1b writer | done ~21:50; 5 diagrams, b1b.json 14 terms |
+| 2026-10-22 21:51 | B1b fact check | running |
 | 2026-10-22 20:36 | B2a writer (architecture-overview, engine-client, data-contracts + 4 engine module pages) | done ~21:00; 4 diagrams, b2a.json 7 terms |
 | 2026-10-22 21:01 | B2a fact check | done ~21:35: ~270 claims, 37 defects. Supervisor REJECTED its 'last-slice abort bug' (abort is inside the loop) and removed the note from 3 pages; supervisor fixed the msgspec claim on processes-and-ipc. |
-| 2026-10-22 21:37 | B2b writer | running |
+| 2026-10-22 21:37 | B2b writer | done ~22:10; 5 diagrams, b2b.json 9 terms |
+| 2026-10-22 22:11 | B2b fact check | running |
 | 2026-10-22 19:18 | 1b Tour 1 (t1) | done 19:45: 16 stops, 3 diagrams, request_stepper.js, t1.json (12 terms); not browser-checked by writer |
 | 2026-10-22 19:46 | Fact check t1 (+ browser check of stepper) | done ~20:00: ~230 claims, 38 defects (11 citation, 6 value, 9 logic, 3 default source, 9 other). Stepper OK at 1280/390, no overflow. |
 | 2026-10-22 19:49 | Fact check concepts/plugin-loading (+ folder descriptions) | done ~19:58: ~80 claims, 30 defects fixed (8 citation, 11 value/condition, 4 logic, 3 missing source, 5 glossary/folder). Open question answered (platform before general plugins in every process). |
