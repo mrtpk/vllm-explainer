@@ -1,0 +1,240 @@
+---
+title: Prefix caching in the engine core: hashes, lookup, caching, eviction and KV events
+nav_title: Prefix caching
+level: Advanced
+prerequisites: learn/prefix-caching, concepts/kv-cache-manager
+related: learn/prefix-caching, concepts/kv-cache-manager, concepts/hybrid-kv-cache, concepts/kv-connectors, concepts/scheduler, concepts/metrics-and-observability, code/v1-core-kv-cache-utils, code/v1-core-block-pool, code/v1-core-kv-cache-manager
+summary: The mechanics of prefix caching in the engine core. The input thread hashes each new request, the scheduler looks the hashes up in the block pool and touches the hits, allocate_slots hashes blocks that become full, and the free queue decides what to evict. KV events tell an external router what each engine holds.
+scripts: viz/prefix_cache_explorer.js
+---
+<x-sentence>The engine core names each full block by a chained hash, looks up the hashes of new requests, and evicts cached blocks only for space.</x-sentence>
+
+<h2>The idea</h2>
+<p>The page {{link learn/prefix-caching}} teaches the idea: why chat traffic repeats, the {{term hash-chain}}, the extra keys, two chat turns and the metrics. Read it first. This page shows <em>who</em> does each part in the engine core, <em>when</em>, and with which data. It also covers what the basics page leaves out. That is the hash types, the lookup code and the moment a block gets its hash. It is also the reset route, external hits from a KV connector, and KV events.</p>
+
+<p>Four parts work together, all in the {{term engine-core}} process:</p>
+<ol>
+  <li><strong>The hasher.</strong> When a request arrives, the input thread computes one {{term block-hash}} per full block of its tokens. When the request gets new tokens, the hasher adds the hashes of new full blocks.</li>
+  <li><strong>The lookup.</strong> When the scheduler admits a request, the KV cache manager walks the hashes from block 0 and stops at the first miss. It never looks past <code>num_tokens − 1</code> tokens ({{term cache-hit-cap}}).</li>
+  <li><strong>The cache.</strong> When <code>allocate_slots()</code> gives a request its blocks, the blocks that will be full after this step get their hash. From then on, other requests can hit them.</li>
+  <li><strong>The eviction.</strong> A freed block keeps its hash in the {{term free-block-queue}}. Normally its hash goes away only when the pool hands the block out again, or when somebody resets the cache. A failed load from a KV connector can also evict hashes ({{cite vllm/v1/core/sched/scheduler.py:3515-3516}}).</li>
+</ol>
+
+<p><strong>An everyday comparison.</strong> Think of a library that keeps photocopies of book chapters. Each copy has a label that names the book and all earlier chapters. A reader asks for chapters 1 to 5. The desk checks the labels in order and stops at the first chapter that has no copy. Old copies stay on a "free" shelf, and the library recycles the oldest copy only when it needs paper. The comparison stops at the label: vLLM does not compare text. Two blocks match when their hashes are equal, and the hash includes every earlier token.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b3b_prefix_lookup" alt="Panel 1: a request with 90 prompt tokens and block size 16 has hashes h0 to h4 for blocks 0 to 4; each hash includes the previous one; block 5 with tokens 80 to 89 is not full and has no hash. The lookup may check at most 89 // 16 = 5 hashes. Panel 2: the hash map returns block 7 for h0 (ref_cnt 1, used by request R1), block 3 for h1 (ref_cnt 0, in the free queue), block 12 for h2 (ref_cnt 0), and nothing for h3, so the walk stops; h4 is not checked. The hit is 3 blocks, 48 tokens; the request computes 42 tokens. Panel 3: the free queue before is 9, 40, 3#, 12#, 21#, 5#. touch removes 3 and 12; get_new_blocks(3) pops 9, 40 and 21 and evicts the old hash of block 21. The block table becomes 7, 3, 12, 9, 40, 21 with ref counts 2, 1, 1, 1, 1, 1; blocks 9 and 40 get hashes h3 and h4, block 21 is not full." caption="Figure: the hashes of a new request (1), the walk over the hash map (2), and what <code>allocate_slots()</code> changes in the free queue and the block table (3). Block ids are illustrative." />
+<p>Read the panels from top to bottom. Panel 2 is <code>get_computed_blocks()</code>: a miss ends the walk, because every later hash includes the missed one. Panel 3 is the first part of <code>allocate_slots()</code>. <code>touch()</code> runs before <code>get_new_blocks()</code>, so the request cannot pop and evict its own hit blocks.</p>
+
+<x-diagram name="b3b_block_life" alt="Panel 1: three boxes. 1. Allocated: get_new_blocks pops the front of the free queue, removes an old hash, sets ref_cnt from 0 to 1. 2. Full, hashed: allocate_slots caches every block that is full after this step, before the step runs; set_block_hash, map insert, BlockStored event. 3. Freed, still cached: the request frees in reverse order; ref_cnt minus 1; at 0 the block goes to the back of the free queue with its hash. A note says that a block that is not full has no hash and goes to the front. Panel 2: three ways out. 4a. Hit again: touch removes it from the queue, ref_cnt 0 to 1, back to state 2. 4b. Evicted: it reaches the front, get_new_blocks pops it, the hash is removed, BlockRemoved event, back to state 1. 4c. Reset: reset_prefix_cache drops all hashes, only when no block is in use, AllBlocksCleared event." caption="Figure: the life of one cached block. It enters the map in state 2 and normally leaves it only by eviction (4b) or a reset (4c)." />
+
+<x-viz id="prefix-cache-explorer" title="Prefix cache explorer" caption="Edit the prompts, then press <em>Send</em>, <em>+1 token</em> and <em>Finish</em> (Tab, then Enter or Space). <em>Undo</em> and every settings change replay all actions on an empty pool. The hash is a stand-in (FNV-1a, 32 bits), not SHA-256." />
+<p>The explorer follows these rules of the real code:</p>
+<ol>
+  <li>Only full blocks get a hash. The hash of block <em>i</em> uses the hash of block <em>i − 1</em>, and block 0 uses <code>NONE_HASH</code> ({{cite vllm/v1/core/kv_cache_utils.py:988-1008}}, {{cite vllm/v1/core/kv_cache_utils.py:731-737}}).</li>
+  <li>The lookup checks at most <code>(num_tokens − 1) // block_size</code> hashes and stops at the first miss ({{cite vllm/v1/core/kv_cache_manager.py:295-300}}, {{cite vllm/v1/core/single_type_kv_cache_manager.py:791-799}}).</li>
+  <li>A request starts only if its new blocks plus its free hit blocks fit in the free queue ({{cite vllm/v1/core/single_type_kv_cache_manager.py:256-266}}, {{cite vllm/v1/core/kv_cache_manager.py:575-579}}).</li>
+  <li><code>touch()</code> adds 1 to <code>ref_cnt</code> and takes a free hit block out of the queue ({{cite vllm/v1/core/block_pool.py:761-768}}). Only then does <code>get_new_blocks()</code> pop new blocks from the front and evict their old hashes ({{cite vllm/v1/core/block_pool.py:681-691}}).</li>
+  <li>The blocks that are full now get their hash; an equal hash on a second block is kept as a duplicate ({{cite vllm/v1/core/block_pool.py:273-299}}, {{cite vllm/v1/core/block_pool.py:48-52}}).</li>
+  <li>A finished request frees its blocks in reverse order. At <code>ref_cnt</code> 0, a block without a hash goes to the front, a block with a hash to the back ({{cite vllm/v1/core/single_type_kv_cache_manager.py:597-598}}, {{cite vllm/v1/core/block_pool.py:795-807}}).</li>
+  <li>Block 0 is the {{term null-block}}; the pool never hands it out ({{cite vllm/v1/core/block_pool.py:184-188}}).</li>
+</ol>
+<x-simplified><p>The explorer has no steps, no token budget and no chunked prefill. <em>Send</em> admits the whole prompt at once, and <em>+1 token</em> adds one generated token. The real scheduler computes the KV of a new token in the step after the sampler gives it. When no block is free, it preempts a running request ({{link concepts/scheduler}}). The explorer has one KV cache group and no {{term extra-keys}}, and its hash is FNV-1a over a text string, not SHA-256 over pickled data.</p></x-simplified>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the hasher is made once, and runs when a request arrives</h3>
+<p><code>EngineCore.__init__</code> first resolves the hash granularity, <code>hash_block_size</code>. With one {{term kv-cache-group}}, it is the block size ({{cite vllm/v1/engine/core.py:173-175}}, {{cite vllm/v1/core/kv_cache_utils.py:840-858}}). Then it makes the request hasher, but only when prefix caching or a KV connector is on:</p>
+<x-code file="vllm/v1/engine/core.py" lines="216-225" highlight="217,221,223-225" />
+<ol>
+  <li><strong>Line 217.</strong> No prefix caching and no connector: <code>request_block_hasher</code> stays <code>None</code>, and requests get no hashes at all.</li>
+  <li><strong>Lines 218-221.</strong> The hash function comes from <code>--prefix-caching-hash-algo</code>. <code>init_none_hash()</code> sets the module-level {{term none-hash}} for this process.</li>
+  <li><strong>Lines 223-225.</strong> <code>get_request_block_hasher()</code> returns a closure over the block size and the hash function ({{cite vllm/v1/core/kv_cache_utils.py:953-1012}}).</li>
+</ol>
+<p>Each new <code>Request</code> gets this function and calls it in its constructor ({{cite vllm/v1/engine/core.py:1128}}, {{cite vllm/v1/request.py:225-230}}). In <code>vllm serve</code>, the input thread of the engine core process builds the <code>Request</code> while the main thread runs the model ({{cite vllm/v1/engine/core.py:1114-1119}}, {{cite vllm/v1/engine/core.py:1990-1993}}). So the hashing of a long prompt does not delay the current step.</p>
+<p>When the scheduler appends a sampled token, the request runs the hasher again ({{cite vllm/v1/core/sched/scheduler.py:2598-2599}}, {{cite vllm/v1/request.py:272-288}}). The hasher starts after the last hash and returns an empty list until a new block is full ({{cite vllm/v1/core/kv_cache_utils.py:967-972}}). So <code>request.block_hashes</code> always covers every full block of the known tokens.</p>
+
+<h3>Step 2: the hash types</h3>
+<x-code file="vllm/v1/core/kv_cache_utils.py" lines="44-85" highlight="47,52,57,69,85" />
+<ul>
+  <li><code>BlockHash</code> is the raw digest of one block: 32 bytes for <code>sha256</code>, 16 bytes for the xxHash 128-bit options ({{cite vllm/utils/hashing.py:41}}, {{cite vllm/utils/hashing.py:69}}).</li>
+  <li><code>BlockHashWithGroupId</code> appends the KV cache group id as 4 big-endian bytes. The hash map uses this key, so the same tokens in two groups are two entries (line 69).</li>
+  <li><code>ExternalBlockHash</code> is what KV events publish. By default <code>VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1</code> turns the digest into a 64-bit integer: the low 64 bits of the big-endian number (line 85, {{cite vllm/envs.py:2022-2024}}).</li>
+</ul>
+
+<h3>Step 3: the hash function and NONE_HASH</h3>
+<p>The four names of <code>--prefix-caching-hash-algo</code> and their serialization are in the basics page ({{link learn/prefix-caching}}, deep dive "The hash chain in the code"). In short: <code>sha256</code> (the default) pickles the tuple <code>(parent, tokens, extra_keys)</code>; the <code>_cbor</code> options use canonical CBOR, so other languages can compute the same hash ({{cite vllm/utils/hashing.py:26-81}}).</p>
+<p>The comment above <code>NONE_HASH</code> gives the reason for the two seeds. A cryptographic hash can use a fixed, public seed, so independent processes compute equal hashes and can share a cache. A non-cryptographic hash keeps a secret random seed, because a known seed would let an attacker build colliding blocks ({{cite vllm/v1/core/kv_cache_utils.py:90-101}}). <code>PYTHONHASHSEED</code> overrides both ({{cite vllm/v1/core/kv_cache_utils.py:125-130}}).</p>
+
+<h3>Step 4: extra keys</h3>
+<p><code>generate_block_hash_extra_keys()</code> joins four lists in a fixed order: LoRA, multimodal items, cache salt, prompt-embedding digests. Without any key it returns <code>None</code>, so a plain text block hashes <code>(parent, tokens, None)</code>:</p>
+<x-code file="vllm/v1/core/kv_cache_utils.py" lines="654-675" highlight="659-663,668-673" />
+<p>The basics page explains each key ({{link learn/prefix-caching}}, deep dive "Extra keys"). KV events publish the keys without their tags: a bare LoRA name, a bare salt, <code>(identifier, offset)</code> pairs for images ({{cite vllm/v1/core/kv_cache_utils.py:678-704}}).</p>
+
+<h3>Step 5: the lookup</h3>
+<p>The scheduler asks for the hit only in the waiting pass, and only for a request with <code>num_computed_tokens == 0</code>: a new or a preempted request ({{cite vllm/v1/core/sched/scheduler.py:1016-1024}}). <code>KVCacheManager.get_computed_blocks()</code> does the work:</p>
+<x-code file="vllm/v1/core/kv_cache_manager.py" lines="282-300" highlight="286-287,295-300" />
+<ol>
+  <li><strong>Lines 286-287.</strong> No lookup when prefix caching is off, or when the request sets <code>skip_reading_prefix_cache</code> ({{cite vllm/v1/core/kv_cache_manager.py:249-251}}). Sampling parameters set it for prompt logprobs; pooling parameters can set it too ({{cite vllm/sampling_params.py:625-632}}, {{cite vllm/v1/request.py:314-325}}).</li>
+  <li><strong>Line 295.</strong> The {{term cache-hit-cap}}: the last token must be computed, so it gives logits.</li>
+  <li><strong>Lines 296-300.</strong> The coordinator finds the hit. With one group, <code>UnitaryKVCacheCoordinator</code> calls the manager of that group directly ({{cite vllm/v1/core/kv_cache_coordinator.py:574-591}}).</li>
+</ol>
+<p>For full attention, the walk is short:</p>
+<x-code file="vllm/v1/core/single_type_kv_cache_manager.py" lines="788-799" highlight="793-796" />
+<p>Line 793 checks only <code>max_length // block_size</code> hashes. Line 794 asks the pool for a block per group. <code>get_cached_block()</code> builds the key from the hash and the group id. It returns the first block with that key, or <code>None</code> ({{cite vllm/v1/core/block_pool.py:198-224}}). A model with several groups needs one hit length that is valid for every group; {{link concepts/hybrid-kv-cache}} explains that search.</p>
+
+<h3>Step 6: adopting the hit</h3>
+<p>The scheduler passes the hit blocks to <code>allocate_slots()</code>. The count check includes free hit blocks, because <code>touch()</code> will take them out of the free queue ({{link concepts/kv-cache-manager}}, Step 3). If the blocks fit, <code>allocate_slots()</code> adds the hit blocks first and allocates the new blocks after that ({{cite vllm/v1/core/kv_cache_manager.py:581-600}}). The coordinator adds the hits in two phases. First it touches the hit blocks of every group, then it allocates blocks for external tokens of a KV connector. The comment names the bug that this order prevents:</p>
+<x-code file="vllm/v1/core/kv_cache_coordinator.py" lines="291-301" />
+<x-code file="vllm/v1/core/single_type_kv_cache_manager.py" lines="303-318" highlight="305,312,314,318" />
+<p>Line 305 is the {{term touch}}. Line 318 records that the hit blocks are already cached, so the caching step does not hash them again. Line 312 puts null blocks where a sliding window has skipped blocks (see {{link concepts/hybrid-kv-cache}}).</p>
+
+<h3>Step 7: caching blocks that become full</h3>
+<p>At the end of <code>allocate_slots()</code>, the manager hashes every block that will be full after this step:</p>
+<x-code file="vllm/v1/core/kv_cache_manager.py" lines="602-616" highlight="604-605,612-616" />
+<ol>
+  <li><strong>Lines 604-605.</strong> With an asynchronous load from a KV connector, the data is not there yet, so caching waits. The scheduler caches these blocks when the transfer is done ({{cite vllm/v1/core/sched/scheduler.py:3254-3257}}).</li>
+  <li><strong>Lines 612-616.</strong> Otherwise it caches up to <code>computed + new</code> tokens, but not past <code>request.num_tokens</code>. So draft tokens never get a hash. The hash is set when the step is <em>scheduled</em>, before the GPU computes the KV values.</li>
+</ol>
+<p>The default <code>AsyncScheduler</code> plans the next step before the sampled token is known. That token is a placeholder and not part of <code>num_tokens</code> yet, so a block that it fills is not hashed at that allocation. The block gets its hash in a later <code>allocate_slots()</code>, after the token arrives. When tokens arrive, the async scheduler also caches up to <code>num_computed_tokens − num_output_placeholders</code> tokens ({{cite vllm/v1/core/sched/async_scheduler.py:75-79}}).</p>
+<p>The single-type manager skips the blocks that already have a hash. Then it calls the pool for the new full blocks only ({{cite vllm/v1/core/single_type_kv_cache_manager.py:531-541}}):</p>
+<x-code file="vllm/v1/core/single_type_kv_cache_manager.py" lines="499-505" />
+<x-code file="vllm/v1/core/block_pool.py" lines="273-299" highlight="277-278,283-285,295-299" />
+<p>Lines 277-278 skip null blocks and blocks that a mask leaves out (sliding-window and Mamba groups). Lines 295-299 set the hash on the block and insert it into the map. The map does not remove duplicates: two blocks with the same hash both stay, so the block ids in running block tables never change ({{cite vllm/v1/core/block_pool.py:48-52}}).</p>
+
+<h3>Step 8: free, eviction and reset</h3>
+<p>{{link concepts/kv-cache-manager}} (Step 5) and the basics deep dive "Free blocks, LRU order and eviction" explain the free order and the eviction. In short, a request frees its blocks in reverse order. At <code>ref_cnt</code> 0, an unhashed block goes to the front and a hashed block to the back ({{cite vllm/v1/core/block_pool.py:795-807}}). <code>get_new_blocks()</code> pops the front and evicts the old hash ({{cite vllm/v1/core/block_pool.py:729-750}}).</p>
+<p>A reset drops every hash at once. The API server has the route only in dev mode ({{cite vllm/entrypoints/launchers/api_server/routers.py:46-49}}):</p>
+<x-code file="vllm/entrypoints/serve/dev/cache/api_router.py" lines="20-44" highlight="23-24,41-43" />
+<p><code>Scheduler.reset_prefix_cache()</code> can first preempt every running request (<code>reset_running_requests=true</code>), so that all blocks are free. Without it, the reset fails while any block is in use ({{cite vllm/v1/core/sched/scheduler.py:2950-2975}}, {{cite vllm/v1/core/block_pool.py:841-848}}). <code>reset_external=true</code> also resets the cache of the KV connector ({{cite vllm/v1/core/sched/scheduler.py:2977-2978}}). The docstring of the pool names two uses: RLHF after a weight update, and benchmarks ({{cite vllm/v1/core/block_pool.py:831-835}}).</p>
+
+<h3>Step 9: external hits from a KV connector</h3>
+<p>A {{link concepts/kv-connectors | KV connector}} can hold KV blocks outside this engine: in CPU memory, on disk, or in another vLLM instance. After the local lookup, the scheduler asks the connector how many tokens <em>after</em> the local hit it can load ({{cite vllm/v1/core/sched/scheduler.py:1026-1039}}). A request that skips the prefix cache gets 0 external tokens too ({{cite vllm/v1/core/sched/scheduler.py:1040-1041}}). The external tokens are added to the computed tokens, and an asynchronous load puts the request into <code>WAITING_FOR_REMOTE_KVS</code> ({{cite vllm/v1/core/sched/scheduler.py:1101-1104}}, {{cite vllm/v1/core/sched/scheduler.py:1384-1393}}). The connector uses the same block hashes, which is one reason why the hasher also runs when only a connector is on (Step 1).</p>
+
+<h3>Step 10: KV events</h3>
+<p>With {{term kv-events}} on, the pool queues an event for each change of the prefix cache. Turn them on with <code>--kv-events-config</code> ({{cite vllm/engine/arg_utils.py:1873}}):</p>
+<pre><code class="language-bash">vllm serve Qwen/Qwen3-0.6B \
+  --kv-events-config '{"enable_kv_cache_events": true, "publisher": "zmq", "topic": "kv-events"}'</code></pre>
+<x-code file="vllm/config/kv_events.py" lines="10-52" highlight="14,19,23,27,31,36,45,51-52" />
+<p>Three event types exist ({{cite vllm/distributed/kv_events.py:56-142}}):</p>
+<table>
+  <thead><tr><th>Event</th><th>When</th><th>Main fields</th></tr></thead>
+  <tbody>
+    <tr><td><code>BlockStored</code></td><td>blocks get hashes in <code>cache_full_blocks()</code> ({{cite vllm/v1/core/block_pool.py:303-344}})</td><td><code>block_hashes</code>, <code>parent_block_hash</code>, <code>token_ids</code>, <code>block_size</code>, <code>lora_name</code>, <code>extra_keys</code>, <code>group_idx</code>, <code>medium</code> ("GPU"), spec kind and sliding window</td></tr>
+    <tr><td><code>BlockRemoved</code></td><td>a hash leaves the map: eviction (also after a failed connector load) or a partial-to-full change ({{cite vllm/v1/core/block_pool.py:611-624}})</td><td><code>block_hashes</code>, <code>medium</code>, <code>group_idx</code></td></tr>
+    <tr><td><code>AllBlocksCleared</code></td><td>a successful reset ({{cite vllm/v1/core/block_pool.py:867-868}})</td><td>none</td></tr>
+  </tbody>
+</table>
+<p>The KV cache manager adds the spec kind and the window size of the group to each <code>BlockStored</code> ({{cite vllm/v1/core/kv_cache_manager.py:703-720}}). At the end of <code>update_from_output()</code>, the scheduler takes the events of the pool and of the connector, and publishes one <code>KVEventBatch</code> per step ({{cite vllm/v1/core/sched/scheduler.py:2469-2484}}). The ZMQ publisher runs its own thread. It sends three frames per batch: the topic, an 8-byte sequence number and the msgpack payload ({{cite vllm/distributed/kv_events.py:472-507}}). With <code>replay_endpoint</code>, a subscriber that missed a sequence number can ask for the batches from that number on. The publisher keeps the last <code>buffer_steps</code> batches for this ({{cite vllm/distributed/kv_events.py:306-329}}). Each data-parallel rank adds its rank to the port ({{cite vllm/distributed/kv_events.py:530-563}}).</p>
+<p><strong>What an external router can do with them.</strong> A router in front of several vLLM instances can subscribe to every instance. From <code>BlockStored</code> and <code>BlockRemoved</code> it keeps, per instance, the set of block hashes that the instance holds. For a new request, the router tokenizes the prompt and computes the same hash chain. Then it sends the request to the instance with the longest run of known hashes.</p>
+<p>This works only when the router computes the same digests: the same block size, algorithm, extra keys and <code>NONE_HASH</code> seed. By default, the events carry only the low 64 bits of each digest as an integer. The router must convert its digests the same way ({{cite vllm/v1/core/kv_cache_utils.py:82-85}}). The default <code>sha256</code> with its fixed seed allows it; xxhash without <code>PYTHONHASHSEED</code> does not (Step 3). <code>sha256</code> hashes a Python pickle, so a router in another language needs <code>sha256_cbor</code>. The repository has a small subscriber that prints the events ({{cite examples/features/kv_events/kv_events_subscriber.py:72-120}}).</p>
+<x-note title="Report mode &quot;full&quot;"><p>By default, a prefix-cache hit emits no event, because the blocks are already known. A request can set <code>kv_cache_report_mode</code> to <code>"full"</code> in the extra arguments of its sampling parameters. Then a hit re-emits <code>BlockStored</code> for the reused blocks, so a gateway also learns about them ({{cite vllm/v1/request.py:126-130}}, {{cite vllm/v1/core/kv_cache_manager.py:302-310}}).</p></x-note>
+
+<h3>Step 11: the metrics</h3>
+<p><code>vllm:prefix_cache_queries</code> and <code>vllm:prefix_cache_hits</code> count tokens; the basics page shows the PromQL ({{link learn/prefix-caching}}). Three details are new here:</p>
+<ul>
+  <li>The scheduler records a lookup only when the request is admitted ({{cite vllm/v1/core/sched/scheduler.py:1378-1382}}). A lookup for a request that waits is not counted.</li>
+  <li>A request that was preempted before is counted in separate <code>preempted_*</code> fields, not in <code>queries</code> and <code>hits</code> ({{cite vllm/v1/metrics/stats.py:138-155}}). No logger exports these fields, so the Prometheus counters show only first admissions.</li>
+  <li>The log line "Prefix cache hit rate" is a moving value over about the last 1,000 requests, not a total ({{cite vllm/v1/metrics/stats.py:39-57}}, {{cite vllm/v1/metrics/loggers.py:321-323}}).</li>
+</ul>
+<p>With a KV connector, <code>vllm:external_prefix_cache_queries</code> and <code>vllm:external_prefix_cache_hits</code> count the external lookup ({{cite vllm/v1/metrics/loggers.py:685-707}}). Its queries are the tokens after the local hit ({{cite vllm/v1/core/sched/scheduler.py:1096-1099}}). <code>vllm:prompt_tokens_cached_by_source</code> splits the cached prompt tokens by tier: device, host, disk, p2p or external_unspecified ({{cite vllm/v1/metrics/loggers.py:781-796}}). Local hits count as device ({{cite vllm/v1/metrics/loggers.py:1174-1177}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data shapes and sizes">
+<table>
+  <thead><tr><th>Data</th><th>Type</th><th>Size</th><th>Owner</th></tr></thead>
+  <tbody>
+    <tr><td><code>Request.block_hashes</code></td><td><code>list[BlockHash]</code></td><td>one entry per full block; 32 bytes each with sha256</td><td>the request ({{cite vllm/v1/request.py:225}})</td></tr>
+    <tr><td>map key</td><td><code>BlockHashWithGroupId</code></td><td>digest + 4 bytes (36 bytes with sha256)</td><td>{{cite vllm/v1/core/kv_cache_utils.py:60-69}}</td></tr>
+    <tr><td><code>cached_block_hash_to_block</code></td><td><code>dict[key, KVCacheBlock | dict[int, KVCacheBlock]]</code></td><td>one entry per cached block and group</td><td>the pool ({{cite vllm/v1/core/block_pool.py:57-60}})</td></tr>
+    <tr><td><code>KVCacheBlock._block_hash</code></td><td>key or <code>None</code></td><td>set only when full and cached</td><td>{{cite vllm/v1/core/kv_cache_utils.py:173-178}}</td></tr>
+    <tr><td><code>num_cached_block[req_id]</code></td><td><code>int</code></td><td>blocks of the request that already have a hash</td><td>each single-type manager ({{cite vllm/v1/core/single_type_kv_cache_manager.py:128-132}})</td></tr>
+  </tbody>
+</table>
+<p><strong>Worked example.</strong> A prompt of 2,000 tokens with block size 16 has <code>2000 // 16 = 125</code> full blocks. The input thread computes 125 SHA-256 digests over pickled tuples of 16 integers: 125 × 32 = 4,000 bytes of hashes. The lookup checks at most <code>1999 // 16 = 124</code> of them, so even a complete hit computes the last 16 tokens: 2,000 − 124 × 16 = 16. If the request also generates 500 tokens, it reaches 2,500 tokens and <code>156</code> hashes. Block 156 (tokens 2,496-2,499) has no hash when the request ends. (Derived from the lines above.)</p>
+</x-deepdive>
+
+<x-deepdive title="The full-attention lookup, line by line">
+<x-code file="vllm/v1/core/single_type_kv_cache_manager.py" lines="760-837" />
+<ol>
+  <li><strong>Lines 760-771.</strong> The block size of this group, times the decode context parallel size if the KV is sharded. <code>resolve_block_hashes()</code> gives a view of the hashes at this block size; with one group it returns the list as it is ({{cite vllm/v1/core/kv_cache_utils.py:1201-1202}}).</li>
+  <li><strong>Lines 776-786.</strong> Fine-grained mode only for hybrid models whose hits can end inside a block. Normal models skip it.</li>
+  <li><strong>Lines 791-799.</strong> Phase 1, the walk of the figure. <code>hit_length</code> is a whole number of blocks.</li>
+  <li><strong>Lines 803-822.</strong> Phase 2, only in fine-grained mode: try a partial hit inside the next block, longest first.</li>
+  <li><strong>Lines 828-829.</strong> With EAGLE or MTP drafting, drop the last matched block (or hash unit). The drafter needs the hidden states of those tokens, so they are computed again.</li>
+  <li><strong>Lines 833-837.</strong> Round down to the alignment and cut the block lists to the new length.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="When exactly does a block get its hash?">
+<p>Assume block size 16, synchronous scheduling, and a prompt of 40 tokens that runs in one step.</p>
+<ol>
+  <li>The request arrives. The input thread computes <code>h0</code> and <code>h1</code> (tokens 0-31). Tokens 32-39 fill no block.</li>
+  <li>The scheduler admits it: <code>allocate_slots(num_new_tokens=40)</code> gets 3 blocks. It caches <code>min(0 + 40, 40) = 40</code> tokens: <code>40 // 16 = 2</code> blocks get <code>h0</code> and <code>h1</code>. The GPU has not run yet.</li>
+  <li>The step runs, and the sampler gives token 40. <code>append_output_token_ids()</code> runs the hasher: 41 tokens, still 2 full blocks.</li>
+  <li>Decode steps follow. When the request has 48 tokens, the hasher adds <code>h2</code>. The next <code>allocate_slots()</code> caches <code>min(47 + 1, 48) = 48</code> tokens, so block 2 gets <code>h2</code>.</li>
+</ol>
+<p>With the <code>AsyncScheduler</code>, step 4 differs. The step that computes the KV of token 47 is planned while token 47 is still a placeholder. Then <code>request.num_tokens</code> is 47, so that allocation caches only <code>47 // 16 = 2</code> blocks. When token 47 arrives, that step is already planned: <code>num_computed_tokens</code> is 48, and 1 placeholder is left. <code>_update_request_with_output()</code> caches <code>48 − 1 = 47</code> tokens, which adds no block ({{cite vllm/v1/core/sched/async_scheduler.py:75-79}}). The <code>allocate_slots()</code> of the step after that caches <code>min(48 + 1, 48) = 48</code> tokens, and block 2 gets <code>h2</code>. (Derived from the cited lines and {{cite vllm/v1/core/sched/scheduler.py:759-763}}, with a batch queue of 2.)</p>
+</x-deepdive>
+
+<x-deepdive title="Flags, fields and environment variables">
+<table>
+  <thead><tr><th>Name</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--enable-prefix-caching</code></td><td><code>None</code> → from the model ({{cite vllm/engine/arg_utils.py:3062-3063}})</td><td>on for generative decoder and hybrid models; see {{link learn/prefix-caching}}</td></tr>
+    <tr><td><code>--prefix-caching-hash-algo</code></td><td><code>sha256</code> ({{cite vllm/config/cache.py:256}})</td><td>hash function of the chain</td></tr>
+    <tr><td><code>--prefix-match-unit</code></td><td><code>None</code> ({{cite vllm/config/cache.py:200-211}})</td><td>finer hash granularity, for hybrid models only; with one group any other value than the block size raises <code>ValueError</code> ({{cite vllm/v1/core/kv_cache_utils.py:845-857}})</td></tr>
+    <tr><td><code>--prefix-cache-retention-interval</code></td><td><code>0</code> ({{cite vllm/config/cache.py:272-278}})</td><td>how many sliding-window and Mamba checkpoints keep a hash; see {{link concepts/hybrid-kv-cache}}</td></tr>
+    <tr><td><code>--kv-events-config</code></td><td><code>None</code></td><td>KV events (Step 10)</td></tr>
+    <tr><td><code>VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES</code></td><td><code>1</code> ({{cite vllm/envs.py:2022-2024}})</td><td>events carry 64-bit integers instead of the digest bytes</td></tr>
+    <tr><td><code>PYTHONHASHSEED</code></td><td>unset</td><td>seed of <code>NONE_HASH</code> for every algorithm ({{cite vllm/v1/core/kv_cache_utils.py:125-127}})</td></tr>
+    <tr><td><code>VLLM_SERVER_DEV_MODE</code></td><td>unset</td><td>adds <code>POST /reset_prefix_cache</code> (Step 8)</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Errors and edge cases">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Unknown hash algorithm name</td><td><code>ValueError</code> "Unsupported hash function"</td><td>{{cite vllm/utils/hashing.py:103}}</td></tr>
+    <tr><td><code>xxhash</code> chosen, package missing</td><td><code>ModuleNotFoundError</code> at the first hash</td><td>{{cite vllm/utils/hashing.py:63-69}}</td></tr>
+    <tr><td><code>xxhash</code> without <code>PYTHONHASHSEED</code></td><td>WARNING; hashes differ between processes</td><td>{{cite vllm/v1/core/kv_cache_utils.py:150-157}}</td></tr>
+    <tr><td>A block gets a second hash</td><td><code>AssertionError</code> (only a partial-to-full change is allowed)</td><td>{{cite vllm/v1/core/kv_cache_utils.py:201-203}}, {{cite vllm/v1/core/block_pool.py:286-294}}</td></tr>
+    <tr><td>KV events on, prefix caching off</td><td>WARNING; no <code>BlockStored</code> events</td><td>{{cite vllm/config/vllm.py:2026-2034}}</td></tr>
+    <tr><td>Reset while blocks are in use</td><td>WARNING, <code>{"success": false}</code></td><td>{{cite vllm/v1/core/block_pool.py:841-848}}</td></tr>
+    <tr><td>Reset with <code>reset_running_requests</code> fails anyway</td><td><code>RuntimeError</code> (requests wait for remote KV)</td><td>{{cite vllm/v1/core/sched/scheduler.py:2969-2975}}</td></tr>
+    <tr><td>The ZMQ subscriber is too slow</td><td>events dropped after <code>hwm</code> queued messages</td><td>{{cite vllm/config/kv_events.py:36-39}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>The router sends requests to the wrong instance.</strong> The router hashes with another algorithm, block size or seed than the engines. Its hashes never match the events. Use the default <code>sha256</code>, or set <code>PYTHONHASHSEED</code> on every instance, and convert digests the same way as <code>VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES</code> ({{cite vllm/v1/core/kv_cache_utils.py:82-85}}).</li>
+  <li><strong>Prompt logprobs give no cache benefit.</strong> The request skips the lookup and the external lookup ({{cite vllm/sampling_params.py:625-632}}, {{cite vllm/v1/core/sched/scheduler.py:1040-1041}}).</li>
+  <li><strong>The reset route returns 404.</strong> The dev routes exist only with <code>VLLM_SERVER_DEV_MODE</code> ({{cite vllm/entrypoints/launchers/api_server/routers.py:46-49}}). A reset under load returns <code>false</code> unless you also pass <code>reset_running_requests=true</code>.</li>
+  <li><strong>The hit rate in the log differs from Prometheus.</strong> The log uses a window of recent requests; the counters are totals since start-up ({{cite vllm/v1/metrics/stats.py:47-57}}).</li>
+  <li><strong>An identical prompt still computes a whole block.</strong> The cap is <code>num_tokens − 1</code>, and hits are whole blocks. A prompt of 4,096 tokens hits at most 4,080 tokens with block size 16.</li>
+</ul>
+<p><strong>Why it matters.</strong> The prefix cache uses no extra memory: it has no size limit and no timer, only the order of the free queue. The metrics, a prefix-aware router and a reset after a weight update all depend on one fact. It is when a block gets its hash, and when it loses it.</p>
+
+<x-quiz>
+  <x-q level="easy">Which thread computes the block hashes of a new request in <code>vllm serve</code>?
+    <x-a><p>The input thread of the engine core process. It builds the <code>Request</code> in <code>preprocess_add_request()</code>, and the constructor runs the hasher ({{cite vllm/v1/engine/core.py:1990-1993}}, {{cite vllm/v1/request.py:225-230}}). The docstring says that this runs in parallel with the model forward ({{cite vllm/v1/engine/core.py:1114-1119}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Prefix caching is off, but a KV connector is configured. Do requests get block hashes?
+    <x-a><p>Yes. The engine core makes the hasher when prefix caching <em>or</em> a connector is on ({{cite vllm/v1/engine/core.py:217}}). The connector needs the hashes to find blocks outside the engine.</p></x-a>
+  </x-q>
+  <x-q level="medium">A new request hits three blocks. Two of them have <code>ref_cnt</code> 0. Why does <code>allocate_slots()</code> touch them before it calls <code>get_new_blocks()</code>?
+    <x-a><p><code>touch()</code> removes free hit blocks from the free queue ({{cite vllm/v1/core/block_pool.py:766-768}}). If <code>get_new_blocks()</code> ran first, it could pop one of those blocks and evict its hash. Then the request would lose its own hit. <code>allocate_slots()</code> adds the hit blocks before it allocates new blocks ({{cite vllm/v1/core/kv_cache_manager.py:581-600}}). The coordinator comment gives the same rule across KV cache groups ({{cite vllm/v1/core/kv_cache_coordinator.py:291-301}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With synchronous scheduling, a request has just sampled its 48th token (tokens 0-47 now exist). When does block 2 (tokens 32-47) get its hash, compared with the GPU step that computes the KV of token 47?
+    <x-a><p>Before it. The hasher adds <code>h2</code> as soon as the request has 48 tokens. The next <code>allocate_slots()</code> caches <code>min(computed + new, num_tokens) = 48</code> tokens, so block 2 enters the map when that step is scheduled ({{cite vllm/v1/core/kv_cache_manager.py:612-616}}). The GPU computes the KV of the last token in that same step. See the deep dive "When exactly does a block get its hash?".</p></x-a>
+  </x-q>
+  <x-q level="hard">An external router uses <code>xxhash</code> with a fixed seed, and the engines run with <code>--prefix-caching-hash-algo xxhash</code> and no <code>PYTHONHASHSEED</code>. Why does routing by prefix fail?
+    <x-a><p>Without <code>PYTHONHASHSEED</code>, each engine process picks a random seed for <code>NONE_HASH</code> when the algorithm is xxhash ({{cite vllm/v1/core/kv_cache_utils.py:125-130}}). Every chain starts from <code>NONE_HASH</code> ({{cite vllm/v1/core/kv_cache_utils.py:731-732}}), so the router's hashes and the hashes in the events never match. Set the same <code>PYTHONHASHSEED</code> everywhere, or use <code>sha256</code>.</p></x-a>
+  </x-q>
+</x-quiz>

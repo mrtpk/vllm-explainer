@@ -17,7 +17,7 @@ This file is the memory of the project. A new session must be able to continue f
 
 ## RESUME NOTES
 
-- 2026-10-23 ~00:05: usage limit (spend limit, reset 1am Dubai) cut off BOTH running writers: B3b (prefix-caching, hybrid-kv-cache, code/v1-core-kv-cache-utils, prefix_cache_explorer.js) and B4b (oot-models, model-interfaces, custom-ops, code/model-executor-custom-op, code/model-executor-models-registry). Their partial files are on disk (see git status). Resume order: continue both writers with SendMessage (not restart); then B3b FC, B4b FC; then B5 ...
+(none — both cut-off writers were resumed at 01:01; B3b finished.)
 
 ## Done
 
@@ -49,6 +49,8 @@ Wait for the foundation + generators agents. Review, build, commit Phase 1a. The
 See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
+
+- FINAL-PASS TODO (B3b FC): code/v1-core-kv-cache-manager ~132 'AsyncScheduler hashes it later when output of step 3 arrives' → the next step's allocate_slots hashes it; concepts/async-scheduling ~96 mechanism → num_tokens cap at allocation (kv_cache_manager.py:612-615).
 
 - FINAL-PASS TODO (B4a FC): kv-connectors, frontend-plugins, reference/extension-points must say connector registries are also read in the front end (class only); attention-backend-selection: register_backend string duplicate raises; custom-ops: forward_oot only for enabled ops; quantization-plugins: workers get the quant config object via pickled VllmConfig; compile-and-cuda-graphs / config-system: check_and_update_config 'late in' __post_init__.
 
@@ -114,10 +116,13 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-22 22:11 | B2b fact check | done ~22:45: ~380 claims, ~73 defects. NOTE: it started 3 forks itself (the 'unknown agents'); briefs now forbid sub-agents. |
 | 2026-10-22 22:32 | B3a writer (scheduler, kv-cache-manager + 3 modules + scheduler simulator) | done ~23:10; 4 diagrams, b3a.json 12 terms; core block-pool term reworded by supervisor |
 | 2026-10-22 23:11 | B3a fact check | done ~23:40: ~260 claims, 25 defects; simulator verified |
-| 2026-10-22 23:41 | B3b writer | running |
+| 2026-10-22 23:41 | B3b writer | cut off by usage limit ~00:05, resumed 01:01, done ~01:30 |
+| 2026-10-23 01:31 | B3b fact check | done ~01:45: ~190 claims, 21 defects; explorer verified in 12 scenarios |
+| 2026-10-23 01:46 | B5 writer | running |
 | 2026-10-22 22:47 | B4a writer (plugin-map, platform-plugins, platform-interface + 2 modules + plugin timeline) | done ~23:25; 3 diagrams, b4a.json 5 terms |
 | 2026-10-22 23:26 | B4a fact check | done ~23:55: ~270 claims, 24 defects; OOT quant open question answered |
-| 2026-10-22 23:56 | B4b writer | running |
+| 2026-10-22 23:56 | B4b writer | cut off ~00:05, resumed 01:01, done ~01:45; 3 diagrams, b4b.json 11 terms |
+| 2026-10-23 01:46 | B4b fact check | running |
 | 2026-10-22 19:18 | 1b Tour 1 (t1) | done 19:45: 16 stops, 3 diagrams, request_stepper.js, t1.json (12 terms); not browser-checked by writer |
 | 2026-10-22 19:46 | Fact check t1 (+ browser check of stepper) | done ~20:00: ~230 claims, 38 defects (11 citation, 6 value, 9 logic, 3 default source, 9 other). Stepper OK at 1280/390, no overflow. |
 | 2026-10-22 19:49 | Fact check concepts/plugin-loading (+ folder descriptions) | done ~19:58: ~80 claims, 30 defects fixed (8 citation, 11 value/condition, 4 logic, 3 missing source, 5 glossary/folder). Open question answered (platform before general plugins in every process). |

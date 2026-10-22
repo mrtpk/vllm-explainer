@@ -1,0 +1,201 @@
+---
+title: The hybrid KV cache: specs, groups and one manager per layer type
+nav_title: Hybrid KV cache
+level: Advanced
+prerequisites: concepts/kv-cache-manager, concepts/prefix-caching
+related: concepts/kv-cache-manager, concepts/prefix-caching, learn/prefix-caching, concepts/attention-backends, concepts/kv-connectors, code/v1-core-kv-cache-utils, code/v1-core-kv-cache-manager, code/v1-core-block-pool, concepts/tuning
+summary: Models that mix full attention with sliding-window, chunked-local or Mamba layers get one KV cache group per layer type. Each group has its own block table and single-type manager, all groups share one block pool, and so every group must use the same page size. Prefix caching finds one hit length that is valid for all groups.
+---
+<x-sentence>vLLM groups the layers with the same KV cache spec, gives each group its own block table, and shares one block pool between groups.</x-sentence>
+
+<h2>The idea</h2>
+<p>Many new models mix layer types. Some layers use full attention and read every earlier token. Other layers use a sliding window and read only the last few tokens, or chunked local attention, or a Mamba layer with a fixed-size state. The design document lists examples: gpt-oss, Gemma 2 and 3, Llama 4, Jamba and others ({{cite docs/design/hybrid_kv_cache_manager.md:6-21}}). If every layer kept the KV of every token, the sliding-window layers would hold blocks that they never read again.</p>
+
+<p>The hybrid KV cache manager gives each layer type its own rules, on top of the {{link concepts/kv-cache-manager | KV cache manager}}:</p>
+<ol>
+  <li>Each layer describes its cache with a {{term kv-cache-spec}}: full attention, sliding window, chunked local, MLA, Mamba and more.</li>
+  <li>Layers with the same spec form a {{term kv-cache-group}}. A request has one {{term block-table}} per group.</li>
+  <li>Each group gets a single-type manager that knows the rules of its spec. The {{term sliding-window-manager}} frees blocks behind the window.</li>
+  <li>All groups take block ids from one {{term block-pool}}. A block id belongs to one group at a time, and it means the same bytes in every group. So every group must use the same page size in bytes ({{term page-size-unification}}).</li>
+</ol>
+<p>Prefix caching still works: the coordinator finds the longest prefix that <em>every</em> group can reuse.</p>
+
+<p><strong>An everyday comparison.</strong> Think of a hotel with one stock of identical rooms and two kinds of guests. A long-stay guest keeps every room that he ever booked. A traveller keeps only the last two rooms and checks out of older rooms as he moves on. Both kinds of guests take rooms from the same stock, so all rooms must have the same size. The comparison stops at the room number. In vLLM, one block id stands for one page in each layer of its group, not for one place.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b3b_hybrid_groups" alt="Panel 1: 24 layers L0 to L23 of a gpt-oss-20b-like model; even layers are sliding window, odd layers full attention. They form a sliding-window group (12 layers, SlidingWindowSpec with window 128, SlidingWindowManager) and a full-attention group (12 layers, FullAttentionSpec, FullAttentionManager), and both take block ids from one BlockPool under a HybridKVCacheCoordinator. Panel 2: a request with 200 computed tokens has a full-attention block table with 13 block ids and a sliding-window block table with 13 entries; the first 4 are the null block because 200 - 128 + 1 = 73 tokens fall behind the window. It holds 22 blocks of 384 KiB (8.25 MiB) instead of 13 blocks of 768 KiB (9.75 MiB) without the hybrid manager. Panel 3: memory: 12 regions, one per pair of layers (L1 full with L0 sliding, and so on); block 40 and 41 of the full group and block 50 and 51 of the sliding group each take 32 KiB in every region; one owner per block id." caption="Figure: the two groups of a sliding-window + full-attention model (1), the two block tables of one request (2), and why one block id must mean the same number of bytes in every group (3). Model numbers are from the public gpt-oss-20b config; block ids are illustrative." />
+<p>Read panel 2 from left to right: the sliding table keeps its length, but its first places hold the {{term null-block}}. Panel 3 shows the memory side: the two groups use the same bytes, and only the owner of a block id writes into it.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: each layer reports a KV cache spec</h3>
+<p>After loading the model, each worker asks every attention layer for its spec. A decoder layer with a sliding window returns a <code>SlidingWindowSpec</code>, any other decoder layer a <code>FullAttentionSpec</code>:</p>
+<x-code file="vllm/model_executor/layers/attention/attention.py" lines="661-679" />
+<p>The spec classes are in <code>vllm/v1/kv_cache_interface.py</code>. The registry maps each class to a single-type manager ({{cite vllm/v1/core/single_type_kv_cache_manager.py:2645-2715}}):</p>
+<table>
+  <thead><tr><th>Spec</th><th>Layer type</th><th>Manager</th><th>Blocks per request</th></tr></thead>
+  <tbody>
+    <tr><td><code>FullAttentionSpec</code> ({{cite vllm/v1/kv_cache_interface.py:603-633}})</td><td>full attention</td><td><code>FullAttentionManager</code></td><td>one per <code>block_size</code> tokens, all kept</td></tr>
+    <tr><td><code>MLAAttentionSpec</code> ({{cite vllm/v1/kv_cache_interface.py:713-728}})</td><td>MLA (one latent vector, <code>head_size_v = 0</code>)</td><td><code>FullAttentionManager</code></td><td>all kept</td></tr>
+    <tr><td><code>SlidingWindowSpec</code> ({{cite vllm/v1/kv_cache_interface.py:885-949}})</td><td>sliding window</td><td><code>SlidingWindowManager</code></td><td>only the window, plus in-flight tokens</td></tr>
+    <tr><td><code>ChunkedLocalAttentionSpec</code> ({{cite vllm/v1/kv_cache_interface.py:845-882}})</td><td>chunked local (Llama 4)</td><td><code>ChunkedLocalAttentionManager</code></td><td>only the current chunk, plus in-flight tokens</td></tr>
+    <tr><td><code>MambaSpec</code> ({{cite vllm/v1/kv_cache_interface.py:1078-1151}})</td><td>Mamba / linear attention state</td><td><code>MambaManager</code></td><td>1 to a few state blocks</td></tr>
+    <tr><td><code>CrossAttentionSpec</code> ({{cite vllm/v1/kv_cache_interface.py:1200-1208}})</td><td>encoder-decoder cross attention</td><td><code>CrossAttentionManager</code></td><td>encoder tokens</td></tr>
+  </tbody>
+</table>
+<p>More specs exist for special models (R-SWA, sinks, circular buffers, HiSparse). A platform can register its own ({{cite vllm/v1/core/single_type_kv_cache_manager.py:2717-2719}}). The page size of an attention spec is <code>num_heads × num_states × (head_size + head_size_v) × dtype bytes</code>, where <code>num_states</code> is the block size for normal layers ({{cite vllm/v1/kv_cache_interface.py:570-586}}, {{cite vllm/v1/kv_cache_interface.py:253-260}}). The page size of a Mamba spec comes from its state shapes, not from the block size ({{cite vllm/v1/kv_cache_interface.py:1094-1114}}).</p>
+
+<h3>Step 2: from specs to groups</h3>
+<p>The engine core turns the specs of all layers into groups in <code>get_kv_cache_configs()</code> ({{cite vllm/v1/engine/core.py:311}}). A model can bring its own grouping (<code>SupportsKVCacheGrouping</code>); otherwise the default builder calls <code>get_kv_cache_groups()</code> ({{cite vllm/v1/core/kv_cache_planning.py:1659-1670}}). It tries the simple cases first:</p>
+<x-code file="vllm/v1/core/kv_cache_planning.py" lines="1127-1176" highlight="1127-1128,1138-1147,1159-1165,1170,1176" />
+<ol>
+  <li><strong>Lines 1127-1128.</strong> With the hybrid manager off, sliding-window and chunked-local specs become full-attention specs first (Step 6).</li>
+  <li><strong>Lines 1138-1147.</strong> All layers have the same spec, or the same type: one group. A plain Llama ends here.</li>
+  <li><strong>Lines 1159-1165.</strong> Only with a block-outermost KV cache layout: a packed grouping that does not need equal page sizes ({{cite vllm/v1/core/kv_cache_planning.py:929-932}}).</li>
+  <li><strong>Lines 1170-1176.</strong> The normal hybrid path: make the page sizes equal (Step 3), then group the layers.</li>
+</ol>
+<p>The grouping puts layers with the same spec into buckets. Then it cuts each bucket into groups of equal size, so every group has the same bytes per block:</p>
+<x-code file="vllm/v1/core/kv_cache_planning.py" lines="521-556" highlight="521-532,535-541,554-555" />
+<p>The group size is the smallest bucket, or the largest bucket when the buckets are almost equal (lines 521-532). gpt-oss-20b has 12 sliding and 12 full layers, so it gets two groups of 12 (the comment at lines 526-531 names gpt-oss with EAGLE). A short group wastes memory, and the code logs a warning (lines 535-541). Line 555 takes every <em>n</em>-th layer, which keeps the groups equal with pipeline parallelism.</p>
+<p>Each group becomes a <code>KVCacheGroupSpec</code>: the layer names and one merged spec ({{cite vllm/v1/kv_cache_interface.py:1484-1502}}, {{cite vllm/v1/core/kv_cache_planning.py:187-215}}).</p>
+
+<h3>Step 3: one page size for all groups</h3>
+<p>All groups use the same memory. The KV cache tensors of different groups start at byte 0 of the same allocation, and the comment explains why that is safe ({{cite vllm/v1/kv_cache_interface.py:1458-1467}}):</p>
+<x-code file="vllm/v1/core/kv_cache_planning.py" lines="681-694" />
+<p>So one block id must cover the same bytes in every group. <code>unify_kv_cache_spec_page_size()</code> makes the page sizes equal:</p>
+<x-code file="vllm/v1/core/kv_cache_planning.py" lines="370-408" highlight="375,378,380-389,392-395,396-399,400-405" />
+<ol>
+  <li><strong>Line 375.</strong> The target is the largest page.</li>
+  <li><strong>Lines 380-389.</strong> A Mamba page does not grow with the block size, so it is padded.</li>
+  <li><strong>Lines 392-395.</strong> If the largest page is a multiple of this page, the block size of this layer grows by that factor. Its group then has a larger block size than the others.</li>
+  <li><strong>Lines 396-399.</strong> Otherwise a non-MLA attention page is padded.</li>
+  <li><strong>Lines 400-405.</strong> MLA cannot be padded: <code>NotImplementedError</code>, and <code>get_kv_cache_groups()</code> tries a full-allocation fallback.</li>
+</ol>
+<p>For attention + Mamba models, the platform does most of this work before the model is built. <code>_align_hybrid_block_size()</code> raises the attention block size until one attention page is at least one Mamba state. Then it pads the Mamba page to the attention page:</p>
+<x-code file="vllm/platforms/interface.py" lines="1093-1125" highlight="1095-1098,1103-1104,1111-1112,1121-1125" />
+<p>When groups end up with different block sizes, the scheduler works in units of their least common multiple. Prefix hashes use their greatest common divisor, or <code>--prefix-match-unit</code> ({{cite vllm/v1/core/kv_cache_utils.py:860-891}}). <code>BlockHashListWithBlockSize</code> then reads the hashes of a larger block from the finer list ({{cite vllm/v1/core/kv_cache_utils.py:1111-1181}}).</p>
+
+<h3>Step 4: the coordinator and the single-type managers</h3>
+<p>With more than one group and prefix caching on, the manager uses the <code>HybridKVCacheCoordinator</code> ({{cite vllm/v1/core/kv_cache_coordinator.py:1009-1038}}). Every coordinator makes one block pool and one manager per group ({{cite vllm/v1/core/kv_cache_coordinator.py:119-125}}, {{cite vllm/v1/core/kv_cache_coordinator.py:157-172}}). Each allocation call loops over the managers ({{cite vllm/v1/core/kv_cache_coordinator.py:335-344}}). The managers differ in three methods: how many tokens the attention skips, how a prefix hit looks, and which blocks get a hash.</p>
+<p><strong>FullAttentionManager.</strong> It skips nothing and keeps every block until the request ends ({{cite vllm/v1/core/single_type_kv_cache_manager.py:721-732}}).</p>
+<p><strong>SlidingWindowManager.</strong> The next token reads only the last <code>sliding_window</code> tokens, so everything before them is skipped:</p>
+<x-code file="vllm/v1/core/single_type_kv_cache_manager.py" lines="1176-1179" />
+<p>At the start of every <code>allocate_slots()</code>, the manager frees the skipped blocks and puts the null block in their place. It counts only <em>processed</em> tokens, because a step in flight can still read the old blocks ({{cite vllm/v1/core/kv_cache_manager.py:546-559}}):</p>
+<x-code file="vllm/v1/core/single_type_kv_cache_manager.py" lines="705-719" />
+<x-code file="vllm/v1/core/single_type_kv_cache_manager.py" lines="669-679" highlight="673-679" />
+<p>The table keeps its length, so position <em>i</em> is still block <em>i</em> of the sequence. The worker sees the null block (id 0) at the freed places. Admission uses a cap per request, because the group frees blocks while the request runs ({{cite vllm/v1/kv_cache_interface.py:922-929}}, {{cite vllm/v1/core/single_type_kv_cache_manager.py:214-227}}).</p>
+<x-diagram name="b3b_sliding_window_free" alt="Panel 1: a table of five rows for sliding window 32, block size 16, a 96-token prompt in chunks of 32. Step 1, computed 0: skip 0, table 1, 2. Step 2, computed 32: skip 1 token = 0 blocks, table 1 to 4. Step 3, computed 64: skip 33 tokens = 2 blocks, blocks 2 and 1 freed, table null, null, 3, 4, 5, 6. Step 4, computed 96, new 1: skip 65 = 4 blocks, blocks 4 and 3 freed, table four nulls then 5, 6, 7. Step 20, computed 112: skip 81 = 5 blocks, block 5 freed, table five nulls then 6, 7, 8. The full-attention group holds 2, 4, 6, 7 and 8 blocks. Panel 2: freed blocks are freed backwards and, without a hash, go to the front of the free queue; the admission cap is cdiv(min(window - 1 + in-flight, max_model_len), block_size) + 1; with async scheduling the free uses processed tokens, so it comes one step later." caption="Figure: the sliding-window block table over five steps (1), and what happens to the freed blocks (2). Illustrative numbers; the formulas are from the code." />
+<p><strong>ChunkedLocalAttentionManager.</strong> Chunked local attention reads only the tokens of the current chunk. All tokens before the start of the chunk are skipped ({{cite vllm/v1/core/single_type_kv_cache_manager.py:1418-1421}}). Its prefix hit counts all blocks before the current chunk as computed and fills them with the null block ({{cite vllm/v1/core/single_type_kv_cache_manager.py:1345-1375}}).</p>
+<p><strong>MambaManager.</strong> A Mamba layer keeps one {{term mamba-state}} per request, not one entry per token. The manager needs only the state after the last computed token, so it skips <code>num_computed_tokens − 1</code> tokens ({{cite vllm/v1/core/single_type_kv_cache_manager.py:1966-1971}}). What it keeps depends on <code>mamba_cache_mode</code>:</p>
+<ul>
+  <li><code>"none"</code> (prefix caching off): the Mamba block size becomes <code>max_model_len</code>, so one block holds the state of the whole request ({{cite vllm/model_executor/models/config.py:779-786}}). A request needs <code>1 + num_speculative_blocks</code> pages ({{cite vllm/v1/kv_cache_interface.py:1120-1126}}).</li>
+  <li><code>"align"</code> (prefix caching on): the state is stored at block boundaries, so a later request can resume from it. The Mamba block size equals the attention block size, and chunked prefill must be on ({{cite vllm/model_executor/models/config.py:762-778}}). A request holds <code>2 + num_speculative_blocks + num_prefill_checkpoint_blocks</code> pages at a time; older states are freed ({{cite vllm/v1/kv_cache_interface.py:1121-1124}}, {{cite vllm/v1/core/single_type_kv_cache_manager.py:1636-1653}}).</li>
+</ul>
+<p>The manager refuses prefix caching in any other mode ({{cite vllm/v1/core/single_type_kv_cache_manager.py:1437-1440}}).</p>
+
+<h3>Step 5: prefix caching across groups</h3>
+<p>The block pool keys every cached block by <code>(block hash, group id)</code>, so each group caches and evicts its own blocks ({{cite vllm/v1/core/kv_cache_utils.py:60-69}}). A hit is useful only if <em>every</em> group has the blocks for it. The coordinator finds the longest such length with a fixed-point loop:</p>
+<x-code file="vllm/v1/core/kv_cache_coordinator.py" lines="837-907" highlight="848-855,876-890,896,903-907" />
+<ol>
+  <li>The attention groups are sorted so that full attention comes first ({{cite vllm/v1/core/kv_cache_coordinator.py:746-750}}). Its left-to-right walk gives the first upper bound.</li>
+  <li><strong>Lines 848-855.</strong> Full attention is "downward-closed": a hit of length L is also a hit of every shorter length. So the code looks it up once and later only cuts it.</li>
+  <li><strong>Lines 876-890, 896.</strong> Each other group searches a hit of at most the current length, and may return a shorter one.</li>
+  <li><strong>Lines 903-907.</strong> If no group made the length shorter, the loop ends. A model with one full group plus one other group needs only one pass.</li>
+</ol>
+<p>After the loop, the code cuts the full-attention block lists to the final length ({{cite vllm/v1/core/kv_cache_coordinator.py:909-922}}). Some group can have a longer hit than the final one. The difference is an "uncached common prefix", and the scheduler stores its end as <code>shared_prefix_boundary</code> ({{cite vllm/v1/core/kv_cache_coordinator.py:924-931}}, {{cite vllm/v1/core/kv_cache_manager.py:312-321}}, {{cite vllm/v1/core/sched/scheduler.py:1019-1024}}). Later, <code>cache_blocks()</code> keeps a hash at that boundary, so the next request can hit it in every group ({{cite vllm/v1/core/single_type_kv_cache_manager.py:510-512}}).</p>
+<p>The sliding-window search is different from the full-attention walk. A hit at length L needs only the blocks of the last <code>sliding_window − 1</code> tokens before L. So the manager searches from right to left for enough contiguous cached blocks, and fills the rest with the null block:</p>
+<x-code file="vllm/v1/core/single_type_kv_cache_manager.py" lines="993-1033" highlight="994-996,1012-1015,1025-1033" />
+<p>Not every sliding-window or Mamba block gets a hash. With the default <code>--prefix-cache-retention-interval 0</code>, these groups keep hashes only at "semantic checkpoints": the end of the prompt (<code>num_prompt_tokens − 1</code>) and shared-prefix junctions ({{cite vllm/config/cache.py:272-278}}, {{cite vllm/v1/core/kv_cache_coordinator.py:65-86}}). A mask in <code>cache_blocks()</code> leaves out the other blocks ({{cite vllm/v1/core/single_type_kv_cache_manager.py:1131-1142}}, {{cite vllm/v1/core/block_pool.py:277-278}}).</p>
+
+<h3>Step 6: when the hybrid manager or prefix caching is off</h3>
+<p><strong>Prefix caching.</strong> The default comes from <code>is_prefix_caching_supported</code>. Generative decoder models, including sliding-window ones, and generative attention + Mamba hybrids get it. Hybrid pooling models, attention-free models and encoder-decoder models do not ({{cite vllm/config/model.py:2272-2291}}). With prefix caching off, the manager uses <code>KVCacheCoordinatorNoPrefixCache</code> for any number of groups ({{cite vllm/v1/core/kv_cache_coordinator.py:476-481}}).</p>
+<p><strong>The hybrid manager.</strong> <code>--disable-hybrid-kv-cache-manager</code> has the default <code>None</code>, and <code>VllmConfig</code> decides ({{cite vllm/config/vllm.py:2202-2273}}):</p>
+<ul>
+  <li>off on a platform without hybrid support; the base <code>Platform</code> says no, CUDA says yes ({{cite vllm/platforms/interface.py:1351-1353}}, {{cite vllm/platforms/cuda.py:683-684}});</li>
+  <li>off for chunked local attention with EAGLE, or when <code>VLLM_ALLOW_CHUNKED_LOCAL_ATTN_WITH_HYBRID_KV_CACHE=0</code> (default 1, {{cite vllm/envs.py:1929-1931}});</li>
+  <li>off when the KV connector does not support it, with a WARNING. vLLM checks the connector only when neither flag is given;</li>
+  <li>an explicit <code>--enable-hybrid-kv-cache-manager</code> in one of the first two cases raises <code>ValueError</code>.</li>
+</ul>
+<p>When it is off, sliding-window and chunked-local specs become full-attention specs, so every layer keeps every block. The attention still computes only the window ({{cite vllm/v1/core/kv_cache_planning.py:853-876}}). Mamba layers cannot be converted, so attention + Mamba models need the hybrid manager ({{cite vllm/config/vllm.py:2245-2256}}).</p>
+<x-note title="Docs and code differ"><p>The design document says that the hybrid prefix-cache search supports exactly two attention types, full attention plus one other ({{cite docs/design/hybrid_kv_cache_manager.md:201}}). It also says that <code>HybridKVCacheCoordinator</code> handles exactly two KV cache groups ({{cite docs/design/hybrid_kv_cache_manager.md:221}}). A code comment says the same ({{cite vllm/v1/core/kv_cache_planning.py:464-469}}). The coordinator code has a fixed-point loop over any number of attention types (Step 5), and models without full attention get <code>full_attention_group_id = None</code> ({{cite vllm/v1/core/kv_cache_coordinator.py:756-759}}). The document also assumes one block size for all groups; the code allows different sizes (Step 3).</p></x-note>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: gpt-oss-20b on one GPU">
+<p>The model numbers are from the public Hugging Face config of gpt-oss-20b, not from the vLLM repo. They are 24 layers, sliding window 128, 8 KV heads, head size 64, BF16 KV cache, and <code>max_position_embeddings</code> 131,072. vLLM puts the window on every even layer, so 12 layers are sliding and 12 are full ({{cite vllm/model_executor/models/gpt_oss.py:174-175}}). The memory size, the batched tokens and block size 16 are assumptions. The attention backend can choose another block size ({{cite vllm/model_executor/layers/attention/attention.py:621-660}}).</p>
+<ol>
+  <li><strong>Specs.</strong> 12 <code>SlidingWindowSpec(sliding_window=128)</code> and 12 <code>FullAttentionSpec</code>, block size 16.</li>
+  <li><strong>Page.</strong> 8 × 16 × (64 + 64) × 2 bytes = 32 KiB for both types. The pages are equal, so no layer changes its block size.</li>
+  <li><strong>Groups.</strong> Buckets of 12 and 12: 12 &lt; 1.5 × 12, so the group size is 12. Two groups, no padding.</li>
+  <li><strong>Bytes per block.</strong> 12 × 32 KiB = 384 KiB ({{cite vllm/v1/core/kv_cache_planning.py:578-586}}). Without the hybrid manager, one group of 24 layers: 768 KiB.</li>
+  <li><strong>Blocks.</strong> With 40 GiB for the KV cache: 41,943,040 KiB / 384 KiB = 109,226 blocks.</li>
+  <li><strong>One request of 1,200 tokens.</strong> Full group: <code>cdiv(1200, 16) = 75</code> blocks. Sliding group: <code>1200 − 128 + 1 = 1073</code> skipped tokens, so 67 null places and 8 real blocks. Total 83 blocks = 31.1 MiB. Without the hybrid manager: 75 blocks of 768 KiB = 56.25 MiB.</li>
+  <li><strong>Capacity at <code>max_model_len</code> 131,072</strong> (from the config). Assume 8,192 batched tokens and async scheduling, so 16,384 in-flight tokens ({{cite vllm/config/vllm.py:586-608}}). Full group: 8,192 blocks per request. Sliding group: <code>cdiv(min(127 + 16384, 131072), 16) + 1 = 1,033</code> ({{cite vllm/v1/kv_cache_interface.py:922-929}}). Together 9,225 blocks, so the start-up log shows about 109,226 / 9,225 = 11.8x concurrency ({{cite vllm/v1/core/kv_cache_utils.py:1030-1047}}, {{cite vllm/v1/core/kv_cache_utils.py:1101-1107}}). Without the hybrid manager: 54,613 blocks / 8,192 = 6.7x.</li>
+</ol>
+<p>All numbers after the config values are derived from the cited lines.</p>
+</x-deepdive>
+
+<x-deepdive title="Grouping with uneven layer counts">
+<p>Gemma-3-27b has 52 sliding-window and 10 full-attention layers, according to the design document ({{cite docs/design/hybrid_kv_cache_manager.md:113}}). The code at {{cite vllm/v1/core/kv_cache_planning.py:521-556}} does this:</p>
+<ol>
+  <li>Smallest bucket 10, largest 52. 52 is not below 1.5 × 10, so the group size is 10.</li>
+  <li>Full attention: 10 layers, one group.</li>
+  <li>Sliding window: <code>cdiv(52, 10) = 6</code> groups. The code logs "Add 8 padding layers, may waste at most 15.38% KV cache memory".</li>
+  <li>Line 555 takes <code>layers[i::6]</code>: groups of 9, 9, 9, 9, 8 and 8 layers. The bytes per block come from the largest group, the full group with 10 layers. So the smaller groups leave part of each block empty.</li>
+</ol>
+<p>The design document draws the six sliding groups as consecutive runs: five groups of 10 and one group of 2 + 8 padding ({{cite docs/design/hybrid_kv_cache_manager.md:115-121}}). The code interleaves the layers instead (lines 543-555). The padding is the same: 7 groups × 10 layer slots for 62 layers, so 8 empty slots.</p>
+</x-deepdive>
+
+<x-deepdive title="Mamba prefix caching in align mode">
+<p>A Mamba state is the result of all earlier tokens, like a hash chain. To resume a new request at token <em>t</em>, the engine needs the state exactly after token <em>t</em>. In <code>"align"</code> mode, vLLM keeps the state of the last token of each step and of each block boundary ({{cite vllm/config/cache.py:301-308}}).</p>
+<ul>
+  <li><strong>Lookup.</strong> The manager searches from right to left and takes the last cached state. It puts null blocks before it, so the hit length is <code>(i + 1) × block_size</code> ({{cite vllm/v1/core/single_type_kv_cache_manager.py:1518-1542}}).</li>
+  <li><strong>Same-step rule.</strong> A request cannot use a state that another request cached in the current step. The manager then reports more needed blocks than the pool has, so the scheduler waits one step ({{cite vllm/v1/core/single_type_kv_cache_manager.py:1700-1708}}).</li>
+  <li><strong>Free.</strong> Each step copies the state from the block of the previous step into a new block. The block of two steps ago is freed ({{cite vllm/v1/core/single_type_kv_cache_manager.py:1636-1653}}).</li>
+  <li><strong>Page.</strong> The platform raised the attention block size so that one attention page holds one Mamba state, and padded the Mamba page (Step 3). For a large state, the attention block size can become several hundred tokens; the design document mentions more than 400 ({{cite docs/design/hybrid_kv_cache_manager.md:144}}).</li>
+</ul>
+<p>With fine-grained hashing (<code>--prefix-match-unit</code> smaller than the Mamba block), hits can also end inside a block ({{cite vllm/v1/core/kv_cache_utils.py:762-801}}, {{cite vllm/v1/core/single_type_kv_cache_manager.py:1496-1516}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Errors and edge cases">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Pages cannot be made equal (MLA next to another page size)</td><td><code>NotImplementedError</code>, then a full-allocation fallback or the error</td><td>{{cite vllm/v1/core/kv_cache_planning.py:400-405}}, {{cite vllm/v1/core/kv_cache_planning.py:1169-1175}}</td></tr>
+    <tr><td>Hybrid manager off, specs still not uniform (Mamba)</td><td><code>ValueError</code> "Failed to promote local KV cache specs"</td><td>{{cite vllm/v1/core/kv_cache_planning.py:810-814}}</td></tr>
+    <tr><td><code>--enable-hybrid-kv-cache-manager</code> where it is not supported</td><td><code>ValueError</code></td><td>{{cite vllm/config/vllm.py:2260-2269}}</td></tr>
+    <tr><td><code>--prefix-match-unit</code> does not divide a group block size</td><td><code>ValueError</code></td><td>{{cite vllm/v1/core/kv_cache_utils.py:892-898}}</td></tr>
+    <tr><td>Mamba prefix caching without chunked prefill</td><td><code>AssertionError</code></td><td>{{cite vllm/model_executor/models/config.py:771-773}}</td></tr>
+    <tr><td>Uneven layer counts per type</td><td>WARNING "Add N padding layers"</td><td>{{cite vllm/v1/core/kv_cache_planning.py:535-541}}</td></tr>
+    <tr><td>Decode context parallel with sliding window</td><td><code>AssertionError</code></td><td>{{cite vllm/v1/core/single_type_kv_cache_manager.py:980}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Less KV capacity than expected with a KV connector.</strong> A connector without hybrid support turns the hybrid manager off. Sliding-window layers then keep every block ({{cite vllm/config/vllm.py:2236-2256}}). Check the start-up log for "Turning off hybrid kv cache manager".</li>
+  <li><strong>An attention + Mamba model fails at start-up with a connector.</strong> The same warning; such models need the hybrid manager.</li>
+  <li><strong>Prefix hits are shorter on a sliding-window model.</strong> With retention interval 0, sliding-window blocks keep hashes only at the end of a prompt and at shared-prefix junctions. A hit must end where all groups have blocks (Step 5). <code>--prefix-cache-retention-interval</code> keeps more checkpoints ({{cite vllm/config/cache.py:272-278}}).</li>
+  <li><strong>A large attention block size on a Mamba hybrid.</strong> The platform logs "Setting attention block size to N tokens" ({{cite vllm/platforms/interface.py:1103-1109}}). Larger blocks make prefix hits coarser.</li>
+</ul>
+<p><strong>Why it matters.</strong> For models with sliding-window or Mamba layers, the hybrid manager decides how many requests fit in the KV cache. To size a deployment, you must know which layers keep every block, which free them, and when the manager is off.</p>
+
+<x-quiz>
+  <x-q level="easy">Why do all KV cache groups need the same page size?
+    <x-a><p>All groups take block ids from one block pool, and their KV cache tensors use the same bytes from offset 0 ({{cite vllm/v1/core/kv_cache_planning.py:685-694}}). A block id belongs to one group at a time, so it must mean the same number of bytes in every group ({{cite vllm/v1/kv_cache_interface.py:1465-1467}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A sliding-window layer has a window of 128 and block size 16. A request has processed 300 tokens. How many leading places of its block table hold the null block?
+    <x-a><p>The skipped tokens are <code>300 − 128 + 1 = 173</code> ({{cite vllm/v1/core/single_type_kv_cache_manager.py:1176-1179}}). That is <code>173 // 16 = 10</code> whole blocks, so 10 places hold the null block ({{cite vllm/v1/core/single_type_kv_cache_manager.py:713-719}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">What happens to a sliding-window model when you pass <code>--disable-hybrid-kv-cache-manager</code>?
+    <x-a><p>The sliding-window specs become full-attention specs, so all layers form one group and keep every block. The attention still computes only the window ({{cite vllm/v1/core/kv_cache_planning.py:853-876}}, {{cite vllm/v1/core/kv_cache_planning.py:785-808}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">In the gpt-oss-20b deep dive, why does the sliding-window group need 1,033 blocks per request at start-up, and not <code>cdiv(128, 16) = 8</code>?
+    <x-a><p>The group frees blocks only for processed tokens. Blocks for every in-flight token stay allocated: up to <code>max_concurrent_batches × max_num_batched_tokens</code> ({{cite vllm/config/vllm.py:600-608}}). The cap adds them to <code>window − 1</code>, plus one block because the window may start inside a block ({{cite vllm/v1/kv_cache_interface.py:922-929}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A model has one full-attention group and one sliding-window group. The full-attention walk finds 96 cached tokens, but the sliding-window group has a valid hit only at 64 tokens. What is the hit, and what does the scheduler remember?
+    <x-a><p>The hit is 64 tokens: the sliding-window group cuts the candidate length, and the full-attention blocks are cut to 64 ({{cite vllm/v1/core/kv_cache_coordinator.py:896}}, {{cite vllm/v1/core/kv_cache_coordinator.py:909-922}}). The longest group hit was 96, so 32 tokens are an uncached common prefix ({{cite vllm/v1/core/kv_cache_coordinator.py:927}}). The request stores <code>shared_prefix_boundary = 64 + 32 = 96</code> ({{cite vllm/v1/core/kv_cache_manager.py:316-318}}). When its blocks get hashes, the sliding-window mask keeps the blocks that end at 96, so a later request can hit 96 tokens ({{cite vllm/v1/core/single_type_kv_cache_manager.py:510-512}}, {{cite vllm/v1/core/single_type_kv_cache_manager.py:1131-1140}}).</p></x-a>
+  </x-q>
+</x-quiz>

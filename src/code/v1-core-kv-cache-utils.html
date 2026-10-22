@@ -1,0 +1,195 @@
+---
+title: v1/core/kv_cache_utils.py: block hashes, KVCacheBlock and the free queue
+nav_title: v1/core/kv_cache_utils.py
+level: Advanced
+prerequisites: concepts/kv-cache-manager, concepts/prefix-caching
+related: concepts/prefix-caching, concepts/hybrid-kv-cache, concepts/kv-cache-manager, learn/prefix-caching, code/v1-core-block-pool, code/v1-core-kv-cache-manager, code/v1-engine-core
+summary: vllm/v1/core/kv_cache_utils.py holds the building blocks of the KV cache manager. It defines the block hash types, NONE_HASH, the extra keys and the request block hasher, the KVCacheBlock record, the FreeKVCacheBlockQueue linked list, the block-size resolution for several KV cache groups, and the capacity log line.
+---
+<h2>Purpose</h2>
+<p><code>vllm/v1/core/kv_cache_utils.py</code> is the toolbox under the {{term block-pool}} and the single-type managers. It holds data types, the hash chain, and small helpers for the start-up of the engine core.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/v1/core/kv_cache_utils.py</code>, 1,217 lines of Python. Four classes and 28 top-level functions.</td></tr>
+    <tr><th>Main classes</th><td><code>KVCacheBlock</code> ({{cite vllm/v1/core/kv_cache_utils.py:161-224}}), <code>FreeKVCacheBlockQueue</code> ({{cite vllm/v1/core/kv_cache_utils.py:258-519}}), <code>BlockHashListWithBlockSize</code> ({{cite vllm/v1/core/kv_cache_utils.py:1111-1181}}), <code>KVCacheBlockCopy</code> ({{cite vllm/v1/core/kv_cache_utils.py:253-255}}).</td></tr>
+    <tr><th>Runs in</th><td>The {{term engine-core}} process. The request hasher runs on its input thread when a request arrives, and on the main thread when tokens are appended. Some KV connectors also call the block-size helpers in the workers. CPU only.</td></tr>
+    <tr><th>Called by</th><td><code>EngineCore</code> at start-up, <code>Request</code>, <code>BlockPool</code>, the single-type managers, <code>KVCacheManager</code>, the scheduler, and many KV connectors (29 files in <code>vllm/</code> import it).</td></tr>
+    <tr><th>Calls</th><td>The <code>xxhash</code> functions of <code>vllm/utils/hashing.py</code> (only to tell them apart), <code>get_mm_features_in_window</code>, <code>KVCacheSpecRegistry</code> and the spec classes of <code>kv_cache_interface.py</code> ({{cite vllm/v1/core/kv_cache_utils.py:21-37}}).</td></tr>
+    <tr><th>Not in this file</th><td>The hash functions themselves (<code>vllm/utils/hashing.py</code>), the block pool and the hash map (<code>block_pool.py</code>), the hit search (single-type managers), the grouping and memory planning (<code>kv_cache_planning.py</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b3b_block_life" alt="Panel 1: a block is allocated from the front of the free queue, gets a hash when full, and goes to the back of the free queue with its hash when the last request frees it. Panel 2: from the free queue it is either hit again (touch), evicted when it reaches the front, or cleared by a reset." caption="Figure: the life of one block. This file supplies the block record, the free queue and the hashes; <code>block_pool.py</code> runs the cycle (from {{link concepts/prefix-caching}})." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><code>EngineCore</code> resolves the block sizes, makes the hasher, and logs the capacity ({{cite vllm/v1/engine/core.py:57-65}}, {{cite vllm/v1/engine/core.py:173-175}}, {{cite vllm/v1/engine/core.py:216-225}}, {{cite vllm/v1/engine/core.py:324-354}}).</li>
+  <li><code>Request</code> calls the hasher in its constructor and after each new token ({{cite vllm/v1/request.py:225-230}}, {{cite vllm/v1/request.py:285-288}}).</li>
+  <li><code>BlockPool</code> makes all <code>KVCacheBlock</code>s and the free queue, and uses the hash-key helpers ({{cite vllm/v1/core/block_pool.py:16-29}}, {{cite vllm/v1/core/block_pool.py:172-178}}).</li>
+  <li>The single-type managers use <code>resolve_block_hashes</code>, <code>BlockHashListWithBlockSize</code> and <code>trim_null_head</code> ({{cite vllm/v1/core/single_type_kv_cache_manager.py:13-20}}).</li>
+  <li>The workers use <code>KVCacheBlockCopy</code> for copy-on-write ({{cite vllm/v1/worker/utils.py:30}}). A P2P offload tier reads the <code>NONE_HASH</code> seed ({{cite vllm/v1/kv_offload/tiering/p2p/manager.py:714}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>xxhash</code> and <code>xxhash_cbor</code>, only to know which hash functions are not cryptographic ({{cite vllm/v1/core/kv_cache_utils.py:110-111}}).</li>
+  <li><code>get_mm_features_in_window</code> to find the first image that touches a block ({{cite vllm/v1/core/kv_cache_utils.py:976-983}}).</li>
+  <li><code>KVCacheSpecRegistry.get_manager_class</code> to check if every group supports fine-grained hits ({{cite vllm/v1/core/kv_cache_utils.py:936-942}}).</li>
+  <li><code>envs.VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES</code> for the hash format of KV events ({{cite vllm/v1/core/kv_cache_utils.py:82-85}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<p>The file in order. Line ranges are at the pinned commit.</p>
+<table>
+  <thead><tr><th>Lines</th><th>Name</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td>{{cite vllm/v1/core/kv_cache_utils.py:44-85}}</td><td><code>BlockHash</code>, <code>BlockHashWithGroupId</code>, <code>ExternalBlockHash</code>, pack/unpack helpers</td><td>the {{term block-hash}} types; group id as 4 big-endian bytes</td></tr>
+    <tr><td>{{cite vllm/v1/core/kv_cache_utils.py:90-158}}</td><td><code>NONE_HASH</code>, <code>resolve_none_hash_seed</code>, <code>get_none_hash_seed</code>, <code>init_none_hash</code></td><td>the parent hash of block 0 ({{term none-hash}})</td></tr>
+    <tr><td>{{cite vllm/v1/core/kv_cache_utils.py:161-224}}</td><td><code>KVCacheBlock</code></td><td>the record of one block ({{term kv-cache-block}})</td></tr>
+    <tr><td>{{cite vllm/v1/core/kv_cache_utils.py:227-250}}</td><td><code>null_head_len</code>, <code>trim_null_head</code></td><td>count or drop the leading null blocks of a block table</td></tr>
+    <tr><td>{{cite vllm/v1/core/kv_cache_utils.py:253-255}}</td><td><code>KVCacheBlockCopy</code></td><td>a (source, destination) pair for copy-on-write</td></tr>
+    <tr><td>{{cite vllm/v1/core/kv_cache_utils.py:258-519}}</td><td><code>FreeKVCacheBlockQueue</code></td><td>the {{term free-block-queue}}: a doubly linked list through the blocks</td></tr>
+    <tr><td>{{cite vllm/v1/core/kv_cache_utils.py:522-675}}</td><td><code>_gen_mm_extra_hash_keys</code>, <code>_gen_lora_extra_hash_keys</code>, <code>_gen_prompt_embeds_extra_hash_keys</code>, <code>generate_block_hash_extra_keys</code></td><td>the {{term extra-keys}} of one block</td></tr>
+    <tr><td>{{cite vllm/v1/core/kv_cache_utils.py:678-704}}</td><td><code>to_event_extra_keys</code></td><td>extra keys without tags, for KV events</td></tr>
+    <tr><td>{{cite vllm/v1/core/kv_cache_utils.py:707-737}}</td><td><code>hash_block_tokens</code></td><td>one link of the {{term hash-chain}}</td></tr>
+    <tr><td>{{cite vllm/v1/core/kv_cache_utils.py:740-813}}</td><td><code>resolve_dcp_kv_block_size</code>, <code>resolve_dcp_kv_cache_spec</code>, <code>partial_hash_hits_enabled</code>, <code>eagle_proof_margin</code></td><td>block sizes under decode context parallelism; fine-grained hits; EAGLE margin</td></tr>
+    <tr><td>{{cite vllm/v1/core/kv_cache_utils.py:816-950}}</td><td><code>resolve_kv_cache_block_sizes</code>, <code>resolve_cache_hit_alignment_tokens</code></td><td>scheduler block size, hash block size and hit alignment for one or several groups</td></tr>
+    <tr><td>{{cite vllm/v1/core/kv_cache_utils.py:953-1012}}</td><td><code>get_request_block_hasher</code></td><td>the closure that hashes the new full blocks of a request</td></tr>
+    <tr><td>{{cite vllm/v1/core/kv_cache_utils.py:1015-1108}}</td><td><code>get_max_concurrency_for_kv_cache_config</code>, <code>generate_scheduler_kv_cache_config</code>, <code>get_kv_cache_capacity</code>, <code>update_kv_cache_capacity</code></td><td>the scheduler's copy of the KV cache config, and the capacity log line</td></tr>
+    <tr><td>{{cite vllm/v1/core/kv_cache_utils.py:1111-1184}}</td><td><code>BlockHashListWithBlockSize</code>, <code>BlockHashList</code></td><td>a lazy view of fine hashes at a larger block size</td></tr>
+    <tr><td>{{cite vllm/v1/core/kv_cache_utils.py:1187-1217}}</td><td><code>resolve_block_hashes</code></td><td>picks the right hash view for one group</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>KVCacheBlock</code>: one record per block</h3>
+<x-code file="vllm/v1/core/kv_cache_utils.py" lines="161-210" highlight="161,166,168,170-172,175,178,182-183,186,201-203" />
+<ol>
+  <li><strong>Line 161.</strong> <code>slots=True</code>: no <code>__dict__</code> per block. A large GPU has tens of thousands of these objects.</li>
+  <li><strong>Lines 166-168.</strong> The id indexes the KV tensors of every worker. <code>ref_cnt</code> counts the requests that hold the block.</li>
+  <li><strong>Lines 170-172.</strong> The pool of the block. A deferred free can hold blocks of two pools (the GPU pool and a HiSparse host pool).</li>
+  <li><strong>Lines 175-178.</strong> The hash key, set only when the block is cached. <code>_block_hash_num_tokens</code> is the prefix length that the key covers. It can end inside a block for fine-grained (partial) entries.</li>
+  <li><strong>Lines 182-183.</strong> The two links of the free queue. Only <code>FreeKVCacheBlockQueue</code> changes them.</li>
+  <li><strong>Line 186.</strong> <code>is_null</code> marks block 0, the {{term null-block}}.</li>
+  <li><strong>Lines 201-203.</strong> A second hash on the same block is a bug, so the method asserts. <code>BlockPool</code> calls <code>reset_hash()</code> first on eviction.</li>
+</ol>
+
+<h3><code>FreeKVCacheBlockQueue</code>: O(1) remove from the middle</h3>
+<p>A Python <code>deque</code> cannot remove an element from the middle in O(1). A prefix-cache hit on a free block must do exactly that. So the queue links the blocks themselves, with two fake ends that are never popped:</p>
+<x-code file="vllm/v1/core/kv_cache_utils.py" lines="281-310" highlight="285-289,297-298,302-305" />
+<x-code file="vllm/v1/core/kv_cache_utils.py" lines="391-412" highlight="400-403,406-412" />
+<ol>
+  <li><strong>Lines 285-289.</strong> At start-up the queue links the blocks in id order: block 0, 1, 2, ...</li>
+  <li><strong>Lines 297-305.</strong> Fake head and tail blocks with id −1. Every real block in the queue then has a previous and a next block, so no method needs a special case for the ends.</li>
+  <li><strong>Lines 400-403.</strong> <code>remove()</code> on a block that is not in the queue raises <code>RuntimeError</code>: a caller bug.</li>
+  <li><strong>Lines 406-412.</strong> Two pointer changes and a counter: O(1). <code>BlockPool.touch()</code> uses it for hits ({{cite vllm/v1/core/block_pool.py:766-767}}).</li>
+</ol>
+<p><code>popleft_n()</code> takes <em>n</em> blocks from the front, <code>prepend_n()</code> puts blocks at the front, and <code>append_n()</code> at the back ({{cite vllm/v1/core/kv_cache_utils.py:347-389}}, {{cite vllm/v1/core/kv_cache_utils.py:438-484}}). None of them makes a Python object; they only change the links (docstring, {{cite vllm/v1/core/kv_cache_utils.py:258-279}}).</p>
+
+<h3><code>get_request_block_hasher</code>: the chain for one request</h3>
+<p>The engine core makes the closure once ({{cite vllm/v1/engine/core.py:223-225}}). The basics page reads it line by line ({{link learn/prefix-caching}}, deep dive "The hash chain in the code"). The key points:</p>
+<x-code file="vllm/v1/core/kv_cache_utils.py" lines="966-972" />
+<p>It starts after the last existing hash and stops before a block that is not full ({{cite vllm/v1/core/kv_cache_utils.py:988-993}}). It returns only the <em>new</em> hashes; <code>Request.update_block_hashes()</code> appends them ({{cite vllm/v1/request.py:285-288}}).</p>
+
+<h3><code>resolve_kv_cache_block_sizes</code>: three sizes for several groups</h3>
+<x-code file="vllm/v1/core/kv_cache_utils.py" lines="836-873" highlight="840-858,860-863,871-873" />
+<ol>
+  <li><strong>Lines 840-858.</strong> One group: both sizes are the block size (times the decode context parallel size when the cache is sharded). Another <code>prefix_match_unit</code> raises <code>ValueError</code> when hashing is active.</li>
+  <li><strong>Lines 860-863.</strong> Several groups: the scheduler works in units of the least common multiple of the group block sizes.</li>
+  <li><strong>Lines 871-873.</strong> No prefix caching and no connector: nobody reads the hashes, so the hash size equals the scheduler size.</li>
+</ol>
+<p>Otherwise the hash size is <code>prefix_match_unit</code>, or the greatest common divisor of the prefix-cacheable group sizes. Every such group size must divide by it ({{cite vllm/v1/core/kv_cache_utils.py:885-898}}). The engine core passes both sizes to the scheduler ({{cite vllm/v1/engine/core.py:173-185}}).</p>
+
+<h3><code>BlockHashListWithBlockSize</code>: coarse hashes for free</h3>
+<p>Each fine hash already names its whole prefix. So the hash of a 32-token block is simply the second 16-token hash:</p>
+<x-code file="vllm/v1/core/kv_cache_utils.py" lines="1124-1136" lang="none" />
+<x-code file="vllm/v1/core/kv_cache_utils.py" lines="1178-1181" />
+<p>The view computes nothing ahead of time; it reads one list element per access.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data layout of the hash key">
+<table>
+  <thead><tr><th>Value</th><th>Python type</th><th>Bytes (sha256)</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>BlockHash</code></td><td><code>NewType("BlockHash", bytes)</code></td><td>32 (16 for xxhash)</td><td>{{cite vllm/v1/core/kv_cache_utils.py:47}}</td></tr>
+    <tr><td><code>BlockHashWithGroupId</code></td><td><code>bytes</code>: digest + <code>group_id.to_bytes(4, "big")</code></td><td>36</td><td>{{cite vllm/v1/core/kv_cache_utils.py:60-69}}</td></tr>
+    <tr><td><code>get_block_hash(key)</code></td><td><code>key[:-4]</code></td><td>32</td><td>{{cite vllm/v1/core/kv_cache_utils.py:72-74}}</td></tr>
+    <tr><td><code>get_group_id(key)</code></td><td><code>int.from_bytes(key[-4:], "big")</code></td><td>-</td><td>{{cite vllm/v1/core/kv_cache_utils.py:77-79}}</td></tr>
+    <tr><td><code>ExternalBlockHash</code> (events)</td><td><code>bytes | int</code>; by default the low 64 bits as <code>int</code></td><td>8 as an integer</td><td>{{cite vllm/v1/core/kv_cache_utils.py:57}}, {{cite vllm/v1/core/kv_cache_utils.py:82-85}}</td></tr>
+  </tbody>
+</table>
+<p>The comments give the reason for raw bytes: they are compact, and they avoid a tuple object per key ({{cite vllm/v1/core/kv_cache_utils.py:49-51}}, {{cite vllm/v1/core/kv_cache_utils.py:65-67}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: the free queue at start-up and after one request">
+<p>A pool of 6 blocks (ids 0-5), prefix caching on. (Derived from the methods above and {{cite vllm/v1/core/block_pool.py:172-188}}.)</p>
+<ol>
+  <li><code>FreeKVCacheBlockQueue([b0..b5])</code>: <code>head ⇄ 0 ⇄ 1 ⇄ 2 ⇄ 3 ⇄ 4 ⇄ 5 ⇄ tail</code>, <code>num_free_blocks = 6</code>.</li>
+  <li>The pool pops block 0 as the null block: <code>head ⇄ 1 ⇄ 2 ⇄ 3 ⇄ 4 ⇄ 5 ⇄ tail</code>, 5 free.</li>
+  <li>A request of 40 tokens with block size 16 takes 3 blocks with <code>popleft_n(3)</code>: blocks 1, 2, 3. Queue: <code>4 ⇄ 5</code>. The links of 1, 2 and 3 are <code>None</code>.</li>
+  <li>Blocks 1 and 2 are full and get hashes; block 3 has 8 tokens.</li>
+  <li>The request ends. The pool frees <code>[3, 2, 1]</code>: <code>prepend_n([3])</code>, then <code>append_n([2, 1])</code>. Queue: <code>3 ⇄ 4 ⇄ 5 ⇄ 2 ⇄ 1</code>.</li>
+  <li>A new request hits <code>h0</code>: <code>remove(block 1)</code> links 2 to the tail. Queue: <code>3 ⇄ 4 ⇄ 5 ⇄ 2</code>.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Worked example: block sizes for two groups">
+<p>Assume a hybrid model with a full-attention group of block size 16 and a sliding-window group of block size 32. Prefix caching is on, there is no decode context parallelism, and <code>--prefix-match-unit</code> is unset. (Derived from {{cite vllm/v1/core/kv_cache_utils.py:860-918}}.)</p>
+<ol>
+  <li><code>group_block_sizes = [16, 32]</code>, so <code>scheduler_block_size = lcm(16, 32) = 32</code>.</li>
+  <li>Both groups are prefix-cacheable: <code>hash_block_size = gcd(16, 32) = 16</code>. 16 and 32 both divide by 16, so no error.</li>
+  <li>The request hasher makes one hash per 16 tokens. The sliding-window group reads them through <code>BlockHashListWithBlockSize(scale_factor=2)</code>: its hash <em>i</em> is fine hash <code>2i + 1</code>.</li>
+  <li>The log shows "kv cache group sizes (16, 32)" and "kv lcm block sizes 32" ({{cite vllm/v1/core/kv_cache_utils.py:865-866}}).</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Error paths and environment variables">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>A second hash on a block</td><td><code>AssertionError</code></td><td>{{cite vllm/v1/core/kv_cache_utils.py:201-203}}</td></tr>
+    <tr><td><code>popleft()</code> on an empty queue</td><td><code>ValueError</code> "No free blocks available"</td><td>{{cite vllm/v1/core/kv_cache_utils.py:320-325}}</td></tr>
+    <tr><td><code>remove()</code> or <code>popleft()</code> on a block without links</td><td><code>RuntimeError</code></td><td>{{cite vllm/v1/core/kv_cache_utils.py:328-334}}, {{cite vllm/v1/core/kv_cache_utils.py:400-403}}</td></tr>
+    <tr><td><code>prefix_match_unit</code> other than the block size, one group</td><td><code>ValueError</code></td><td>{{cite vllm/v1/core/kv_cache_utils.py:845-857}}</td></tr>
+    <tr><td>A group size not divisible by the hash size</td><td><code>ValueError</code></td><td>{{cite vllm/v1/core/kv_cache_utils.py:892-898}}</td></tr>
+    <tr><td>Hit boundaries do not match a compressed spec</td><td><code>ValueError</code></td><td>{{cite vllm/v1/core/kv_cache_utils.py:912-917}}</td></tr>
+    <tr><td>A coarse view with a size that is not a multiple</td><td><code>AssertionError</code></td><td>{{cite vllm/v1/core/kv_cache_utils.py:1152}}</td></tr>
+  </tbody>
+</table>
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>PYTHONHASHSEED</code></td><td>unset</td><td>{{cite vllm/v1/core/kv_cache_utils.py:125}}, {{cite vllm/v1/core/kv_cache_utils.py:150}}</td><td>seed of <code>NONE_HASH</code>; without it, xxhash gets a random seed and a WARNING</td></tr>
+    <tr><td><code>VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES</code></td><td><code>1</code> ({{cite vllm/envs.py:2022-2024}})</td><td>{{cite vllm/v1/core/kv_cache_utils.py:83}}</td><td>KV events carry 64-bit integers instead of digest bytes</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/prefix-caching}}: who calls the hasher and the queue, and when.</li>
+  <li>{{link concepts/hybrid-kv-cache}}: why several groups need the block-size helpers.</li>
+  <li>{{link learn/prefix-caching}}: the hash chain and the extra keys, step by step.</li>
+  <li>{{link code/v1-core-block-pool}}: the pool that owns the blocks and the queue.</li>
+  <li>{{link concepts/kv-cache-manager}}: the managers above the pool.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Why does vLLM implement its own linked list instead of using <code>collections.deque</code> for free blocks?
+    <x-a><p>A prefix-cache hit must take a block out of the <em>middle</em> of the free queue. The linked list does this in O(1), a deque does not ({{cite vllm/v1/core/kv_cache_utils.py:258-266}}, {{cite vllm/v1/core/kv_cache_utils.py:391-412}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">How many bytes is one key of the prefix-cache map with the default hash algorithm, and what are its parts?
+    <x-a><p>36 bytes: the 32-byte SHA-256 digest of the block plus the KV cache group id as 4 big-endian bytes ({{cite vllm/v1/core/kv_cache_utils.py:60-69}}, {{cite vllm/utils/hashing.py:40-41}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A request has 47 tokens and 2 hashes (block size 16). It gets one more token. What does the hasher return?
+    <x-a><p>One new hash. It starts at <code>2 × 16 = 32</code> tokens; <code>32 + 16 = 48 ≤ 48</code>, so block 2 is full now ({{cite vllm/v1/core/kv_cache_utils.py:967-972}}, {{cite vllm/v1/core/kv_cache_utils.py:989-1008}}). The request appends it to <code>block_hashes</code> ({{cite vllm/v1/request.py:285-288}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Look at the deep dive "Worked example: block sizes for two groups". Why is the hash of sliding-window block 1 the fine hash 3, not a new hash of tokens 32-63?
+    <x-a><p>Each fine hash chains over its whole prefix, so fine hash 3 (tokens 48-63) already names tokens 0-63. That is exactly the prefix of sliding-window block 1. The view returns <code>block_hashes[(idx + 1) × scale_factor − 1]</code> = <code>block_hashes[3]</code> ({{cite vllm/v1/core/kv_cache_utils.py:1178-1181}}).</p></x-a>
+  </x-q>
+</x-quiz>
