@@ -1,0 +1,210 @@
+---
+title: "Weight loading: from checkpoint files to GPU parameters"
+nav_title: Weight loading
+level: Advanced
+prerequisites: learn/hf-checkpoints, concepts/model-definition, learn/tp-pp-in-practice
+related: concepts/tp-layers, learn/quantized-checkpoints, concepts/quantization-plugins, concepts/engine-hooks, code/model-executor-models-llama, code/model-executor-layers-linear, concepts/model-runner
+summary: Each worker picks a model loader by --load-format, builds the model with empty per-rank parameters on its GPU, streams every checkpoint tensor once, renames it with a WeightsMapper, and lets the parameter's weight_loader copy only this rank's slice.
+---
+<x-sentence>Each worker streams all checkpoint tensors; a mapper renames each one, and the target parameter's weight loader copies only this rank's slice.</x-sentence>
+
+<h2>The idea</h2>
+<p>A checkpoint is a set of named tensors in safetensors files, and loading copies each tensor into the matching model parameter ({{deepinfer concepts/weight-loading | Weight loading}}). The page {{link learn/hf-checkpoints}} shows which files vLLM downloads and keeps. This page follows the tensors from the files into the parameters of each GPU.</p>
+<p>vLLM loads the weights in six steps, in every {{term worker}}:</p>
+<ol>
+  <li><strong>Pick a loader.</strong> The {{term load-format}} (<code>--load-format</code>, default <code>auto</code>) selects a {{term model-loader}} class. For <code>auto</code> it is <code>DefaultModelLoader</code>.</li>
+  <li><strong>Build an empty model.</strong> The loader builds the model class on the GPU. Each tensor-parallel layer makes parameters of its <em>per-rank</em> shape, with no values yet.</li>
+  <li><strong>Stream the tensors.</strong> An iterator opens the files one by one and gives <code>(name, tensor)</code> pairs. In the default path, the tensors stay on the CPU.</li>
+  <li><strong>Map the names.</strong> The model's <code>load_weights()</code> uses an {{term auto-weights-loader}}. A {{term weights-mapper}} renames checkpoint names to vLLM names, for example <code>q_proj</code> to <code>qkv_proj</code> with the shard id <code>"q"</code>.</li>
+  <li><strong>Copy the slice.</strong> The target parameter has a {{term weight-loader}}. It cuts the part of the tensor that this rank owns and copies it into the right rows of the parameter.</li>
+  <li><strong>Post-process.</strong> Each layer's quantization method can repack or quantize its weights once, in <code>process_weights_after_loading</code>.</li>
+</ol>
+<p><strong>An everyday comparison.</strong> Think of the branches of a library that all get the same delivery list. Each branch reads every line of the list. For each book, the list gives the shelf name in the publisher's words, and a branch translates it into its own shelf names. Some books go into a shared box with three marked parts, such as Q, K and V. Each branch keeps only the pages for its own readers. The comparison stops here. In vLLM, nobody sends a branch its part: every GPU walks the full list itself, and the parameter cuts its slice.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b6a_weight_flow" alt="Panel 1: three boxes. Checkpoint folder with model-0000N-of-0000M.safetensors and model.safetensors.index.json, in the Hugging Face cache or a local path. DefaultModelLoader._prepare_weights: auto becomes hf when there is no consolidated file, patterns safetensors, bin, pt, keep files named in the index. safetensors_weights_iterator: files in natural sort order, safe_open with framework pt, yields name and CPU tensor. Panel 2: LlamaForCausalLM.load_weights makes an AutoWeightsLoader; the first name part model goes to LlamaModel.load_weights. The WeightsMapper renames layers.0.self_attn.q_proj.weight to layers.0.self_attn.qkv_proj.weight and sets tensor.shard_id to q; k and v likewise. QKVParallelLinear.load_weights calls param.weight_loader with the shard id; for BF16 this is weight_loader_v2, which calls param.load_qkv_weight. Panel 3: two lanes, TP rank 0 and TP rank 1, each with qkv_proj.weight of shape 3072 by 4096, 24 MiB in BF16. Rank 0: parameter rows 0-2047 get q_proj rows 0-2047, heads 0-15; rows 2048-2559 get k_proj rows 0-511, KV heads 0-3; rows 2560-3071 get v_proj rows 0-511. Rank 1: rows 0-2047 get q_proj rows 2048-4095, heads 16-31; rows 2048-2559 get k_proj rows 512-1023, KV heads 4-7; rows 2560-3071 get v_proj rows 512-1023." caption="Figure: the loader streams (name, tensor) pairs (panel 1); a mapper and the module tree route each tensor to a parameter (panel 2); the parameter of each rank copies only its own rows (panel 3). Shapes: Llama-3-8B with TP = 2." />
+<p>Read panels 1 and 2 from left to right: they run the same way in every worker. Panel 3 shows the only step where the ranks differ. The rows of the stacked parameter are the same on both ranks; the rows taken from the checkpoint tensor depend on the rank.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the load format picks the loader</h3>
+<x-code file="vllm/model_executor/model_loader/__init__.py" lines="50-66" />
+<p><code>get_model_loader()</code> looks up <code>load_config.load_format</code> in this table and raises <code>ValueError</code> for an unknown name ({{cite vllm/model_executor/model_loader/__init__.py:123-128}}). The field default is <code>"auto"</code>, and a validator lower-cases the value ({{cite vllm/config/load.py:30}}, {{cite vllm/config/load.py:136-138}}). <code>EngineArgs</code> copies this default without a change ({{cite vllm/engine/arg_utils.py:509}}). One later override exists: for a model in object storage (S3, GCS, Azure), <code>auto</code> becomes <code>runai_streamer</code> ({{cite vllm/config/vllm.py:2754-2762}}). A plugin can add a format with <code>register_model_loader</code> ({{link concepts/engine-hooks}}).</p>
+<p>Model Runner V2 calls the loader in <code>load_model()</code> ({{cite vllm/v1/worker/gpu/model_runner.py:398-406}}). It runs in every worker: with TP = 2, two processes do all the steps below at the same time.</p>
+
+<h3>Step 2: build the model with empty parameters</h3>
+<x-code file="vllm/model_executor/model_loader/base_loader.py" lines="62-115" highlight="73-80,88,106-109" />
+<ol>
+  <li><strong>Lines 73-74.</strong> The default dtype is the model dtype, and the default device is the GPU of this worker. So every <code>torch.empty</code> in a layer constructor makes a GPU tensor of the right dtype.</li>
+  <li><strong>Lines 76-80.</strong> <code>create_model()</code> calls <code>initialize_model()</code>, which builds the class with <code>vllm_config</code> and <code>prefix</code> ({{link concepts/model-definition}}). The log line "Initializing model took ... seconds" measures this part.</li>
+  <li><strong>Line 88.</strong> <code>self.load_weights()</code> is the loader's method; for the default loader it streams the files (Step 3).</li>
+  <li><strong>Lines 106-109.</strong> Online quantization finishes first; then <code>process_weights_after_loading()</code> runs for every layer (Step 6).</li>
+</ol>
+<p>The layer constructors do the per-rank sizing. <code>UnquantizedLinearMethod.create_weights()</code> makes <code>torch.empty(sum(output_partition_sizes), input_size_per_partition)</code> ({{cite vllm/model_executor/layers/linear.py:178-205}}). The page {{link concepts/tp-layers}} gives these sizes for each layer class.</p>
+
+<h3>Step 3: choose the files and stream the tensors</h3>
+<p><code>DefaultModelLoader._prepare_weights()</code> finds, downloads and filters the files ({{cite vllm/model_executor/model_loader/default_loader.py:147-263}}); {{link learn/hf-checkpoints}} explains that part. Then <code>_get_weights_iterator()</code> picks an iterator by format ({{cite vllm/model_executor/model_loader/default_loader.py:301-365}}). The usual case is <code>safetensors_weights_iterator()</code>:</p>
+<x-code file="vllm/model_executor/model_loader/weight_utils.py" lines="1243-1249" caption="The default (lazy) strategy: the file is opened with safetensors, and each tensor is read when the loop reaches its name." />
+<ul>
+  <li><strong>Order.</strong> The files are sorted by a natural sort key, so <code>...-00002-of-...</code> comes before <code>...-00010-of-...</code> ({{cite vllm/model_executor/model_loader/weight_utils.py:1134}}).</li>
+  <li><strong>Strategies.</strong> <code>--safetensors-load-strategy</code> is <code>None</code> by default. <code>eager</code> reads the whole file into CPU memory first; <code>torchao</code> rebuilds torchao tensors ({{cite vllm/model_executor/model_loader/weight_utils.py:1207-1242}}).</li>
+  <li><strong>Prefetch.</strong> With the default <code>None</code>, vLLM prefetches the files into the page cache only on NFS or Lustre. They must also fit in 90% of the free RAM ({{cite vllm/model_executor/model_loader/weight_utils.py:1136-1155}}). <code>prefetch</code> forces it. Each process prefetches a different part of the files, <code>sorted_files[rank::world_size]</code>. Rank and world size are the global values of <code>torch.distributed</code>, not the TP values ({{cite vllm/model_executor/model_loader/weight_utils.py:1051-1057}}).</li>
+  <li><strong>PyTorch files.</strong> For <code>.bin</code> and <code>.pt</code> files, <code>pt_weights_iterator()</code> calls <code>torch.load(..., weights_only=True)</code> on each file and yields its items ({{cite vllm/model_executor/model_loader/weight_utils.py:1479-1495}}).</li>
+  <li><strong>Many threads.</strong> <code>--model-loader-extra-config '{"enable_multithread_load": true}'</code> selects the multi-thread iterators, with 8 threads by default ({{cite vllm/model_executor/model_loader/default_loader.py:58-59}}, {{cite vllm/model_executor/model_loader/default_loader.py:329-336}}).</li>
+</ul>
+<p>The loader then calls <code>model.load_weights()</code> with the iterator, and logs "Loading weights took ... seconds" ({{cite vllm/model_executor/model_loader/default_loader.py:503-509}}).</p>
+
+<h3>Step 4: map the names (WeightsMapper and AutoWeightsLoader)</h3>
+<p>Llama has two <code>load_weights</code> methods. The outer class makes an <code>AutoWeightsLoader</code> without a mapper ({{cite vllm/model_executor/models/llama.py:559-561}}). The loader groups the names by their first part and finds the child <code>model</code>. That child has its own <code>load_weights</code>, so the loader gives it the names without <code>model.</code> ({{cite vllm/model_executor/models/utils.py:387-400}}). <code>LlamaModel.load_weights</code> uses the mapper:</p>
+<x-code file="vllm/model_executor/models/llama.py" lines="348-357" />
+<x-code file="vllm/model_executor/models/utils.py" lines="125-129" caption="In <code>_map_name_with_shard()</code>: each stacked key that is in the name replaces its first occurrence, and the loop keeps the shard id." />
+<x-code file="vllm/model_executor/models/utils.py" lines="147-164" highlight="158-164" caption="<code>apply()</code> puts the shard id on the tensor itself, as the attribute <code>shard_id</code>." />
+<p>The mapper has six kinds of rule: <code>orig_to_new_renaming</code>, <code>_regex</code>, <code>_substr</code>, <code>_stacked</code>, <code>_prefix</code> and <code>_suffix</code>, applied in this order. A regex, substring, prefix or suffix rule that maps to <code>None</code> drops the tensor ({{cite vllm/model_executor/models/utils.py:48-61}}, {{cite vllm/model_executor/models/utils.py:108-145}}). <code>AutoWeightsLoader.load_weights()</code> adds more mappers. With a quantization config, it adds the config's mappers for KV cache scale names and checkpoint names. It always adds a rule that drops old rotary tables ({{cite vllm/model_executor/models/utils.py:460-473}}).</p>
+<p>Then the loader walks the module tree:</p>
+<x-code file="vllm/model_executor/models/utils.py" lines="402-424" />
+<ol>
+  <li><strong>Line 409.</strong> <code>_groupby_prefix()</code> splits each name at the first dot: <code>layers.0.self_attn.qkv_proj.weight</code> becomes <code>layers</code> and <code>0.self_attn.qkv_proj.weight</code>.</li>
+  <li><strong>Lines 412-415.</strong> A child module: recurse. For <code>QKVParallelLinear</code> the recursion ends early, because that layer has its own <code>load_weights</code> (line 388).</li>
+  <li><strong>Lines 416-424.</strong> A parameter: <code>_load_param()</code> calls <code>param.weight_loader</code>, or <code>default_weight_loader</code> when the parameter has none ({{cite vllm/model_executor/models/utils.py:340-341}}).</li>
+</ol>
+<p><code>QKVParallelLinear.load_weights</code> reads the shard id from the tensor and calls <code>param.weight_loader(param, loaded_weight, shard_id)</code> ({{cite vllm/model_executor/layers/linear.py:1339-1354}}). <code>MergedColumnParallelLinear</code> has the same method for the integer shard ids of <code>gate_up_proj</code> ({{cite vllm/model_executor/layers/linear.py:985-1000}}).</p>
+
+<h3>Step 5: the weight loader of each parameter</h3>
+<p>A linear layer chooses one of two loader families when it is built. If the class name of its quantization method is in <code>WEIGHT_LOADER_V2_SUPPORTED</code>, it uses <code>weight_loader_v2</code>; else <code>weight_loader</code> ({{cite vllm/model_executor/layers/linear.py:530-534}}). <code>UnquantizedLinearMethod</code> is in the list, so a BF16 model uses v2 ({{cite vllm/model_executor/layers/linear.py:50-64}}). The v2 loaders give the work to the parameter class:</p>
+<x-code file="vllm/model_executor/parameter.py" lines="145-151" caption="Column-parallel: cut along <code>output_dim</code> (dimension 0 of a <code>[out, in]</code> weight) at <code>tp_rank × shard_size</code>." />
+<x-code file="vllm/model_executor/parameter.py" lines="216-226" caption="Row-parallel: cut along <code>input_dim</code> (dimension 1) at <code>tp_rank × shard_size</code>." />
+<p>The shard size is the size of the parameter on this rank, so the loader needs no TP arithmetic of its own. <code>ModelWeightParameter</code> inherits both methods, and the layer calls the one that fits ({{cite vllm/model_executor/parameter.py:229-234}}). The v1 loaders do the same cut with <code>getattr(param, "output_dim")</code> and <code>"input_dim"</code> ({{cite vllm/model_executor/layers/linear.py:589-606}}, {{cite vllm/model_executor/layers/linear.py:1758-1774}}).</p>
+<p>For a stacked parameter, the loader first selects the part of the parameter, then the part of the tensor:</p>
+<x-code file="vllm/model_executor/parameter.py" lines="175-198" highlight="191-195" />
+<ol>
+  <li><strong>Line 191.</strong> For <code>q</code>, the slice index is the TP rank. For <code>k</code> and <code>v</code> it is <code>tp_rank // num_kv_head_replicas</code>; <code>num_heads</code> here carries the replica count ({{cite vllm/model_executor/layers/linear.py:1203-1209}}).</li>
+  <li><strong>Line 192.</strong> The part of the parameter: offset and size from the head counts of this rank ({{cite vllm/model_executor/layers/linear.py:1101-1117}}).</li>
+  <li><strong>Lines 193-195.</strong> The part of the checkpoint tensor. Then an assertion and one copy.</li>
+</ol>
+<p>Other parameters:</p>
+<ul>
+  <li><strong>Embedding and LM head.</strong> <code>VocabParallelEmbedding.weight_loader</code> cuts rows <code>org_vocab_start_index</code> to <code>org_vocab_end_index</code>, and fills the padding rows with zeros ({{cite vllm/model_executor/layers/vocab_parallel_embedding.py:497-520}}).</li>
+  <li><strong>Norm weights.</strong> <code>RMSNorm.weight</code> is a plain <code>nn.Parameter</code> without a loader ({{cite vllm/model_executor/layers/layernorm.py:65-67}}). <code>default_weight_loader</code> checks the shape and copies the full tensor on every rank ({{cite vllm/model_executor/model_loader/weight_utils.py:1529-1547}}).</li>
+</ul>
+
+<h3>Step 6: older model files: stacked_params_mapping</h3>
+<p>Before <code>WeightsMapper</code> had stacked rules, each model wrote the loop itself. 38 files in <code>vllm/model_executor/models/</code> still do. 98 other files use <code>orig_to_new_stacked</code>, and no file uses both (git grep at this commit). An example:</p>
+<x-code file="vllm/model_executor/models/minicpm.py" lines="488-529" highlight="489-496,517-528" />
+<ol>
+  <li><strong>Lines 489-496.</strong> The list has the same content as Llama's mapper, as tuples <code>(param_name, shard_name, shard_id)</code>.</li>
+  <li><strong>Lines 517-528.</strong> For each name, find a matching tuple and rename. Skip parameters of other pipeline stages. Call the loader with the shard id as the third argument.</li>
+</ol>
+
+<h3>Step 7: quantized weights</h3>
+<p>For a quantized checkpoint, the layer's quantization method makes the parameters in <code>create_weights()</code> ({{link concepts/quantization-plugins}}). FP8, for example, registers an FP8 <code>weight</code> and a <code>weight_scale</code> (or <code>weight_scale_inv</code> for block scales), each with the layer's weight loader ({{cite vllm/model_executor/layers/quantization/fp8.py:312-339}}). The checkpoint has tensors with the same names, so the mapping and slicing above work for them too. A per-tensor scale of a stacked layer has one slot per part (q, k, v). <code>PerTensorScaleParameter</code> copies each checkpoint scale into the slot of its shard id ({{cite vllm/model_executor/parameter.py:253-301}}); the v1 loaders use <code>adjust_scalar_to_fused_array</code> for the same job ({{cite vllm/model_executor/layers/linear.py:97-121}}).</p>
+<p>After all tensors are copied, <code>process_weights_after_loading()</code> visits every module with a quantization method and calls its post-processing ({{cite vllm/model_executor/model_loader/utils.py:157-196}}). FP8 with per-tensor scales, for example, re-quantizes the parts of a stacked layer to one scale, the maximum of their scales, and transposes the weight. This happens only without block scales and without the Marlin kernel ({{cite vllm/model_executor/layers/quantization/fp8.py:372-409}}, {{cite vllm/model_executor/layers/quantization/utils/fp8_utils.py:1454-1479}}). The page {{link learn/quantized-checkpoints}} explains the formats.</p>
+
+<h3>Step 8: the other loaders</h3>
+<p>The table maps 15 format names to 7 classes ({{cite vllm/model_executor/model_loader/__init__.py:50-66}}). There is no <code>gguf</code> and no <code>bitsandbytes</code> format at this commit.</p>
+<table>
+  <thead><tr><th>Format names</th><th>Class</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>auto</code>, <code>hf</code>, <code>safetensors</code>, <code>pt</code>, <code>npcache</code>, <code>mistral</code>, <code>fastsafetensors</code>, <code>instanttensor</code></td><td><code>DefaultModelLoader</code></td><td>The path of this page; the name selects the file patterns and the iterator ({{cite vllm/model_executor/model_loader/default_loader.py:184-203}}).</td></tr>
+    <tr><td><code>dummy</code></td><td><code>DummyModelLoader</code></td><td>Random values, no files; for profiling ({{cite vllm/model_executor/model_loader/dummy_loader.py:21-48}}).</td></tr>
+    <tr><td><code>sharded_state</code>, <code>runai_streamer_sharded</code></td><td><code>ShardedStateLoader</code></td><td>Each rank reads its own pre-sharded files, for example <code>model-rank-{rank}-part-{part}.safetensors</code> (another pattern with PP), with no slicing ({{cite vllm/model_executor/model_loader/sharded_state_loader.py:30-39}}).</td></tr>
+    <tr><td><code>tensorizer</code></td><td><code>TensorizerLoader</code></td><td>CoreWeave tensorizer files ({{cite vllm/config/load.py:48-50}}).</td></tr>
+    <tr><td><code>runai_streamer</code></td><td><code>RunaiModelStreamerLoader</code></td><td>Safetensors through the Run:ai Model Streamer ({{cite vllm/config/load.py:51-52}}).</td></tr>
+    <tr><td><code>modelexpress</code></td><td><code>ModelExpressModelLoader</code></td><td>Weights through ModelExpress ({{cite vllm/config/load.py:59}}).</td></tr>
+    <tr><td><code>ipc_cache</code></td><td><code>IpcModelLoader</code></td><td>Maps already processed weights from a local cache daemon over CUDA IPC ({{cite vllm/config/load.py:41-43}}).</td></tr>
+  </tbody>
+</table>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: q_proj, k_proj and v_proj of layer 0, TP = 2">
+<p>These values are from the Llama-3-8B <code>config.json</code> on the Hugging Face Hub: <code>hidden_size</code> 4096, <code>num_attention_heads</code> 32, <code>num_key_value_heads</code> 8. So the head size is 4096 / 32 = 128 (llama.py line 159). The checkpoint stores PyTorch linear weights as <code>[out, in]</code>.</p>
+<table>
+  <thead><tr><th>Checkpoint name</th><th>Shape</th><th>After the mapper</th><th>Shard id</th></tr></thead>
+  <tbody>
+    <tr><td><code>model.layers.0.self_attn.q_proj.weight</code></td><td><code>[4096, 4096]</code></td><td><code>layers.0.self_attn.qkv_proj.weight</code></td><td><code>"q"</code></td></tr>
+    <tr><td><code>model.layers.0.self_attn.k_proj.weight</code></td><td><code>[1024, 4096]</code></td><td><code>layers.0.self_attn.qkv_proj.weight</code></td><td><code>"k"</code></td></tr>
+    <tr><td><code>model.layers.0.self_attn.v_proj.weight</code></td><td><code>[1024, 4096]</code></td><td><code>layers.0.self_attn.qkv_proj.weight</code></td><td><code>"v"</code></td></tr>
+  </tbody>
+</table>
+<p>On each rank, <code>QKVParallelLinear</code> has <code>num_heads</code> = 16, <code>num_kv_heads</code> = 4 and <code>num_kv_head_replicas</code> = 1 ({{cite vllm/model_executor/layers/linear.py:1064-1071}}). The parameter is <code>[16×128 + 4×128 + 4×128, 4096] = [3072, 4096]</code>, 24 MiB in BF16. The loads:</p>
+<table>
+  <thead><tr><th>Shard</th><th>Parameter rows (both ranks)</th><th>Checkpoint rows, rank 0</th><th>Checkpoint rows, rank 1</th></tr></thead>
+  <tbody>
+    <tr><td><code>q</code></td><td>0-2047 (offset 0, size 2048)</td><td>0-2047</td><td>2048-4095</td></tr>
+    <tr><td><code>k</code></td><td>2048-2559 (offset 16×128, size 512)</td><td>0-511</td><td>512-1023</td></tr>
+    <tr><td><code>v</code></td><td>2560-3071 (offset 20×128, size 512)</td><td>0-511</td><td>512-1023</td></tr>
+  </tbody>
+</table>
+<p>Each rank reads 4096 × 4096 + 2 × 1024 × 4096 values of the checkpoint (48 MiB) and keeps half of them (24 MiB). For the whole model, each rank keeps about 4.0 of the 8.03 billion parameters: about 8.0 GB in BF16. (Derived from the shapes. The small norm weights are on both ranks.)</p>
+</x-deepdive>
+
+<x-deepdive title="AutoWeightsLoader.load_weights, line by line">
+<x-code file="vllm/model_executor/models/utils.py" lines="450-478" />
+<ol>
+  <li><strong>Line 458.</strong> Unexpected <code>.bias</code> tensors are ignored; the comment says GPTQ checkpoints often have them.</li>
+  <li><strong>Lines 463-470.</strong> The quantization config can be on the model or on a direct child. If it exists, its mappers and its ignore list join in.</li>
+  <li><strong>Line 471.</strong> Old rotary tables such as <code>rotary_emb.inv_freq</code> are dropped ({{cite vllm/model_executor/models/utils.py:233-240}}).</li>
+  <li><strong>Lines 473-474.</strong> Both steps are generators: no tensor is read before the tree walk asks for it.</li>
+  <li><strong>Line 476.</strong> The walk returns the names of all loaded parameters. The default loader compares them with <code>model.named_parameters()</code> (next deep dive).</li>
+  <li><strong>Line 477.</strong> With tied embeddings (<code>lm_head.weight</code> is <code>embed_tokens.weight</code>), the loader loads the first name only. If that name is missing in the checkpoint, it raises <code>ValueError</code> ({{cite vllm/model_executor/models/utils.py:491-502}}).</li>
+</ol>
+<p>Inside the walk, a <code>PPMissingLayer</code> returns at once, so the tensors of other pipeline stages are skipped ({{cite vllm/model_executor/models/utils.py:382-383}}). A name that matches no child and no parameter raises <code>ValueError</code> with the list of available names ({{cite vllm/model_executor/models/utils.py:425-448}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Memory, time and the completeness check">
+<ul>
+  <li><strong>Where the bytes go.</strong> The parameters are allocated on the GPU in Step 2, at their final per-rank size. The checkpoint tensors stay on the CPU; each loader copies a slice into the GPU parameter with <code>copy_</code>.</li>
+  <li><strong>Peak memory.</strong> After the load, the loader logs "Peak GPU memory after loading weights" at DEBUG level on CUDA, ROCm and XPU ({{cite vllm/model_executor/model_loader/base_loader.py:95-102}}).</li>
+  <li><strong>Three timers.</strong> "Initializing model took" (constructors, {{cite vllm/model_executor/model_loader/base_loader.py:82-85}}), "Loading weights took" (the stream, {{cite vllm/model_executor/model_loader/default_loader.py:505-509}}), and "Model loading took ... GiB memory and ... seconds" (the whole <code>load_model</code>, {{cite vllm/v1/worker/gpu/model_runner.py:428-435}}).</li>
+  <li><strong>Completeness.</strong> For a model without quantization, the default loader checks that parameters got a value; else "Following weights were not initialized from checkpoint" ({{cite vllm/model_executor/model_loader/default_loader.py:510-523}}, {{cite vllm/model_executor/model_loader/default_loader.py:567-572}}). In this case, it exempts all parameters of modules that have a quantization method ({{cite vllm/model_executor/model_loader/default_loader.py:533-566}}). Every quantize method has <code>process_weights_after_loading</code> ({{cite vllm/model_executor/layers/quantization/base_config.py:80-85}}), so in a BF16 Llama the linear, embedding and head weights are exempt too. The check then covers only parameters such as the norm weights (derived). <code>enable_weights_track</code> in <code>--model-loader-extra-config</code> turns the check on or off.</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Flags and their defaults">
+<table>
+  <thead><tr><th>Flag</th><th>Default</th><th>Defined at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--load-format</code></td><td><code>auto</code></td><td>{{cite vllm/config/load.py:30-61}}</td><td>Loader class and file patterns.</td></tr>
+    <tr><td><code>--download-dir</code></td><td>Hugging Face cache</td><td>{{cite vllm/config/load.py:62-64}}</td><td>Where to download and read the files.</td></tr>
+    <tr><td><code>--safetensors-load-strategy</code></td><td><code>None</code></td><td>{{cite vllm/config/load.py:65-86}}</td><td><code>lazy</code>, <code>eager</code>, <code>prefetch</code>, <code>torchao</code>; <code>None</code> = lazy with auto-prefetch on NFS/Lustre.</td></tr>
+    <tr><td><code>--safetensors-prefetch-num-threads</code></td><td>8</td><td>{{cite vllm/config/load.py:12}}, {{cite vllm/config/load.py:87-91}}</td><td>Prefetch threads.</td></tr>
+    <tr><td><code>--safetensors-prefetch-block-size</code></td><td>16 MiB</td><td>{{cite vllm/config/load.py:13}}, {{cite vllm/config/load.py:92-95}}</td><td>Read size per prefetch call.</td></tr>
+    <tr><td><code>--model-loader-extra-config</code></td><td><code>{}</code></td><td>{{cite vllm/config/load.py:96-98}}</td><td>For the default loader only <code>enable_multithread_load</code>, <code>num_threads</code>, <code>enable_weights_track</code>; other keys raise ({{cite vllm/model_executor/model_loader/default_loader.py:103-115}}).</td></tr>
+    <tr><td><code>--ignore-patterns</code></td><td><code>["original/**/*"]</code></td><td>{{cite vllm/config/load.py:102-104}}</td><td>Files not to download, so the extra Llama files in <code>original/</code> are skipped.</td></tr>
+    <tr><td><code>--pt-load-map-location</code></td><td><code>cpu</code></td><td>{{cite vllm/config/load.py:108-117}}</td><td><code>map_location</code> of <code>torch.load</code> for <code>.bin</code>/<code>.pt</code> files.</td></tr>
+  </tbody>
+</table>
+<p>The flags come from the <code>LoadConfig</code> fields ({{cite vllm/engine/arg_utils.py:1069-1094}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="A checkpoint name that the model does not know stops start-up">
+<p>The tree walk raises "There is no module or parameter named ..." for every name it cannot place ({{cite vllm/model_executor/models/utils.py:442-448}}). By default the loader ignores only <code>.bias</code> tensors and the suffixes of the quantization config, and the mapper drops old rotary tables. A fine-tuned checkpoint with extra tensors needs a mapper rule that maps them to <code>None</code>.</p>
+</x-warning>
+<ul>
+  <li><strong>A shape mismatch.</strong> The weight loaders assert that the slice and the parameter have the same shape ({{cite vllm/model_executor/parameter.py:197}}, {{cite vllm/model_executor/model_loader/weight_utils.py:1538-1541}}). A checkpoint for another config, or a wrong <code>--hf-overrides</code>, fails here.</li>
+  <li><strong>Missing weights.</strong> An unquantized model raises "Following weights were not initialized from checkpoint" for an empty norm weight, or another parameter outside quantize-method modules ({{cite vllm/model_executor/model_loader/default_loader.py:533-572}}). A missing linear weight gives no error here (derived).</li>
+  <li><strong>A dtype mismatch.</strong> A tensor with another dtype is converted by <code>copy_</code>, and the loader logs a warning ({{cite vllm/model_executor/models/utils.py:324-339}}).</li>
+  <li><strong>An unknown format.</strong> <code>--load-format gguf</code> raises "Load format `gguf` is not supported" ({{cite vllm/model_executor/model_loader/__init__.py:126-127}}).</li>
+  <li><strong>Slow loads from network storage.</strong> On NFS, a large model that does not fit in 90% of the free RAM is not prefetched, and vLLM logs a warning ({{cite vllm/model_executor/model_loader/weight_utils.py:1156-1165}}). Try <code>--safetensors-load-strategy eager</code> or <code>prefetch</code>, or a pre-sharded checkpoint.</li>
+</ul>
+<p><strong>Why it matters.</strong> Weight loading is often the longest part of start-up, and its errors are the first errors of a new model or a new checkpoint. When you know the path from file to parameter, you can read the log timers, fix name and shape errors, and choose a faster format.</p>
+
+<x-quiz>
+  <x-q level="easy">Which loader class serves the default <code>--load-format auto</code>, and which iterator does it use for a safetensors checkpoint?
+    <x-a><p><code>DefaultModelLoader</code> ({{cite vllm/model_executor/model_loader/__init__.py:51}}). Without the multi-thread option it uses <code>safetensors_weights_iterator</code> ({{cite vllm/model_executor/model_loader/default_loader.py:337-349}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">How does <code>QKVParallelLinear</code> know that a tensor is the K part?
+    <x-a><p>Llama's mapper renames <code>.k_proj</code> to <code>.qkv_proj</code> with the shard id <code>"k"</code> ({{cite vllm/model_executor/models/llama.py:351-353}}). <code>WeightsMapper.apply()</code> stores it as <code>tensor.shard_id</code> ({{cite vllm/model_executor/models/utils.py:158-164}}), and <code>QKVParallelLinear.load_weights</code> reads it back ({{cite vllm/model_executor/layers/linear.py:1342-1354}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">For a BF16 model with TP = 4, which dimension of <code>o_proj.weight</code> does each rank cut, and at which offset?
+    <x-a><p><code>o_proj</code> is row-parallel, so the loader cuts <code>input_dim</code> = 1 at <code>tp_rank × shard_size</code> ({{cite vllm/model_executor/parameter.py:216-220}}). For Llama-3-8B, the parameter is <code>[4096, 1024]</code>, so rank 2 takes columns 2048-3071.</p></x-a>
+  </x-q>
+  <x-q level="hard">A model has 8 KV heads and runs with TP = 16. Which rows of <code>k_proj.weight</code> does rank 5 load? Why does rank 4 load the same rows?
+    <x-a><p><code>num_kv_heads</code> is 1 and <code>num_kv_head_replicas</code> is 2 ({{cite vllm/model_executor/layers/linear.py:1066-1068}}). The slice index for <code>k</code> is <code>tp_rank // num_heads</code>, where <code>num_heads</code> carries the replica count: 5 // 2 = 2 ({{cite vllm/model_executor/parameter.py:191}}, {{cite vllm/model_executor/layers/linear.py:1203-1205}}). With a slice size of 128 rows, rank 5 loads rows 256-383 (KV head 2). Rank 4 gives 4 // 2 = 2 too, so both ranks hold a copy of KV head 2.</p></x-a>
+  </x-q>
+  <x-q level="hard">A model runs with PP = 2. What happens to the checkpoint tensors of layers 16-31 on stage 0?
+    <x-a><p>The iterator still reads every tensor of every file, because it calls <code>get_tensor</code> for each name ({{cite vllm/model_executor/model_loader/weight_utils.py:1243-1249}}). The tree walk reaches <code>PPMissingLayer</code> objects for those layers and returns without a copy ({{cite vllm/model_executor/models/utils.py:382-383}}). Hand-written loaders use <code>is_pp_missing_parameter()</code> for the same skip ({{cite vllm/model_executor/models/minicpm.py:524-525}}).</p></x-a>
+  </x-q>
+</x-quiz>

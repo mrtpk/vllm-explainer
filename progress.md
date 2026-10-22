@@ -50,6 +50,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
 
+- FINAL-PASS TODO (B6a FC): learn/tp-pp-in-practice ~47 '64 all-reduces per step' → align with 65 (64 + embedding) on model-definition; any page saying the completeness check catches missing linear weights in BF16 models; TeleChat2 mapper-only; SupportsQuant remapping Llama names.
+
 - FINAL-PASS TODO (B5 FC): any page saying sleep mode is CUDA/HIP only; front end imports the KV factory lazily; Llama prefix model.layers.N.qkv_proj (missing self_attn); platform-interface 'pre_register_and_update only before parsing'.
 
 - FINAL-PASS TODO (B4b FC): 'O2 gives VLLM_COMPILE' needs the exceptions (breakable-CUDA-graph default archs vllm.py:75-108, 825-851; --enforce-eager; TORCH_COMPILE_DISABLE=1) on learn/what-is-vllm ~96, learn/pytorch-for-serving ~118, ~146, reference/serve-flags ~65.
@@ -126,7 +128,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-23 02:36 | B5 fact check (+ 3 plugin-map row fixes) | done ~03:00: ~270 claims, 34 defects; chooser all 640 combos OK |
 | 2026-10-23 03:01 | B5t writer (life-of-a-plugin, build-a-toy-plugin) | running |
 | 2026-10-23 02:11 | B6a writer | done ~02:50; 3 diagrams, b6a.json 13 terms |
-| 2026-10-23 02:51 | B6a fact check | running |
+| 2026-10-23 02:51 | B6a fact check | done ~03:15: ~175 claims, 26 defects |
+| 2026-10-23 03:16 | B6b writer | running |
 | 2026-10-22 22:47 | B4a writer (plugin-map, platform-plugins, platform-interface + 2 modules + plugin timeline) | done ~23:25; 3 diagrams, b4a.json 5 terms |
 | 2026-10-22 23:26 | B4a fact check | done ~23:55: ~270 claims, 24 defects; OOT quant open question answered |
 | 2026-10-22 23:56 | B4b writer | cut off ~00:05, resumed 01:01, done ~01:45; 3 diagrams, b4b.json 11 terms |

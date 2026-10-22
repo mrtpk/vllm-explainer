@@ -1,0 +1,203 @@
+---
+title: "model_executor/models/llama.py: the Llama model"
+nav_title: models/llama.py
+level: Advanced
+prerequisites: concepts/model-definition, concepts/weight-loading
+related: concepts/model-definition, concepts/weight-loading, concepts/tp-layers, concepts/model-interfaces, code/model-executor-layers-linear, code/model-executor-models-registry, concepts/forward-context
+summary: vllm/model_executor/models/llama.py defines LlamaMLP, LlamaAttention, LlamaDecoderLayer, LlamaModel and LlamaForCausalLM from tensor-parallel layers, plus two bidirectional wrappers. It is the reference model file of vLLM; nine registry names and many other model files reuse it.
+---
+<h2>Purpose</h2>
+<p><code>vllm/model_executor/models/llama.py</code> implements the Llama architecture with vLLM layers, so that the worker can build it, load a Hugging Face checkpoint into it, and run it in the forward pass of each step.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/model_executor/models/llama.py</code>, 585 lines of Python. The header says it is adapted from the Transformers Llama code, v4.28.0 ({{cite vllm/model_executor/models/llama.py:4-5}}).</td></tr>
+    <tr><th>Main class</th><td><code>LlamaForCausalLM</code> ({{cite vllm/model_executor/models/llama.py:464-561}}).</td></tr>
+    <tr><th>Runs in</th><td>Each {{term worker}} (one per GPU), or the engine core process with the uni executor. Built once in <code>load_model</code>; <code>forward</code> runs on the GPU in every step, usually inside a compiled graph or a CUDA graph.</td></tr>
+    <tr><th>Called by</th><td>The model loader through <code>initialize_model()</code> after the registry resolves the name ({{cite vllm/model_executor/model_loader/utils.py:96-103}}); Model Runner V2 for <code>forward</code> and <code>compute_logits</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2070}}, {{cite vllm/v1/worker/gpu/model_runner.py:1638}}); 21 other files that import it.</td></tr>
+    <tr><th>Calls</th><td>The TP layers of <code>linear.py</code> and <code>vocab_parallel_embedding.py</code>, <code>Attention</code>, <code>RMSNorm</code>, <code>get_rope</code>, <code>SiluAndMul</code>, <code>LogitsProcessor</code>, and the helpers <code>make_layers</code>, <code>AutoWeightsLoader</code> and <code>WeightsMapper</code> ({{cite vllm/model_executor/models/llama.py:35-79}}).</td></tr>
+    <tr><th>Not in this file</th><td>How the layers split and communicate ({{link concepts/tp-layers}}), the attention kernels ({{link concepts/attention-backends}}), compilation ({{link concepts/compile-and-cuda-graphs}}), the registry lookup ({{link code/model-executor-models-registry}}).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/model-definition}} explains the patterns of this file. This page reads the file class by class and follows the <code>load_weights</code> path.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b6a_llama_tree" alt="The module tree of LlamaForCausalLM with prefixes: model (LlamaModel) with embed_tokens, layers 0 to 31 and norm; layer 0 with input_layernorm, self_attn (qkv_proj, rotary_emb, attn, o_proj), post_attention_layernorm and mlp (gate_up_proj, act_fn, down_proj); then lm_head and logits_processor. Per-rank weight shapes for Llama-3-8B with TP = 2." caption="Figure: the objects that this file builds, with their prefixes and per-rank weight shapes (Llama-3-8B, TP = 2)." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>The registry.</strong> Nine names map to this file, seven of them to <code>LlamaForCausalLM</code>: <code>LlamaForCausalLM</code>, <code>LLaMAForCausalLM</code>, <code>InternLM3ForCausalLM</code>, <code>IQuestCoderForCausalLM</code>, <code>TeleChat3ForCausalLM</code>, and the embedding names <code>LlamaModel</code> and <code>MistralModel</code> ({{cite vllm/model_executor/models/registry.py:140-155}}, {{cite vllm/model_executor/models/registry.py:212}}, {{cite vllm/model_executor/models/registry.py:231-238}}). Two more map to the bidirectional wrappers ({{cite vllm/model_executor/models/registry.py:230}}, {{cite vllm/model_executor/models/registry.py:326-329}}). (Counts from an evaluation of the tables.)</li>
+  <li><strong>The loader.</strong> <code>initialize_model()</code> builds the class; the default loader calls <code>load_weights()</code> ({{cite vllm/model_executor/model_loader/default_loader.py:503}}).</li>
+  <li><strong>The model runner.</strong> Each step calls the model with <code>input_ids</code>, <code>positions</code>, <code>inputs_embeds</code> and <code>intermediate_tensors</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1984-2009}}), then <code>compute_logits()</code> on the sampled rows.</li>
+  <li><strong>Other model files.</strong> For example <code>MistralForCausalLM</code>, <code>Phi3ForCausalLM</code> and <code>TeleChat2ForCausalLM</code> subclass <code>LlamaForCausalLM</code> ({{cite vllm/model_executor/models/mistral.py:236}}, {{cite vllm/model_executor/models/phi3.py:10}}, {{cite vllm/model_executor/models/telechat2.py:107}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>QKVParallelLinear</code>, <code>MergedColumnParallelLinear</code>, <code>RowParallelLinear</code> ({{cite vllm/model_executor/models/llama.py:45-49}}), <code>VocabParallelEmbedding</code> and <code>ParallelLMHead</code> ({{cite vllm/model_executor/models/llama.py:53-56}}).</li>
+  <li><code>Attention</code> or <code>EncoderOnlyAttention</code> ({{cite vllm/model_executor/models/llama.py:39-42}}).</li>
+  <li>CustomOps: <code>RMSNorm</code>, <code>SiluAndMul</code>, and the rotary embedding from <code>get_rope</code> ({{cite vllm/model_executor/models/llama.py:38}}, {{cite vllm/model_executor/models/llama.py:44}}, {{cite vllm/model_executor/models/llama.py:52}}).</li>
+  <li><code>maybe_fused_act_quant</code>, which can fuse the activation with the quantization of the next layer's input ({{cite vllm/model_executor/models/llama.py:43}}, {{cite vllm/model_executor/models/llama.py:120}}).</li>
+  <li>Helpers from <code>models/utils.py</code> and mixins from <code>models/interfaces.py</code> ({{cite vllm/model_executor/models/llama.py:61-79}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Lines</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>LlamaMLP</code></td><td>{{cite vllm/model_executor/models/llama.py:82-122}}</td><td>gate_up (column), SiLU × up, down (row).</td></tr>
+    <tr><td><code>LlamaAttention</code></td><td>{{cite vllm/model_executor/models/llama.py:125-248}}</td><td>Per-rank heads, QKV, RoPE, <code>Attention</code>, o_proj.</td></tr>
+    <tr><td><code>LlamaDecoderLayer</code></td><td>{{cite vllm/model_executor/models/llama.py:251-334}}</td><td>Reads config knobs; norm, attention, norm, MLP with a separate residual.</td></tr>
+    <tr><td><code>LlamaModel</code></td><td>{{cite vllm/model_executor/models/llama.py:337-461}}</td><td>Compiled inner model: embedding, layers of this PP stage, final norm, the mapper and <code>load_weights</code>.</td></tr>
+    <tr><td><code>LlamaForCausalLM</code></td><td>{{cite vllm/model_executor/models/llama.py:464-561}}</td><td>Outer class: mixins, LoRA attributes, LM head, <code>compute_logits</code>, <code>load_weights</code>.</td></tr>
+    <tr><td>bidirectional bases</td><td>{{cite vllm/model_executor/models/llama.py:564-571}}</td><td><code>as_seq_cls_model</code> and <code>as_embedding_model</code> of <code>LlamaForCausalLM</code>.</td></tr>
+    <tr><td><code>LlamaBidirectionalForSequenceClassification</code>, <code>LlamaBidirectionalModel</code></td><td>{{cite vllm/model_executor/models/llama.py:574-585}}</td><td>Empty subclasses; the config sets the attention and pooling types.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>LlamaAttention.__init__</code>: sliding windows and the attention class</h3>
+<p>The head arithmetic and the two linear layers are on {{link concepts/model-definition}} (lines 143-181). The second half of the constructor:</p>
+<x-code file="vllm/model_executor/models/llama.py" lines="183-222" highlight="183,186-204,206-210,212-222" />
+<ol>
+  <li><strong>Line 183.</strong> <code>_init_rotary_emb</code> calls <code>get_rope</code> with the head size, <code>max_position_embeddings</code> and the config's <code>rope_parameters</code>, NeoX style (lines 236-248).</li>
+  <li><strong>Lines 186-204.</strong> If the config has <code>layer_types</code>, a layer marked <code>sliding_attention</code> gets <code>config.sliding_window</code>. The layer index comes from the prefix (line 141). For an EAGLE-3 draft, the index is shifted by <code>target_layer_count</code>.</li>
+  <li><strong>Lines 206-210.</strong> <code>ENCODER_ONLY</code> selects <code>EncoderOnlyAttention</code>; everything else uses <code>Attention</code>.</li>
+  <li><strong>Lines 212-222.</strong> The attention layer gets per-rank heads (<code>self.num_heads</code>, <code>self.num_kv_heads</code>), the scale <code>head_dim ** -0.5</code> (line 162) and its prefix.</li>
+</ol>
+
+<h3><code>LlamaDecoderLayer</code>: config knobs and the residual</h3>
+<x-code file="vllm/model_executor/models/llama.py" lines="261-283" highlight="263,268-274,280-283" />
+<ol>
+  <li><strong>Line 263.</strong> The quant config comes from <code>get_quant_config()</code>, which subclasses can override (lines 332-334).</li>
+  <li><strong>Lines 268-274.</strong> <code>attention_bias</code> or <code>bias</code> turns on biases in QKV and o_proj; <code>qkv_bias</code> sets the QKV bias alone. The comments name the models that need this.</li>
+  <li><strong>Lines 280-283.</strong> <code>is_causal=False</code> in the config makes the layer bidirectional, for embedding models.</li>
+</ol>
+<x-code file="vllm/model_executor/models/llama.py" lines="313-330" highlight="320-324,328" />
+<ol>
+  <li><strong>Lines 320-322.</strong> The first layer has no residual yet: it keeps the input as the residual and normalizes.</li>
+  <li><strong>Line 324.</strong> Later layers call the norm with the residual. <code>RMSNorm</code> adds it and normalizes in one op, and returns the new residual too.</li>
+  <li><strong>Line 328.</strong> The same fused add-and-norm before the MLP. The layer returns <code>(hidden_states, residual)</code>; the final norm of <code>LlamaModel</code> adds the last residual (line 452).</li>
+</ol>
+
+<h3><code>LlamaModel.load_weights</code> and <code>LlamaForCausalLM.load_weights</code>: the load path</h3>
+<x-code file="vllm/model_executor/models/llama.py" lines="459-461" />
+<x-code file="vllm/model_executor/models/llama.py" lines="559-561" />
+<p>Follow one tensor, <code>model.layers.0.mlp.up_proj.weight</code>, in a TP = 2 worker:</p>
+<ol>
+  <li>The default loader calls <code>LlamaForCausalLM.load_weights(iterator)</code> ({{cite vllm/model_executor/model_loader/default_loader.py:503}}).</li>
+  <li>The outer <code>AutoWeightsLoader</code> has no model mapper. It adds the quant config mappers, if any, and the rule that drops old rotary tables ({{cite vllm/model_executor/models/utils.py:460-473}}).</li>
+  <li>The walk groups by <code>model</code> and finds <code>self.model</code>, a <code>LlamaModel</code> with its own <code>load_weights</code>. It passes the rest of the name: <code>layers.0.mlp.up_proj.weight</code> ({{cite vllm/model_executor/models/utils.py:387-400}}).</li>
+  <li><code>LlamaModel.load_weights</code> makes a second <code>AutoWeightsLoader</code> with <code>hf_to_vllm_mapper</code>. <code>.up_proj</code> becomes <code>.gate_up_proj</code> with shard id 1 ({{cite vllm/model_executor/models/llama.py:354-355}}).</li>
+  <li>The walk goes <code>layers</code> → <code>0</code> → <code>mlp</code> → <code>gate_up_proj</code>. <code>MergedColumnParallelLinear</code> has a <code>load_weights</code>; it reads <code>shard_id = 1</code> from the tensor and calls the parameter's loader ({{cite vllm/model_executor/layers/linear.py:985-1000}}).</li>
+  <li>The v2 loader computes offset 14336 / 2 = 7168 and size 7168 in the parameter. It copies checkpoint rows <code>rank × 7168</code> to <code>rank × 7168 + 7167</code> ({{cite vllm/model_executor/layers/linear.py:965-983}}, {{cite vllm/model_executor/parameter.py:153-173}}).</li>
+  <li>The loaded name goes back up the tree with its prefixes: <code>model.layers.0.mlp.gate_up_proj.weight</code>. The default loader uses the set of these names for its completeness check ({{cite vllm/model_executor/model_loader/default_loader.py:510-523}}).</li>
+</ol>
+<p>The tensor <code>lm_head.weight</code> takes another path. In the outer walk, <code>lm_head</code> is a <code>ParallelLMHead</code> without <code>load_weights</code>, so its <code>weight</code> parameter uses <code>VocabParallelEmbedding.weight_loader</code> ({{cite vllm/model_executor/models/utils.py:416-424}}). If <code>tie_word_embeddings</code> is set, <code>lm_head.weight</code> is the same object as <code>model.embed_tokens.weight</code> (lines 509-510), and the loader skips the second name ({{cite vllm/model_executor/models/utils.py:255-259}}). One exception: if the config says tied but the checkpoint has its own <code>lm_head</code>, <code>VllmConfig</code> turns the flag off, so the head loads ({{cite vllm/config/vllm.py:1594-1599}}). After loading, vLLM ties the two again if they are equal ({{cite vllm/config/model.py:1255-1281}}, {{cite vllm/model_executor/model_loader/utils.py:155}}).</p>
+
+<h3><code>LlamaForCausalLM</code>: class attributes</h3>
+<x-code file="vllm/model_executor/models/llama.py" lines="464-482" />
+<ol>
+  <li><strong>Lines 464-472.</strong> The mixins; {{link concepts/model-definition}} has a table of what each one adds.</li>
+  <li><strong>Line 473.</strong> The outer class shares the mapper of <code>LlamaModel</code>. <code>SupportsQuant.__new__</code> gives its rename-only part to the quant config, so names in <code>ignored_layers</code> can match vLLM names ({{cite vllm/model_executor/models/interfaces.py:1292-1299}}). For Llama this part is empty: <code>get_rename_mapper()</code> drops the stacked rules, which are the only rules of this mapper ({{cite vllm/model_executor/models/utils.py:180-199}}).</li>
+  <li><strong>Lines 475-478.</strong> <code>packed_modules_mapping</code> tells LoRA and the quant config which checkpoint layers form each stacked layer.</li>
+  <li><strong>Lines 479-482.</strong> <code>embedding_modules</code> lists the layers that get LoRA embedding buffers; Mistral clears it ({{cite vllm/model_executor/models/mistral.py:237-238}}).</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types and shapes">
+<table>
+  <thead><tr><th>Value</th><th>Type, shape (per rank)</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>input_ids</code></td><td><code>int</code> tensor <code>[T]</code>, or <code>None</code> when <code>inputs_embeds</code> is given or on a later PP stage</td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1981-1997}}</td></tr>
+    <tr><td><code>positions</code></td><td><code>[T]</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1986}}</td></tr>
+    <tr><td>dynamic dimensions for <code>torch.compile</code></td><td>dimension 0 of all four inputs</td><td>{{cite vllm/model_executor/models/llama.py:340-345}}</td></tr>
+    <tr><td><code>qkv</code></td><td><code>[T, q_size + 2 × kv_size]</code></td><td>{{cite vllm/model_executor/models/llama.py:229-230}}</td></tr>
+    <tr><td>decoder layer output</td><td><code>(hidden_states, residual)</code>, both <code>[T, hidden_size]</code></td><td>{{cite vllm/model_executor/models/llama.py:313-330}}</td></tr>
+    <tr><td><code>LlamaModel.forward</code> result</td><td><code>[T, hidden_size]</code>; <code>IntermediateTensors</code> on non-last PP stages; <code>(hidden, aux list)</code> with EAGLE-3</td><td>{{cite vllm/model_executor/models/llama.py:443-457}}</td></tr>
+    <tr><td><code>compute_logits</code> result</td><td><code>[R, vocab_size]</code> float logits after the TP gather</td><td>{{cite vllm/model_executor/models/llama.py:546-551}}</td></tr>
+    <tr><td><code>load_weights</code> result</td><td><code>set[str]</code> of loaded parameter names</td><td>{{cite vllm/model_executor/models/llama.py:559-561}}</td></tr>
+  </tbody>
+</table>
+<p>T is the number of scheduled tokens of the step after padding; R is the number of rows that sample.</p>
+</x-deepdive>
+
+<x-deepdive title="Interaction with other subsystems">
+<ul>
+  <li><strong>Forward context.</strong> Each <code>Attention</code> registers under its prefix, for example <code>model.layers.0.self_attn.attn</code> ({{cite vllm/model_executor/layers/attention/attention.py:443-445}}). See {{link concepts/forward-context}}.</li>
+  <li><strong>torch.compile.</strong> Only <code>LlamaModel.forward</code> is compiled ({{cite vllm/model_executor/models/llama.py:337-346}}); the attention call is an opaque custom op on CUDA-like platforms ({{cite vllm/model_executor/layers/attention/attention.py:436-440}}).</li>
+  <li><strong>LoRA.</strong> The LoRA manager wraps the linear layers that it finds with <code>named_modules()</code>; <code>packed_modules_mapping</code> maps <code>qkv_proj</code> to the three LoRA targets ({{cite vllm/model_executor/models/llama.py:475-478}}). The names in <code>embedding_modules</code> (lines 479-482) also count as supported LoRA modules ({{cite vllm/lora/utils.py:251-254}}).</li>
+  <li><strong>Speculative decoding.</strong> EAGLE-3 sets the layers whose hidden states <code>EagleModelMixin</code> collects (lines 427-441); with PP they travel in <code>IntermediateTensors</code> under <code>aux_hidden_states_&lt;i&gt;</code> ({{cite vllm/model_executor/models/interfaces.py:1652-1661}}). <code>spec_decode_needs_target_embed</code> keeps a real embedding on the last PP stage for some drafters ({{cite vllm/model_executor/models/utils.py:863-883}}).</li>
+  <li><strong>Pooling.</strong> The bidirectional classes reuse the whole file through the adapters <code>as_seq_cls_model</code> and <code>as_embedding_model</code> (lines 564-571).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Worked example: which config keys change the module tree">
+<table>
+  <thead><tr><th>Config key (Hugging Face)</th><th>Effect</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td><code>num_key_value_heads</code> (missing)</td><td>defaults to <code>num_attention_heads</code> (no GQA)</td><td>{{cite vllm/model_executor/models/llama.py:289-291}}</td></tr>
+    <tr><td><code>head_dim</code></td><td>overrides <code>hidden_size / num_attention_heads</code></td><td>{{cite vllm/model_executor/models/llama.py:158-159}}</td></tr>
+    <tr><td><code>attention_bias</code> / <code>bias</code> / <code>qkv_bias</code></td><td>biases in QKV and o_proj</td><td>{{cite vllm/model_executor/models/llama.py:268-274}}</td></tr>
+    <tr><td><code>mlp_bias</code></td><td>biases in gate_up and down</td><td>{{cite vllm/model_executor/models/llama.py:305}}</td></tr>
+    <tr><td><code>hidden_act</code></td><td>must be <code>silu</code></td><td>{{cite vllm/model_executor/models/llama.py:112-115}}</td></tr>
+    <tr><td><code>is_causal</code></td><td><code>false</code> → <code>EncoderOnlyAttention</code></td><td>{{cite vllm/model_executor/models/llama.py:280-283}}</td></tr>
+    <tr><td><code>layer_types</code>, <code>sliding_window</code></td><td>per-layer sliding window</td><td>{{cite vllm/model_executor/models/llama.py:186-204}}</td></tr>
+    <tr><td><code>tie_word_embeddings</code></td><td>LM head shares the embedding weight; embedding also on the last PP stage</td><td>{{cite vllm/model_executor/models/llama.py:379}}, {{cite vllm/model_executor/models/llama.py:509-510}}</td></tr>
+    <tr><td><code>logit_scale</code></td><td>multiplies the logits (default 1.0)</td><td>{{cite vllm/model_executor/models/llama.py:512-515}}</td></tr>
+  </tbody>
+</table>
+<p>Example: <code>internlm/internlm3-8b</code> maps to <code>LlamaForCausalLM</code> ({{cite vllm/model_executor/models/registry.py:140}}), and the comment at line 272 names it as the reason for <code>qkv_bias</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>hidden_act</code> is not <code>silu</code></td><td><code>ValueError</code></td><td>{{cite vllm/model_executor/models/llama.py:112-115}}</td></tr>
+    <tr><td>query heads do not divide by TP</td><td><code>AssertionError</code> (start-up normally stops earlier with a <code>ValueError</code>)</td><td>{{cite vllm/model_executor/models/llama.py:145}}, {{cite vllm/config/model.py:1559-1564}}</td></tr>
+    <tr><td>KV heads and TP do not divide either way</td><td><code>AssertionError</code></td><td>{{cite vllm/model_executor/models/llama.py:148-155}}</td></tr>
+    <tr><td>layer index outside <code>layer_types</code></td><td><code>AssertionError</code> with both values</td><td>{{cite vllm/model_executor/models/llama.py:197-200}}</td></tr>
+    <tr><td>a non-first PP stage gets no intermediate tensors</td><td><code>AssertionError</code></td><td>{{cite vllm/model_executor/models/llama.py:421}}</td></tr>
+    <tr><td>a checkpoint name with no module or parameter</td><td><code>ValueError</code> from the loader</td><td>{{cite vllm/model_executor/models/utils.py:442-448}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<p>The file reads no environment variable. Two variables help when you study it:</p>
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_LOG_MODEL_INSPECTION</code></td><td><code>0</code></td><td>{{cite vllm/envs.py:2153-2155}}</td><td>Logs the built module tree after <code>create_model</code> ({{cite vllm/model_executor/model_loader/base_loader.py:118-125}}).</td></tr>
+    <tr><td><code>VLLM_LOGGING_LEVEL=DEBUG</code></td><td><code>INFO</code></td><td>{{cite vllm/envs.py:860}}</td><td>Shows one "Loaded weight ... with shape ..." line per parameter ({{cite vllm/model_executor/models/utils.py:343}}).</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/model-definition}}: the patterns of this file, with the prefix rules and PP.</li>
+  <li>{{link concepts/weight-loading}}: the loader, the mapper and the weight loaders.</li>
+  <li>{{link concepts/tp-layers}}: the layer classes that this file builds.</li>
+  <li>{{link concepts/model-interfaces}}: what the mixins mean to the registry.</li>
+  <li>{{link concepts/custom-ops}}: <code>RMSNorm</code>, <code>SiluAndMul</code> and the rotary embedding.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which class of llama.py carries <code>@support_torch_compile</code>?
+    <x-a><p><code>LlamaModel</code> ({{cite vllm/model_executor/models/llama.py:337-347}}). <code>LlamaForCausalLM.forward</code> only calls it.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>LlamaForCausalLM.load_weights</code> pass no mapper, although the class has <code>hf_to_vllm_mapper</code>?
+    <x-a><p>The outer loader hands every <code>model.*</code> tensor to <code>LlamaModel.load_weights</code>, which applies the mapper itself ({{cite vllm/model_executor/models/utils.py:387-400}}, {{cite vllm/model_executor/models/llama.py:459-461}}). The class attribute on the outer class is for others: <code>SupportsQuant</code> gives its rename part to the quant config ({{cite vllm/model_executor/models/interfaces.py:1296-1297}}). For Llama that part is empty, because the mapper has only stacked rules ({{cite vllm/model_executor/models/utils.py:186-196}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A config has <code>"qkv_bias": true</code> and no <code>attention_bias</code>. Which layers get a bias?
+    <x-a><p>Only <code>qkv_proj</code>. <code>bias_o_proj</code> takes the value of <code>attention_bias</code> before <code>qkv_bias</code> overrides <code>attention_bias</code> ({{cite vllm/model_executor/models/llama.py:268-274}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Follow <code>model.layers.0.mlp.gate_proj.weight</code> on TP rank 1 of a Llama-3-8B with TP = 2. Which rows of the checkpoint tensor end up where?
+    <x-a><p>The mapper renames it to <code>layers.0.mlp.gate_up_proj.weight</code> with shard id 0 ({{cite vllm/model_executor/models/llama.py:354}}). The v2 loader uses offset 0 and size 14336 / 2 = 7168 in the parameter ({{cite vllm/model_executor/layers/linear.py:967-970}}). The parameter copies checkpoint rows 7168-14335 (rank 1 × 7168) into its rows 0-7167 ({{cite vllm/model_executor/parameter.py:168-173}}).</p></x-a>
+  </x-q>
+</x-quiz>

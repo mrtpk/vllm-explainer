@@ -1,0 +1,192 @@
+---
+title: "model_executor/layers/linear.py: tensor-parallel linear layers"
+nav_title: layers/linear.py
+level: Advanced
+prerequisites: concepts/tp-layers, concepts/weight-loading
+related: concepts/tp-layers, concepts/weight-loading, concepts/quantization-plugins, concepts/custom-ops, code/model-executor-models-llama, code/model-executor-custom-op, concepts/distributed-groups
+summary: vllm/model_executor/layers/linear.py holds LinearBase and the replicated, column-parallel, merged-column, QKV and row-parallel linear layers. Each one resolves a quantize method, allocates its per-rank weight through it, cuts checkpoint tensors in weight_loader or weight_loader_v2, and calls the TP all-gather or all-reduce in forward.
+---
+<h2>Purpose</h2>
+<p><code>vllm/model_executor/layers/linear.py</code> gives model files linear layers that know their tensor-parallel rank: each layer stores only its slice of the weight, loads that slice from a full checkpoint tensor, and does the communication of its split.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/model_executor/layers/linear.py</code>, 1,819 lines of Python.</td></tr>
+    <tr><th>Main classes</th><td><code>LinearBase</code>, <code>ReplicatedLinear</code>, <code>ColumnParallelLinear</code>, <code>MergedColumnParallelLinear</code>, <code>QKVParallelLinear</code>, <code>RowParallelLinear</code>; the quantize methods <code>LinearMethodBase</code> and <code>UnquantizedLinearMethod</code>.</td></tr>
+    <tr><th>Runs in</th><td>Each worker. Constructors and loaders run once at model load; <code>forward</code> runs on the GPU in every step.</td></tr>
+    <tr><th>Called by</th><td>Model files (for example {{cite vllm/model_executor/models/llama.py:95-111}}), quantization methods that subclass <code>LinearMethodBase</code>, and LoRA wrappers. About 315 files in <code>vllm/</code> name this module (git grep at this commit).</td></tr>
+    <tr><th>Calls</th><td><code>resolve_quant_method</code>, the TP helpers <code>divide</code>, <code>split_tensor_along_last_dim</code>, <code>tensor_model_parallel_all_gather</code> and <code>tensor_model_parallel_all_reduce</code>, and the parameter classes of <code>parameter.py</code> ({{cite vllm/model_executor/layers/linear.py:14-45}}).</td></tr>
+    <tr><th>Not in this file</th><td>The embedding and LM head (<code>vocab_parallel_embedding.py</code>), the GEMM kernels (chosen by each quantize method), the communicators ({{link concepts/distributed-groups}}), and the per-parameter load methods (<code>parameter.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/tp-layers}} explains the ideas. This page maps the file and reads the <code>forward</code> and loader methods line by line.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b6a_qkv_split" alt="QKVParallelLinear with 32 query heads and 8 KV heads. With TP = 2, each rank owns 16 query heads and 4 KV heads. With TP = 16, each rank owns 2 query heads and one KV head, and each KV head is on two ranks." caption="Figure: the head split of QKVParallelLinear, the most complex layer of this file, for TP = 2 and TP = 16." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Model constructors</strong> build the layers with full sizes, a <code>quant_config</code> and a prefix ({{cite vllm/model_executor/models/llama.py:165-181}}).</li>
+  <li><strong><code>AutoWeightsLoader</code></strong> calls <code>load_weights</code> of the merged and QKV layers, and the <code>weight_loader</code> of other parameters ({{cite vllm/model_executor/models/utils.py:387-424}}).</li>
+  <li><strong>Quantization methods</strong> subclass <code>LinearMethodBase</code>, for example <code>Fp8LinearMethod</code> ({{cite vllm/model_executor/layers/quantization/fp8.py:225}}).</li>
+  <li><strong>LoRA</strong> wraps these layers; it finds a replaced class with <code>maybe_get_oot_by_class</code> ({{cite vllm/lora/layers/column_parallel_linear.py:169}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>resolve_quant_method(quant_config, layer, prefix)</code> in <code>LinearBase.__init__</code> ({{cite vllm/model_executor/layers/linear.py:293}}).</li>
+  <li><code>quant_method.create_weights(...)</code> and <code>quant_method.apply(...)</code> ({{cite vllm/model_executor/layers/linear.py:536-544}}, {{cite vllm/model_executor/layers/linear.py:623}}).</li>
+  <li>The collectives in <code>forward</code> ({{cite vllm/model_executor/layers/linear.py:627}}, {{cite vllm/model_executor/layers/linear.py:1804}}).</li>
+  <li>The parameter methods <code>load_column_parallel_weight</code>, <code>load_merged_column_weight</code>, <code>load_qkv_weight</code> and <code>load_row_parallel_weight</code> in the v2 loaders ({{cite vllm/model_executor/parameter.py:145-226}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Lines</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>WEIGHT_LOADER_V2_SUPPORTED</code>, <code>register_weight_loader_v2_supported_method</code></td><td>{{cite vllm/model_executor/layers/linear.py:50-70}}</td><td>Quantize-method class names that use the v2 loaders.</td></tr>
+    <tr><td><code>adjust_marlin_shard</code>, <code>adjust_block_scale_shard</code>, <code>adjust_scalar_to_fused_array</code></td><td>{{cite vllm/model_executor/layers/linear.py:73-121}}</td><td>Offset fixes for Marlin tiles, block scales and per-part scalar scales.</td></tr>
+    <tr><td><code>LinearMethodBase</code></td><td>{{cite vllm/model_executor/layers/linear.py:124-163}}</td><td>Abstract quantize method: <code>create_weights</code>, <code>apply</code>.</td></tr>
+    <tr><td><code>UnquantizedLinearMethod</code></td><td>{{cite vllm/model_executor/layers/linear.py:166-242}}</td><td>BF16/FP16 weights; GEMM from <code>dispatch_unquantized_gemm</code>.</td></tr>
+    <tr><td><code>LinearBase</code></td><td>{{cite vllm/model_executor/layers/linear.py:245-324}}</td><td>Common fields, quantize method, TP rank and size.</td></tr>
+    <tr><td><code>ReplicatedLinear</code></td><td>{{cite vllm/model_executor/layers/linear.py:327-431}}</td><td>Full weight on every rank.</td></tr>
+    <tr><td><code>ColumnParallelLinear</code></td><td>{{cite vllm/model_executor/layers/linear.py:434-642}}</td><td>Output split; optional all-gather.</td></tr>
+    <tr><td><code>DCPGroupColumnParallelLinear</code></td><td>{{cite vllm/model_executor/layers/linear.py:645-683}}</td><td>Splits across decode-context-parallel groups, not every rank.</td></tr>
+    <tr><td><code>MergedColumnParallelLinear</code></td><td>{{cite vllm/model_executor/layers/linear.py:686-1008}}</td><td>Several column parts in one weight; integer shard ids.</td></tr>
+    <tr><td><code>QKVParallelLinear</code></td><td>{{cite vllm/model_executor/layers/linear.py:1011-1362}}</td><td>Q, K, V by heads; KV replication; shard ids q, k, v.</td></tr>
+    <tr><td><code>MinimaxM3QKVParallelLinearWithIndexer</code></td><td>{{cite vllm/model_executor/layers/linear.py:1365-1545}}</td><td>Model-specific: QKV plus indexer heads (MiniMax-M3).</td></tr>
+    <tr><td><code>KimiK3MergedQKVGateLinear</code></td><td>{{cite vllm/model_executor/layers/linear.py:1548-1634}}</td><td>Model-specific: replicated latents plus a TP gate (Kimi-K3).</td></tr>
+    <tr><td><code>RowParallelLinear</code></td><td>{{cite vllm/model_executor/layers/linear.py:1637-1819}}</td><td>Input split; bias on rank 0; optional all-reduce.</td></tr>
+  </tbody>
+</table>
+<p>Three classes are registered as <code>PluggableLayer</code> names: <code>replicated_linear</code>, <code>column_parallel_linear</code> and <code>row_parallel_linear</code> ({{cite vllm/model_executor/layers/linear.py:328}}, {{cite vllm/model_executor/layers/linear.py:435}}, {{cite vllm/model_executor/layers/linear.py:1638}}). The merged and QKV classes have no name of their own. A plugin can swap a registered class ({{link concepts/custom-ops}}).</p>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>ColumnParallelLinear.__init__</code>: sizes and the loader choice</h3>
+<x-code file="vllm/model_executor/layers/linear.py" lines="484-544" highlight="496-503,524-534,536-544" />
+<ol>
+  <li><strong>Lines 484-495.</strong> The rank and size come from the TP group, unless <code>disable_tp</code> or explicit values are given. <code>DCPGroupColumnParallelLinear</code> uses the explicit values to split across groups.</li>
+  <li><strong>Lines 496-503.</strong> The full input and <code>output_size / tp_size</code>. If the subclass set <code>output_sizes</code> (merged and QKV), each part is divided separately.</li>
+  <li><strong>Lines 524-534.</strong> The v2 loader if the quantize method's class name is in the list; an online-quantization method is judged by its source method.</li>
+  <li><strong>Lines 536-544.</strong> The quantize method makes the weight parameters and gives each one the chosen loader. For <code>UnquantizedLinearMethod</code> this is one <code>ModelWeightParameter</code> of shape <code>[sum(output_partition_sizes), input_size]</code> ({{cite vllm/model_executor/layers/linear.py:192-205}}).</li>
+</ol>
+
+<h3><code>ColumnParallelLinear.forward</code> and <code>weight_loader</code></h3>
+<x-code file="vllm/model_executor/layers/linear.py" lines="589-634" highlight="595-598,602-603,623,625-627" />
+<ol>
+  <li><strong>Lines 595-598.</strong> v1 loader: if the parameter has <code>output_dim</code> and is not already sharded, cut <code>shard_size</code> rows at <code>tp_rank × shard_size</code>. <code>shard_size</code> is the parameter's own size, so the cut needs no TP size.</li>
+  <li><strong>Lines 602-603.</strong> A scalar scale from the checkpoint becomes a 1-element tensor.</li>
+  <li><strong>Lines 608-614.</strong> The v2 loader gives the work to <code>param.load_column_parallel_weight</code>.</li>
+  <li><strong>Line 623.</strong> <code>quant_method.apply(self, input_, bias)</code>: the GEMM. Every rank gets the same full input.</li>
+  <li><strong>Lines 625-627.</strong> The all-gather only with <code>gather_output</code> and TP &gt; 1; else the output stays a slice <code>[T, out / tp_size]</code>.</li>
+</ol>
+
+<h3><code>QKVParallelLinear.weight_loader</code> (v1)</h3>
+<x-code file="vllm/model_executor/layers/linear.py" lines="1278-1320" highlight="1282-1290,1312,1313-1317,1319-1320" />
+<ol>
+  <li><strong>Lines 1282-1290.</strong> Offset and size of the shard inside this rank's parameter: q first, then k, then v, all in per-rank head counts.</li>
+  <li><strong>Lines 1292-1309.</strong> Fixes for block scales and packed or Marlin weights (see the deep dive).</li>
+  <li><strong>Line 1312.</strong> The view of the parameter for this shard.</li>
+  <li><strong>Lines 1313-1317.</strong> The slice index in the checkpoint tensor: <code>tp_rank</code> for q, <code>tp_rank // num_kv_head_replicas</code> for k and v.</li>
+  <li><strong>Lines 1319-1320.</strong> The cut of the checkpoint tensor; then the assertion and the copy at lines 1336-1337.</li>
+</ol>
+<p>A <code>None</code> shard id means the checkpoint already stores QKV fused (Phi-3 style). Then the loader cuts the full tensor into q, k and v by the <em>total</em> head counts and calls itself once per part (lines 1225-1276). The v2 loader does the same through <code>param.load_qkv_weight</code>, with <code>num_heads=self.num_kv_head_replicas</code> ({{cite vllm/model_executor/layers/linear.py:1191-1209}}).</p>
+
+<h3><code>RowParallelLinear.weight_loader</code> and <code>forward</code></h3>
+<x-code file="vllm/model_executor/layers/linear.py" lines="1758-1774" highlight="1763-1766" />
+<ol>
+  <li><strong>Lines 1763-1766.</strong> The cut is along <code>input_dim</code> (dimension 1 of <code>[out, in]</code>) at <code>tp_rank × shard_size</code>.</li>
+  <li><strong>Lines 1770-1774.</strong> Scalars become 1-element tensors; then a shape assertion and the copy.</li>
+</ol>
+<p>The bias is a full <code>[output_size]</code> parameter with the v1 loader (lines 1742-1753). Its <code>output_dim</code> is 0 and it has no <code>input_dim</code>, so the row loader copies it whole on every rank. In <code>forward</code>, only rank 0 adds it ({{cite vllm/model_executor/layers/linear.py:1798-1801}}). <code>forward</code> is on {{link concepts/tp-layers}}: optional split of the input, GEMM, and the all-reduce when <code>reduce_results</code> and TP &gt; 1 ({{cite vllm/model_executor/layers/linear.py:1785-1811}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types and shapes">
+<table>
+  <thead><tr><th>Layer</th><th>Input (per rank)</th><th>Weight (per rank, unquantized)</th><th>Output (per rank)</th><th>Collective</th></tr></thead>
+  <tbody>
+    <tr><td><code>ReplicatedLinear</code></td><td><code>[T, in]</code></td><td><code>[out, in]</code></td><td><code>[T, out]</code></td><td>none</td></tr>
+    <tr><td><code>ColumnParallelLinear</code></td><td><code>[T, in]</code></td><td><code>[out / tp, in]</code></td><td><code>[T, out / tp]</code>, or <code>[T, out]</code> with gather</td><td>all-gather if <code>gather_output</code></td></tr>
+    <tr><td><code>MergedColumnParallelLinear</code></td><td><code>[T, in]</code></td><td><code>[Σ out_i / tp, in]</code></td><td><code>[T, Σ out_i / tp]</code></td><td>same</td></tr>
+    <tr><td><code>QKVParallelLinear</code></td><td><code>[T, hidden]</code></td><td><code>[(h_q + 2 h_kv) × d, hidden]</code></td><td><code>[T, (h_q + 2 h_kv) × d]</code></td><td>none</td></tr>
+    <tr><td><code>RowParallelLinear</code></td><td><code>[T, in / tp]</code></td><td><code>[out, in / tp]</code></td><td><code>[T, out]</code> (full after the all-reduce)</td><td>all-reduce if <code>reduce_results</code></td></tr>
+  </tbody>
+</table>
+<p><code>h_q</code> and <code>h_kv</code> are the per-rank head counts and <code>d</code> the head size ({{cite vllm/model_executor/layers/linear.py:1065-1077}}). Every <code>forward</code> returns <code>(output, output_bias)</code> unless <code>return_bias=False</code>; <code>output_bias</code> is not <code>None</code> only with <code>skip_bias_add</code> (for example {{cite vllm/model_executor/layers/linear.py:631-634}}). This is why llama.py writes <code>x, _ = self.gate_up_proj(x)</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: gate_up_proj and down_proj of Llama-3-8B, TP = 2">
+<p>From the Llama-3-8B <code>config.json</code> on the Hugging Face Hub: hidden 4,096, intermediate 14,336. llama.py builds <code>MergedColumnParallelLinear(4096, [14336, 14336])</code> and <code>RowParallelLinear(14336, 4096)</code>.</p>
+<ol>
+  <li><strong>gate_up, constructor.</strong> <code>output_partition_sizes = [7168, 7168]</code> (lines 500-503). The weight is <code>[14336, 4096]</code>, 112 MiB in BF16.</li>
+  <li><strong>Load <code>gate_proj</code> (shard 0) on rank 1.</strong> Offset 0, size 7168 in the parameter; checkpoint rows 7168-14335 (lines 966-983 and <code>load_merged_column_weight</code>).</li>
+  <li><strong>Load <code>up_proj</code> (shard 1) on rank 1.</strong> Offset 14336 / 2 = 7168, size 7168 in the parameter; checkpoint rows 7168-14335 of <code>up_proj</code>.</li>
+  <li><strong>down, constructor.</strong> <code>input_size_per_partition</code> = 7168; the weight is <code>[4096, 7168]</code>, 56 MiB.</li>
+  <li><strong>Load <code>down_proj</code> on rank 1.</strong> Columns 7168-14335 of the checkpoint tensor (lines 1763-1766, or <code>load_row_parallel_weight</code>).</li>
+  <li><strong>Forward with T = 2048.</strong> gate_up gives <code>[2048, 14336]</code>; <code>SiluAndMul</code> gives <code>[2048, 7168]</code>; down gives a partial <code>[2048, 4096]</code>; the all-reduce moves 2048 × 4096 × 2 B = 16 MiB.</li>
+</ol>
+<p>These are the numbers of {{link learn/tp-pp-in-practice}}, now with the line of each step (derived).</p>
+</x-deepdive>
+
+<x-deepdive title="Quantized storage in the loaders">
+<ul>
+  <li><strong>Packed weights.</strong> INT4 formats pack several values into one element. A parameter with <code>packed_dim == output_dim</code> divides the offset and size by <code>packed_factor</code> ({{cite vllm/model_executor/layers/linear.py:1301-1304}}).</li>
+  <li><strong>Marlin.</strong> <code>adjust_marlin_shard</code> multiplies offset and size by <code>marlin_tile_size</code> when the parameter has one ({{cite vllm/model_executor/layers/linear.py:73-82}}).</li>
+  <li><strong>Block scales.</strong> For <code>BlockQuantScaleParameter</code>, offsets and sizes are rounded up to whole blocks of <code>weight_block_size[0]</code> rows ({{cite vllm/model_executor/layers/linear.py:85-94}}). <code>_maybe_allow_fp8_block_shape_mismatch</code> allows parts that do not fill whole blocks, with a DEBUG log ({{cite vllm/model_executor/layers/linear.py:562-587}}).</li>
+  <li><strong>Per-part scalars.</strong> A stacked layer with per-tensor scales keeps one scale per part; <code>adjust_scalar_to_fused_array</code> picks slot 0, 1 or 2 from the shard id ({{cite vllm/model_executor/layers/linear.py:97-121}}).</li>
+  <li><strong>After the copy.</strong> A quantize method may replace parameters in <code>process_weights_after_loading</code>. <code>update_param_tp_status</code> then resets the rank fields of the new parameters ({{cite vllm/model_executor/layers/linear.py:311-324}}, {{cite vllm/model_executor/model_loader/utils.py:187-193}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>No quantize method for a linear layer</td><td><code>ValueError</code></td><td>{{cite vllm/model_executor/layers/linear.py:295-296}}</td></tr>
+    <tr><td>An output part does not divide by TP (merged)</td><td><code>AssertionError</code></td><td>{{cite vllm/model_executor/layers/linear.py:731}}</td></tr>
+    <tr><td>Heads, or TP and KV heads, do not divide (QKV)</td><td><code>AssertionError</code> from <code>divide</code></td><td>{{cite vllm/model_executor/layers/linear.py:1065-1070}}</td></tr>
+    <tr><td>Bad shard id</td><td><code>ValueError</code></td><td>{{cite vllm/model_executor/layers/linear.py:745-770}}, {{cite vllm/model_executor/layers/linear.py:1093-1099}}</td></tr>
+    <tr><td>Slice and parameter shapes differ</td><td><code>AssertionError</code></td><td>{{cite vllm/model_executor/layers/linear.py:605}}, {{cite vllm/model_executor/layers/linear.py:1773}}</td></tr>
+    <tr><td><code>reduce_results=False</code> with an added bias</td><td><code>ValueError</code></td><td>{{cite vllm/model_executor/layers/linear.py:1736-1740}}</td></tr>
+    <tr><td>Parameter without <code>output_dim</code> in a merged or QKV layer (v1 loader)</td><td>WARNING; the same tensor on all ranks</td><td>{{cite vllm/model_executor/layers/linear.py:870-877}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_BATCH_INVARIANT</code></td><td><code>0</code> ({{cite vllm/envs.py:637}})</td><td>{{cite vllm/model_executor/layers/linear.py:238-241}}</td><td>On CUDA-like and XPU platforms, the unquantized GEMM uses a batch-invariant kernel.</td></tr>
+    <tr><td><code>VLLM_XPU_FORCE_N_CONTIG_WEIGHT</code></td><td><code>0</code> ({{cite vllm/envs.py:2221-2223}})</td><td>{{cite vllm/model_executor/layers/linear.py:222-228}}</td><td>On XPU, re-lays out an unquantized weight after loading.</td></tr>
+  </tbody>
+</table>
+<p>The GEMM backend of <code>UnquantizedLinearMethod</code> comes from <code>kernel_config.linear_backend</code>, default <code>"auto"</code> when no config is current ({{cite vllm/model_executor/layers/linear.py:171-176}}).</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/tp-layers}}: the ideas and the vocabulary layers.</li>
+  <li>{{link concepts/weight-loading}}: how tensors reach these loaders.</li>
+  <li>{{link concepts/quantization-plugins}}: the quantize methods that make and use the weights.</li>
+  <li>{{link concepts/custom-ops}}: <code>PluggableLayer</code> and how a plugin replaces a layer class.</li>
+  <li>{{link concepts/distributed-groups}}: the TP group behind the collectives.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">What is the default of <code>gather_output</code> in <code>ColumnParallelLinear</code>, and why?
+    <x-a><p><code>False</code> ({{cite vllm/model_executor/layers/linear.py:473}}). The next layer is usually row-parallel and wants the slice; a gather would only add traffic.</p></x-a>
+  </x-q>
+  <x-q level="medium">Which loader does a BF16 <code>QKVParallelLinear</code> weight use, and where is the cut done?
+    <x-a><p><code>weight_loader_v2</code>, because <code>UnquantizedLinearMethod</code> is in <code>WEIGHT_LOADER_V2_SUPPORTED</code> ({{cite vllm/model_executor/layers/linear.py:50-51}}, {{cite vllm/model_executor/layers/linear.py:530-534}}). It calls <code>param.load_qkv_weight</code>, which cuts the parameter and the checkpoint tensor ({{cite vllm/model_executor/parameter.py:175-198}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does every linear <code>forward</code> return a tuple?
+    <x-a><p>With <code>return_bias=True</code> (the default), it returns <code>(output, output_bias)</code>. <code>output_bias</code> is the bias only with <code>skip_bias_add</code>, so a caller can fuse the bias into a later op ({{cite vllm/model_executor/layers/linear.py:631-634}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A checkpoint stores <code>qkv_proj.weight</code> already fused, for a model with 32 query heads, 8 KV heads and head size 128, and TP = 2. Which rows of the fused tensor does rank 1 copy for its k part?
+    <x-a><p>For a BF16 weight the v2 loader runs. The shard id is <code>None</code>, so it calls <code>_load_fused_module_from_checkpoint</code> ({{cite vllm/model_executor/layers/linear.py:1174-1189}}). That method cuts the fused tensor by total head counts: k is rows 4096-5119 ({{cite vllm/model_executor/layers/linear.py:1130-1143}}). It then loads that part with shard id <code>k</code>. Rank 1 takes slice 1 // 1 = 1 of size 512 ({{cite vllm/model_executor/parameter.py:191-195}}): rows 512-1023 of the k part, which are rows 4608-5119 of the fused tensor. The v1 loader gives the same rows (lines 1237-1320).</p></x-a>
+  </x-q>
+</x-quiz>

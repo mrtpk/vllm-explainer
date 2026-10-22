@@ -1,0 +1,176 @@
+---
+title: The tensor-parallel layers (linear.py and vocab_parallel_embedding.py)
+nav_title: TP layers
+level: Advanced
+prerequisites: learn/tp-pp-in-practice, concepts/model-definition
+related: code/model-executor-layers-linear, concepts/weight-loading, concepts/distributed-groups, concepts/quantization-plugins, concepts/custom-ops, concepts/compile-and-cuda-graphs, learn/tp-pp-in-practice
+summary: vLLM's linear and embedding layers know their tensor-parallel rank. They resolve a quantization method per layer, allocate only their slice, cut checkpoint tensors when they load, and call the all-reduce or all-gather in forward. QKVParallelLinear splits by heads and copies KV heads when TP is larger than their count.
+---
+<x-sentence>Each TP layer allocates only its slice, cuts its slice from the checkpoint when it loads, and calls the collective that its split needs.</x-sentence>
+
+<h2>The idea</h2>
+<p>With {{term tensor-parallel}} (TP) each GPU holds a slice of every weight. A {{term column-parallel}} layer splits the output features; a {{term row-parallel}} layer splits the input features and adds the partial sums with an {{term all-reduce}}. The page {{link learn/tp-pp-in-practice}} shows this with one Llama MLP. This page explains the classes that do it.</p>
+<p>A model file never calls a collective and never computes a slice. It builds layers such as <code>QKVParallelLinear(hidden_size, head_size, total_num_heads, total_num_kv_heads)</code> with <em>full</em> sizes ({{link concepts/model-definition}}). Each layer class then does five jobs itself:</p>
+<ol>
+  <li>It asks the quantization config for a {{term quantize-method}} for its {{term model-prefix}}.</li>
+  <li>It computes its per-rank sizes and lets the quantize method make parameters of that size.</li>
+  <li>It gives each parameter a {{term weight-loader}} that cuts this rank's slice from a full checkpoint tensor ({{link concepts/weight-loading}}).</li>
+  <li>In <code>forward</code>, it runs the GEMM through the quantize method.</li>
+  <li>It calls the collective that the split needs: an all-gather when {{term gather-output}} is set, an all-reduce when {{term reduce-results}} is set.</li>
+</ol>
+<p><strong>An everyday comparison.</strong> Think of a choir that sings one long chord. In a column split, each singer sings different notes of the chord; together they give the full chord. In a row split, every singer sings the same note at part of the volume. The hall adds the voices into one loud note. The comparison stops here. A hall adds the voices for free. On GPUs, the sum is an all-reduce over the links between the GPUs, and it costs time in every layer.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b6a_qkv_split" alt="Panel 1, TP = 2: rank 0 holds query heads 0 to 15 and KV heads 0 to 3; rank 1 holds query heads 16 to 31 and KV heads 4 to 7. Each KV head has its own colour, and the four query heads that use it have the same colour, so the query heads of a rank use the KV heads of the same rank. Rank 0 loads q rows 0-2047 of q_proj and k, v rows 0-511; rank 1 loads q rows 2048-4095 and k, v rows 512-1023. Panel 2, TP = 16: rank r holds query heads 2r and 2r+1 and KV head r divided by 2, so each KV head is on two ranks: ranks 0 and 1 hold KV head 0, ranks 2 and 3 hold KV head 1, and so on up to ranks 14 and 15 with KV head 7. The text says that the slice index for q is tp_rank and for k and v is tp_rank divided by num_kv_head_replicas, and that the 16 ranks store 16 copies of the 8 real KV heads." caption="Figure: QKVParallelLinear splits the 32 query heads and 8 KV heads of a Llama-3-8B layer. With TP = 2 each rank owns 4 KV heads (panel 1). With TP = 16 there are fewer KV heads than ranks, so each KV head is copied to 2 ranks (panel 2)." />
+<p>Colour marks the KV head. A query head always lands on a rank that also holds the KV head it reads. So attention needs no data from other ranks; only <code>o_proj</code> adds the results.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: LinearBase resolves the quantize method</h3>
+<x-code file="vllm/model_executor/layers/linear.py" lines="284-309" highlight="290-296,299-309" />
+<ol>
+  <li><strong>Lines 290-296.</strong> Without a quantization config the method is <code>UnquantizedLinearMethod</code>. Else <code>resolve_quant_method(quant_config, self, prefix=prefix)</code> asks the config; it must return a method, or the constructor raises <code>ValueError</code>. The page {{link concepts/quantization-plugins}} explains the methods.</li>
+  <li><strong>Lines 299-309.</strong> <code>disable_tp=True</code> makes the layer act as if TP were 1 (rank 0 of size 1). Else the rank and size come from the TP group, or from explicit arguments.</li>
+</ol>
+<p><code>LinearBase</code> is a <code>PluggableLayer</code>, so a plugin can replace a whole layer class by its registered name, for example <code>column_parallel_linear</code> ({{cite vllm/model_executor/layers/linear.py:434-436}}; {{link concepts/custom-ops}}). The bare <code>LinearBase</code> creates no weights; each subclass calls <code>quant_method.create_weights()</code> with its own sizes.</p>
+
+<h3>Step 2: ReplicatedLinear: no split</h3>
+<p>A {{term replicated-linear}} layer makes the full weight on every rank: <code>create_weights(self, input_size, [output_size], input_size, output_size, ...)</code> ({{cite vllm/model_executor/layers/linear.py:379-387}}). Its loader copies the whole tensor after a size check ({{cite vllm/model_executor/layers/linear.py:404-412}}), and its forward needs no communication ({{cite vllm/model_executor/layers/linear.py:414-425}}). 62 model files use it (git grep at this commit). An example is the <code>score</code> head that <code>as_seq_cls_model</code> adds, with one output per class label ({{cite vllm/model_executor/models/adapters.py:365-372}}).</p>
+
+<h3>Step 3: ColumnParallelLinear: split the outputs</h3>
+<x-code file="vllm/model_executor/layers/linear.py" lines="496-503" caption="Per-rank sizes: the full input, and output_size / tp_size. For merged layers, each part is divided on its own." />
+<x-code file="vllm/model_executor/layers/linear.py" lines="616-634" highlight="623,625-629" />
+<ol>
+  <li><strong>Line 623.</strong> The quantize method multiplies the full input <code>[T, in]</code> with the local weight. The result is <code>[T, out / tp_size]</code>.</li>
+  <li><strong>Lines 625-629.</strong> Only with <code>gather_output=True</code> and TP &gt; 1 does the layer call <code>tensor_model_parallel_all_gather</code>. The default is <code>False</code> ({{cite vllm/model_executor/layers/linear.py:473}}), because a row-parallel layer usually comes next.</li>
+</ol>
+<p><code>divide()</code> asserts that the size divides by TP; a wrong size stops the build with an <code>AssertionError</code> ({{cite vllm/distributed/utils.py:51-55}}, {{cite vllm/distributed/utils.py:122-126}}).</p>
+
+<h3>Step 4: MergedColumnParallelLinear: several outputs in one GEMM</h3>
+<p><code>MergedColumnParallelLinear(input_size, output_sizes)</code> stacks several column-parallel matrices, for example gate and up with <code>output_sizes=[14336, 14336]</code> ({{cite vllm/model_executor/models/llama.py:95-102}}). Each part must divide by TP, and each part is split on its own ({{cite vllm/model_executor/layers/linear.py:727-731}}). So a rank holds <code>[gate slice; up slice]</code>, not a slice of <code>[gate; up]</code>. This is what lets <code>SiluAndMul</code> work locally.</p>
+<x-code file="vllm/model_executor/layers/linear.py" lines="965-983" caption="The v2 loader for shard id <i>i</i>: offset = sum of the earlier parts / tp_size, size = part i / tp_size." />
+<p>The shard id is an integer (0 for gate, 1 for up) or a tuple of consecutive ids. <code>None</code> means that the checkpoint already stores the tensor merged ({{cite vllm/model_executor/layers/linear.py:745-770}}).</p>
+
+<h3>Step 5: QKVParallelLinear: split by heads</h3>
+<x-code file="vllm/model_executor/layers/linear.py" lines="1063-1091" highlight="1065-1071,1073-1077" />
+<ol>
+  <li><strong>Line 1065.</strong> The query heads must divide by TP.</li>
+  <li><strong>Lines 1066-1068.</strong> When TP is at least the number of KV heads, each rank gets one KV head, and <code>num_kv_head_replicas = tp_size / total_num_kv_heads</code> ranks share it. <code>divide()</code> asserts that TP is a multiple of the KV head count.</li>
+  <li><strong>Lines 1069-1071.</strong> Else the KV heads are split, with no copies.</li>
+  <li><strong>Lines 1073-1077.</strong> <code>output_sizes</code> are the sizes <em>across all ranks</em>, including copies: <code>num_kv_heads × head_size × tp_size</code>. With TP = 16 and 8 KV heads, the "total" K size is 16 × 128, twice the 8 × 128 of the checkpoint.</li>
+</ol>
+<p>The parameter of a rank is <code>[q | k | v]</code> along dimension 0. The offsets are 0, <code>num_heads × head_size</code> and <code>(num_heads + num_kv_heads) × head_size</code> ({{cite vllm/model_executor/layers/linear.py:1101-1117}}). When it loads, the q part takes slice number <code>tp_rank</code> of the checkpoint tensor; k and v take slice number <code>tp_rank // num_kv_head_replicas</code> ({{cite vllm/model_executor/parameter.py:191-195}}). The page {{link concepts/weight-loading}} follows one tensor through this code.</p>
+<p>The model splits the GEMM output with the same per-rank sizes: <code>qkv.split([q_size, kv_size, kv_size], dim=-1)</code> ({{cite vllm/model_executor/models/llama.py:229-230}}). <code>QKVParallelLinear</code> always uses <code>gather_output=False</code> ({{cite vllm/model_executor/layers/linear.py:1084}}).</p>
+
+<h3>Step 6: RowParallelLinear: split the inputs, add the outputs</h3>
+<x-code file="vllm/model_executor/layers/linear.py" lines="1785-1811" highlight="1789-1795,1800,1803-1806" />
+<ol>
+  <li><strong>Lines 1789-1795.</strong> With <code>input_is_parallel=True</code> (the default) the input is already this rank's slice, <code>[T, in / tp_size]</code>. Else the layer splits the last dimension and keeps its part.</li>
+  <li><strong>Line 1800.</strong> Only rank 0 adds the bias; with TP ranks adding it, the all-reduce would add it TP times.</li>
+  <li><strong>Lines 1803-1806.</strong> With <code>reduce_results=True</code> (the default) and TP &gt; 1, the layer all-reduces the partial sums <code>[T, out]</code>. With <code>False</code>, the caller must reduce later, so a bias is then not allowed unless <code>skip_bias_add</code> is set ({{cite vllm/model_executor/layers/linear.py:1736-1740}}).</li>
+</ol>
+<p>The per-rank sizes are the reverse of the column case: <code>input_size / tp_size</code> and the full output ({{cite vllm/model_executor/layers/linear.py:1692-1696}}). The bias is not split ({{cite vllm/model_executor/layers/linear.py:1742-1745}}).</p>
+
+<h3>Step 7: VocabParallelEmbedding and ParallelLMHead</h3>
+<p>The embedding splits the vocabulary rows across the ranks. First it applies {{term vocab-padding}}: the vocabulary is rounded up to a multiple of <code>padding_size</code>, 64 by default ({{cite vllm/model_executor/layers/vocab_parallel_embedding.py:36}}, {{cite vllm/model_executor/layers/vocab_parallel_embedding.py:95-97}}, {{cite vllm/model_executor/layers/vocab_parallel_embedding.py:286-291}}). Each rank holds <code>padded_vocab / tp_size</code> rows ({{cite vllm/model_executor/layers/vocab_parallel_embedding.py:304-306}}).</p>
+<x-code file="vllm/model_executor/layers/vocab_parallel_embedding.py" lines="541-564" highlight="542-550,557,558-563" />
+<ol>
+  <li><strong>Lines 542-550.</strong> <code>get_masked_input_and_mask</code> shifts each token id into the local row range and marks ids that other ranks own. On CUDA with an unquantized weight, a fused kernel does this instead (lines 527-536).</li>
+  <li><strong>Line 557.</strong> Rows for ids of other ranks become zero.</li>
+  <li><strong>Lines 558-563.</strong> The all-reduce adds the ranks: exactly one rank gives a non-zero row for each token, so the sum is the embedding.</li>
+</ol>
+<p><code>ParallelLMHead</code> has the same weight layout, but its <code>forward</code> raises: the weight is used by <code>LogitsProcessor</code> ({{cite vllm/model_executor/layers/vocab_parallel_embedding.py:640-642}}). <code>LogitsProcessor</code> multiplies the hidden states with the local rows, gathers the vocabulary slices across the TP group, and cuts off the padding ({{cite vllm/model_executor/layers/logits_processor.py:180-199}}). It uses an all-gather: <code>Platform.use_all_gather()</code> returns <code>True</code>, and no built-in platform overrides it ({{cite vllm/platforms/interface.py:1275-1278}}). <code>tie_weights</code> makes the head use the embedding's weight object ({{cite vllm/model_executor/layers/vocab_parallel_embedding.py:88-92}}).</p>
+
+<h3>Step 8: the collectives and the communicator</h3>
+<p>The layers call two small functions. Both use the TP group of this process:</p>
+<x-code file="vllm/distributed/communication_op.py" lines="12-21" />
+<p><code>GroupCoordinator.all_reduce</code> returns the input unchanged when the group has one rank. On CUDA, ROCm, XPU and TPU it calls the registered op <code>torch.ops.vllm.all_reduce</code>, so <code>torch.compile</code> sees one opaque op. Other platforms call the device communicator directly ({{cite vllm/distributed/parallel_state.py:740-746}}, {{cite vllm/distributed/parallel_state.py:571-573}}, for example {{cite vllm/platforms/cuda.py:708-709}}). The CUDA communicator then picks one of several all-reduce implementations, such as custom all-reduce, symmetric-memory NCCL or plain NCCL ({{cite vllm/distributed/device_communicators/cuda_communicator.py:362-446}}). The page {{link concepts/distributed-groups}} explains the groups and the communicators.</p>
+<x-note title="Fused communication">
+<p>vLLM has no sequence-parallel or async-TP pass in <code>vllm/compilation/</code> at this commit. The one TP fusion pass is <code>fuse_allreduce_rms</code>: it fuses the all-reduce with the next RMSNorm through FlashInfer ({{cite vllm/config/compilation.py:136-137}}). At optimization level O2 it is on only with TP &gt; 1, CUDA, FlashInfer and a Hopper or Blackwell GPU, or AITER on ROCm ({{cite vllm/config/vllm.py:178-202}}, {{cite vllm/config/vllm.py:296-301}}). The page {{link concepts/compile-and-cuda-graphs}} explains the passes.</p>
+</x-note>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Per-rank weight shapes of one Llama layer">
+<p>Llama-3.1-8B (and Llama-3-8B) from its Hugging Face <code>config.json</code>: hidden 4,096, intermediate 14,336, 32 query heads, 8 KV heads, head size 128. Weights are <code>[out, in]</code>. These are the per-rank shapes that the formulas of Steps 3-6 give (derived).</p>
+<table>
+  <thead><tr><th>TP</th><th><code>qkv_proj</code></th><th><code>o_proj</code></th><th><code>gate_up_proj</code></th><th><code>down_proj</code></th><th>KV replicas</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><code>[6144, 4096]</code></td><td><code>[4096, 4096]</code></td><td><code>[28672, 4096]</code></td><td><code>[4096, 14336]</code></td><td>1</td></tr>
+    <tr><td>2</td><td><code>[3072, 4096]</code></td><td><code>[4096, 2048]</code></td><td><code>[14336, 4096]</code></td><td><code>[4096, 7168]</code></td><td>1</td></tr>
+    <tr><td>4</td><td><code>[1536, 4096]</code></td><td><code>[4096, 1024]</code></td><td><code>[7168, 4096]</code></td><td><code>[4096, 3584]</code></td><td>1</td></tr>
+    <tr><td>8</td><td><code>[768, 4096]</code></td><td><code>[4096, 512]</code></td><td><code>[3584, 4096]</code></td><td><code>[4096, 1792]</code></td><td>1</td></tr>
+    <tr><td>16</td><td><code>[512, 4096]</code></td><td><code>[4096, 256]</code></td><td><code>[1792, 4096]</code></td><td><code>[4096, 896]</code></td><td>2</td></tr>
+  </tbody>
+</table>
+<p>Read the <code>qkv_proj</code> column: <code>(num_heads + 2 × num_kv_heads) × 128</code>. At TP = 8 that is (4 + 2) × 128 = 768. At TP = 16 it is (2 + 2) × 128 = 512: the query part halves again, but the KV part cannot get smaller than one head. The MLP column for TP = 2 is the table of {{link learn/tp-pp-in-practice}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Vocab padding and masking with real numbers">
+<p>The class docstring gives an example with an original vocabulary of 1,010, 16 LoRA tokens and padding 64 ({{cite vllm/model_executor/layers/vocab_parallel_embedding.py:216-233}}). Without LoRA tokens it goes like this:</p>
+<ol>
+  <li><code>pad_vocab_size(1010, 64)</code> = 1,024. With TP = 2, each rank holds 512 rows.</li>
+  <li>Rank 0 owns ids 0-511. Rank 1 owns ids 512-1009 in its rows 0-497; rows 498-511 are padding.</li>
+  <li>The loader copies 498 rows into rank 1 and fills the rest with zeros ({{cite vllm/model_executor/layers/vocab_parallel_embedding.py:518-520}}).</li>
+  <li>Token id 700 in a batch: rank 0 masks it (out of range) and returns a zero row. Rank 1 looks up row 700 − 512 = 188. The all-reduce gives the row of id 700 on both ranks.</li>
+</ol>
+<p>For Llama-3 the vocabulary is 128,256, which is 2,004 × 64, so there is no padding. With TP = 2 each rank holds 64,128 rows: <code>[64128, 4096]</code>, about 501 MiB in BF16 (derived). The LM head after the gather gives <code>[R, 128256]</code> logits; the slice <code>[..., :org_vocab_size]</code> removes padding columns when there are any ({{cite vllm/model_executor/layers/logits_processor.py:196-198}}).</p>
+</x-deepdive>
+
+<x-deepdive title="weight_loader and weight_loader_v2">
+<p>Every linear class has two loaders. The class picks one when it is built ({{cite vllm/model_executor/layers/linear.py:522-534}}):</p>
+<table>
+  <thead><tr><th></th><th><code>weight_loader</code> (v1)</th><th><code>weight_loader_v2</code></th></tr></thead>
+  <tbody>
+    <tr><td>Used when</td><td>the quantize method's class name is not in <code>WEIGHT_LOADER_V2_SUPPORTED</code></td><td>the name is in the list ({{cite vllm/model_executor/layers/linear.py:50-64}}), for example <code>UnquantizedLinearMethod</code>, <code>Fp8LinearMethod</code>, <code>CompressedTensorsLinearMethod</code></td></tr>
+    <tr><td>Parameter type</td><td>plain <code>Parameter</code> with attributes <code>output_dim</code>, <code>input_dim</code>, <code>packed_dim</code></td><td><code>BasevLLMParameter</code> subclasses, for example <code>ModelWeightParameter</code></td></tr>
+    <tr><td>Where the cut is</td><td>in the layer method ({{cite vllm/model_executor/layers/linear.py:589-606}})</td><td>in the parameter method, for example <code>load_column_parallel_weight</code> ({{cite vllm/model_executor/parameter.py:145-151}})</td></tr>
+  </tbody>
+</table>
+<p>A method can add itself to the list with <code>register_weight_loader_v2_supported_method</code> ({{cite vllm/model_executor/layers/linear.py:67-70}}). The bias of a column-parallel layer always uses v1 (line 555).</p>
+<p>Both families handle quantized storage. <code>packed_dim</code> and <code>packed_factor</code> shrink offsets for packed INT4 weights. Marlin tiles scale them up, and block scales divide by the block size ({{cite vllm/model_executor/layers/linear.py:73-94}}, {{cite vllm/model_executor/layers/linear.py:1292-1309}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Errors and checks">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>A size does not divide by TP</td><td><code>AssertionError</code> "x is not divisible by y"</td><td>{{cite vllm/distributed/utils.py:51-55}}</td></tr>
+    <tr><td>A quant config returns no method for a linear layer</td><td><code>ValueError</code> "All linear layers should support quant method."</td><td>{{cite vllm/model_executor/layers/linear.py:295-296}}</td></tr>
+    <tr><td><code>reduce_results=False</code> with a bias that is added</td><td><code>ValueError</code></td><td>{{cite vllm/model_executor/layers/linear.py:1736-1740}}</td></tr>
+    <tr><td>Shard id other than q, k, v for QKV</td><td><code>ValueError</code></td><td>{{cite vllm/model_executor/layers/linear.py:1093-1099}}</td></tr>
+    <tr><td>Shard id out of range, or a non-consecutive tuple, for merged layers</td><td><code>ValueError</code></td><td>{{cite vllm/model_executor/layers/linear.py:745-770}}</td></tr>
+    <tr><td>A parameter without <code>output_dim</code> in a merged or QKV layer (v1 loader)</td><td>WARNING "assume the weight is the same for all partitions"</td><td>{{cite vllm/model_executor/layers/linear.py:1327-1334}}</td></tr>
+    <tr><td><code>ParallelLMHead.forward</code> called</td><td><code>RuntimeError</code></td><td>{{cite vllm/model_executor/layers/vocab_parallel_embedding.py:640-642}}</td></tr>
+    <tr><td>Embedding with a quantize method that has no <code>embedding()</code></td><td><code>NotImplementedError</code></td><td>{{cite vllm/model_executor/layers/vocab_parallel_embedding.py:326-334}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A TP size that does not fit the model.</strong> Start-up checks the query heads first ({{cite vllm/config/model.py:1559-1564}}). Other sizes fail later, while the layers are built, in <code>divide()</code> or an assertion. Examples are the MLP intermediate size, or a KV head count that does not fit TP ({{cite vllm/model_executor/layers/linear.py:731}}, {{cite vllm/model_executor/layers/linear.py:1066-1071}}).</li>
+  <li><strong>KV replication eats KV cache.</strong> With TP larger than the KV head count, each rank stores one full KV head, so the cluster stores copies ({{cite vllm/model_executor/layers/linear.py:1066-1068}}). TP = 16 for an 8-KV-head model gives twice the KV bytes of TP = 8 in total.</li>
+  <li><strong>A custom layer without a reduce.</strong> A model that sets <code>reduce_results=False</code> must call the all-reduce itself. Without it, each rank keeps a partial sum, and the output is wrong with no error (derived) ({{cite vllm/model_executor/layers/linear.py:1803-1806}}).</li>
+  <li><strong>TP across nodes.</strong> Every decoder layer has two all-reduces on the critical path ({{link learn/tp-pp-in-practice}}). Over a slow network, prefer PP or DP across nodes.</li>
+</ul>
+<p><strong>Why it matters.</strong> These layer classes decide the memory per GPU, the number of collectives per step and the rules for valid TP sizes. When you know them, you can predict the per-GPU shapes of any model and read the errors of a wrong TP size.</p>
+
+<x-quiz>
+  <x-q level="easy">Which flag makes a <code>RowParallelLinear</code> add the partial sums of the ranks, and what is its default?
+    <x-a><p><code>reduce_results</code>, default <code>True</code> ({{cite vllm/model_executor/layers/linear.py:1684}}). The all-reduce runs only when TP &gt; 1 ({{cite vllm/model_executor/layers/linear.py:1803-1806}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>MergedColumnParallelLinear</code> split gate and up separately instead of splitting the stacked matrix once?
+    <x-a><p>So each rank holds matching slices of gate and up, and <code>SiluAndMul</code> can combine them without data from other ranks. The loader puts part <i>i</i> at offset <code>sum(output_sizes[:i]) / tp_size</code> ({{cite vllm/model_executor/layers/linear.py:965-983}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does only rank 0 add the bias in <code>RowParallelLinear.forward</code>?
+    <x-a><p>The all-reduce sums the outputs of all ranks. If every rank added the bias, the sum would contain it TP times ({{cite vllm/model_executor/layers/linear.py:1798-1801}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A model has 32 query heads and 8 KV heads. What is the shape of <code>qkv_proj.weight</code> on each rank with TP = 16, and which checkpoint rows of <code>v_proj</code> does rank 9 load?
+    <x-a><p><code>num_heads</code> = 2, <code>num_kv_heads</code> = 1, replicas = 2 ({{cite vllm/model_executor/layers/linear.py:1065-1068}}), so the weight is <code>[(2 + 1 + 1) × 128, 4096] = [512, 4096]</code>. For v the slice index is 9 // 2 = 4 ({{cite vllm/model_executor/parameter.py:191}}), so rank 9 loads rows 512-639 (KV head 4).</p></x-a>
+  </x-q>
+  <x-q level="hard">With TP = 2, token id 70,000 enters the embedding of a Llama-3 model (vocabulary 128,256). What does each rank compute?
+    <x-a><p>Each rank holds 64,128 rows. Rank 0 owns ids 0-64,127, so it masks the id and returns a zero row. Rank 1 looks up local row 70,000 − 64,128 = 5,872. The all-reduce sums both rows, so both ranks get the embedding of id 70,000 ({{cite vllm/model_executor/layers/vocab_parallel_embedding.py:541-563}}).</p></x-a>
+  </x-q>
+</x-quiz>

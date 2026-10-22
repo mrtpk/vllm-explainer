@@ -1,0 +1,227 @@
+---
+title: How a vLLM model file is written (llama.py)
+nav_title: Model definition
+level: Advanced
+prerequisites: concepts/oot-models, learn/pytorch-for-serving, learn/tp-pp-in-practice
+related: concepts/weight-loading, concepts/tp-layers, code/model-executor-models-llama, concepts/model-interfaces, concepts/custom-ops, concepts/forward-context, concepts/compile-and-cuda-graphs, code/model-executor-layers-linear
+summary: A vLLM model file rebuilds the Hugging Face architecture from vLLM layers. Every constructor takes vllm_config and a prefix, linear layers are tensor-parallel, attention is an Attention layer object, and pipeline stages use PPMissingLayer and IntermediateTensors. llama.py is the example.
+---
+<x-sentence>A vLLM model file builds the network from tensor-parallel layers, names every layer with a prefix, and leaves attention, compilation and weight loading to vLLM.</x-sentence>
+
+<h2>The idea</h2>
+<p>A decoder model is a stack of layers: an embedding, N decoder layers and an LM head. Each decoder layer has a norm, attention, a norm and an MLP ({{deepinfer learn/transformer | Inside a transformer}}). vLLM does not run the Transformers class of the checkpoint. It runs its own class for the architecture name, for example <code>LlamaForCausalLM</code> in <code>vllm/model_executor/models/llama.py</code> ({{link concepts/oot-models}}).</p>
+<p>The vLLM class has the same math and the same parameter tree as the Transformers class. It differs in four ways:</p>
+<ul>
+  <li><strong>Constructor contract.</strong> Every class takes <code>vllm_config</code> (the whole {{term vllm-config}}) and a {{term model-prefix}}, the dotted name of the layer in the tree.</li>
+  <li><strong>Tensor-parallel layers.</strong> Linear layers and the embedding are vLLM classes that hold only the slice of this {{term tensor-parallel}} rank, and do the communication themselves ({{link concepts/tp-layers}}).</li>
+  <li><strong>An attention layer object.</strong> The model gives Q, K and V to an <code>Attention</code> layer. That layer finds its KV cache and the metadata of the step itself, through the {{term forward-context}} ({{link concepts/forward-context}}).</li>
+  <li><strong>Pipeline stages.</strong> Layers that another {{term pipeline-parallel}} stage owns are placeholders, and a stage that is not the last returns {{term intermediate-tensors}} instead of hidden states.</li>
+</ul>
+<p>Other work is not in the model file. A decorator adds <code>torch.compile</code>; the compile backend and the model runner add CUDA graphs. A loader streams the weights in, and each parameter cuts its own slice ({{link concepts/weight-loading}}). Mixin classes tell the registry what the model supports ({{link concepts/model-interfaces}}).</p>
+<p><strong>An everyday comparison.</strong> Think of a new office building. The builders put a room number on every door, such as "3.12.B" (floor, corridor, room). Later, the furniture company, the phone list and the cleaning plan all use these numbers. A door with a wrong number gets the wrong desk or no phone. The comparison stops here. In vLLM, nobody checks the number on the door. Two systems read the number, and two systems walk the real module tree. When the number and the path are different, the systems disagree.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b6a_llama_tree" alt="A tree of rows. LlamaForCausalLM, prefix empty, with mixins LoRA, PP, Eagle and Quant. Child model: LlamaModel, prefix model, with support_torch_compile. Its children: embed_tokens, a VocabParallelEmbedding with no prefix passed, weight 64128 by 4096 per rank, on the first PP rank and also on the last when the head is tied; layers, a ModuleList of 32 made by make_layers, prefix model.layers. Layer 0 is a LlamaDecoderLayer with prefix model.layers.0. Its children: input_layernorm RMSNorm, a CustomOp; self_attn LlamaAttention with prefix model.layers.0.self_attn and 16 query heads and 4 KV heads per rank; under it qkv_proj QKVParallelLinear, column-parallel, weight 3072 by 4096; rotary_emb RotaryEmbedding, a CustomOp shared by all layers; attn Attention, the key in static_forward_context; o_proj RowParallelLinear, row-parallel with an all-reduce, weight 4096 by 2048. Then post_attention_layernorm RMSNorm; mlp LlamaMLP with gate_up_proj MergedColumnParallelLinear, weight 2 times 7168 by 4096, act_fn SiluAndMul, and down_proj RowParallelLinear, weight 4096 by 7168, with an all-reduce. Layers 1 to 31 are the same, or PPMissingLayer on another stage. Then norm RMSNorm on the last PP rank, lm_head ParallelLMHead with prefix lm_head, weight 64128 by 4096, and logits_processor LogitsProcessor with an all-gather." caption="Figure: the module tree of LlamaForCausalLM. Each row shows the attribute, the class, the prefix that the parent passes, and the per-rank weight shape for Llama-3-8B with TP = 2. Colour shows the kind of layer." />
+<p>Read the tree from the top. Each parent passes a longer prefix to its children, so the prefix of a row is the dotted path to it. Blue and violet rows are the tensor-parallel linear layers. The amber row is the attention layer that registers itself under its prefix.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the constructor contract</h3>
+<p>The worker builds the model in <code>initialize_model()</code>. It checks by name that the constructor has the parameters <code>vllm_config</code> and <code>prefix</code>. Then it calls the class with both, inside <code>set_current_vllm_config</code> ({{cite vllm/model_executor/model_loader/utils.py:96-103}}). A class without them gets a <code>DeprecationWarning</code> and an argument guess; {{link concepts/oot-models}} explains that path. The root gets <code>prefix=""</code>: Model Runner V2 calls <code>load_model()</code> without a prefix, so the default <code>""</code> goes to <code>create_model()</code> ({{cite vllm/v1/worker/gpu/model_runner.py:403-406}}, {{cite vllm/model_executor/model_loader/base_loader.py:63-80}}).</p>
+<x-code file="vllm/model_executor/models/llama.py" lines="484-521" highlight="487-488,492-493,496-500,502-508,519-521" />
+<ol>
+  <li><strong>Lines 487-488.</strong> Keyword-only <code>vllm_config</code> and <code>prefix</code>. The registry also checks the keyword <code>vllm_config</code> when it inspects the class ({{link concepts/model-interfaces}}).</li>
+  <li><strong>Lines 492-493.</strong> The model reads what it needs from <code>vllm_config</code>: the Hugging Face config and the quantization config. Inner classes do the same.</li>
+  <li><strong>Lines 496-500.</strong> The inner model gets the prefix <code>maybe_prefix(prefix, "model")</code>, which is <code>"model"</code> for the root ({{cite vllm/model_executor/models/utils.py:971-982}}).</li>
+  <li><strong>Lines 502-508.</strong> Only the last pipeline stage builds the LM head.</li>
+  <li><strong>Lines 519-521.</strong> The model exposes a factory for empty intermediate tensors; pipeline parallelism needs it.</li>
+</ol>
+
+<h3>Step 2: how each layer gets its prefix, and why it matters</h3>
+<p>Each constructor adds the attribute name to the prefix it got. The decoder layer gives <code>f"{prefix}.self_attn"</code> and <code>f"{prefix}.mlp"</code> ({{cite vllm/model_executor/models/llama.py:285-307}}). The attention class gives <code>.qkv_proj</code>, <code>.o_proj</code> and <code>.attn</code> ({{cite vllm/model_executor/models/llama.py:165-181}}, {{cite vllm/model_executor/models/llama.py:212-222}}). <code>make_layers()</code> builds the list of decoder layers with <code>prefix=f"{prefix}.{idx}"</code> ({{cite vllm/model_executor/models/utils.py:911-917}}). So the QKV layer of layer 0 gets the prefix <code>model.layers.0.self_attn.qkv_proj</code>.</p>
+<p>Four parts of vLLM use the name of a layer:</p>
+<table>
+  <thead><tr><th>Who</th><th>Reads</th><th>What it does with it</th></tr></thead>
+  <tbody>
+    <tr><td>Quantization config</td><td>the <code>prefix</code> argument</td><td><code>get_quant_method(layer, prefix)</code>, where the prefix is "the full name of the layer in the state dict" ({{cite vllm/model_executor/layers/quantization/base_config.py:203-217}}). Each linear layer calls it in its constructor ({{cite vllm/model_executor/layers/linear.py:290-296}}). FP8, for example, leaves a layer unquantized when the prefix is in <code>ignored_layers</code> ({{cite vllm/model_executor/layers/quantization/fp8.py:177-187}}). The default match is an exact string compare ({{cite vllm/model_executor/layers/quantization/utils/quant_utils.py:624-625}}).</td></tr>
+    <tr><td>Attention layer</td><td>the <code>prefix</code> argument</td><td>Registers itself as <code>static_forward_context[prefix]</code>; a second layer with the same prefix raises <code>ValueError</code> ({{cite vllm/model_executor/layers/attention/attention.py:443-445}}). The model runner binds each KV cache tensor by this name ({{cite vllm/v1/worker/utils.py:879-880}}). The layer index for sliding windows comes from the prefix too ({{cite vllm/model_executor/models/llama.py:141}}).</td></tr>
+    <tr><td>Weight loading</td><td>the module tree</td><td><code>AutoWeightsLoader</code> matches checkpoint names to <code>named_children()</code> and <code>named_parameters()</code>, not to the prefix ({{cite vllm/model_executor/models/utils.py:402-424}}).</td></tr>
+    <tr><td>LoRA</td><td>the module tree</td><td>The LoRA manager walks <code>model.named_modules()</code> to find the layers to wrap ({{cite vllm/lora/model_manager.py:486}}).</td></tr>
+  </tbody>
+</table>
+<p>No code checks that the prefix equals the attribute path of the layer. But the quantization config compares the prefix with checkpoint names, and the weight loader and LoRA use the module tree. So use the attribute path as the prefix; then all four parts use the same name (derived from the four rows above). The section <em>What can go wrong</em> gives the failures.</p>
+
+<h3>Step 3: tensor-parallel layers</h3>
+<p><code>LlamaAttention</code> divides the heads by the TP size and builds a <code>QKVParallelLinear</code> and a <code>RowParallelLinear</code>:</p>
+<x-code file="vllm/model_executor/models/llama.py" lines="143-181" highlight="145-146,148-156,160-161,165-173,175-181" />
+<ol>
+  <li><strong>Lines 145-146.</strong> The query heads must divide by the TP size. Start-up checks this earlier, with a clear error ({{cite vllm/config/model.py:1557-1564}}).</li>
+  <li><strong>Lines 148-156.</strong> KV heads are split when there are enough of them, and replicated when TP is larger ({{link learn/tp-pp-in-practice}} has the table).</li>
+  <li><strong>Lines 160-161.</strong> <code>q_size</code> and <code>kv_size</code> are per rank. The forward pass splits the QKV output with them.</li>
+  <li><strong>Lines 165-181.</strong> The model gives the <em>total</em> head counts to <code>QKVParallelLinear</code> and the <em>full</em> input size to <code>o_proj</code>. The layers divide by the TP size themselves.</li>
+</ol>
+<p><code>LlamaMLP</code> uses a <code>MergedColumnParallelLinear</code> for gate and up, and a <code>RowParallelLinear</code> for down ({{cite vllm/model_executor/models/llama.py:95-111}}); {{link learn/tp-pp-in-practice}} shows the shapes. The embedding is a <code>VocabParallelEmbedding</code> and the head is a <code>ParallelLMHead</code> ({{cite vllm/model_executor/models/llama.py:382-386}}, {{cite vllm/model_executor/models/llama.py:503-508}}). The model code calls no collective itself. The page {{link concepts/tp-layers}} explains each layer class.</p>
+
+<h3>Step 4: the attention layer and the CustomOps</h3>
+<x-code file="vllm/model_executor/models/llama.py" lines="206-234" highlight="212-222,229-233" />
+<ol>
+  <li><strong>Lines 212-222.</strong> <code>Attention</code> gets the per-rank head counts, the scale, the cache and quantization configs, an optional sliding window, and its prefix. When it is built, it selects an {{term attention-backend}}, unless the caller gives one ({{cite vllm/model_executor/layers/attention/attention.py:349-350}}). It also registers itself in the forward context.</li>
+  <li><strong>Line 229.</strong> One GEMM computes Q, K and V for the heads of this rank: <code>[T, q_size + 2 × kv_size]</code>.</li>
+  <li><strong>Lines 230-231.</strong> The split, then RoPE on Q and K.</li>
+  <li><strong>Line 232.</strong> <code>self.attn(q, k, v)</code> passes no KV cache and no metadata. The attention op uses the layer name to find the metadata and the layer object (with its KV cache) in the forward context ({{cite vllm/model_executor/layers/attention/attention.py:705-717}}). The page {{link concepts/forward-context}} explains how.</li>
+  <li><strong>Line 233.</strong> The row-parallel <code>o_proj</code> adds the partial sums of the ranks.</li>
+</ol>
+<p>Three small layers are {{term custom-op | CustomOps}}: <code>RMSNorm</code> ({{cite vllm/model_executor/layers/layernorm.py:38-39}}), the rotary embedding from <code>get_rope()</code> ({{cite vllm/model_executor/layers/rotary_embedding/base.py:14-15}}) and <code>SiluAndMul</code> ({{cite vllm/model_executor/layers/activation.py:115-116}}). Each one picks its forward method when it is built ({{link concepts/custom-ops}}). <code>get_rope()</code> keeps a cache keyed by its arguments, so all 32 layers share one rotary object ({{cite vllm/model_executor/layers/rotary_embedding/__init__.py:84-85}}, {{cite vllm/model_executor/layers/rotary_embedding/__init__.py:351}}).</p>
+
+<h3>Step 5: LlamaModel, compilation and pipeline stages</h3>
+<x-code file="vllm/model_executor/models/llama.py" lines="337-346" caption="<code>@support_torch_compile</code> on the inner model. Dimension 0 of each tensor argument (the token count) is dynamic." />
+<p>The decorator wraps <code>LlamaModel.forward</code> for <code>torch.compile</code> and CUDA graphs ({{link concepts/compile-and-cuda-graphs}}). It sits on <code>LlamaModel</code>, not on <code>LlamaForCausalLM</code>, so <code>compute_logits</code> stays outside the compiled graph.</p>
+<p>The constructor builds the parts of this pipeline stage only:</p>
+<x-code file="vllm/model_executor/models/llama.py" lines="377-401" highlight="377-388,389-393,394-397,399-401" />
+<ol>
+  <li><strong>Lines 377-388.</strong> The embedding is real on the first stage. It is also real on the last stage when the head shares its weight, or when a speculative drafter needs it. Elsewhere it is a {{term pp-missing-layer}}.</li>
+  <li><strong>Lines 389-393.</strong> <code>make_layers()</code> builds real layers only for indices <code>start_layer</code> to <code>end_layer - 1</code>. All other slots are <code>PPMissingLayer</code>, so the indices and names stay the same on every stage ({{cite vllm/model_executor/models/utils.py:886-919}}).</li>
+  <li><strong>Lines 394-397.</strong> The final norm exists on the last stage only.</li>
+  <li><strong>Lines 399-401.</strong> Empty intermediate tensors have the keys <code>hidden_states</code> and <code>residual</code>, each <code>[batch_size, hidden_size]</code> of zeros ({{cite vllm/model_executor/models/utils.py:955-968}}).</li>
+</ol>
+<x-code file="vllm/model_executor/models/llama.py" lines="406-457" highlight="414-423,432-438,443-450,452" />
+<ol>
+  <li><strong>Lines 414-423.</strong> The first stage starts from the token embeddings, or from <code>inputs_embeds</code> when the runner gives them. Other stages read <code>hidden_states</code> and <code>residual</code> from the stage before.</li>
+  <li><strong>Lines 432-438.</strong> The loop runs only the layers of this stage. Each layer returns the new hidden states and the residual.</li>
+  <li><strong>Lines 443-450.</strong> A stage that is not the last returns <code>IntermediateTensors</code>.</li>
+  <li><strong>Line 452.</strong> The last stage applies the final norm. It returns hidden states of shape <code>[T, hidden_size]</code>, not logits.</li>
+</ol>
+<p>The decoder layer keeps the residual outside the norm. <code>input_layernorm(hidden_states, residual)</code> adds the residual and normalizes in one call, and returns both tensors ({{cite vllm/model_executor/models/llama.py:320-328}}, {{cite vllm/model_executor/layers/layernorm.py:85-99}}).</p>
+
+<h3>Step 6: LlamaForCausalLM: forward, logits and mixins</h3>
+<x-code file="vllm/model_executor/models/llama.py" lines="534-561" highlight="541-543,550,557,560-561" />
+<ol>
+  <li><strong>Lines 541-543.</strong> <code>forward(input_ids, positions, intermediate_tensors, inputs_embeds)</code> only calls the inner model. The model runner builds these four arguments ({{cite vllm/v1/worker/gpu/model_runner.py:1984-2009}}).</li>
+  <li><strong>Line 550.</strong> <code>compute_logits</code> applies the head through <code>LogitsProcessor</code>. To sample, the runner calls it only on the rows that sample a token, <code>hidden_states[logits_indices]</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1637-1638}}). Prompt logprobs call it on prompt rows too ({{cite vllm/v1/worker/gpu/model_runner.py:2177-2178}}).</li>
+  <li><strong>Line 557.</strong> <code>compute_logits_local</code> skips the gather. The runner uses it for batch-sharded sampling.</li>
+  <li><strong>Lines 560-561.</strong> <code>load_weights</code> hands the checkpoint stream to <code>AutoWeightsLoader</code> ({{link concepts/weight-loading}}).</li>
+</ol>
+<p>The class header lists the mixins ({{cite vllm/model_executor/models/llama.py:464-472}}):</p>
+<table>
+  <thead><tr><th>Mixin</th><th>What it adds</th></tr></thead>
+  <tbody>
+    <tr><td><code>SupportsLoRA</code></td><td>LoRA support; with <code>packed_modules_mapping</code> and <code>embedding_modules</code> ({{cite vllm/model_executor/models/llama.py:474-482}})</td></tr>
+    <tr><td><code>SupportsPP</code></td><td>pipeline parallelism; the factory of lines 519-521 is its required member</td></tr>
+    <tr><td><code>SupportsEagle</code>, <code>SupportsEagle3</code></td><td>the model can be the target of EAGLE drafts; EAGLE-3 reads auxiliary hidden states ({{cite vllm/model_executor/models/interfaces.py:1684-1740}})</td></tr>
+    <tr><td><code>SupportsQuant</code></td><td>its <code>__new__</code> stores the quant config on the model and gives the config the rename rules of <code>hf_to_vllm_mapper</code> and the <code>packed_modules_mapping</code> ({{cite vllm/model_executor/models/interfaces.py:1260-1299}}). For Llama the rename part is empty, because <code>get_rename_mapper()</code> drops the stacked rules ({{cite vllm/model_executor/models/utils.py:180-199}}).</td></tr>
+    <tr><td><code>LocalArgmaxMixin</code></td><td><code>get_top_tokens</code> for a speculative-decoding draft: each rank takes the argmax of its vocabulary slice, and the ranks all-gather only (value, index) pairs, not the full logits ({{cite vllm/model_executor/models/interfaces.py:1570-1605}}, {{cite vllm/model_executor/layers/logits_processor.py:231-250}})</td></tr>
+  </tbody>
+</table>
+<p><code>LlamaModel</code> also inherits <code>EagleModelMixin</code>, which collects the hidden states of chosen layers for EAGLE-3 ({{cite vllm/model_executor/models/interfaces.py:1608-1681}}). The page {{link concepts/model-interfaces}} explains how the registry detects each protocol.</p>
+
+<h3>Step 7: how other files reuse llama.py</h3>
+<p>Nine registry names point to <code>llama.py</code>. Seven of them use <code>LlamaForCausalLM</code> directly, for example <code>InternLM3ForCausalLM</code> and <code>TeleChat3ForCausalLM</code> ({{cite vllm/model_executor/models/registry.py:140-155}}, {{cite vllm/model_executor/models/registry.py:212}}). The embedding table also copies every name that maps to <code>LlamaForCausalLM</code> ({{cite vllm/model_executor/models/registry.py:231-238}}). (Counts from an evaluation of the tables at this commit.)</p>
+<p>Other model files subclass the Llama classes. <code>MistralForCausalLM</code> subclasses <code>LlamaForCausalLM</code> ({{cite vllm/model_executor/models/mistral.py:236}}), and so does <code>Phi3ForCausalLM</code> ({{cite vllm/model_executor/models/phi3.py:10}}). <code>TeleChat2ForCausalLM</code> adds its own name mapper and builds <code>TeleChat2Model</code>, a subclass of <code>LlamaModel</code> ({{cite vllm/model_executor/models/telechat2.py:107-127}}, {{cite vllm/model_executor/models/telechat2.py:35}}). 21 files in <code>vllm/</code> import from <code>llama.py</code> (git grep at this commit). The file has two hooks for this reuse:</p>
+<ul>
+  <li>A <code>layer_type</code> argument, so a subclass can give its own decoder layer class ({{cite vllm/model_executor/models/llama.py:360-366}}, {{cite vllm/model_executor/models/llama.py:523-529}}).</li>
+  <li><code>LlamaDecoderLayer.get_quant_config()</code>, which the docstring says to override in subclasses ({{cite vllm/model_executor/models/llama.py:332-334}}).</li>
+</ul>
+
+<h3>A second model tree: vllm/models/</h3>
+<p>Some new model families do not live in <code>vllm/model_executor/models/</code>. They have one package per family in <code>vllm/models/</code>, with sub-packages per hardware vendor. The package <code>__init__.py</code> imports the implementation for <code>current_platform</code>, for example the NVIDIA, AMD, XPU or CPU variant of DeepSeek V4 ({{cite vllm/models/deepseek_v4/__init__.py:1-48}}). For the registry they are normal lazy entries ({{link concepts/oot-models}}). This site does not explain these packages further; <code>llama.py</code> is the one model example.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: shapes through one step, Llama-3-8B with TP = 2">
+<p>The numbers come from the Llama-3-8B <code>config.json</code> on the Hugging Face Hub, not from the vLLM repository. Hidden size 4,096, intermediate size 14,336, 32 layers. 32 query heads, 8 KV heads, head size 128, vocabulary 128,256. Take a step with T = 2,048 tokens, of which R = 16 sample a token. All shapes are per rank.</p>
+<table>
+  <thead><tr><th>Step</th><th>Code</th><th>Shape per rank</th></tr></thead>
+  <tbody>
+    <tr><td>input ids, positions</td><td><code>forward(input_ids, positions, ...)</code></td><td><code>[2048]</code> each (one flat list of tokens)</td></tr>
+    <tr><td>embedding (after its all-reduce)</td><td>llama.py:418</td><td><code>[2048, 4096]</code></td></tr>
+    <tr><td><code>qkv_proj</code> output</td><td>llama.py:229</td><td><code>[2048, 2048 + 512 + 512] = [2048, 3072]</code></td></tr>
+    <tr><td>split</td><td>llama.py:230</td><td>q <code>[2048, 2048]</code>, k <code>[2048, 512]</code>, v <code>[2048, 512]</code></td></tr>
+    <tr><td>attention output</td><td>attention.py:529</td><td><code>[2048, 16 × 128] = [2048, 2048]</code></td></tr>
+    <tr><td><code>o_proj</code> (after all-reduce)</td><td>llama.py:233</td><td><code>[2048, 4096]</code></td></tr>
+    <tr><td><code>gate_up_proj</code></td><td>llama.py:119</td><td><code>[2048, 2 × 7168]</code></td></tr>
+    <tr><td><code>SiluAndMul</code></td><td>llama.py:120</td><td><code>[2048, 7168]</code></td></tr>
+    <tr><td><code>down_proj</code> (after all-reduce)</td><td>llama.py:121</td><td><code>[2048, 4096]</code></td></tr>
+    <tr><td>final norm</td><td>llama.py:452</td><td><code>[2048, 4096]</code></td></tr>
+    <tr><td>rows that sample</td><td>model_runner.py:1637</td><td><code>[16, 4096]</code></td></tr>
+    <tr><td>logits on this rank</td><td>logits_processor.py:188</td><td><code>[16, 64128]</code></td></tr>
+    <tr><td>logits after the gather</td><td>logits_processor.py:193-198</td><td><code>[16, 128256]</code></td></tr>
+  </tbody>
+</table>
+<p>Each decoder layer does two all-reduces of <code>[2048, 4096]</code> BF16 values: one in <code>o_proj</code> and one in <code>down_proj</code>. The embedding adds one more all-reduce per step ({{cite vllm/model_executor/layers/vocab_parallel_embedding.py:558-563}}). So a step has 2 × 32 + 1 = 65 all-reduces of 16 MiB each (derived). The logits add one all-gather of <code>[16, 64128]</code> per rank. Batch-sharded sampling, which is off by default, changes this last step ({{cite vllm/config/parallel.py:192-198}}).</p>
+<x-simplified><p>The table ignores CUDA graph padding of T and the fused all-reduce paths. The attention output size uses <code>num_heads × head_size_v</code>, which equals 2,048 here ({{cite vllm/model_executor/layers/attention/attention.py:525-529}}).</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="All prefixes of one decoder layer">
+<p>The root prefix is <code>""</code>. These are the prefixes that the constructors build for layer 0 (derived by following the f-strings of llama.py):</p>
+<table>
+  <thead><tr><th>Module</th><th>Prefix</th><th>Built at</th></tr></thead>
+  <tbody>
+    <tr><td><code>LlamaModel</code></td><td><code>model</code></td><td>{{cite vllm/model_executor/models/llama.py:498}}</td></tr>
+    <tr><td><code>LlamaDecoderLayer</code></td><td><code>model.layers.0</code></td><td>{{cite vllm/model_executor/models/llama.py:389-393}}, {{cite vllm/model_executor/models/utils.py:914}}</td></tr>
+    <tr><td><code>LlamaAttention</code></td><td><code>model.layers.0.self_attn</code></td><td>{{cite vllm/model_executor/models/llama.py:297}}</td></tr>
+    <tr><td><code>QKVParallelLinear</code></td><td><code>model.layers.0.self_attn.qkv_proj</code></td><td>{{cite vllm/model_executor/models/llama.py:172}}</td></tr>
+    <tr><td><code>RowParallelLinear</code> (o)</td><td><code>model.layers.0.self_attn.o_proj</code></td><td>{{cite vllm/model_executor/models/llama.py:180}}</td></tr>
+    <tr><td><code>Attention</code></td><td><code>model.layers.0.self_attn.attn</code></td><td>{{cite vllm/model_executor/models/llama.py:221}}</td></tr>
+    <tr><td><code>LlamaMLP</code></td><td><code>model.layers.0.mlp</code></td><td>{{cite vllm/model_executor/models/llama.py:306}}</td></tr>
+    <tr><td><code>MergedColumnParallelLinear</code></td><td><code>model.layers.0.mlp.gate_up_proj</code></td><td>{{cite vllm/model_executor/models/llama.py:101}}</td></tr>
+    <tr><td><code>RowParallelLinear</code> (down)</td><td><code>model.layers.0.mlp.down_proj</code></td><td>{{cite vllm/model_executor/models/llama.py:110}}</td></tr>
+    <tr><td><code>ParallelLMHead</code></td><td><code>lm_head</code></td><td>{{cite vllm/model_executor/models/llama.py:507}}</td></tr>
+    <tr><td><code>VocabParallelEmbedding</code></td><td>none passed (default <code>""</code>)</td><td>{{cite vllm/model_executor/models/llama.py:382-386}}, {{cite vllm/model_executor/layers/vocab_parallel_embedding.py:260}}</td></tr>
+  </tbody>
+</table>
+<p>The Llama embedding gets the prefix <code>""</code>. So a name in a quantization config, such as <code>model.embed_tokens</code>, cannot match it: an exact or suffix compare with <code>""</code> fails ({{cite vllm/model_executor/layers/quantization/utils/quant_utils.py:624-637}}). compressed-tensors can still match it by its class name, for example with the target <code>Embedding</code> ({{cite vllm/model_executor/layers/quantization/compressed_tensors/utils.py:105-109}}, {{cite vllm/model_executor/layers/quantization/utils/config_utils.py:444-445}}). (Derived.)</p>
+<p><code>extract_layer_index()</code> finds the one integer in a prefix: <code>model.layers.0.self_attn</code> gives 0. A prefix with two integers fails its assertion, unless the caller says that a layer has several attention modules ({{cite vllm/model_executor/models/utils.py:1010-1042}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Pipeline parallelism in the model file, step by step">
+<p>Take 32 layers and PP = 2. <code>get_pp_indices()</code> gives stage 0 the layers 0-15 and stage 1 the layers 16-31 ({{link learn/tp-pp-in-practice}} explains the split rule).</p>
+<ol>
+  <li><strong>Build, stage 0.</strong> <code>embed_tokens</code> is real. <code>layers[0:16]</code> are real; <code>layers[16:32]</code> are <code>PPMissingLayer</code>. <code>norm</code> and <code>lm_head</code> are <code>PPMissingLayer</code>, and there is no <code>logits_processor</code> ({{cite vllm/model_executor/models/llama.py:502-517}}).</li>
+  <li><strong>Build, stage 1.</strong> <code>embed_tokens</code> is <code>PPMissingLayer</code> unless the head shares its weight or a speculative drafter needs it. <code>layers[0:16]</code> are placeholders; <code>norm</code>, <code>lm_head</code> and <code>logits_processor</code> are real.</li>
+  <li><strong>Forward, stage 0.</strong> Embed, run layers 0-15, return <code>IntermediateTensors({"hidden_states", "residual"})</code>, each <code>[T, 4096]</code>.</li>
+  <li><strong>Forward, stage 1.</strong> The runner fills its own buffers from the received tensors and passes them as <code>intermediate_tensors</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1993-2009}}). The model reads them (llama.py lines 421-423), runs layers 16-31, then the final norm.</li>
+  <li><strong>Weights.</strong> <code>AutoWeightsLoader</code> skips every <code>PPMissingLayer</code>, so the checkpoint tensors of other stages are read but not stored ({{cite vllm/model_executor/models/utils.py:382-383}}). Hand-written loaders call <code>is_pp_missing_parameter()</code> instead ({{cite vllm/model_executor/models/utils.py:944-952}}).</li>
+</ol>
+<p><code>PPMissingLayer</code> is a <code>torch.nn.Identity</code> whose <code>forward</code> returns its first argument ({{cite vllm/model_executor/models/utils.py:852-860}}). <code>IntermediateTensors</code> is a thin wrapper around a dict of tensors, with indexing by key or by slice ({{cite vllm/sequence.py:12-34}}). With EAGLE-3 and PP, the dict also carries keys <code>aux_hidden_states_&lt;i&gt;</code> ({{cite vllm/model_executor/models/interfaces.py:1652-1661}}).</p>
+</x-deepdive>
+
+<x-deepdive title="A checklist for your own model file (derived from llama.py)">
+<ol>
+  <li>Constructors take <code>vllm_config</code> and <code>prefix</code>; children get <code>f"{prefix}.{attr}"</code> or <code>maybe_prefix(prefix, attr)</code>.</li>
+  <li>Linear layers are <code>QKVParallelLinear</code>, <code>MergedColumnParallelLinear</code>, <code>RowParallelLinear</code> or <code>ReplicatedLinear</code>, each with <code>quant_config</code> and <code>prefix</code>.</li>
+  <li>Attention is an <code>Attention</code> layer with the per-rank head counts and a unique prefix.</li>
+  <li>The inner model has <code>embed_input_ids</code> and <code>forward(input_ids, positions, intermediate_tensors, inputs_embeds)</code>; the outer class has <code>compute_logits</code>. The registry checks these names ({{link concepts/model-interfaces}}).</li>
+  <li>For PP: build layers with <code>make_layers</code>, use <code>PPMissingLayer</code>, return <code>IntermediateTensors</code>, set <code>make_empty_intermediate_tensors</code>, and inherit <code>SupportsPP</code>.</li>
+  <li>For loading: a <code>load_weights</code> with <code>AutoWeightsLoader</code> and a <code>WeightsMapper</code> for stacked parameters ({{link concepts/weight-loading}}).</li>
+  <li>For LoRA: <code>packed_modules_mapping</code> that lists the parts of each stacked layer.</li>
+</ol>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Two attention layers with the same prefix.</strong> The second one raises <code>ValueError: Duplicate layer name</code> while the model is built ({{cite vllm/model_executor/layers/attention/attention.py:443-444}}). A model that builds its layers in a loop must put the index in the prefix.</li>
+  <li><strong>A prefix that is not the real path.</strong> No error occurs at once. The quantization config compares the wrong name with its lists, so a layer can get the wrong method. For example, it can get FP8 although the checkpoint lists it in <code>ignored_layers</code> ({{cite vllm/model_executor/layers/quantization/fp8.py:180-190}}). An attention prefix without exactly one layer number fails the assertion of <code>extract_layer_index()</code> ({{cite vllm/model_executor/models/llama.py:141}}, {{cite vllm/model_executor/models/utils.py:1027-1030}}).</li>
+  <li><strong>Heads that do not divide.</strong> 32 query heads with TP = 3 stop start-up with "must be divisible by tensor parallel size" ({{cite vllm/config/model.py:1559-1564}}).</li>
+  <li><strong>Another activation.</strong> <code>LlamaMLP</code> accepts only <code>silu</code> and raises <code>ValueError</code> for other values of <code>hidden_act</code> ({{cite vllm/model_executor/models/llama.py:112-115}}).</li>
+  <li><strong>PP on a model without the mixin.</strong> Start-up raises <code>NotImplementedError</code> when the class does not implement <code>SupportsPP</code> ({{cite vllm/config/model.py:1569-1576}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> A new architecture, a fork of a model, or an out-of-tree model plugin starts with a file like <code>llama.py</code>. Learn the contract, the prefixes and the TP layer classes. Then you can read any model file in vLLM. You can also write a new one that works with quantization, LoRA, PP and <code>torch.compile</code>.</p>
+
+<x-quiz>
+  <x-q level="easy">Which two constructor parameters must every vLLM model class have, and who checks them?
+    <x-a><p><code>vllm_config</code> and <code>prefix</code>. <code>initialize_model()</code> checks the constructor signature by name; without both, it warns and guesses the arguments ({{cite vllm/model_executor/model_loader/utils.py:96-112}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">What prefix does the QKV layer of decoder layer 5 get, and which component would break if the prefix were <code>"qkv"</code> only?
+    <x-a><p><code>model.layers.5.self_attn.qkv_proj</code> (llama.py lines 172, 297, 498 and <code>make_layers</code>). With <code>"qkv"</code>, the quantization config would look up the wrong name, for example in FP8's <code>ignored_layers</code> check ({{cite vllm/model_executor/layers/quantization/fp8.py:177-187}}). Weight loading would still work, because <code>AutoWeightsLoader</code> uses the module tree.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>LlamaAttention.forward</code> not pass the KV cache or the attention metadata to <code>self.attn</code>?
+    <x-a><p>The <code>Attention</code> layer registered itself under its prefix in <code>static_forward_context</code> ({{cite vllm/model_executor/layers/attention/attention.py:443-445}}). The runner binds the KV cache by that name. It also sets the metadata in the forward context before each step, so the attention op finds both by the layer name ({{cite vllm/model_executor/layers/attention/attention.py:705-717}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A Llama with 32 layers runs with PP = 2 and TP = 2. How many all-reduces does the first stage do per step, and what does it return?
+    <x-a><p>Stage 0 runs layers 0-15, each with two all-reduces (<code>o_proj</code>, <code>down_proj</code>), plus one in the embedding: 33 (derived from {{cite vllm/model_executor/layers/linear.py:1803-1806}} and {{cite vllm/model_executor/layers/vocab_parallel_embedding.py:558-563}}). It returns <code>IntermediateTensors</code> with <code>hidden_states</code> and <code>residual</code>, each <code>[T, 4096]</code> ({{cite vllm/model_executor/models/llama.py:443-450}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Why is <code>@support_torch_compile</code> on <code>LlamaModel</code> and not on <code>LlamaForCausalLM</code>? Name one consequence.
+    <x-a><p>The decorator wraps the <code>forward</code> of the class it decorates ({{cite vllm/model_executor/models/llama.py:337-347}}). <code>compute_logits</code> is a method of <code>LlamaForCausalLM</code>, so the runner calls it outside the compiled graph of <code>LlamaModel</code>. To sample, it passes only the rows in <code>logits_indices</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1637-1638}}).</p></x-a>
+  </x-q>
+</x-quiz>
