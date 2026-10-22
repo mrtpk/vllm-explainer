@@ -1,0 +1,368 @@
+---
+title: Tour: Build a toy plugin
+nav_title: Build a toy plugin
+level: Intermediate
+prerequisites: concepts/plugin-loading, learn/python-entry-points, tours/life-of-a-plugin
+related: concepts/plugin-loading, concepts/plugin-map, concepts/oot-models, concepts/model-interfaces, concepts/custom-ops, concepts/frontend-plugins, concepts/platform-plugins, tours/life-of-a-plugin, code/plugins-init
+summary: Build a small plugin package in 9 stops, with vLLM's own test plugins as templates - entry points in pyproject.toml, a general plugin that registers a lazy model and an RMSNorm replacement, the switch that makes the op run, a stat logger, an endpoint, the start command and the log lines that prove each part loaded.
+---
+<x-sentence>We write one small plugin package with four parts, start vllm serve with it, and check in the logs that each part loaded.</x-sentence>
+
+<h2>The idea</h2>
+<p>The tour {{link tours/life-of-a-plugin}} follows an existing package through the start-up. This tour goes the other way: you write the package. It has four parts, and each part uses one {{term extension-point}}:</p>
+<ol>
+  <li>a <strong>model</strong>: a new architecture name in the {{term model-registry}};</li>
+  <li>a <strong>layer replacement</strong>: your own subclass of <code>RMSNorm</code>, a {{term custom-op}};</li>
+  <li>a <strong>stat logger</strong> that receives the statistics of the server;</li>
+  <li>an <strong>endpoint</strong>: one new HTTP route.</li>
+</ol>
+<p>The first two parts come from one {{term general-plugin}}, so they reach every process. The last two parts act only in the {{term front-end}}. Every vLLM call in the toy is one that a test plugin of the vLLM repository also makes. So each stop shows the real test plugin next to the toy.</p>
+<p><strong>An everyday comparison.</strong> Think of a kit that adds parts to a car. One part goes into the engine bay, one replaces a standard part, one is a gauge on the dashboard and one is a new button. The kit has one label per part, so the factory knows where each part goes. The comparison stops in one place. A vLLM server is like several copies of the car, one per process. The engine-bay parts go into every copy, and the dashboard parts go into the front copy only.</p>
+
+<x-note title="The toy code is illustrative">
+<p>The package <code>vllm_toy_plugin</code> is not in the vLLM repository. Its code blocks are plain <code>&lt;pre&gt;</code> blocks, not excerpts. Each vLLM API that they use is cited to the code at {{project short_sha}}, and the matching test plugin is shown as a real excerpt. The model name and the checkpoint in the commands are examples.</p>
+</x-note>
+
+<h2>The picture</h2>
+<x-diagram name="b5t_toy_package" alt="Panel 1, three rows from files to entry points to effects. Row 1, green: __init__.py with register(), which imports ops.py, and model.py with ToyLlamaForCausalLM; entry point vllm.general_plugins toy_register = vllm_toy_plugin:register; effect in every process: a lazy ModelRegistry entry and op_registry_oot RMSNorm. Row 2, blue: stat_logger.py with class ToyStatLogger (StatLoggerBase); entry point vllm.stat_logger_plugins toy_stat_logger; effect in the front end only: AsyncLLM stat loggers, record() each step. Row 3, blue: endpoint.py with class ToyEndpointPlugin, attach_router and init_state; entry point vllm.endpoint_plugins toy_endpoint; effect in the front end if allowlisted: GET /v1/toy/hello, needs VLLM_PLUGINS. Panel 2, four cards: the model acts with --hf-overrides architectures or a config.json that names ToyLlamaForCausalLM; the op's forward_cuda acts with custom_ops +RMSNorm (the class name) or base mode all, for example with --enforce-eager; the stat logger acts always once installed, off when VLLM_PLUGINS is set without its name; the route acts when VLLM_PLUGINS names toy_endpoint, and then every plugin name you need must be in the list." caption="Figure: the five files of the toy package, its three entry points, and what each one registers (panel 1). Panel 2: the setting that makes each part act." />
+<p>Read panel 1 row by row, from the file to the entry point to the effect. Green parts run in every process; blue parts run only in the front end. Panel 2 is the checklist for the start command in stop 8.</p>
+
+<table>
+  <thead><tr><th>Stop</th><th>What you write or do</th><th>Template in the repository</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>Package layout and entry points</td><td><code>tests/plugins/*/setup.py</code>; vLLM's <code>pyproject.toml</code></td></tr>
+    <tr><td>2</td><td>The general plugin: register a lazy model</td><td><code>vllm_add_dummy_model/__init__.py</code></td></tr>
+    <tr><td>3</td><td>The model class</td><td><code>vllm_add_dummy_model/my_opt.py</code></td></tr>
+    <tr><td>4</td><td>The op replacement with <code>register_oot</code></td><td><code>vllm_add_dummy_platform/dummy_custom_ops.py</code></td></tr>
+    <tr><td>5</td><td>The switch that makes the op run</td><td><code>vllm_add_dummy_platform/dummy_platform.py</code></td></tr>
+    <tr><td>6</td><td>A stat logger</td><td><code>vllm_add_dummy_stat_logger</code></td></tr>
+    <tr><td>7</td><td>An endpoint</td><td><code>vllm_add_dummy_endpoint_plugin</code></td></tr>
+    <tr><td>8</td><td>Install and start</td><td>CI steps in <code>.buildkite/test_areas/plugins.yaml</code></td></tr>
+    <tr><td>9</td><td>Check that each part loaded</td><td>the log lines of <code>vllm/plugins/__init__.py</code> and others</td></tr>
+  </tbody>
+</table>
+
+<x-stop n="1" title="Lay out the package and publish the entry points">
+<p>A {{term plugin-package}} is a normal Python package. vLLM finds it only through its {{term entry-point | entry points}}. The toy has five modules:</p>
+<pre><code class="language-none">vllm-toy-plugin/
+  pyproject.toml
+  vllm_toy_plugin/
+    __init__.py       # register(): the general plugin (stop 2)
+    model.py          # ToyLlamaForCausalLM (stop 3)
+    ops.py            # ToyRMSNorm (stop 4)
+    stat_logger.py    # ToyStatLogger (stop 6)
+    endpoint.py       # ToyEndpointPlugin (stop 7)</code></pre>
+<p>The test plugins use <code>setup.py</code> with an <code>entry_points</code> dictionary. The stat logger test plugin is the shortest example:</p>
+<x-code file="tests/plugins/vllm_add_dummy_stat_logger/setup.py" lines="6-15" highlight="10-13" />
+<p>vLLM itself uses the newer <code>pyproject.toml</code> form for its own general plugins:</p>
+<x-code file="pyproject.toml" lines="45-47" lang="toml" />
+<p>The toy uses the same form, with one table per {{term plugin-group}}:</p>
+<pre><code class="language-toml"># pyproject.toml (illustrative)
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-toy-plugin"
+version = "0.1.0"
+
+[tool.setuptools]
+packages = ["vllm_toy_plugin"]
+
+[project.entry-points."vllm.general_plugins"]
+toy_register = "vllm_toy_plugin:register"
+
+[project.entry-points."vllm.stat_logger_plugins"]
+toy_stat_logger = "vllm_toy_plugin.stat_logger:ToyStatLogger"
+
+[project.entry-points."vllm.endpoint_plugins"]
+toy_endpoint = "vllm_toy_plugin.endpoint:ToyEndpointPlugin"</code></pre>
+<p>The left side of each line is the <em>entry-point name</em>. <code>VLLM_PLUGINS</code> matches this name exactly, not the package name ({{cite vllm/plugins/__init__.py:63-64}}). The right side is <code>module:attribute</code>. Each group expects a different kind of object. The general group needs a function, the stat logger group a <code>StatLoggerBase</code> subclass, and the endpoint group a factory with no arguments. The table in {{link concepts/plugin-loading#in-the-code}} lists all six groups.</p>
+</x-stop>
+
+<x-stop n="2" title="Write the general plugin: register the model lazily">
+<p>vLLM calls a general plugin function with no arguments, once in each process ({{cite vllm/plugins/__init__.py:82-90}}). With TP = 2 that means four processes, and the function must do the same thing each time. The model test plugin shows the pattern: check first, then register. Its last two registrations use the lazy string form:</p>
+<x-code file="tests/plugins/vllm_add_dummy_model/vllm_add_dummy_model/__init__.py" lines="19-27" highlight="20,23,26-27" />
+<p>The toy does the same for one architecture, and also imports the module with the op replacement:</p>
+<pre><code class="language-python"># vllm_toy_plugin/__init__.py (illustrative)
+def register():
+    """General plugin. vLLM calls it once in every process."""
+    from vllm import ModelRegistry
+
+    # The model: a "module:Class" string. Nothing is imported now.
+    if "ToyLlamaForCausalLM" not in ModelRegistry.get_supported_archs():
+        ModelRegistry.register_model(
+            "ToyLlamaForCausalLM", "vllm_toy_plugin.model:ToyLlamaForCausalLM"
+        )
+
+    # The op: importing the module runs @RMSNorm.register_oot (stop 4).
+    import vllm_toy_plugin.ops  # noqa: F401</code></pre>
+<ul>
+  <li><code>from vllm import ModelRegistry</code> is a lazy attribute of the <code>vllm</code> package ({{cite vllm/__init__.py:26}}).</li>
+  <li><code>get_supported_archs()</code> returns the keys of the registry ({{cite vllm/model_executor/models/registry.py:1157-1158}}).</li>
+  <li>A string must contain exactly one colon. It becomes a lazy entry, and nothing is imported ({{cite vllm/model_executor/models/registry.py:1187-1193}}). A class would be inspected at once, in every process ({{cite vllm/model_executor/models/registry.py:1194-1195}}).</li>
+  <li>The import of <code>ops</code> is inside the function. So the import, and the decorator, run only when vLLM calls the plugin. Python caches the module, so a second call in the same process does not register the op again.</li>
+</ul>
+<p>The page {{link concepts/oot-models}} explains the registry and its lazy entries.</p>
+</x-stop>
+
+<x-stop n="3" title="Write the model class">
+<p>The model test plugin subclasses an in-tree model and changes one method:</p>
+<x-code file="tests/plugins/vllm_add_dummy_model/vllm_add_dummy_model/my_opt.py" lines="11-18" highlight="11-12" />
+<p>The toy subclasses Llama and changes nothing, so it runs any Llama-architecture checkpoint under a new name:</p>
+<pre><code class="language-python"># vllm_toy_plugin/model.py (illustrative)
+from vllm.model_executor.models.llama import LlamaForCausalLM
+
+
+class ToyLlamaForCausalLM(LlamaForCausalLM):
+    """Llama under a new architecture name. Override methods here."""</code></pre>
+<p>The class inherits the constructor <code>__init__(self, *, vllm_config, prefix="", ...)</code> ({{cite vllm/model_executor/models/llama.py:484-490}}). That matters: <code>initialize_model</code> checks for both parameter names, and otherwise warns and guesses old arguments ({{cite vllm/model_executor/model_loader/utils.py:96-115}}). The registry also checks the structure, for example <code>embed_input_ids</code> and <code>compute_logits</code> ({{cite vllm/model_executor/models/interfaces_base.py:69-76}}, {{cite vllm/model_executor/models/interfaces_base.py:140-147}}, {{link concepts/model-interfaces}}).</p>
+<p>vLLM finds the class by the architecture name in the checkpoint's <code>config.json</code>. To use a normal Llama checkpoint, rename the architecture at start-up. A vLLM test does the same for its OPT model ({{cite tests/distributed/test_distributed_oot.py:20-21}}):</p>
+<pre><code class="language-bash">--hf-overrides '{"architectures": ["ToyLlamaForCausalLM"]}'</code></pre>
+<p>On the first start, the front end inspects the lazy entry in a subprocess and caches the result on disk ({{cite vllm/model_executor/models/registry.py:1088-1116}}). That subprocess runs <code>register()</code> too ({{cite vllm/model_executor/models/registry.py:1612}}). Later starts read the cache, until <code>model.py</code> changes.</p>
+</x-stop>
+
+<x-stop n="4" title="Replace an op with register_oot">
+<p>The platform test plugin replaces the rotary embedding layer. The decorator goes on a subclass of the in-tree class:</p>
+<x-code file="tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_custom_ops.py" lines="6-19" highlight="10-11,18-19" />
+<p>The toy replaces <code>RMSNorm</code>, which every Llama decoder layer builds ({{cite vllm/model_executor/models/llama.py:308-309}}):</p>
+<pre><code class="language-python"># vllm_toy_plugin/ops.py (illustrative)
+import torch
+
+from vllm.model_executor.layers.layernorm import RMSNorm
+
+
+@RMSNorm.register_oot            # the key is "RMSNorm", the class name
+class ToyRMSNorm(RMSNorm):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.toy = True            # a visible mark: the swap happened
+
+    def forward_cuda(self, x: torch.Tensor, residual: torch.Tensor | None = None):
+        # Your CUDA kernel goes here. The toy calls the in-tree path.
+        return super().forward_cuda(x, residual)</code></pre>
+<p>The decorator stores the class under a key and gives the class that key as its <code>name</code>:</p>
+<x-code file="vllm/model_executor/custom_op.py" lines="334-356" highlight="337-340,349-353,354-356" />
+<ol>
+  <li><strong>Line 337.</strong> Without <code>name=</code>, the key is the name of the class on which you call the decorator: <code>RMSNorm.register_oot</code> gives <code>"RMSNorm"</code>.</li>
+  <li><strong>Lines 338-340.</strong> A second registration with the same key fails the <code>assert</code>. The toy class gets <code>name = "RMSNorm"</code>.</li>
+  <li><strong>Lines 349-353.</strong> <code>@RMSNorm.register_oot</code> without parentheses passes the class as the first argument.</li>
+  <li><strong>Lines 354-356.</strong> A string as the first argument raises <code>TypeError</code>.</li>
+</ol>
+<p>When a Llama layer calls <code>RMSNorm(...)</code>, <code>CustomOp.__new__</code> finds <code>"RMSNorm"</code> in the out-of-tree registry and makes a <code>ToyRMSNorm</code> instead ({{cite vllm/model_executor/custom_op.py:107-126}}). The lookup uses the Python class name of the called class (line 109). So if you use the keyword form, the value must be the class name: <code>@CustomOp.register_oot(name="RMSNorm")</code>, not <code>name="rms_norm"</code>. (Derived from lines 109 and 117.)</p>
+</x-stop>
+
+<x-stop n="5" title="Make the op actually run">
+<x-warning title="The swap happens, but your forward_cuda may never run">
+<p>With the default settings, <code>vllm serve</code> on CUDA disables <code>ToyRMSNorm</code>. The swapped op then runs the inherited <code>forward_native</code>, and your <code>forward_cuda</code> does not run. Turn the op on with one of the two switches below.</p>
+</x-warning>
+<p>Each op picks one method when it is built. A disabled op takes <code>forward_native</code>; an enabled op takes the method of the {{term platform}} ({{cite vllm/model_executor/custom_op.py:183-205}}). Whether an op is enabled depends on the list <code>compilation_config.custom_ops</code>:</p>
+<x-code file="vllm/model_executor/custom_op.py" lines="282-290" highlight="282-283,290" />
+<p>The base mode is <code>"all"</code> or <code>"none"</code>. vLLM adds it after it parses the flags:</p>
+<x-code file="vllm/config/vllm.py" lines="1819-1826" highlight="1821-1824" />
+<p>With the default compilation (Inductor, mode <code>VLLM_COMPILE</code>), the base mode is <code>"none"</code>. The page {{link concepts/custom-ops}} gives the full rule. So you have two switches:</p>
+<table>
+  <thead><tr><th>Setting</th><th>Effect on <code>ToyRMSNorm</code> on CUDA</th></tr></thead>
+  <tbody>
+    <tr><td>nothing (default)</td><td>disabled: <code>forward_native</code></td></tr>
+    <tr><td><code>--compilation-config '{"custom_ops": ["+RMSNorm"]}'</code></td><td>enabled: <code>ToyRMSNorm.forward_cuda</code>. vLLM still appends <code>"none"</code>, so the other ops stay off.</td></tr>
+    <tr><td><code>--compilation-config '{"custom_ops": ["+rms_norm"]}'</code></td><td>disabled: <code>forward_native</code>, with a WARNING that the switch "has no effect"</td></tr>
+    <tr><td><code>--enforce-eager</code></td><td>mode <code>NONE</code>, so base mode <code>"all"</code>: every op enabled, the toy included ({{cite vllm/config/vllm.py:1745-1746}})</td></tr>
+  </tbody>
+</table>
+<p><strong>The name quirk.</strong> The in-tree class registered the op name <code>rms_norm</code> ({{cite vllm/model_executor/layers/layernorm.py:38-39}}). But <code>register_oot</code> gave <code>ToyRMSNorm</code> the name <code>"RMSNorm"</code> (stop 4, line 339), and <code>enabled()</code> builds the switch from that name (line 282). So <code>+rms_norm</code> matches nothing in this model, and <code>custom_op_log_check</code> warns ({{cite vllm/config/compilation.py:1341-1361}}). (Derived from the cited lines; no test covers it.)</p>
+<p>Which method runs on an enabled op depends on the platform. On CUDA it is <code>forward_cuda</code> (line 205 of <code>custom_op.py</code>). On an out-of-tree platform it is <code>forward_oot</code> (lines 202-203). The test platform turns every op on in its config hook ({{cite tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_platform.py:21-23}}). A general plugin such as the toy has no config hook, so the user must set the switch.</p>
+</x-stop>
+
+<x-stop n="6" title="Add a stat logger">
+<p>A {{term stat-logger}} receives the scheduler and iteration statistics in the front end. The test plugin implements the minimal interface:</p>
+<x-code file="tests/plugins/vllm_add_dummy_stat_logger/dummy_stat_logger/dummy_stat_logger.py" lines="7-30" highlight="12,19-21,26,29" />
+<p>The base class has three abstract methods: the constructor, <code>record</code> and <code>log_engine_initialized</code> ({{cite vllm/v1/metrics/loggers.py:54-81}}). The toy counts the generated tokens and prints them:</p>
+<pre><code class="language-python"># vllm_toy_plugin/stat_logger.py (illustrative)
+from vllm.logger import init_logger
+from vllm.v1.metrics.loggers import StatLoggerBase
+
+logger = init_logger("vllm.toy_plugin")    # a child of "vllm", so INFO lines show
+
+
+class ToyStatLogger(StatLoggerBase):
+    def __init__(self, vllm_config, engine_index: int = 0):
+        self.engine_index = engine_index
+        self.generated = 0
+
+    def record(self, scheduler_stats, iteration_stats,
+               mm_cache_stats=None, engine_idx=0):
+        if iteration_stats is not None:
+            self.generated += iteration_stats.num_generation_tokens
+
+    def log(self):
+        logger.info("toy: engine %d generated %d tokens",
+                    self.engine_index, self.generated)
+
+    def log_engine_initialized(self):
+        logger.info("toy: engine %d is ready", self.engine_index)</code></pre>
+<ul>
+  <li>The loader checks the class. An object that is not a <code>StatLoggerBase</code> subclass raises <code>TypeError</code> and stops start-up ({{cite vllm/v1/metrics/loggers.py:84-98}}).</li>
+  <li><code>AsyncLLM.__init__</code> loads the group ({{cite vllm/v1/engine/async_llm.py:155-156}}). <code>StatLoggerManager</code> wraps a per-engine class in an adapter ({{cite vllm/v1/metrics/loggers.py:1408-1414}}). The adapter calls <code>ToyStatLogger(vllm_config, engine_index)</code> once for each engine ({{cite vllm/v1/metrics/loggers.py:442-445}}).</li>
+  <li><code>record</code> runs for each batch of engine outputs ({{cite vllm/v1/engine/async_llm.py:929-935}}). <code>IterationStats</code> has the field <code>num_generation_tokens</code> ({{cite vllm/v1/metrics/stats.py:483}}). The base class docstring warns that these stats classes are not a stable interface ({{cite vllm/v1/metrics/loggers.py:55-60}}).</li>
+  <li><code>log</code> runs every <code>VLLM_LOG_STATS_INTERVAL</code> seconds, default 10, when stats logging is on ({{cite vllm/entrypoints/launchers/utils/server_utils.py:78-84}}, {{cite vllm/envs.py:874-878}}).</li>
+  <li>The logger name starts with <code>vllm.</code> on purpose. vLLM's logging config attaches its handler to the logger <code>"vllm"</code> only ({{cite vllm/logger.py:100-105}}). A logger with another name has no level of its own and gets the level of Python's root logger, which is WARNING by default. So Python drops its INFO lines. (Derived from the config and the Python logging defaults; other code can configure the root logger.)</li>
+</ul>
+</x-stop>
+
+<x-stop n="7" title="Add an endpoint">
+<p>An {{term endpoint-plugin}} adds HTTP routes. Its entry point gives a factory with no arguments, and the object must have <code>name</code>, <code>required_tasks</code>, <code>attach_router</code> and <code>init_state</code> ({{cite vllm/plugins/endpoint_plugins/interface.py:49-94}}). The test plugin uses the class itself as the factory:</p>
+<x-code file="tests/plugins/vllm_add_dummy_endpoint_plugin/vllm_add_dummy_endpoint_plugin/__init__.py" lines="19-37" highlight="20-21,23-24,36-37" />
+<p>The toy route needs no engine, so its <code>init_state</code> does nothing:</p>
+<pre><code class="language-python"># vllm_toy_plugin/endpoint.py (illustrative)
+from fastapi import FastAPI
+
+
+class ToyEndpointPlugin:
+    name = "toy_endpoint"        # use the entry-point name here too
+    required_tasks = None        # no task needed
+
+    def attach_router(self, app: FastAPI) -> None:
+        @app.get("/v1/toy/hello")
+        async def hello():
+            return {"plugin": "vllm_toy_plugin", "status": "loaded"}
+
+    async def init_state(self, engine_client, state, args) -> None:
+        pass                     # this route does not use the engine</code></pre>
+<ol>
+  <li><strong>Phase A.</strong> <code>build_app</code> calls <code>attach_endpoint_plugins</code> after the core routes ({{cite vllm/entrypoints/launchers/app.py:47-51}}). A plugin route with the same path and method as a core route replaces it ({{cite vllm/plugins/endpoint_plugins/interface.py:72-74}}).</li>
+  <li><strong>Phase B.</strong> <code>init_endpoint_plugins_state</code> awaits <code>init_state</code> of each attached plugin ({{cite vllm/plugins/endpoint_plugins/interface.py:163-164}}).</li>
+</ol>
+<x-warning title="Endpoint plugins are opt-in">
+<p>With <code>VLLM_PLUGINS</code> unset, vLLM loads no endpoint plugin. It only warns: "Found endpoint plugin(s) ... but VLLM_PLUGINS is not set" ({{cite vllm/plugins/__init__.py:122-131}}). You must name <code>toy_endpoint</code> in <code>VLLM_PLUGINS</code>, and that list then filters every other group too (stop 8).</p>
+</x-warning>
+<p>The interface module says that an endpoint should not open new paths into the engine. A plugin that needs engine-side code pairs the endpoint with a general plugin ({{cite vllm/plugins/endpoint_plugins/interface.py:5-16}}). The page {{link concepts/frontend-plugins}} explains the route replacement in detail.</p>
+</x-stop>
+
+<x-stop n="8" title="Install and start the server">
+<p>CI installs a test plugin in editable mode, then runs the tests ({{cite .buildkite/test_areas/plugins.yaml:37-39}}). Do the same with the toy, in the same Python environment as vLLM:</p>
+<pre><code class="language-bash">pip install -e ./vllm-toy-plugin
+
+# List EVERY plugin you need: the endpoint forces an allowlist (stop 7).
+export VLLM_PLUGINS=toy_register,toy_stat_logger,toy_endpoint
+
+vllm serve meta-llama/Llama-3.2-1B-Instruct \
+    --hf-overrides '{"architectures": ["ToyLlamaForCausalLM"]}' \
+    --compilation-config '{"custom_ops": ["+RMSNorm"]}'
+
+curl http://localhost:8000/v1/toy/hello</code></pre>
+<p>The checkpoint is an example: any Llama-architecture checkpoint works. Three rules about <code>VLLM_PLUGINS</code> matter here:</p>
+<ul>
+  <li>The value is split at commas, and the parts are not stripped ({{cite vllm/envs.py:1163-1167}}). Do not put spaces after the commas.</li>
+  <li>The list also filters the platform group and vLLM's own general plugins. This list drops the two LoRA resolvers ({{cite pyproject.toml:45-47}}). Add <code>lora_filesystem_resolver</code> if you use it.</li>
+  <li>An empty string is a list that matches nothing ({{cite vllm/plugins/__init__.py:107-109}}).</li>
+</ul>
+<p>With TP = 2, <code>register()</code> runs in four processes; the stat logger and the endpoint load once, in the front end. The tour {{link tours/life-of-a-plugin}} shows where.</p>
+</x-stop>
+
+<x-stop n="9" title="Check that each part loaded">
+<p>Start with <code>VLLM_LOGGING_LEVEL=DEBUG</code> the first time. The default level is <code>INFO</code> ({{cite vllm/envs.py:860}}), and some of the lines below are DEBUG lines. The table lists what to look for, in start-up order:</p>
+<table>
+  <thead><tr><th>Part</th><th>Log line</th><th>Level</th><th>Where in the code</th></tr></thead>
+  <tbody>
+    <tr><td>discovery, general group</td><td>"Available plugins for group vllm.general_plugins:" and "- toy_register -&gt; vllm_toy_plugin:register"</td><td>DEBUG</td><td>{{cite vllm/plugins/__init__.py:48-54}}</td></tr>
+    <tr><td>allowlist</td><td>"Loading plugin toy_register"</td><td>DEBUG (general group); INFO (other groups)</td><td>{{cite vllm/plugins/__init__.py:65-66}}</td></tr>
+    <tr><td>broken import</td><td>"Failed to load plugin ..." with a traceback</td><td>ERROR</td><td>{{cite vllm/plugins/__init__.py:71-72}}</td></tr>
+    <tr><td>model cache</td><td>"Cache model info for class ... miss" on the first start</td><td>DEBUG</td><td>{{cite vllm/model_executor/models/registry.py:1100-1104}}</td></tr>
+    <tr><td>model</td><td>"Resolved architecture: ToyLlamaForCausalLM"</td><td>INFO</td><td>{{cite vllm/config/model.py:744}}</td></tr>
+    <tr><td>stat logger, discovery</td><td>"Available plugins for group vllm.stat_logger_plugins:"</td><td>INFO</td><td>{{cite vllm/plugins/__init__.py:52-54}}</td></tr>
+    <tr><td>op swap (each worker)</td><td>"Instantiating custom op: RMSNorm using ..."</td><td>DEBUG</td><td>{{cite vllm/model_executor/custom_op.py:121-125}}</td></tr>
+    <tr><td>op switch (each worker)</td><td>"enabled custom ops: ..." should contain <code>RMSNorm</code></td><td>DEBUG</td><td>{{cite vllm/config/compilation.py:1329-1330}}</td></tr>
+    <tr><td>stat logger, ready</td><td>the toy's own "toy: engine 0 is ready"</td><td>INFO</td><td>{{cite vllm/v1/engine/async_llm.py:214}}</td></tr>
+    <tr><td>endpoint</td><td>"Loaded endpoint plugin toy_endpoint"</td><td>INFO</td><td>{{cite vllm/plugins/__init__.py:156}}</td></tr>
+  </tbody>
+</table>
+<p>You can also check the first two parts without a server, in one Python process. The functions below are the ones that vLLM itself calls; the test of the stat logger plugin uses the loader the same way ({{cite tests/plugins_tests/test_stats_logger_plugins.py:13-21}}):</p>
+<pre><code class="language-python"># quick check (illustrative)
+from vllm.plugins import load_general_plugins
+from vllm.v1.metrics.loggers import load_stat_logger_plugin_factories
+
+load_general_plugins()                       # runs toy_register once
+from vllm import ModelRegistry
+from vllm.model_executor.custom_op import op_registry_oot
+print("ToyLlamaForCausalLM" in ModelRegistry.get_supported_archs())   # True
+print(op_registry_oot)                       # {'RMSNorm': &lt;class 'vllm_toy_plugin.ops.ToyRMSNorm'&gt;}
+print(load_stat_logger_plugin_factories())   # [&lt;class 'vllm_toy_plugin.stat_logger.ToyStatLogger'&gt;]</code></pre>
+<x-simplified><p>The quick check runs the plugin functions in a plain process. It does not prove that the workers load them; only the worker logs show that. The printed values are the expected ones, not a recorded output.</p></x-simplified>
+</x-stop>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Which process imports which toy module">
+<p>For <code>vllm serve -tp 2</code> with the default <code>spawn</code> start method. (Derived from the call sites cited on this page and on {{link concepts/plugin-loading}}.)</p>
+<table>
+  <thead><tr><th>Module</th><th>Front end</th><th>Engine core</th><th>Each worker</th><th>Registry subprocess (cache miss only)</th></tr></thead>
+  <tbody>
+    <tr><td><code>__init__.py</code> (<code>register</code>)</td><td>yes</td><td>yes ({{cite vllm/v1/engine/core.py:132}})</td><td>yes ({{cite vllm/v1/worker/worker_base.py:284}})</td><td>yes ({{cite vllm/model_executor/models/registry.py:1612}})</td></tr>
+    <tr><td><code>ops.py</code></td><td>yes</td><td>yes</td><td>yes</td><td>yes</td></tr>
+    <tr><td><code>model.py</code></td><td>no, for a plain text model (derived)</td><td>no, for a plain text model (derived)</td><td>yes, when it builds the model ({{cite vllm/model_executor/model_loader/utils.py:305-313}})</td><td>yes: this is the inspection</td></tr>
+    <tr><td><code>stat_logger.py</code></td><td>yes ({{cite vllm/v1/engine/async_llm.py:156}})</td><td>no</td><td>no</td><td>no</td></tr>
+    <tr><td><code>endpoint.py</code></td><td>yes, if allowlisted ({{cite vllm/entrypoints/launchers/app.py:51}})</td><td>no</td><td>no</td><td>no</td></tr>
+  </tbody>
+</table>
+<p><code>ops.py</code> runs in every process because <code>register()</code> imports it. Only the workers build layers, so only there does the swap matter. The import in the other processes is cheap but not free: it imports <code>layernorm.py</code>.</p>
+<p>The "no" for <code>model.py</code> is derived from the callers of <code>get_model_cls</code> and <code>resolve_model_cls</code> at this commit. The front end and the engine core use only the model info, which the registry subprocess or the disk cache gives (stop 3). Some features ask the loader for the class and so import it: multimodal input processing ({{cite vllm/multimodal/registry.py:115-119}}), speech-to-text serving ({{cite vllm/entrypoints/speech_to_text/base/serving.py:158-160}}), scoring ({{cite vllm/entrypoints/pooling/scoring/io_processor.py:457-460}}) and a model-declared KV cache grouping ({{cite vllm/v1/core/kv_cache_planning.py:1669-1681}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Two ways to bring a layer: replacement or platform method">
+<table>
+  <thead><tr><th></th><th>General plugin with <code>register_oot</code> (this toy)</th><th>Platform plugin with <code>forward_oot</code></th></tr></thead>
+  <tbody>
+    <tr><td>What changes</td><td>the class that the model builds</td><td>the method that an enabled op calls</td></tr>
+    <tr><td>Platform</td><td>any; also CUDA</td><td>only the out-of-tree platform ({{cite vllm/model_executor/custom_op.py:202-203}})</td></tr>
+    <tr><td>Turned on by</td><td>the user: <code>+RMSNorm</code> or base mode <code>"all"</code></td><td>the platform's <code>check_and_update_config</code> can set <code>custom_ops</code> ({{cite tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_platform.py:21-23}})</td></tr>
+    <tr><td>Method to override</td><td>the one of the current platform, for example <code>forward_cuda</code></td><td><code>forward_oot</code></td></tr>
+    <tr><td>Conflicts</td><td>a second <code>register_oot</code> with the same key fails the <code>assert</code> ({{cite vllm/model_executor/custom_op.py:338}})</td><td>only one out-of-tree platform can be active ({{cite vllm/platforms/__init__.py:272-276}})</td></tr>
+  </tbody>
+</table>
+<p>The test platform combines both: a platform plugin and a general plugin that calls <code>register_oot</code> ({{cite tests/plugins/vllm_add_dummy_platform/setup.py:10-17}}). The page {{link concepts/custom-ops}} also explains the IR op providers, a second level of kernel choice inside <code>RMSNorm.forward_native</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Testing the toy like vLLM tests its own plugins">
+<ul>
+  <li><strong>Model.</strong> The online test starts a real server with the plugin model and checks the answer ({{cite tests/plugins_tests/test_oot_registration_online.py:10-39}}). The offline test sets <code>VLLM_PLUGINS=""</code> and expects the "not supported" error ({{cite tests/plugins_tests/test_oot_registration_offline.py:13-22}}).</li>
+  <li><strong>Op.</strong> A test calls <code>load_general_plugins()</code>, builds the in-tree class and checks the class name of the result ({{cite tests/plugins_tests/test_platform_plugins.py:51-64}}). The same test works for <code>ToyRMSNorm</code>.</li>
+  <li><strong>Stat logger.</strong> The test checks discovery, the empty allowlist and the <code>TypeError</code> for a wrong class ({{cite tests/plugins_tests/test_stats_logger_plugins.py:13-52}}).</li>
+  <li><strong>Endpoint.</strong> The tests check the allowlist, for example the empty string ({{cite tests/plugins_tests/test_endpoint_plugins.py:107-115}}), and the replacement of a core route ({{cite tests/plugins_tests/test_endpoint_plugins.py:196-220}}).</li>
+</ul>
+<p>vLLM's CI runs the plugin model tests in a fresh process: "it needs a clean process" ({{cite .buildkite/test_areas/plugins.yaml:50-51}}). The reason is the once-per-process guard: after the first <code>load_general_plugins()</code>, a test in the same process cannot load a changed plugin again ({{cite vllm/plugins/__init__.py:83-85}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="The docs show a register_oot form that raises TypeError">
+<p><code>docs/design/custom_op.md</code> writes <code>@CustomOp.register_oot("op_name")</code> and <code>@CustomOp.register_oot("MMEncoderAttention")</code> ({{cite docs/design/custom_op.md:11}}, {{cite docs/design/custom_op.md:285}}). A string as the first argument raises <code>TypeError</code> ({{cite vllm/model_executor/custom_op.py:354-356}}). Write <code>@RMSNorm.register_oot</code> or <code>@CustomOp.register_oot(name="RMSNorm")</code>.</p>
+</x-warning>
+<ul>
+  <li><strong>A plugin function that is not re-entrant.</strong> vLLM calls it once per process, but in every process ({{cite vllm/plugins/__init__.py:82-90}}). The design doc asks for a function that "can be called multiple times without causing issues" ({{cite docs/design/plugin_system.md:60}}). Check the registry before you register, as the test plugin does. Keep decorators at module level. A decorator inside the function body runs again when your own code or a test calls the function twice. Then <code>register_oot</code> fails its <code>assert</code> ({{cite vllm/model_executor/custom_op.py:338}}). Side effects outside the process, such as a file write, happen once in each process: four times or more with TP = 2.</li>
+  <li><strong>Eager class registration.</strong> <code>register_model("ToyLlamaForCausalLM", ToyLlamaForCausalLM)</code> imports the model module in every process and inspects it at once ({{cite vllm/model_executor/models/registry.py:1194-1195}}). The docstring gives the main risk: an import that starts CUDA, and then "Cannot re-initialize CUDA in forked subprocess" ({{cite vllm/model_executor/models/registry.py:1167-1173}}). <code>vllm serve</code> uses <code>spawn</code>, and vLLM switches to <code>spawn</code> when CUDA is already started ({{cite vllm/utils/system_utils.py:145-162}}). But vLLM used as a library defaults to <code>fork</code> ({{cite vllm/envs.py:936-940}}). Use the string form.</li>
+  <li><strong><code>VLLM_PLUGINS</code> disables the LoRA resolvers.</strong> The endpoint forces you to set the list (stop 7). Every name that is not in it is skipped, also vLLM's own <code>lora_filesystem_resolver</code> and <code>lora_hf_hub_resolver</code> ({{cite pyproject.toml:45-47}}). The loader does not log a skipped name, and the general group logs its plugin list only at DEBUG level. So nothing shows at INFO ({{cite vllm/plugins/__init__.py:48-66}}).</li>
+  <li><strong>The wrong switch name.</strong> <code>+rms_norm</code> does not enable <code>ToyRMSNorm</code>; <code>+RMSNorm</code> does (stop 5).</li>
+  <li><strong>Your INFO lines do not show.</strong> A logger that is not under <code>vllm.</code> has no vLLM handler and gets the WARNING level of the root logger (stop 6).</li>
+  <li><strong>A broken import is only logged.</strong> A typo in the entry-point value gives "Failed to load plugin ..." and the server starts without the part ({{cite vllm/plugins/__init__.py:71-72}}). An exception inside <code>register()</code> is not caught and stops the process ({{cite vllm/plugins/__init__.py:89-90}}).</li>
+  <li><strong>A stale entry point.</strong> You renamed a function but did not install the package again. The old value is still in the {{term entry-point-metadata}}, and the import fails ({{link learn/python-entry-points}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Most plugin bugs are not in the plugin's own logic. They are in the wiring: the entry-point name, the allowlist, the switch name, the process. The log lines of stop 9 check the wiring before you debug any kernel or model code.</p>
+
+<x-quiz>
+  <x-q level="easy">Which <code>VLLM_PLUGINS</code> value do you need for the toy with its endpoint, and why can you not leave the variable unset?
+    <x-a><p><code>toy_register,toy_stat_logger,toy_endpoint</code>, with no spaces. Endpoint plugins load only when <code>VLLM_PLUGINS</code> is set and names them ({{cite vllm/plugins/__init__.py:122-131}}). The list then filters every other group too, so the other two names must be in it ({{cite vllm/plugins/__init__.py:63-64}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">What is wrong with <code>register_model("ToyLlamaForCausalLM", "vllm_toy_plugin.model.ToyLlamaForCausalLM")</code>?
+    <x-a><p>The string has no colon. The lazy form must be <code>"module:Class"</code> with exactly one colon, else <code>register_model</code> raises <code>ValueError</code> ({{cite vllm/model_executor/models/registry.py:1187-1191}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You start the server with no compilation flags. Is <code>ToyRMSNorm</code> built? Does its <code>forward_cuda</code> run?
+    <x-a><p>It is built: <code>CustomOp.__new__</code> swaps every <code>RMSNorm</code> for it ({{cite vllm/model_executor/custom_op.py:117-126}}). Its <code>forward_cuda</code> does not run. The default base mode is <code>"none"</code> ({{cite vllm/config/vllm.py:1819-1824}}), so the op is disabled and uses <code>forward_native</code> ({{cite vllm/model_executor/custom_op.py:189-192}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You pass <code>--compilation-config '{"custom_ops": ["+rms_norm"]}'</code>. What happens, and why?
+    <x-a><p><code>ToyRMSNorm</code> stays disabled, and vLLM warns that the switch has no effect. <code>register_oot</code> set the attribute <code>name</code> of the class to the key <code>"RMSNorm"</code> ({{cite vllm/model_executor/custom_op.py:337-339}}). <code>enabled()</code> looks for <code>"+RMSNorm"</code> ({{cite vllm/model_executor/custom_op.py:282}}). After the model build, <code>rms_norm</code> is not among the op names of the model, so <code>custom_op_log_check</code> logs the warning ({{cite vllm/config/compilation.py:1341-1361}}). (Derived.)</p></x-a>
+  </x-q>
+  <x-q level="hard">Your <code>ToyStatLogger</code> uses <code>logging.getLogger(__name__)</code>, which gives the name <code>vllm_toy_plugin.stat_logger</code>. Its <code>logger.info</code> lines never show. Why, and what is the fix?
+    <x-a><p>vLLM attaches its handler only to the logger <code>"vllm"</code> ({{cite vllm/logger.py:100-105}}). A logger outside that tree has no level of its own. It gets the level of Python's root logger, WARNING by default, and drops INFO records. The root logger also has no handler by default, so Python prints only warnings and errors, through its last-resort handler. Use a name under <code>vllm.</code>, for example <code>init_logger("vllm.toy_plugin")</code> ({{cite vllm/logger.py:328-335}}). (Derived from the logging config and the Python logging rules.)</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,359 @@
+---
+title: Tour: Life of a plugin
+nav_title: Life of a plugin
+level: Advanced
+prerequisites: concepts/plugin-loading, concepts/platform-plugins, concepts/custom-ops
+related: concepts/plugin-loading, concepts/plugin-map, concepts/platform-plugins, concepts/platform-interface, concepts/oot-models, concepts/custom-ops, concepts/attention-backend-selection, concepts/executors-and-workers, tours/build-a-toy-plugin, tours/serve-startup, code/plugins-init
+summary: Follow one vendor-style plugin package, built from vLLM's own test plugins, from pip install through vllm serve with TP = 2 in 16 stops - entry points, platform detection, general plugins and platform hooks in each process, worker_cls, the attention backend and the CustomOp swap.
+---
+<x-sentence>We follow one plugin package from pip install to a ready server, through the front end, the engine core and two worker processes.</x-sentence>
+
+<h2>The idea</h2>
+<p>A hardware vendor ships vLLM support as a {{term plugin-package}}. A typical package publishes two {{term entry-point | entry points}}. One is a {{term platform-detector}} that tells vLLM "this machine has my device". The other is a {{term general-plugin}} that registers extra parts, for example a faster version of a layer or a new model. The concept pages explain each part on its own. This tour follows one package through one real start-up, in the order of the code.</p>
+<p><code>vllm serve</code> with tensor parallelism 2 runs four processes: the {{term front-end}}, the {{term engine-core}} process and one {{term worker}} process per GPU ({{deepinfer learn/parallelism | Parallelism basics}}). Python objects do not travel between processes. So each process finds the plugins again, and each plugin does its work again. Of the state that plugins change, only the {{term vllm-config}} object travels, as a pickled copy. The tour shows which stop runs in which process, and what travels to the next one.</p>
+<p><strong>An everyday comparison.</strong> Think of a new employee who works in three buildings of one company. In each building, the receptionist looks at the same staff list, gives the employee a badge and shows the desk. The employee unpacks the same toolbox again at each desk. The comparison stops in one place. Only one building writes the work plan (the config), and it sends copies of the plan to the other buildings.</p>
+
+<h3>The example package</h3>
+<x-warning title="The dummy vendor package is a test fixture, not a real vendor">
+<p>This tour uses two test packages from the vLLM repository as one imaginary vendor package. We call it the <em>dummy vendor package</em>. vLLM's CI installs the two packages one at a time, never together ({{cite .buildkite/test_areas/plugins.yaml:16-18}}, {{cite .buildkite/test_areas/plugins.yaml:48-51}}). The platform test only checks the detection and the op swap ({{cite tests/plugins_tests/test_platform_plugins.py:13-64}}). So the tour follows the code path, not a recorded run. Where the test platform is not a complete platform, the tour says so and names what a real vendor adds (stops 12 and 13).</p>
+</x-warning>
+<ul>
+  <li><strong><code>tests/plugins/vllm_add_dummy_platform</code></strong>: a platform plugin with the class <code>DummyPlatform</code>, and a general plugin that replaces the rotary embedding layer with <code>DummyRotaryEmbedding</code>.</li>
+  <li><strong><code>tests/plugins/vllm_add_dummy_model</code></strong>: a general plugin that registers four model architectures, among them <code>MyOPTForCausalLM</code>.</li>
+</ul>
+<p>We serve the OPT checkpoint of the tests under the plugin's architecture name, with TP = 2. A vLLM test starts this server with <code>tp=2</code> ({{cite tests/distributed/test_distributed_oot.py:13-14}}), and a second test uses <code>--hf-overrides</code> to rename the architecture ({{cite tests/distributed/test_distributed_oot.py:20-21}}):</p>
+<pre><code class="language-bash">pip install -e tests/plugins/vllm_add_dummy_platform     # as in CI, from the repo root
+pip install -e tests/plugins/vllm_add_dummy_model
+vllm serve facebook/opt-125m -tp 2 --hf-overrides '{"architectures": ["MyOPTForCausalLM"]}'</code></pre>
+<x-simplified><p>The command is illustrative. The tests copy <code>facebook/opt-125m</code> and write <code>MyOPTForCausalLM</code> into its <code>config.json</code> ({{cite tests/conftest.py:1542-1556}}); <code>--hf-overrides</code> has the same effect on the architecture name. All counts on this page assume the default <code>spawn</code> start method of <code>vllm serve</code>.</p></x-simplified>
+
+<h3>What you will see</h3>
+<ul>
+  <li>Why installing a package does not run any of its code (stop 1).</li>
+  <li>How the out-of-tree detector beats the CUDA detector, and why the platform is known before any general plugin runs (stop 3).</li>
+  <li>Which platform hooks run only in the front end, and how their results reach the workers (stops 5 to 8).</li>
+  <li>Why the engine core process registers a model that it never builds (stop 9).</li>
+  <li>Where a worker gets its class, its attention backend and its replacement layers (stops 11 to 15).</li>
+</ul>
+
+<h2>The picture</h2>
+<x-diagram name="b5t_plugin_life" alt="A full-width box for stop 1: pip install writes three entry points into entry_points.txt: dummy_platform_plugin in vllm.platform_plugins, and dummy_custom_ops and register_dummy_model in vllm.general_plugins. Below it three lanes. API server lane, stops 2 to 8: vllm serve sets the spawn mode (cli/main.py 67-68); the dummy detector wins (platforms/__init__.py 277); general plugins, run 1 (arg_utils.py 3243); pre_register_and_update four times (arg_utils.py 3257, three times, and 2246); the registry resolves MyOPTForCausalLM (config/model.py 741); platform config hooks (config/vllm.py 1804 and 2046); start the engine core (async_llm.py 156 and 193). Engine core lane, stops 9 and 10: detect the platform and run the general plugins (v1/engine/core.py 132); spawn 2 worker processes (multiproc_executor.py 197). Worker lane, two workers, stops 11 to 16: detect, plugins and Triton overrides (worker_base.py 284-290); resolve worker_cls (293-296); attention backend (selector.py 218); CustomOp.__new__ swap (custom_op.py 117-126); forward_oot if enabled (custom_op.py 183, 202-203); block size, then ready (multiproc_executor.py 702). A callout says that with TP = 1 the uni executor runs stops 11 to 16 in the engine core process." caption="Figure: the 16 stops of this tour in the three kinds of process of <code>vllm serve -tp 2</code>. Stops 11 to 16 run once in each of the two workers." />
+<p>Read the lanes from left to right. Each new process starts from zero: it detects the platform again and runs the general plugins again. Amber marks platform detection, green the plugin functions, violet the config hooks and blue the model build.</p>
+
+<table>
+  <thead><tr><th>Stop</th><th>What happens</th><th>File and function</th><th>Process</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><code>pip install</code> writes the entry points</td><td><code>setup.py</code> of each test package</td><td>none</td></tr>
+    <tr><td>2</td><td><code>vllm serve</code> starts and selects <code>spawn</code></td><td><code>entrypoints/cli/main.py</code>: <code>main</code></td><td>front end</td></tr>
+    <tr><td>3</td><td>An import resolves <code>current_platform</code>; the dummy detector wins</td><td><code>platforms/__init__.py</code>: <code>resolve_current_platform_cls_qualname</code></td><td>front end</td></tr>
+    <tr><td>4</td><td>The general plugins run for the first time</td><td><code>engine/arg_utils.py</code>: <code>AsyncEngineArgs.add_cli_args</code></td><td>front end</td></tr>
+    <tr><td>5</td><td><code>pre_register_and_update</code> runs four times</td><td><code>arg_utils.py</code>: <code>add_cli_args</code>, <code>create_engine_config</code></td><td>front end</td></tr>
+    <tr><td>6</td><td><code>ModelConfig</code> asks the model registry</td><td><code>config/model.py</code>: <code>ModelConfig.__post_init__</code></td><td>front end</td></tr>
+    <tr><td>7</td><td>The platform config hooks change <code>VllmConfig</code></td><td><code>config/vllm.py</code>: <code>VllmConfig.__post_init__</code></td><td>front end</td></tr>
+    <tr><td>8</td><td><code>AsyncLLM</code> loads stat loggers and starts the engine core</td><td><code>v1/engine/async_llm.py</code>: <code>AsyncLLM.__init__</code></td><td>front end</td></tr>
+    <tr><td>9</td><td>The engine core detects the platform and runs the general plugins</td><td><code>v1/engine/core.py</code>: <code>EngineCore.__init__</code></td><td>engine core</td></tr>
+    <tr><td>10</td><td>The executor starts two worker processes</td><td><code>v1/executor/multiproc_executor.py</code>: <code>_init_executor</code></td><td>engine core</td></tr>
+    <tr><td>11</td><td>The worker detects, runs the plugins and the Triton hook</td><td><code>v1/worker/worker_base.py</code>: <code>init_worker</code></td><td>each worker</td></tr>
+    <tr><td>12</td><td>The worker resolves <code>worker_cls</code></td><td><code>worker_base.py</code>: <code>init_worker</code></td><td>each worker</td></tr>
+    <tr><td>13</td><td>The model is built; attention asks the platform for a backend</td><td><code>model_loader/utils.py</code>: <code>initialize_model</code>; <code>v1/attention/selector.py</code></td><td>each worker</td></tr>
+    <tr><td>14</td><td><code>CustomOp.__new__</code> swaps the replaced class</td><td><code>model_executor/custom_op.py</code>: <code>CustomOp.__new__</code></td><td>each worker</td></tr>
+    <tr><td>15</td><td>The op picks <code>forward_oot</code></td><td><code>custom_op.py</code>: <code>dispatch_forward</code></td><td>each worker</td></tr>
+    <tr><td>16</td><td>Block size, environment cache, ready</td><td><code>multiproc_executor.py</code>: <code>WorkerProc.__init__</code></td><td>each worker</td></tr>
+  </tbody>
+</table>
+<p>All paths of vLLM code are under <code>vllm/</code>; the test packages are under <code>tests/plugins/</code>.</p>
+
+<x-stop n="1" title="pip install writes the entry points">
+<p>We are not in vLLM yet. The installer reads the package description and writes the entry points into the {{term entry-point-metadata}} of each package. The platform package publishes two entry points in two {{term plugin-group | plugin groups}}:</p>
+<x-code file="tests/plugins/vllm_add_dummy_platform/setup.py" lines="6-18" highlight="11-12,14-15" />
+<p>The model package publishes one more general plugin, <code>register_dummy_model</code> ({{cite tests/plugins/vllm_add_dummy_model/setup.py:10-12}}). vLLM itself publishes two general plugins, the LoRA resolvers ({{cite pyproject.toml:45-47}}). No function of the packages runs at install time. The page {{link learn/python-entry-points}} explains the format.</p>
+<p><strong>What the data looks like now</strong> (the general group across all installed packages):</p>
+<pre><code class="language-none">[vllm.platform_plugins]
+dummy_platform_plugin = vllm_add_dummy_platform:dummy_platform_plugin
+[vllm.general_plugins]
+dummy_custom_ops         = vllm_add_dummy_platform:register_ops
+register_dummy_model     = vllm_add_dummy_model:register
+lora_filesystem_resolver = vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver
+lora_hf_hub_resolver     = vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver</code></pre>
+<x-simplified><p>Each package has its own <code>entry_points.txt</code>. The block above merges them into one view; <code>importlib.metadata.entry_points()</code> makes the same merge when vLLM asks for a group.</p></x-simplified>
+</x-stop>
+
+<x-stop n="2" title="vllm serve starts, and the CLI selects spawn">
+<p>The command <code>vllm</code> is a {{term console-script}} for <code>vllm.entrypoints.cli.main:main</code> ({{cite pyproject.toml:42-43}}). <code>main()</code> imports the module of each subcommand, then sets up the environment:</p>
+<x-code file="vllm/entrypoints/cli/main.py" lines="43-68" highlight="50,67-68" />
+<p><code>cli_env_setup()</code> sets <code>VLLM_WORKER_MULTIPROC_METHOD=spawn</code> when you did not set it ({{cite vllm/entrypoints/common/startup.py:147-149}}). This matters for the whole tour: each child process of <code>vllm serve</code> is a new Python interpreter ({{term spawn}}). It has empty registries and no platform object, so it must load every plugin again. The page {{link concepts/plugin-loading#deep-dive}} explains fork and spawn.</p>
+</x-stop>
+
+<x-stop n="3" title="An import resolves current_platform: the dummy detector wins">
+<p>The imports of stop 2 reach a module-level <code>from vllm.platforms import current_platform</code>. One such line is in <code>vllm/engine/arg_utils.py</code> ({{cite vllm/engine/arg_utils.py:122}}), which the <code>serve</code> module imports through <code>cli_args.py</code> ({{cite vllm/entrypoints/cli/serve.py:13}}, {{cite vllm/entrypoints/common/cli_args.py:16}}). <code>current_platform</code> is not a real module attribute. So Python calls the module <code>__getattr__</code>, which resolves the platform on first use ({{cite vllm/platforms/__init__.py:303-322}}):</p>
+<x-code file="vllm/platforms/__init__.py" lines="250-279" highlight="250,254,257-259,272-279" />
+<ol>
+  <li>Line 250 loads the group <code>vllm.platform_plugins</code>. It imports <code>dummy_platform_plugin</code>, but does not call it yet.</li>
+  <li>Line 254 calls the five built-in detectors first, then the dummy detector. On a host with an NVIDIA GPU, the CUDA detector answers too.</li>
+  <li>Lines 277-279: exactly one {{term out-of-tree}} detector is active, so it wins over CUDA. vLLM calls it a second time to get the class name, and logs "Platform plugin dummy_platform_plugin is activated" at INFO level.</li>
+</ol>
+<p>The detector itself is short. A real detector checks for its device and returns <code>None</code> when the device is missing ({{cite docs/design/plugin_system.md:50}}). The test detector always answers:</p>
+<x-code file="tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/__init__.py" lines="5-9" highlight="9" />
+<p>Line 319 of <code>platforms/__init__.py</code> imports the class and makes one object. Its identity fields mark it as out-of-tree:</p>
+<x-code file="tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_platform.py" lines="15-19" />
+<p><strong>What the data looks like now</strong> (front end, NVIDIA host):</p>
+<pre><code class="language-python">activated_plugins = ["cuda", "dummy_platform_plugin"]     # order of line 254
+vllm.platforms._current_platform = DummyPlatform()        # is_out_of_tree() is True
+plugins_loaded = False                                    # no general plugin has run yet</code></pre>
+<p>The platform is fixed before any general plugin runs. So a general plugin cannot change the platform choice. The page {{link concepts/platform-plugins}} explains the detection rules.</p>
+</x-stop>
+
+<x-stop n="4" title="The general plugins run for the first time">
+<p>The CLI builds the parsers of all subcommands before it reads your flags ({{cite vllm/entrypoints/cli/main.py:100-110}}). The <code>serve</code> parser calls <code>make_arg_parser</code> ({{cite vllm/entrypoints/cli/serve.py:172}}), which calls <code>AsyncEngineArgs.add_cli_args</code> ({{cite vllm/entrypoints/common/cli_args.py:466}}). That function loads the general plugins first:</p>
+<x-code file="vllm/engine/arg_utils.py" lines="3237-3243" highlight="3243" />
+<p><code>load_general_plugins()</code> sets the once-per-process flag, then calls each function of the group, in the order of <code>entry_points()</code> ({{cite vllm/plugins/__init__.py:82-90}}). Two of the four functions belong to our package:</p>
+<ul>
+  <li><strong><code>register_ops</code></strong> imports the module with the replacement layer ({{cite tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/__init__.py:12-13}}). The import runs the decorator {{term register-oot}}:</li>
+</ul>
+<x-code file="tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_custom_ops.py" lines="9-19" highlight="10" />
+<ul>
+  <li><strong><code>register</code></strong> registers four architectures in the {{term model-registry}}. <code>MyOPTForCausalLM</code> uses the class form, so the function imports <code>my_opt</code> at once ({{cite tests/plugins/vllm_add_dummy_model/vllm_add_dummy_model/__init__.py:9-12}}). <code>MyLlava</code> uses the string form, a {{term lazy-registration}} ({{cite tests/plugins/vllm_add_dummy_model/vllm_add_dummy_model/__init__.py:26-27}}).</li>
+</ul>
+<p>The two LoRA resolver functions also run. They register a resolver only when their environment variables are set ({{link concepts/frontend-plugins}}).</p>
+<p><strong>What the data looks like now</strong> (front end):</p>
+<pre><code class="language-python">plugins_loaded = True
+op_registry_oot = {"RotaryEmbedding": DummyRotaryEmbedding}           # custom_op.py:22
+ModelRegistry.models["MyOPTForCausalLM"] = _RegisteredModel(...)      # model info computed now
+ModelRegistry.models["MyLlava"] = _LazyRegisteredModel("vllm_add_dummy_model.my_llava", "MyLlava")</code></pre>
+<p>The key of <code>op_registry_oot</code> is the class name of the in-tree layer, because the decorator was called on <code>RotaryEmbedding</code> ({{cite vllm/model_executor/custom_op.py:337-340}}). The model info of an eager entry is computed at registration ({{cite vllm/model_executor/models/registry.py:974-979}}).</p>
+<x-deepdive title="Stop 4 in detail: the second call in EngineArgs">
+<p>After the CLI parses the flags, <code>ServeSubcommand.cmd</code> runs the API server in this process ({{cite vllm/entrypoints/cli/serve.py:153-156}}). <code>build_async_engine_client</code> makes the engine arguments with <code>AsyncEngineArgs.from_cli_args(args)</code> ({{cite vllm/entrypoints/launchers/api_server/entry.py:52}}). <code>EngineArgs.__post_init__</code> calls <code>load_general_plugins()</code> again ({{cite vllm/engine/arg_utils.py:921-924}}). Here it returns at once, because the flag is set ({{cite vllm/plugins/__init__.py:83-84}}). The call exists for the offline <code>LLM</code> class, which builds no CLI parser.</p>
+<p>At the default log level INFO, the loader prints nothing for this group: it logs the general group only at DEBUG level ({{cite vllm/plugins/__init__.py:48-50}}).</p>
+</x-deepdive>
+</x-stop>
+
+<x-stop n="5" title="pre_register_and_update runs four times">
+<p>This is the first {{term platform-hook}} of the start-up. The first call is at the end of <code>add_cli_args</code>, with the parser: <code>current_platform.pre_register_and_update(parser)</code> ({{cite vllm/engine/arg_utils.py:3257}}). The docstring names one use: an out-of-tree platform can import and register its own quantization config here ({{cite vllm/platforms/interface.py:642-650}}).</p>
+<p>The CLI also builds the parsers of <code>vllm launch render</code> and <code>vllm run-batch</code> before it parses the flags. Both parsers call <code>AsyncEngineArgs.add_cli_args</code> too ({{cite vllm/entrypoints/cli/launch.py:99-106}}, {{cite vllm/entrypoints/cli/launch.py:39}}, {{cite vllm/entrypoints/cli/run_batch.py:62}}, {{cite vllm/entrypoints/launchers/run_batch.py:294-296}}). So the hook runs three times with a parser, once for each parser. (Derived from the parser loop of stop 4.) The general plugins do not run again in these calls, because the flag is already set.</p>
+<p>The fourth call comes after the flags are parsed. <code>build_async_engine_client_from_engine_args</code> calls <code>create_engine_config</code> ({{cite vllm/entrypoints/launchers/api_server/entry.py:82}}), which starts like this:</p>
+<x-code file="vllm/engine/arg_utils.py" lines="2243-2250" highlight="2246,2248,2250" />
+<p><code>DummyPlatform</code> does not override this hook, so the base method runs, and it does nothing ({{cite vllm/platforms/interface.py:638-651}}). Line 2248 makes the device config from <code>device_type</code>, which is <code>"privateuseone"</code> for the dummy platform. The docstring says that the hook runs "before ... cli arguments are parsed" ({{cite vllm/platforms/interface.py:644-645}}). That is true for the three calls with a parser, but not for the fourth call. So a real hook must give the same result when it runs again.</p>
+</x-stop>
+
+<x-stop n="6" title="ModelConfig asks the model registry">
+<p>Next, <code>create_engine_config</code> makes the model config ({{cite vllm/engine/arg_utils.py:2269}}). <code>ModelConfig.__post_init__</code> reads the architecture name and asks the registry what the class can do ({{cite vllm/config/model.py:703-706}}). Then it resolves the architecture:</p>
+<x-code file="vllm/config/model.py" lines="741-744" highlight="741,744" />
+<p>The architecture is <code>MyOPTForCausalLM</code>, from <code>--hf-overrides</code>. The front end registered it at stop 4 with the class form, so the registry already has its {{term model-info}}. The eager entry returns it with no new process ({{cite vllm/model_executor/models/registry.py:981-982}}). The log shows "Resolved architecture: MyOPTForCausalLM" at INFO level.</p>
+<x-note title="A lazy entry would start a subprocess here">
+<p>If we served <code>MyLlava</code>, the entry would be lazy. The registry would look for a cached model info file. On a miss, it would run the inspection in a new Python process "to avoid initializing CUDA" ({{cite vllm/model_executor/models/registry.py:1088-1109}}). That subprocess loads the general plugins first ({{cite vllm/model_executor/models/registry.py:1608-1612}}), so our two plugin functions would run in a fifth process. The page {{link concepts/oot-models}} explains the cache.</p>
+</x-note>
+</x-stop>
+
+<x-stop n="7" title="VllmConfig.__post_init__: the platform config hooks">
+<p>At the end, <code>create_engine_config</code> builds one <code>VllmConfig</code> from all parts ({{cite vllm/engine/arg_utils.py:2870}}). Its <code>__post_init__</code> calls two more platform hooks. First, <code>apply_config_platform_defaults</code> runs ({{cite vllm/config/vllm.py:1804}}); the dummy platform keeps the base method, which does nothing ({{cite vllm/platforms/interface.py:653-664}}). Then vLLM adds the base mode of the {{term custom-op}} list:</p>
+<x-code file="vllm/config/vllm.py" lines="1819-1826" highlight="1824" />
+<p>With the default compilation (mode <code>VLLM_COMPILE</code>, backend <code>inductor</code>), the list becomes <code>["none"]</code>: all custom ops are off. Later, the platform gets the last word ({{cite vllm/config/vllm.py:2046}}). The dummy platform turns all ops on:</p>
+<x-code file="tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_platform.py" lines="21-23" highlight="23" />
+<p>A real platform must also set the worker class here. CUDA shows the pattern:</p>
+<x-code file="vllm/platforms/cuda.py" lines="325-331" highlight="330-331" />
+<p>The default of <code>worker_cls</code> is <code>"auto"</code> ({{cite vllm/config/parallel.py:306}}). The dummy platform does not change it. That has a cost at stop 12.</p>
+<p><strong>What the data looks like now</strong> (the config that goes to the other processes):</p>
+<pre><code class="language-python">vllm_config.compilation_config.custom_ops      = ["all"]   # dummy hook replaced ["none"]
+vllm_config.parallel_config.worker_cls         = "auto"    # a real platform sets a class here
+vllm_config.parallel_config.tensor_parallel_size = 2
+vllm_config.parallel_config.distributed_executor_backend = "mp"   # world size 2</code></pre>
+<p>The executor backend comes from <code>ParallelConfig.__post_init__</code>: a world size above 1 gives <code>"mp"</code> when Ray is not in use ({{cite vllm/config/parallel.py:1055-1061}}, {{cite vllm/config/parallel.py:1096}}). The page {{link concepts/platform-interface}} lists every hook.</p>
+</x-stop>
+
+<x-stop n="8" title="AsyncLLM loads the stat loggers and starts the engine core">
+<p>The front end now makes {{term async-llm | AsyncLLM}} ({{cite vllm/entrypoints/launchers/api_server/entry.py:94}}). Its constructor loads one more plugin group:</p>
+<x-code file="vllm/v1/engine/async_llm.py" lines="155-156" highlight="156" />
+<p>Our package has no {{term stat-logger}}, so the group is empty. The loader logs "No plugins for group ... found." at DEBUG level and returns ({{cite vllm/plugins/__init__.py:42-45}}). Then <code>AsyncLLM</code> starts the engine core ({{cite vllm/v1/engine/async_llm.py:193}}). The process manager uses the multiprocessing context, so the child is a spawned process:</p>
+<x-code file="vllm/v1/engine/utils.py" lines="256-264" highlight="256,258" />
+<x-code file="vllm/v1/engine/utils.py" lines="281-287" highlight="283,285" />
+<x-warning title="Only the config crosses the process boundary">
+<p>The child gets <code>vllm_config</code> as a pickled argument. It does not get <code>op_registry_oot</code>, the model registry, the flag <code>plugins_loaded</code> or the platform object. Those are module globals of the front end. So stops 3 and 4 must happen again in the child. A change that a platform hook makes outside <code>vllm_config</code> is lost here.</p>
+</x-warning>
+</x-stop>
+
+<x-stop n="9" title="The engine core detects the platform and runs the general plugins">
+<p>The spawned child imports the module of its target, <code>vllm.v1.engine.core</code>. On the way, Python runs the package file <code>vllm/v1/engine/__init__.py</code>, which imports <code>vllm.config.kv_events</code> ({{cite vllm/v1/engine/__init__.py:14}}). So Python runs the package <code>vllm/config/__init__.py</code>, which imports <code>compilation.py</code>, which has a module-level <code>from vllm.platforms import current_platform</code> ({{cite vllm/config/__init__.py:7}}, {{cite vllm/config/compilation.py:22}}). So stop 3 repeats in this process: the dummy detector runs twice more and wins again. Then <code>EngineCore.__init__</code> runs:</p>
+<x-code file="vllm/v1/engine/core.py" lines="129-147" highlight="132,147" />
+<p>Line 132 repeats stop 4 in this process. <code>register_ops</code> registers <code>DummyRotaryEmbedding</code> again, in this process's own <code>op_registry_oot</code>. <code>register</code> imports <code>my_opt</code> and computes its model info again. The engine core never builds the model, because the workers do. The eager form of the registration costs this import anyway. The lazy form would avoid it.</p>
+<p>Line 147 makes the executor. This happens after the plugins, so the plugins are ready before any worker starts.</p>
+</x-stop>
+
+<x-stop n="10" title="The executor starts two worker processes">
+<p>The backend <code>"mp"</code> from stop 7 selects the {{term multiproc-executor}} ({{cite vllm/v1/executor/abstract.py:80-83}}). Its <code>_init_executor</code> starts one process for each local rank:</p>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="191-207" highlight="191,197" />
+<p><code>make_worker_process</code> takes the same multiprocessing context, so each worker is spawned too ({{cite vllm/v1/executor/multiproc_executor.py:723}}). The target is <code>WorkerProc.worker_main</code>, and the pickled <code>vllm_config</code> goes with it ({{cite vllm/v1/executor/multiproc_executor.py:731-750}}). The page {{link concepts/executors-and-workers}} explains the executor.</p>
+</x-stop>
+
+<x-stop n="11" title="Each worker detects the platform, runs the plugins and the Triton hook">
+<p>Each worker child imports <code>multiproc_executor.py</code> to find its target. On the way, Python runs <code>vllm/v1/executor/__init__.py</code>, which imports <code>abstract.py</code>, which imports <code>vllm.config</code> ({{cite vllm/v1/executor/__init__.py:3}}, {{cite vllm/v1/executor/abstract.py:11}}). So the platform resolves in this process too. Then <code>WorkerProc.__init__</code> calls <code>init_worker</code> ({{cite vllm/v1/executor/multiproc_executor.py:659-672}}):</p>
+<x-code file="vllm/v1/worker/worker_base.py" lines="280-290" highlight="284,290" />
+<ol>
+  <li>Line 284 repeats stop 4 a third and a fourth time, once in each worker. Now this worker has <code>DummyRotaryEmbedding</code> in its registry, before it builds any layer.</li>
+  <li>Line 290 is a kernel hook. A platform can replace core Triton kernels here, "before any worker or model code can launch them". The dummy platform keeps the base method, which does nothing ({{cite vllm/platforms/interface.py:375-386}}).</li>
+</ol>
+</x-stop>
+
+<x-stop n="12" title="The worker resolves worker_cls">
+<x-warning title="The test platform cannot go past this stop">
+<p><code>DummyPlatform</code> leaves <code>worker_cls</code> as <code>"auto"</code> (stop 7). <code>resolve_obj_by_qualname</code> splits the name at the last dot ({{cite vllm/utils/import_utils.py:119-123}}). <code>"auto"</code> has no dot, so the split gives one part, and the unpacking at line 121 raises <code>ValueError</code>. The worker fails here. (Derived.) A real vendor sets its own worker class in <code>check_and_update_config</code>; the design doc lists the methods that the class must implement ({{cite docs/design/plugin_system.md:109-117}}).</p>
+</x-warning>
+<x-code file="vllm/v1/worker/worker_base.py" lines="292-302" highlight="293-296" />
+<p>The worker class is the main hook of a hardware plugin: it owns the device, the model runner and the KV cache. Lines 345-347 of the same file then make the worker object inside <code>set_current_vllm_config</code>. Next, <code>WorkerProc.__init__</code> calls <code>init_device</code> and <code>load_model</code> ({{cite vllm/v1/executor/multiproc_executor.py:680-688}}). With TP = 2, the device setup also asks the platform for its communicator class, because the tensor-parallel group has two ranks ({{cite vllm/distributed/parallel_state.py:549-552}}).</p>
+<x-simplified><p>For stops 13 to 15, we assume a vendor worker class that builds the model with vLLM's model loader. vLLM's own GPU worker does this: <code>Worker.load_model</code> calls the model runner ({{cite vllm/v1/worker/gpu_worker.py:591-598}}), which calls <code>model_loader.load_model</code> ({{cite vllm/v1/worker/gpu/model_runner.py:403-406}}). Stops 13 to 15 happen in layer constructors, so they run for any worker that builds vLLM model classes.</p></x-simplified>
+</x-stop>
+
+<x-stop n="13" title="The model is built, and attention asks the platform for a backend">
+<p>The loader finds the class in the registry of this worker ({{cite vllm/model_executor/model_loader/utils.py:305-313}}). The entry is there because of line 284 in stop 11. Then <code>initialize_model</code> calls the constructor inside <code>set_current_vllm_config</code>:</p>
+<x-code file="vllm/model_executor/model_loader/utils.py" lines="96-103" highlight="98,100-101" />
+<p>Each OPT decoder layer builds an <code>OPTAttention</code>, and its constructor builds an attention layer ({{cite vllm/model_executor/models/opt.py:137-144}}, {{cite vllm/model_executor/models/opt.py:106}}). The attention layer asks for its backend in <code>__init__</code> ({{cite vllm/model_executor/layers/attention/attention.py:349-350}}). The selector asks the platform, a {{term component-picker}}:</p>
+<x-code file="vllm/v1/attention/selector.py" lines="206-228" highlight="206,218-222,227" />
+<p><code>DummyPlatform.get_attn_backend_cls</code> returns one class for every layer:</p>
+<x-code file="tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_platform.py" lines="25-32" highlight="32" />
+<p>Line 227 of the selector imports that class. <code>@cache</code> keeps one answer for each set of arguments. The arguments are the backend name, the <code>AttentionSelectorConfig</code>, <code>num_heads</code> and the KV cache data type ({{cite vllm/v1/attention/selector.py:158-180}}, {{cite vllm/v1/attention/selector.py:196-203}}). All OPT attention layers pass the same values, so each process asks the platform only once. (Derived from {{cite vllm/model_executor/models/opt.py:106-113}}.)</p>
+<p>The test backend is a stub: it subclasses a placeholder backend and changes only its name ({{cite tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_attention_backend.py:7-10}}). At this commit, the file imports its parent class from <code>vllm.attention.backends.placeholder_attn</code>, a module that the repository does not contain ({{cite tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_attention_backend.py:4}}). A real vendor returns a backend that computes attention on its device. See {{link concepts/attention-backend-selection}}.</p>
+</x-stop>
+
+<x-stop n="14" title="CustomOp.__new__ swaps the replaced class">
+<p>The same constructors also build small layers such as norms and rotary embeddings. Each of them is a <code>CustomOp</code>. Before Python runs <code>__init__</code>, the class method <code>__new__</code> looks at the {{term op-registry}} of out-of-tree classes:</p>
+<x-code file="vllm/model_executor/custom_op.py" lines="107-126" highlight="109,117-120,126" />
+<ol>
+  <li>Line 109 takes the Python class name of the class that the model code builds, for example <code>"RotaryEmbedding"</code>.</li>
+  <li>Lines 117-120: the name is in <code>op_registry_oot</code>, so vLLM makes the object from <code>DummyRotaryEmbedding</code>, and logs "Instantiating custom op" at DEBUG level.</li>
+  <li>Line 126 returns an object of the replacement class. It is a subclass of the in-tree class, so Python then runs its <code>__init__</code>, which sets <code>addition_config = True</code>.</li>
+</ol>
+<p><strong>For our model, the swap does not happen.</strong> OPT has learned position embeddings and builds no <code>RotaryEmbedding</code> ({{cite vllm/model_executor/models/opt.py:217}}). Its norm layer is <code>LayerNorm</code> ({{cite vllm/model_executor/models/opt.py:35}}, {{cite vllm/model_executor/models/opt.py:147}}). <code>"LayerNorm"</code> is not in <code>op_registry_oot</code>, so line 118 keeps the in-tree class. A model with standard RoPE, such as Llama, gets its rotary layer from <code>get_rope</code>, which builds <code>RotaryEmbedding</code> for the default rope type ({{cite vllm/model_executor/layers/rotary_embedding/__init__.py:147-155}}). There the swap happens. A test checks it ({{cite tests/plugins_tests/test_platform_plugins.py:51-64}}).</p>
+<p>The lookup uses the exact class name. <code>MRotaryEmbedding</code>, which <code>get_rope</code> builds for an <code>mrope_section</code>, has another name, so it is not swapped ({{cite vllm/model_executor/layers/rotary_embedding/__init__.py:113-114}}). (Derived from line 109.)</p>
+</x-stop>
+
+<x-stop n="15" title="The op picks forward_oot, because the platform enabled it">
+<p><code>CustomOp.__init__</code> calls <code>dispatch_forward</code> once and keeps the result ({{cite vllm/model_executor/custom_op.py:128-134}}):</p>
+<x-code file="vllm/model_executor/custom_op.py" lines="183-205" highlight="183,189-192,202-203" />
+<p>The worker's copy of the config has <code>custom_ops = ["all"]</code> from stop 7. So the default <code>enabled()</code> returns true for every op ({{cite vllm/model_executor/custom_op.py:290}}, {{cite vllm/model_executor/custom_op.py:307}}). The platform is out-of-tree, so lines 202-203 select <code>forward_oot</code>. For OPT's <code>LayerNorm</code>, that is the default <code>forward_oot</code>, which calls <code>forward_native</code> ({{cite vllm/model_executor/custom_op.py:167-170}}). In a RoPE model, <code>DummyRotaryEmbedding.forward_oot</code> calls the parent's <code>forward_oot</code> (stop 4 excerpt, lines 18-19). <code>RotaryEmbedding</code> does not override that method, so the call ends in the same <code>forward_native</code>.</p>
+<p>Without the dummy hook of stop 7, the list would be <code>["none"]</code>. Then every op without a <code>+name</code> switch would be disabled and would use <code>forward_native</code> (line 192), and the vendor's <code>forward_oot</code> would not run for it. The page {{link concepts/custom-ops}} explains the switches.</p>
+</x-stop>
+
+<x-stop n="16" title="Block size, environment cache, and the server is ready">
+<p>After <code>load_model</code>, each worker finishes its start-up:</p>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="701-710" highlight="702,710" />
+<ol>
+  <li>Line 702 runs a config hook. It picks a block size that all attention backends of the model accept, when the user did not set one ({{cite vllm/platforms/interface.py:767-774}}, {{link concepts/platform-interface}}).</li>
+  <li>Line 710 freezes the environment variables. From now on, <code>VLLM_PLUGINS</code> and the other variables are read from a cache in this worker ({{cite vllm/envs.py:2308-2326}}).</li>
+</ol>
+<p>The engine core does the same with <code>enable_envs_cache()</code> at the end of its own start-up ({{cite vllm/v1/engine/core.py:241-243}}). The front end then builds the HTTP app. <code>build_app</code> looks for endpoint plugins; our package has none ({{cite vllm/entrypoints/launchers/app.py:51}}). From the first request on, the <code>forward</code> method of each custom op calls the method that stop 15 chose ({{cite vllm/model_executor/custom_op.py:133-134}}). The tour {{link tours/life-of-a-chat-request}} follows that request.</p>
+</x-stop>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="How many times each hook runs">
+<p>Counts for <code>vllm serve -tp 2</code> with the dummy vendor package and the default <code>spawn</code> method. "Per VllmConfig" means: once for each <code>VllmConfig</code> object that code builds. (Derived from the stops above.) The test platform stops at stop 12. So the last three rows assume a vendor worker class as in stop 12. It sets up vLLM's process groups and builds the model with vLLM's loader.</p>
+<table>
+  <thead><tr><th>Function</th><th>Front end</th><th>Engine core</th><th>Each worker</th><th>Total, TP = 2</th><th>Total, TP = 1</th></tr></thead>
+  <tbody>
+    <tr><td><code>dummy_platform_plugin</code> (detector)</td><td>2</td><td>2</td><td>2</td><td>8</td><td>4</td></tr>
+    <tr><td><code>register_ops</code>, <code>register</code> (general plugins)</td><td>1</td><td>1</td><td>1</td><td>4 each</td><td>2 each</td></tr>
+    <tr><td><code>@RotaryEmbedding.register_oot</code> (import of the module)</td><td>1</td><td>1</td><td>1</td><td>4</td><td>2</td></tr>
+    <tr><td><code>pre_register_and_update</code></td><td>4</td><td>0</td><td>0</td><td>4</td><td>4</td></tr>
+    <tr><td><code>apply_config_platform_defaults</code>, <code>check_and_update_config</code></td><td>per VllmConfig</td><td>per VllmConfig</td><td>per VllmConfig</td><td>1 each in a plain start-up</td><td>same</td></tr>
+    <tr><td><code>register_triton_kernel_overrides</code></td><td>0</td><td>0</td><td>1</td><td>2</td><td>1 (engine core)</td></tr>
+    <tr><td><code>get_device_communicator_cls</code></td><td>0</td><td>0</td><td>1 per group with more than 1 rank</td><td>2 for OPT</td><td>0</td></tr>
+    <tr><td><code>get_attn_backend_cls</code></td><td>0</td><td>0</td><td>1 per distinct argument set</td><td>2 for OPT</td><td>1 for OPT</td></tr>
+    <tr><td><code>update_block_size_for_backend</code></td><td>0</td><td>0</td><td>1</td><td>2</td><td>1 (engine core)</td></tr>
+  </tbody>
+</table>
+<ul>
+  <li>The detector runs twice per process: once in the loop and once for the winner ({{cite vllm/platforms/__init__.py:257}}, {{cite vllm/platforms/__init__.py:278}}).</li>
+  <li>The decorator runs once per process. Python caches an imported module, so a second import in <code>register_ops</code> does not run the decorator again. Also, vLLM calls <code>register_ops</code> only once per process ({{cite vllm/plugins/__init__.py:83-85}}). A second <code>register_oot</code> with the same key would fail the <code>assert</code> at {{cite vllm/model_executor/custom_op.py:338}}.</li>
+  <li>The config hooks run in <code>VllmConfig.__post_init__</code>. vLLM's <code>replace()</code> helper builds a new <code>VllmConfig</code> and so runs them again ({{cite vllm/config/utils.py:121-129}}). The EAGLE drafter loader in a worker is one such case ({{cite vllm/v1/worker/gpu/spec_decode/eagle/utils.py:90-91}}).</li>
+  <li>The hook <code>pre_register_and_update</code> runs three times with a parser (the parsers of <code>serve</code>, <code>launch render</code> and <code>run-batch</code>) and once in <code>create_engine_config</code> (stop 5).</li>
+  <li>The world group has no device communicator ({{cite vllm/distributed/parallel_state.py:1510-1514}}). For OPT with TP = 2, only the tensor-parallel group has two ranks. The pipeline, context-parallel and data-parallel groups have one rank. vLLM makes no expert-parallel group for a dense model ({{cite vllm/distributed/parallel_state.py:2313-2314}}). So each worker asks once. (Derived.)</li>
+  <li>The OPT count for <code>get_attn_backend_cls</code> assumes that all layers pass the same arguments, so <code>@cache</code> hits after the first layer ({{cite vllm/v1/attention/selector.py:206}}).</li>
+  <li>Not counted: the model registry subprocess. It does not run for <code>MyOPTForCausalLM</code> (stop 6). For a lazy entry with a cache miss, it adds one process that runs the general plugins once more ({{cite vllm/model_executor/models/registry.py:1612}}). It imports <code>vllm.config</code> at module level ({{cite vllm/model_executor/models/registry.py:26}}), so it also resolves the platform.</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="What changes with TP = 1">
+<p>With one GPU, the world size is 1, and the executor is <code>"uni"</code> ({{cite vllm/config/parallel.py:1099-1100}}). The {{term uni-executor}} makes the worker object inside the engine core process:</p>
+<x-code file="vllm/v1/executor/uniproc_executor.py" lines="54-75" highlight="68,74-75" />
+<ol>
+  <li>Stops 1 to 9 do not change.</li>
+  <li>Stop 10 starts no process. Stops 11 to 16 run in the engine core process.</li>
+  <li>Stop 11: <code>load_general_plugins()</code> in <code>init_worker</code> returns at once, because <code>EngineCore.__init__</code> already set the flag in this process ({{cite vllm/plugins/__init__.py:83-84}}). The platform is not detected again: the engine core already has the object. <code>register_triton_kernel_overrides</code> still runs.</li>
+  <li>Stop 12: the tensor-parallel group has one rank, so the worker does not ask for a device communicator ({{cite vllm/distributed/parallel_state.py:549}}).</li>
+  <li>Stop 16: the engine core calls <code>update_block_size_for_backend</code> (line 75 above).</li>
+</ol>
+<p>So the general plugin functions run twice in total, and the detector runs four times.</p>
+</x-deepdive>
+
+<x-deepdive title="What changes with VLLM_PLUGINS">
+<p><code>VLLM_PLUGINS</code> is one allowlist of entry-point names for five groups ({{cite vllm/envs.py:1160-1167}}, {{cite vllm/plugins/__init__.py:63-64}}). Three cases for our package:</p>
+<table>
+  <thead><tr><th>Value</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td>not set</td><td>The tour above: every plugin of each group loads.</td></tr>
+    <tr><td><code>register_dummy_model</code></td><td>Stop 3 does not load <code>dummy_platform_plugin</code>. On an NVIDIA host the CUDA detector wins, with a DEBUG log only ({{cite vllm/platforms/__init__.py:285-289}}). Stop 4 skips <code>dummy_custom_ops</code> and the LoRA resolvers. Stop 7: CUDA keeps <code>custom_ops = ["none"]</code> and sets the GPU worker class. The model still loads. No warning says that the platform plugin was skipped.</td></tr>
+    <tr><td><code>dummy_platform_plugin,dummy_custom_ops,register_dummy_model</code></td><td>The same as "not set" for our package. The LoRA resolvers do not load. Do not put spaces after the commas: the code does not strip them.</td></tr>
+    <tr><td><code>""</code> (empty)</td><td>No plugin loads. The model is unknown: "are not supported for now". A test checks this ({{cite tests/plugins_tests/test_oot_registration_offline.py:13-22}}).</td></tr>
+  </tbody>
+</table>
+<p>With a list, the loader logs "Loading plugin ..." for each allowed name. For the general group this log is at DEBUG level ({{cite vllm/plugins/__init__.py:65-66}}). The engine core and the workers read the variable from their own environment, which they inherit from the front end.</p>
+</x-deepdive>
+
+<x-deepdive title="What changes with VLLM_TARGET_DEVICE=cpu">
+<p>The CPU target is a short-circuit in every process. <code>resolve_current_platform_cls_qualname</code> returns the CPU platform before it loads <code>vllm.platform_plugins</code> ({{cite vllm/platforms/__init__.py:244-248}}). The value is lower-cased, so <code>CPU</code> works too ({{cite vllm/envs.py:622}}).</p>
+<ul>
+  <li><strong>Stop 3:</strong> <code>dummy_platform_plugin</code> is never imported or called, in any process.</li>
+  <li><strong>Stop 4:</strong> the general plugins still run. They are a separate group. So <code>DummyRotaryEmbedding</code> is still registered, and stop 14 still swaps the class in a RoPE model.</li>
+  <li><strong>Stop 7:</strong> the CPU platform sets <code>worker_cls</code> to <code>CPUWorker</code> ({{cite vllm/platforms/cpu.py:355-356}}) and changes the compilation settings ({{cite vllm/platforms/cpu.py:368-379}}).</li>
+  <li><strong>Stop 15:</strong> an enabled op calls <code>forward_cpu</code>, not <code>forward_oot</code> ({{cite vllm/model_executor/custom_op.py:196-197}}). The swapped class inherits <code>forward_cpu</code> from <code>RotaryEmbedding</code> ({{cite vllm/model_executor/layers/rotary_embedding/base.py:298}}). The vendor's <code>forward_oot</code> never runs.</li>
+</ul>
+<p>This shows a design point. A layer replacement and a platform are independent. A general plugin registers the class on every platform; the platform decides which <code>forward_*</code> method of that class runs.</p>
+</x-deepdive>
+
+<x-deepdive title="What travels between the processes">
+<table>
+  <thead><tr><th>State</th><th>Where it lives</th><th>Reaches the engine core and workers?</th></tr></thead>
+  <tbody>
+    <tr><td><code>_current_platform</code></td><td>module global ({{cite vllm/platforms/__init__.py:296}})</td><td>no: each process detects again</td></tr>
+    <tr><td><code>plugins_loaded</code></td><td>module global ({{cite vllm/plugins/__init__.py:33}})</td><td>no: a spawned child starts with <code>False</code></td></tr>
+    <tr><td><code>op_registry_oot</code></td><td>module global ({{cite vllm/model_executor/custom_op.py:22}})</td><td>no: the general plugin fills it again</td></tr>
+    <tr><td><code>ModelRegistry</code> entries</td><td>module object</td><td>no: the general plugin registers again</td></tr>
+    <tr><td><code>compilation_config.custom_ops</code>, <code>parallel_config.worker_cls</code></td><td>inside <code>VllmConfig</code></td><td>yes: pickled with the config ({{cite vllm/v1/engine/utils.py:258}}, {{cite vllm/v1/executor/multiproc_executor.py:732}})</td></tr>
+    <tr><td>environment variables</td><td>process environment</td><td>yes: a child inherits them (general operating system rule)</td></tr>
+  </tbody>
+</table>
+<p>So a platform plugin puts its decisions into <code>vllm_config</code> fields, and a general plugin puts its registrations into each process again. The page {{link concepts/plugin-map}} lists every extension point with its process.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="A platform hook that changes a global is lost">
+<p>In a plain start-up of <code>vllm serve</code>, <code>check_and_update_config</code> runs only in the front end, where <code>VllmConfig</code> is built ({{cite vllm/config/vllm.py:2046}}, {{cite vllm/engine/arg_utils.py:2870}}). Only changes to <code>vllm_config</code> reach the engine core and the workers (stop 8). Register classes in a general plugin, not in a config hook.</p>
+</x-warning>
+<ul>
+  <li><strong>The worker class is missing.</strong> A platform that leaves <code>worker_cls</code> as <code>"auto"</code> fails in each worker at stop 12 ({{cite vllm/v1/worker/worker_base.py:293-296}}). The front end and the engine core start normally, so read the worker log: "WorkerProc failed to start." ({{cite vllm/v1/executor/multiproc_executor.py:956-957}}).</li>
+  <li><strong>The platform plugin is skipped with no warning.</strong> A <code>VLLM_PLUGINS</code> list without the detector name gives a built-in platform (deep dive). Look for "Platform plugin ... is activated" in the log ({{cite vllm/platforms/__init__.py:279}}).</li>
+  <li><strong>Two platform plugins answer.</strong> Start-up stops with "Only one platform plugin can be activated" in the first process ({{cite vllm/platforms/__init__.py:272-276}}).</li>
+  <li><strong>The replacement never builds.</strong> <code>register_oot</code> keys on the class name. If the model does not build that exact class, as OPT does not build <code>RotaryEmbedding</code>, nothing happens and nothing is logged (stop 14).</li>
+  <li><strong>The vendor kernels never run.</strong> Without <code>"all"</code> or <code>+name</code> in <code>custom_ops</code>, a compiled server disables the ops, and <code>forward_oot</code> does not run (stop 15).</li>
+  <li><strong>A general plugin fails in one process only.</strong> The function runs in each process, and vLLM does not catch its errors ({{cite vllm/plugins/__init__.py:89-90}}). The engine core logs "EngineCore failed to start." ({{cite vllm/v1/engine/core.py:1570-1572}}).</li>
+  <li><strong>Eager registration costs imports everywhere.</strong> The class form imports the model module in the front end, the engine core and every worker (stops 4, 9 and 11). The registry docstring recommends the string form to avoid starting CUDA too early ({{cite vllm/model_executor/models/registry.py:1167-1173}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> A vendor plugin touches every process of the server, at different moments. When a plugin "does not work", the question is: in which process, and at which stop? A wrong platform shows up at stop 3, a missing worker class at stop 12, a silent op at stop 14 or 15. The tour {{link tours/build-a-toy-plugin}} uses these stops to check a plugin of your own.</p>
+
+<x-quiz>
+  <x-q level="easy">In which processes does <code>dummy_platform_plugin</code> run with <code>-tp 2</code>, and why more than once?
+    <x-a><p>In all four: the front end, the engine core and both workers. Each one is a separate Python process with its own <code>_current_platform = None</code>; the three children are spawned ({{cite vllm/platforms/__init__.py:296}}, {{cite vllm/entrypoints/common/startup.py:147-149}}). The first read of <code>current_platform</code> in each process runs the detection again ({{cite vllm/platforms/__init__.py:317-319}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">The engine core never builds the model. Why does it import <code>my_opt.py</code>?
+    <x-a><p><code>EngineCore.__init__</code> runs the general plugins ({{cite vllm/v1/engine/core.py:132}}). The plugin registers <code>MyOPTForCausalLM</code> with the class form, so it imports the module inside the function ({{cite tests/plugins/vllm_add_dummy_model/vllm_add_dummy_model/__init__.py:9-12}}). The class form also computes the model info at once ({{cite vllm/model_executor/models/registry.py:1194-1195}}). The string form would avoid this import.</p></x-a>
+  </x-q>
+  <x-q level="medium">The dummy platform sets <code>custom_ops = ["all"]</code> in the front end. How does that value reach a worker?
+    <x-a><p>Inside the pickled <code>VllmConfig</code>. The hook changes the config object ({{cite vllm/config/vllm.py:2046}}), and the front end passes that object to the spawned engine core ({{cite vllm/v1/engine/utils.py:256-287}}), which passes it to each worker ({{cite vllm/v1/executor/multiproc_executor.py:731-750}}). The hook itself does not run in the worker.</p></x-a>
+  </x-q>
+  <x-q level="hard">We serve <code>MyOPTForCausalLM</code> on the dummy platform with <code>custom_ops = ["all"]</code>. Does <code>DummyRotaryEmbedding.forward_oot</code> ever run? Which <code>forward_*</code> method does OPT's <code>LayerNorm</code> use?
+    <x-a><p>No. OPT builds no <code>RotaryEmbedding</code>, and <code>CustomOp.__new__</code> swaps only the exact class name in <code>op_registry_oot</code> ({{cite vllm/model_executor/custom_op.py:109-120}}). <code>LayerNorm</code> keeps its in-tree class. It is enabled by <code>"all"</code>, and the platform is out-of-tree, so it uses <code>forward_oot</code> ({{cite vllm/model_executor/custom_op.py:202-203}}). The default <code>forward_oot</code> calls <code>forward_native</code> ({{cite vllm/model_executor/custom_op.py:167-170}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With TP = 1, how many times does <code>register_ops</code> run, and how many times does the dummy detector run? Ignore the model registry subprocess.
+    <x-a><p><code>register_ops</code> runs twice: in the front end and in the engine core. The uni executor calls <code>init_worker</code> inside the engine core process ({{cite vllm/v1/executor/uniproc_executor.py:68}}), and the flag is already set there ({{cite vllm/plugins/__init__.py:83-84}}). The detector runs four times: twice in each of the two processes, once in the loop and once for the winner ({{cite vllm/platforms/__init__.py:257}}, {{cite vllm/platforms/__init__.py:278}}).</p></x-a>
+  </x-q>
+</x-quiz>

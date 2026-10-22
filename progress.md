@@ -50,6 +50,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
 
+- FINAL-PASS TODO (B5t FC, supervisor verified): pre_register_and_update runs 4× in the vllm serve front end, not twice: fix concepts/platform-interface ~49, ~101-102, ~118; concepts/quantization-plugins ~136; diagram b4a_platform_hooks (used on platform-interface and code/platforms-interface ~25); also facts docstring note.
+
 - FINAL-PASS TODO (B6a FC): learn/tp-pp-in-practice ~47 '64 all-reduces per step' → align with 65 (64 + embedding) on model-definition; any page saying the completeness check catches missing linear weights in BF16 models; TeleChat2 mapper-only; SupportsQuant remapping Llama names.
 
 - FINAL-PASS TODO (B5 FC): any page saying sleep mode is CUDA/HIP only; front end imports the KV factory lazily; Llama prefix model.layers.N.qkv_proj (missing self_attn); platform-interface 'pre_register_and_update only before parsing'.
@@ -126,7 +128,9 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-23 01:31 | B3b fact check | done ~01:45: ~190 claims, 21 defects; explorer verified in 12 scenarios |
 | 2026-10-23 01:46 | B5 writer | done ~02:35; 6 diagrams, chooser visual, b5.json 16 terms. Decision: DeepSeek-V3 MLA example kept (page notes ignored +quant_fp8). |
 | 2026-10-23 02:36 | B5 fact check (+ 3 plugin-map row fixes) | done ~03:00: ~270 claims, 34 defects; chooser all 640 combos OK |
-| 2026-10-23 03:01 | B5t writer (life-of-a-plugin, build-a-toy-plugin) | running |
+| 2026-10-23 03:01 | B5t writer (life-of-a-plugin, build-a-toy-plugin) | done ~03:35; 2 diagrams |
+| 2026-10-23 03:36 | B5t fact check | done ~03:55: ~190 claims, 27 defects; pre_register_and_update ×4 (supervisor verified) |
+| 2026-10-23 03:57 | B7a writer | running |
 | 2026-10-23 02:11 | B6a writer | done ~02:50; 3 diagrams, b6a.json 13 terms |
 | 2026-10-23 02:51 | B6a fact check | done ~03:15: ~175 claims, 26 defects |
 | 2026-10-23 03:16 | B6b writer | running |
