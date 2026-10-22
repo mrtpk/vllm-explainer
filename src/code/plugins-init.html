@@ -1,0 +1,247 @@
+---
+title: plugins/__init__.py: the plugin loaders
+nav_title: plugins/__init__.py
+level: Intermediate
+prerequisites: learn/python-entry-points, concepts/plugin-loading
+related: concepts/plugin-loading, concepts/plugin-map, concepts/platform-plugins, concepts/frontend-plugins, concepts/lora-serving, code/platforms-init, code/engine-arg-utils, code/v1-engine-core, tours/life-of-a-plugin, tours/build-a-toy-plugin
+summary: vllm/plugins/__init__.py names the five plugin entry-point groups and has the three loaders: the shared group loader, the once-per-process general loader and the strict endpoint loader.
+---
+<h2>Purpose</h2>
+<p><code>vllm/plugins/__init__.py</code> finds the {{term plugin | plugins}} that other Python packages publish as {{term entry-point | entry points}}, filters them with <code>VLLM_PLUGINS</code>, and imports them for the code that asks.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/plugins/__init__.py</code>, 159 lines of Python. Five group-name constants, one flag and three functions.</td></tr>
+    <tr><th>Main functions</th><td><code>load_plugins_by_group</code> ({{cite vllm/plugins/__init__.py:36}}), <code>load_general_plugins</code> ({{cite vllm/plugins/__init__.py:77}}), <code>load_endpoint_plugins</code> ({{cite vllm/plugins/__init__.py:93}}). There is no class.</td></tr>
+    <tr><th>Runs in</th><td>Every process of <code>vllm serve</code>: the API server (the {{term front-end}}), the {{term engine-core}} process, each {{term worker}} process, and the model registry subprocess (only when it starts). With one GPU, the worker runs inside the engine core process. The code runs on the CPU, in the thread of the caller.</td></tr>
+    <tr><th>Called by</th><td>Nine call sites in <code>vllm/</code>: the engine arguments, <code>EngineCore</code>, the worker wrapper, the model registry, the platform detection, the stat loggers, the IO processor loader and the endpoint plugin wiring (see below).</td></tr>
+    <tr><th>Calls</th><td><code>importlib.metadata.entry_points</code>, <code>envs.VLLM_PLUGINS</code>, <code>EntryPoint.load()</code>, and the loaded plugin functions or factories.</td></tr>
+    <tr><th>Not in this file</th><td>The platform detection rules (<code>vllm/platforms/__init__.py</code>), the stat logger type check (<code>vllm/v1/metrics/loggers.py</code>), the IO processor choice (<code>vllm/plugins/io_processors/__init__.py</code>), the route wiring of endpoint plugins (<code>vllm/plugins/endpoint_plugins/interface.py</code>), and the group <code>vllm.logits_processors</code>.</td></tr>
+  </tbody>
+</table>
+<p>The file only finds, filters and imports. Each caller decides what to do with the loaded objects. The page {{link concepts/plugin-loading}} explains the same code from the view of the processes. This page reads the file line by line.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="c1_plugins_init" alt="Panel 1: three columns. Left: the callers, grouped by the function that they call. load_general_plugins is called from engine/arg_utils.py:3243 and :924, v1/engine/core.py:132, v1/worker/worker_base.py:284 and models/registry.py:1612. load_plugins_by_group is called directly from platforms/__init__.py:250, v1/metrics/loggers.py:87 and io_processors/__init__.py:59. load_endpoint_plugins is called from endpoint_plugins/interface.py:108, which build_app calls at launchers/app.py:51. Centre: the three functions; arrows show that load_general_plugins (line 87) and load_endpoint_plugins (line 133) both call load_plugins_by_group. Right: what each function calls: the plugins_loaded guard and each plugin function; VLLM_PLUGINS, entry_points and plugin.load in a try block; the unset check, the factory call and the required_tasks gate. Panel 2: three boxes compare how the three functions treat VLLM_PLUGINS and errors." caption="Figure: who calls each of the three functions, and what each one calls (panel 1); how each function treats <code>VLLM_PLUGINS</code> and errors (panel 2)." />
+<p>Read panel 1 row by row. Green is the path of the general plugins, blue is the shared loader, and pink is the path of the endpoint plugins. Grey boxes are code outside the plugin loaders. Panel 2 is a short form of the walk-through below.</p>
+
+<h3>Who calls it</h3>
+<p><code>load_general_plugins()</code> has five callers in <code>vllm/</code>:</p>
+<ul>
+  <li><strong><code>AsyncEngineArgs.add_cli_args</code></strong> in the front end, before the CLI parser gets its flags. The comment says that a plugin can add a choice to <code>--quantization</code> or <code>--device</code> ({{cite vllm/engine/arg_utils.py:3240-3243}}).</li>
+  <li><strong><code>EngineArgs.__post_init__</code></strong>, again in the front end, and also for the offline <code>LLM</code> class, which builds no CLI parser ({{cite vllm/engine/arg_utils.py:921-924}}). The same file also imports the function at module level ({{cite vllm/engine/arg_utils.py:123}}).</li>
+  <li><strong><code>EngineCore.__init__</code></strong> in the engine core process, before it makes the executor ({{cite vllm/v1/engine/core.py:129-132}}, {{cite vllm/v1/engine/core.py:147}}).</li>
+  <li><strong><code>WorkerWrapperBase.init_worker</code></strong> in each worker, before it resolves <code>worker_cls</code> ({{cite vllm/v1/worker/worker_base.py:282-284}}, {{cite vllm/v1/worker/worker_base.py:292-296}}).</li>
+  <li><strong><code>_run()</code></strong> of the model registry subprocess, before it runs the function that the parent process sent ({{cite vllm/model_executor/models/registry.py:1608-1616}}). vLLM starts this subprocess only when it cannot use the cached model information: the cache has no valid entry, or vLLM cannot find the source file of the model ({{cite vllm/model_executor/models/registry.py:1086-1109}}). This is true for built-in models too, because every built-in model is a lazy registry entry ({{cite vllm/model_executor/models/registry.py:1565-1573}}).</li>
+</ul>
+<p><code>load_plugins_by_group()</code> has three callers outside this file. Each one imports the group constant from this file:</p>
+<ul>
+  <li><strong>Platform detection.</strong> <code>resolve_current_platform_cls_qualname()</code> loads <code>vllm.platform_plugins</code> ({{cite vllm/platforms/__init__.py:10}}, {{cite vllm/platforms/__init__.py:250}}). It runs on the first read of {{term platform | <code>current_platform</code>}} in a process ({{cite vllm/platforms/__init__.py:316-319}}). With <code>VLLM_TARGET_DEVICE=cpu</code>, the function returns the CPU platform before it loads any platform plugin ({{cite vllm/platforms/__init__.py:244-248}}).</li>
+  <li><strong>Stat loggers.</strong> <code>load_stat_logger_plugin_factories()</code> loads <code>vllm.stat_logger_plugins</code> ({{cite vllm/v1/metrics/loggers.py:84-98}}). <code>AsyncLLM.__init__</code> calls it ({{cite vllm/v1/engine/async_llm.py:155-156}}).</li>
+  <li><strong>IO processors.</strong> <code>get_io_processor()</code> loads <code>vllm.io_processor_plugins</code>, but only when a plugin name comes from the model config (<code>io_processor_plugin</code>) or from the Hugging Face config of the model ({{cite vllm/plugins/io_processors/__init__.py:42-61}}). The pooling serving code calls it ({{cite vllm/entrypoints/pooling/pooling/io_processor.py:51-55}}).</li>
+</ul>
+<p><code>load_endpoint_plugins()</code> has one caller: <code>attach_endpoint_plugins()</code> ({{cite vllm/plugins/endpoint_plugins/interface.py:106-108}}). <code>build_app</code> calls that function after the core routes ({{cite vllm/entrypoints/launchers/app.py:45-51}}).</p>
+<p>Tests also call the loaders. For example, a test resets the flag <code>plugins_loaded</code> by hand, so that <code>load_general_plugins()</code> runs again ({{cite tests/v1/kv_connector/unit/test_scheduler_kv_connector_override.py:113-119}}).</p>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>importlib.metadata.entry_points(group=...)</code>, imported inside the functions ({{cite vllm/plugins/__init__.py:38}}, {{cite vllm/plugins/__init__.py:120}}).</li>
+  <li><code>vllm.envs</code> for <code>VLLM_PLUGINS</code> ({{cite vllm/plugins/__init__.py:8}}, {{cite vllm/plugins/__init__.py:40}}, {{cite vllm/plugins/__init__.py:122}}).</li>
+  <li><code>EntryPoint.load()</code>, which imports the module of the plugin ({{cite vllm/plugins/__init__.py:69}}).</li>
+  <li>The plugin objects: each general plugin function ({{cite vllm/plugins/__init__.py:89-90}}) and each endpoint plugin factory ({{cite vllm/plugins/__init__.py:138}}).</li>
+  <li>The standard <code>logging</code> module. The file uses <code>logging.getLogger(__name__)</code> ({{cite vllm/plugins/__init__.py:14}}), not vLLM's <code>init_logger</code>, which adds helper methods to the same kind of logger ({{cite vllm/logger.py:328-335}}).</li>
+</ul>
+
+<h3>The subfolders of vllm/plugins/</h3>
+<p>Three subfolders hold plugin code that vLLM itself ships. The page {{link concepts/frontend-plugins}} explains how to write such plugins.</p>
+<ul>
+  <li><strong><code>lora_resolvers/</code></strong>: two {{term general-plugin | general plugins}} that vLLM publishes in its own <code>pyproject.toml</code> ({{cite pyproject.toml:45-47}}). Each one registers a {{term lora-resolver}}. <code>register_filesystem_resolver</code> registers a resolver only when <code>VLLM_LORA_RESOLVER_CACHE_DIR</code> is set ({{cite vllm/plugins/lora_resolvers/filesystem_resolver.py:49-61}}). The resolver accepts a folder when its <code>adapter_config.json</code> has <code>peft_type</code> <code>LORA</code> and the same base model ({{cite vllm/plugins/lora_resolvers/filesystem_resolver.py:30-45}}). <code>register_hf_hub_resolver</code> registers a resolver for Hugging Face repositories only when <code>VLLM_LORA_RESOLVER_HF_REPO_LIST</code> is set and <code>VLLM_PLUGINS</code> names <code>lora_hf_hub_resolver</code> ({{cite vllm/plugins/lora_resolvers/hf_hub_resolver.py:131-145}}). <code>OpenAIServingModels</code> in the API server gets the registered resolvers ({{cite vllm/entrypoints/openai/models/serving.py:113-117}}).</li>
+  <li><strong><code>io_processors/</code></strong>: the abstract class <code>IOProcessor</code> ({{cite vllm/plugins/io_processors/interface.py:18-24}}), with the abstract methods <code>pre_process</code> and <code>post_process</code> ({{cite vllm/plugins/io_processors/interface.py:41-65}}), and the loader <code>get_io_processor()</code>. An {{term io-processor-plugin}} changes the input and the output of a pooling model. The model config can name the plugin in <code>io_processor_plugin</code> ({{cite vllm/config/model.py:410}}).</li>
+  <li><strong><code>endpoint_plugins/</code></strong>: the protocol <code>EndpointPlugin</code> ({{cite vllm/plugins/endpoint_plugins/interface.py:49-94}}) and the two wiring phases. Phase A, <code>attach_endpoint_plugins()</code>, adds the routes of each {{term endpoint-plugin}} to the FastAPI app ({{cite vllm/plugins/endpoint_plugins/interface.py:97-146}}). Phase B, <code>init_endpoint_plugins_state()</code>, calls <code>init_state</code> of each plugin ({{cite vllm/plugins/endpoint_plugins/interface.py:149-164}}). <code>init_app_state</code> runs Phase B ({{cite vllm/entrypoints/launchers/api_server/app_state.py:173}}). The render server runs it too, with no engine client ({{cite vllm/entrypoints/launchers/render/app_state.py:124}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>DEFAULT_PLUGINS_GROUP</code></td><td>{{cite vllm/plugins/__init__.py:18}}</td><td><code>"vllm.general_plugins"</code>. The comment says: loaded in all processes.</td></tr>
+    <tr><td><code>IO_PROCESSOR_PLUGINS_GROUP</code></td><td>{{cite vllm/plugins/__init__.py:20}}</td><td><code>"vllm.io_processor_plugins"</code>. The comment says: loaded in "process0" only, which is the front end.</td></tr>
+    <tr><td><code>PLATFORM_PLUGINS_GROUP</code></td><td>{{cite vllm/plugins/__init__.py:23}}</td><td><code>"vllm.platform_plugins"</code>. Loaded in all processes, on the first read of <code>current_platform</code>. Not loaded with <code>VLLM_TARGET_DEVICE=cpu</code>.</td></tr>
+    <tr><td><code>STAT_LOGGER_PLUGINS_GROUP</code></td><td>{{cite vllm/plugins/__init__.py:26}}</td><td><code>"vllm.stat_logger_plugins"</code>. Loaded in the front end, with the async engine.</td></tr>
+    <tr><td><code>ENDPOINT_PLUGINS_GROUP</code></td><td>{{cite vllm/plugins/__init__.py:30}}</td><td><code>"vllm.endpoint_plugins"</code>. Loaded in the API server only. Each entry point gives a factory that returns an <code>EndpointPlugin</code>.</td></tr>
+    <tr><td><code>plugins_loaded</code></td><td>{{cite vllm/plugins/__init__.py:33}}</td><td>Module-level flag. It makes sure that one process loads the general plugins only once.</td></tr>
+    <tr><td><code>load_plugins_by_group(group)</code></td><td>{{cite vllm/plugins/__init__.py:36-74}}</td><td>Finds the entry points of one group, filters them by name, imports each one. Returns <code>dict[str, Callable]</code>.</td></tr>
+    <tr><td><code>load_general_plugins()</code></td><td>{{cite vllm/plugins/__init__.py:77-90}}</td><td>Loads <code>vllm.general_plugins</code> once per process and calls each function.</td></tr>
+    <tr><td><code>load_endpoint_plugins(supported_tasks)</code></td><td>{{cite vllm/plugins/__init__.py:93-159}}</td><td>Loads endpoint plugins only when <code>VLLM_PLUGINS</code> is set. Calls each factory and keeps the plugins whose tasks match.</td></tr>
+  </tbody>
+</table>
+<x-note title="Five constants, six groups">
+<p>The file names five groups. A sixth group, <code>vllm.logits_processors</code>, is defined in the sampler code ({{cite vllm/v1/sample/logits_processor/__init__.py:48}}). Its loaders call <code>entry_points()</code> themselves and do not use this file. So <code>VLLM_PLUGINS</code> does not filter this group ({{cite vllm/v1/sample/logits_processor/__init__.py:61}}, {{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:46}}).</p>
+</x-note>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>load_plugins_by_group</code>: find, filter, import</h3>
+<x-code file="vllm/plugins/__init__.py" lines="36-74" highlight="40,42,43-45,64,68-72" />
+<ol>
+  <li><strong>Line 38.</strong> The import of <code>entry_points</code> is inside the function, so it runs only on a call.</li>
+  <li><strong>Line 40.</strong> <code>envs.VLLM_PLUGINS</code> is <code>None</code> when the variable is not set, else the value split at commas ({{cite vllm/envs.py:1163-1167}}).</li>
+  <li><strong>Lines 42-45.</strong> <code>entry_points(group=group)</code> returns the entry points of all installed packages in the group. No entry points: a DEBUG log and an empty dict.</li>
+  <li><strong>Lines 48-50.</strong> The log level is DEBUG for <code>vllm.general_plugins</code> and INFO for every other group. The comment on line 47 does not match the code: the check is only for the group name.</li>
+  <li><strong>Lines 52-60.</strong> The function logs each found plugin as <code>name -&gt; value</code>. When the allowlist is not set, it also logs that it loads all plugins.</li>
+  <li><strong>Lines 63-66.</strong> A plugin passes when there is no allowlist, or when its entry-point name is in the list. The test is an exact string match. With an allowlist, line 66 logs "Loading plugin" for each name that passes. A name that does not pass gets no such line.</li>
+  <li><strong>Lines 68-72.</strong> <code>plugin.load()</code> imports the module and gets the attribute. An exception is logged with its traceback, and the loop continues.</li>
+  <li><strong>Line 74.</strong> The result maps the entry-point name to the loaded object. The function does not call the objects.</li>
+</ol>
+
+<h3><code>load_general_plugins</code>: once per process</h3>
+<x-warning title="The flag is set before the plugins run">
+<p>Line 85 sets <code>plugins_loaded = True</code> before line 90 calls the first plugin function. If a plugin function raises and some code catches the exception, the next call in the same process returns at once. The remaining plugin functions then never run in that process. (Derived from lines 83-90.)</p>
+</x-warning>
+<x-code file="vllm/plugins/__init__.py" lines="77-90" highlight="83-85,87,89-90" />
+<ol>
+  <li><strong>Lines 78-80.</strong> The docstring warns that plugins can load many times, in different processes. So a plugin function must be safe to run again.</li>
+  <li><strong>Lines 82-85.</strong> The guard. The first call sets the module global; each later call in the same process returns at once.</li>
+  <li><strong>Line 87.</strong> The shared loader gets the functions of <code>vllm.general_plugins</code>, filtered by <code>VLLM_PLUGINS</code>.</li>
+  <li><strong>Lines 89-90.</strong> Each function runs with no arguments and no <code>try</code> block. An exception goes up to the caller, for example <code>EngineCore.__init__</code>.</li>
+</ol>
+
+<h3><code>load_endpoint_plugins</code>: opt-in only</h3>
+<p>The docstring gives the reason for a stricter rule: endpoint plugins add HTTP routes, so a plugin loads only when <code>VLLM_PLUGINS</code> names it ({{cite vllm/plugins/__init__.py:98-103}}).</p>
+<x-code file="vllm/plugins/__init__.py" lines="120-159" highlight="122-131,133,138-141,143-154" />
+<ol>
+  <li><strong>Lines 122-131.</strong> <code>VLLM_PLUGINS</code> not set: the function still lists the group. If it finds plugins, it logs a WARNING with their names. Then it returns an empty list. So an endpoint plugin never loads by accident.</li>
+  <li><strong>Line 133.</strong> <code>VLLM_PLUGINS</code> set: the shared loader imports the named entry points. An empty string gives <code>[""]</code>, which matches no name ({{cite vllm/plugins/__init__.py:105-109}}).</li>
+  <li><strong>Lines 136-141.</strong> Each factory runs with no arguments. If it raises, the function logs the error and skips the plugin.</li>
+  <li><strong>Lines 143-154.</strong> The task gate. <code>required_tasks = None</code> means "always eligible". Otherwise, the plugin needs at least one task in common with <code>supported_tasks</code>. If the caller gives <code>supported_tasks = None</code>, every plugin with tasks is skipped. A skip writes an INFO log.</li>
+  <li><strong>Lines 156-159.</strong> The function logs each loaded plugin and returns them in the order of discovery.</li>
+</ol>
+<x-note title="Which name the allowlist checks">
+<p>The docstring of <code>EndpointPlugin.name</code> says that the name is used "for <code>VLLM_PLUGINS</code> allowlisting" ({{cite vllm/plugins/endpoint_plugins/interface.py:58-59}}). In the code, the allowlist checks the <em>entry-point</em> name (line 64), and the logs use the same entry-point name (lines 140, 148, 156). No code in <code>vllm/</code> reads <code>EndpointPlugin.name</code>: the loader and the wiring in <code>interface.py</code> use only <code>required_tasks</code>, <code>attach_router()</code> and <code>init_state()</code>. Use the same string in both places to avoid confusion. (Derived from the lines above.)</p>
+</x-note>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types in and out">
+<table>
+  <thead><tr><th>Value</th><th>Type</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>group</code></td><td><code>str</code>, one of the five constants</td><td>argument of <code>load_plugins_by_group</code> ({{cite vllm/plugins/__init__.py:36}})</td></tr>
+    <tr><td><code>envs.VLLM_PLUGINS</code></td><td><code>list[str] | None</code></td><td>declared at {{cite vllm/envs.py:116}}, parsed at {{cite vllm/envs.py:1163-1167}}</td></tr>
+    <tr><td><code>discovered_plugins</code></td><td><code>importlib.metadata.EntryPoints</code>; each item has <code>.name</code>, <code>.value</code> and <code>.load()</code></td><td>{{cite vllm/plugins/__init__.py:42}}</td></tr>
+    <tr><td>return of <code>load_plugins_by_group</code></td><td><code>dict[str, Callable[[], Any]]</code>: entry-point name to the loaded object</td><td>{{cite vllm/plugins/__init__.py:62}}, {{cite vllm/plugins/__init__.py:74}}</td></tr>
+    <tr><td><code>supported_tasks</code></td><td><code>tuple[SupportedTask, ...] | None</code>; a task is for example <code>"generate"</code></td><td>{{cite vllm/plugins/__init__.py:94}}, {{cite vllm/tasks.py:7}}, {{cite vllm/tasks.py:43}}</td></tr>
+    <tr><td>return of <code>load_endpoint_plugins</code></td><td><code>list[EndpointPlugin]</code>, in discovery order</td><td>{{cite vllm/plugins/__init__.py:95}}, {{cite vllm/plugins/__init__.py:159}}</td></tr>
+  </tbody>
+</table>
+<p>The "callable" in the type hint of line 36 is only true for some groups. The table shows what the object behind each entry point must be, from the code of each caller:</p>
+<table>
+  <thead><tr><th>Group</th><th>The loaded object</th><th>What the caller does with it</th></tr></thead>
+  <tbody>
+    <tr><td><code>vllm.general_plugins</code></td><td>a function with no arguments</td><td>calls it ({{cite vllm/plugins/__init__.py:89-90}})</td></tr>
+    <tr><td><code>vllm.platform_plugins</code></td><td>a function that returns a class name or <code>None</code></td><td>calls it to detect the platform ({{cite vllm/platforms/__init__.py:254-259}})</td></tr>
+    <tr><td><code>vllm.stat_logger_plugins</code></td><td>a subclass of <code>StatLoggerBase</code> (a class, not a function)</td><td>checks the type and keeps the class ({{cite vllm/v1/metrics/loggers.py:87-96}})</td></tr>
+    <tr><td><code>vllm.io_processor_plugins</code></td><td>a function that returns a class name or <code>None</code></td><td>calls it, then resolves the requested class ({{cite vllm/plugins/io_processors/__init__.py:63-88}})</td></tr>
+    <tr><td><code>vllm.endpoint_plugins</code></td><td>a factory with no arguments (a class or a function)</td><td>calls it to get an <code>EndpointPlugin</code> ({{cite vllm/plugins/__init__.py:138}}, {{cite vllm/plugins/endpoint_plugins/interface.py:53-56}})</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Processes and threads">
+<p>The file has no thread and no lock. Each function runs in the thread of its caller. <code>plugins_loaded</code> is a global of the module, so each Python process has its own copy ({{cite vllm/plugins/__init__.py:33}}).</p>
+<table>
+  <thead><tr><th>Process</th><th>Functions that run there</th><th>Call site</th></tr></thead>
+  <tbody>
+    <tr><td>API server (front end)</td><td><code>load_general_plugins</code> (the second call returns at once), platform loading, stat loggers, endpoint plugins, IO processors (pooling only)</td><td>{{cite vllm/engine/arg_utils.py:3243}}, {{cite vllm/engine/arg_utils.py:924}}, {{cite vllm/platforms/__init__.py:250}}, {{cite vllm/v1/engine/async_llm.py:156}}, {{cite vllm/entrypoints/launchers/app.py:51}}, {{cite vllm/entrypoints/pooling/pooling/io_processor.py:51}}</td></tr>
+    <tr><td>Engine core process</td><td><code>load_general_plugins</code>, platform loading</td><td>{{cite vllm/v1/engine/core.py:132}}, {{cite vllm/platforms/__init__.py:250}}</td></tr>
+    <tr><td>Worker process</td><td><code>load_general_plugins</code>, platform loading</td><td>{{cite vllm/v1/worker/worker_base.py:284}}, {{cite vllm/platforms/__init__.py:250}}</td></tr>
+    <tr><td>Model registry subprocess</td><td><code>load_general_plugins</code>, platform loading (through the module-level import of <code>vllm.config</code>)</td><td>{{cite vllm/model_executor/models/registry.py:1612}}, {{cite vllm/model_executor/models/registry.py:26}}</td></tr>
+  </tbody>
+</table>
+<p>With one GPU, the executor is <code>uni</code> ({{cite vllm/config/parallel.py:1099-1100}}), and <code>init_worker</code> runs inside the engine core process ({{cite vllm/v1/executor/uniproc_executor.py:68}}). There, the flag is already <code>True</code>, so line 284 of <code>worker_base.py</code> does nothing. How <code>spawn</code> and <code>fork</code> change the flag in a child process is on {{link concepts/plugin-loading}}.</p>
+<p><strong>The platform comes first.</strong> In the processes of <code>vllm serve</code>, the platform plugins load before the general plugins. A module-level <code>from vllm.platforms import current_platform</code> calls the module <code>__getattr__</code> and resolves the platform at import time ({{cite vllm/platforms/__init__.py:303-319}}). The package <code>vllm.config</code> has such an import: it imports <code>vllm.config.compilation</code> ({{cite vllm/config/__init__.py:7}}), which has the import ({{cite vllm/config/compilation.py:22}}). Each process imports <code>vllm.config</code> or <code>vllm.platforms</code> before it calls <code>load_general_plugins()</code>:</p>
+<ul>
+  <li>The front end: <code>arg_utils.py</code> imports <code>current_platform</code> at module level ({{cite vllm/engine/arg_utils.py:122}}).</li>
+  <li>The engine core process: the package <code>vllm.v1.engine</code> imports <code>vllm.config.kv_events</code> ({{cite vllm/v1/engine/__init__.py:14}}). Python runs this package file before <code>core.py</code>, which also imports <code>vllm.config</code> ({{cite vllm/v1/engine/core.py:24}}).</li>
+  <li>A worker process: the package <code>vllm.v1.executor</code> imports <code>abstract.py</code>, which imports <code>vllm.config</code> ({{cite vllm/v1/executor/__init__.py:3}}, {{cite vllm/v1/executor/abstract.py:11}}). <code>multiproc_executor.py</code> also imports <code>current_platform</code> ({{cite vllm/v1/executor/multiproc_executor.py:46}}).</li>
+</ul>
+<p>So a general plugin cannot change which platform vLLM detects. (Derived from the imports above.)</p>
+<p><code>envs.VLLM_PLUGINS</code> is read again on each access until <code>enable_envs_cache()</code> runs. After that, the value is cached ({{cite vllm/envs.py:2291-2298}}, {{cite vllm/envs.py:2308-2326}}). Only the engine core and the multiproc workers call <code>enable_envs_cache()</code> ({{cite vllm/v1/engine/core.py:243}}, {{cite vllm/v1/executor/multiproc_executor.py:710}}). The front end never calls it. The docstring says that the cache starts "after service initialization" ({{cite vllm/envs.py:2313-2315}}). So change <code>VLLM_PLUGINS</code> only before you start vLLM.</p>
+</x-deepdive>
+
+<x-deepdive title="A worked example: three plugins and two settings of VLLM_PLUGINS">
+<p>Assume this machine has vLLM and two more packages. Package <code>acme_hw</code> publishes <code>acme = acme_hw:detect</code> in <code>vllm.platform_plugins</code>. Package <code>acme_routes</code> publishes <code>acme_admin = acme_routes:make</code> in <code>vllm.endpoint_plugins</code>, with <code>required_tasks = None</code>. vLLM publishes <code>lora_filesystem_resolver</code> and <code>lora_hf_hub_resolver</code> in <code>vllm.general_plugins</code> ({{cite pyproject.toml:45-47}}). The names <code>acme...</code> are examples, not real packages.</p>
+<p><strong>Case 1: <code>VLLM_PLUGINS</code> is not set.</strong></p>
+<ol>
+  <li>General plugins: both vLLM functions run (line 64 passes every name). The filesystem resolver registers only if <code>VLLM_LORA_RESOLVER_CACHE_DIR</code> is set ({{cite vllm/plugins/lora_resolvers/filesystem_resolver.py:51-59}}). The Hugging Face resolver checks the allowlist itself: <code>VLLM_PLUGINS</code> is <code>None</code>, so it does not register. If <code>VLLM_LORA_RESOLVER_HF_REPO_LIST</code> is set, it logs a warning ({{cite vllm/plugins/lora_resolvers/hf_hub_resolver.py:131-142}}).</li>
+  <li>Platform plugins: <code>acme</code> loads, and the platform code calls <code>detect()</code> ({{cite vllm/platforms/__init__.py:254-259}}).</li>
+  <li>Endpoint plugins: none load. The log shows a WARNING with <code>['acme_admin']</code> ({{cite vllm/plugins/__init__.py:122-131}}).</li>
+</ol>
+<p><strong>Case 2: <code>VLLM_PLUGINS=acme,acme_admin</code>.</strong> The parsed value is <code>["acme", "acme_admin"]</code>.</p>
+<ol>
+  <li>General plugins: line 64 rejects both vLLM names, so <code>load_plugins_by_group</code> returns <code>{}</code>, and no LoRA resolver registers. No error and no warning appears. The only log lines for this group are at DEBUG level (lines 50-54), and the default log level is INFO ({{cite vllm/envs.py:860}}).</li>
+  <li>Platform plugins: <code>acme</code> loads, as before.</li>
+  <li>Endpoint plugins: <code>acme_admin</code> loads, <code>make()</code> runs, and with <code>required_tasks = None</code> the plugin is kept. The log shows "Loaded endpoint plugin acme_admin" ({{cite vllm/plugins/__init__.py:156}}).</li>
+</ol>
+<p>To keep the filesystem LoRA resolver in case 2, add its name: <code>VLLM_PLUGINS=acme,acme_admin,lora_filesystem_resolver</code>. (Derived from lines 63-64 and {{cite vllm/envs.py:1166}}. The code does not strip spaces, so do not put a space after a comma.)</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>No entry points in the group</td><td>DEBUG log, empty result</td><td>{{cite vllm/plugins/__init__.py:43-45}}</td></tr>
+    <tr><td>The import of a plugin fails (<code>load()</code> raises)</td><td>ERROR log with traceback ("Failed to load plugin ..."); the plugin is skipped</td><td>{{cite vllm/plugins/__init__.py:68-72}}</td></tr>
+    <tr><td>A general plugin function raises</td><td>not caught here; the caller gets the exception, and start-up of that process stops. The engine core process logs "EngineCore failed to start." and raises again ({{cite vllm/v1/engine/core.py:1570-1576}}). A worker process logs "WorkerProc failed to start." ({{cite vllm/v1/executor/multiproc_executor.py:950-957}}).</td><td>{{cite vllm/plugins/__init__.py:89-90}}</td></tr>
+    <tr><td>Endpoint plugins exist, <code>VLLM_PLUGINS</code> not set</td><td>WARNING log; no plugin loads</td><td>{{cite vllm/plugins/__init__.py:122-131}}</td></tr>
+    <tr><td>An endpoint factory raises</td><td>ERROR log with traceback; the plugin is skipped</td><td>{{cite vllm/plugins/__init__.py:137-141}}</td></tr>
+    <tr><td>Endpoint tasks do not match</td><td>INFO log; the plugin is skipped</td><td>{{cite vllm/plugins/__init__.py:143-154}}</td></tr>
+    <tr><td>A stat logger plugin is not a <code>StatLoggerBase</code> subclass</td><td><code>TypeError</code> (in the caller)</td><td>{{cite vllm/v1/metrics/loggers.py:88-94}}</td></tr>
+    <tr><td>Two out-of-tree platform plugins are active</td><td><code>RuntimeError</code> (in the caller)</td><td>{{cite vllm/platforms/__init__.py:272-276}}</td></tr>
+    <tr><td>The model needs an IO processor that is not installed</td><td><code>ValueError</code> (in the caller)</td><td>{{cite vllm/plugins/io_processors/__init__.py:73-84}}</td></tr>
+    <tr><td><code>VLLM_LORA_RESOLVER_CACHE_DIR</code> is set, but it is not a folder</td><td><code>ValueError</code> from the general plugin, so start-up stops</td><td>{{cite vllm/plugins/lora_resolvers/filesystem_resolver.py:52-57}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_PLUGINS</code></td><td>not set, which gives <code>None</code> ({{cite vllm/envs.py:1163-1167}})</td><td>{{cite vllm/plugins/__init__.py:40}}, {{cite vllm/plugins/__init__.py:122}}</td><td>One comma-separated allowlist for every group of this file. It does not filter <code>vllm.logits_processors</code>, which does not use this file. Not set: load all, except endpoint plugins. <code>""</code>: load none. The comment above the definition gives the first and the last rule, but not the endpoint exception ({{cite vllm/envs.py:1160-1162}}).</td></tr>
+    <tr><td><code>VLLM_LORA_RESOLVER_CACHE_DIR</code></td><td><code>None</code> ({{cite vllm/envs.py:1171-1172}})</td><td>{{cite vllm/plugins/lora_resolvers/filesystem_resolver.py:51}}</td><td>Folder in which the filesystem resolver looks for LoRA adapters.</td></tr>
+    <tr><td><code>VLLM_LORA_RESOLVER_HF_REPO_LIST</code></td><td><code>None</code> ({{cite vllm/envs.py:1178-1179}})</td><td>{{cite vllm/plugins/lora_resolvers/hf_hub_resolver.py:131}}</td><td>Comma-separated Hugging Face repositories for the Hub resolver. Works only when <code>VLLM_PLUGINS</code> names <code>lora_hf_hub_resolver</code>.</td></tr>
+  </tbody>
+</table>
+<p>The tests show the edge cases of <code>VLLM_PLUGINS</code> for endpoint plugins: not set gives no plugin, and an empty string gives no plugin ({{cite tests/plugins_tests/test_endpoint_plugins.py:101-115}}).</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/plugin-loading}}: the same code from the view of the processes, with fork and spawn.</li>
+  <li>{{link concepts/plugin-map}}: all extension points, with and without entry points.</li>
+  <li>{{link concepts/platform-plugins}}: what the platform code does with the loaded detectors.</li>
+  <li>{{link concepts/frontend-plugins}}: endpoint plugins, IO processors, stat loggers and LoRA resolvers.</li>
+  <li>{{link concepts/lora-serving}}: how the API server uses the LoRA resolvers.</li>
+  <li>{{link learn/python-entry-points}}: the Python packaging basics under all of this.</li>
+  <li>{{link tours/life-of-a-plugin}} and {{link tours/build-a-toy-plugin}}: the same code as guided tours.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which function in this file calls the plugin functions, and which function only imports them?
+    <x-a><p><code>load_general_plugins()</code> calls each function ({{cite vllm/plugins/__init__.py:89-90}}). <code>load_plugins_by_group()</code> only imports the objects and returns a dict ({{cite vllm/plugins/__init__.py:68-74}}). The caller decides what to do with them.</p></x-a>
+  </x-q>
+  <x-q level="easy">You install an endpoint plugin and do not set <code>VLLM_PLUGINS</code>. Does the route appear?
+    <x-a><p>No. <code>load_endpoint_plugins()</code> returns an empty list and logs a warning with the plugin names ({{cite vllm/plugins/__init__.py:122-131}}). Endpoint plugins load only when <code>VLLM_PLUGINS</code> names them.</p></x-a>
+  </x-q>
+  <x-q level="medium">A general plugin function raises <code>KeyError</code>. A test catches the exception and calls <code>load_general_plugins()</code> again in the same process. Do the other general plugins run?
+    <x-a><p>No. Line 85 sets <code>plugins_loaded = True</code> before the loop, so the second call returns at once ({{cite vllm/plugins/__init__.py:83-85}}). The functions after the failed one never run in that process. To load again, code must reset the flag by hand, as a test does ({{cite tests/v1/kv_connector/unit/test_scheduler_kv_connector_override.py:113-119}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">An endpoint plugin has <code>required_tasks = ("embed",)</code>. The server supports only <code>("generate",)</code>. What happens, and at which log level?
+    <x-a><p>The factory runs, but the sets <code>{"embed"}</code> and <code>{"generate"}</code> have nothing in common. So the function skips the plugin with an INFO log ({{cite vllm/plugins/__init__.py:143-154}}). A test checks the same rule with the two tasks swapped ({{cite tests/plugins_tests/test_endpoint_plugins.py:129-140}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You set <code>VLLM_PLUGINS=acme,acme_admin</code> to enable your platform and endpoint plugins, and <code>VLLM_LORA_RESOLVER_CACHE_DIR=/loras</code>. Requests for an unknown adapter in <code>/loras</code> now fail. Why, and what is the fix?
+    <x-a><p><code>VLLM_PLUGINS</code> is one allowlist for every group that goes through <code>load_plugins_by_group()</code>, the general plugins too. The name <code>lora_filesystem_resolver</code> is not in it, so line 64 skips vLLM's own general plugin, and <code>register_filesystem_resolver</code> never runs ({{cite vllm/plugins/__init__.py:63-64}}, {{cite pyproject.toml:46}}). No resolver registers, and nothing logs an error. Add the name: <code>VLLM_PLUGINS=acme,acme_admin,lora_filesystem_resolver</code>. This is the worked example in the deep dive.</p></x-a>
+  </x-q>
+</x-quiz>

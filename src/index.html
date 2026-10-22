@@ -1,46 +1,221 @@
 ---
-summary: A study guide to this codebase for developers who are new to it. It starts simple and goes down to the exact code.
+summary: A study guide to the latest vLLM for readers of DeepInfer Explained. It follows one HTTP request through vllm serve, explains the plugin system, and goes down to the exact code.
 ---
-<!-- TEMPLATE: Replace the placeholder text. Keep the section ids: the footer links to #code-version. The page title comes from site_name in explainer.json. -->
-
-<p><strong>{{project name}}</strong> is ... (one paragraph: what the project does, cited from its README, for example {{cite README.md:1}}). This site explains the code at commit <code>{{project short_sha}}</code>. You need to know the main language of the code. You do not need to know the domain.</p>
+<p><strong>vLLM</strong> is "a fast and easy-to-use library for LLM inference and serving" ({{cite README.md:24}}). Its main use is <em>online serving</em>: the command <code>vllm serve</code> starts an {{term openai-compatible-server}} that answers HTTP requests ({{cite vllm/entrypoints/cli/serve.py:39-40}}). Behind the HTTP routes, a {{term scheduler}} runs one {{term engine-step}} after the other and batches the requests of many clients on the GPUs. Outside code can change much of this through {{term plugin | plugins}}.</p>
+<p><strong>Who this site is for.</strong> You know Python. You read {{deepinfer index | DeepInfer Explained}}, or you know the LLM basics that it teaches. Now you want to become proficient in online serving with the latest vLLM: what happens to a request inside <code>vllm serve</code>, how to configure, tune, monitor and scale a deployment, and how plugins extend vLLM. This site does not teach the basics again. When a page needs one, it gives a one-line recap and a link to DeepInfer Explained. The site explains the code at commit <code>{{project short_sha}}</code>. To get exactly this version of the code, read <a href="#code-version">The code version this site explains</a>.</p>
 
 <table>
   <tbody>
-    <tr><th>What it does</th><td>One line, with a citation.</td></tr>
-    <tr><th>Runs on</th><td>Platforms or hardware, with a citation.</td></tr>
-    <tr><th>Code size</th><td>Files and lines per language. See {{link code/index}}.</td></tr>
-    <tr><th>Run it</th><td>The quick-start command from the README, with a citation.</td></tr>
+    <tr><th>What it runs</th><td>"200+ model architectures on Hugging Face": decoder-only and Mixture-of-Experts LLMs, hybrid and state-space models, multimodal models, embedding and reward models ({{cite README.md:53-60}}). The default model of <code>vllm serve</code> is <code>Qwen/Qwen3-0.6B</code> ({{cite vllm/config/model.py:155}}, {{cite vllm/engine/arg_utils.py:486}}, {{cite vllm/entrypoints/cli/serve.py:39-40}}).</td></tr>
+    <tr><th>Hardware</th><td>Built-in {{term platform | platform}} detectors: TPU, CUDA (NVIDIA), ROCm (AMD), XPU (Intel) and CPU ({{cite vllm/platforms/__init__.py:231-237}}). The TPU platform class comes from the separate package <code>tpu_inference</code> ({{cite vllm/platforms/tpu.py:9-19}}). Other hardware comes as platform plugins, for example Intel Gaudi, IBM Spyre and Huawei Ascend ({{cite README.md:51}}).</td></tr>
+    <tr><th>Code size</th><td>8,357 files. Python: 5,471 files, about 2.0 million lines; the package <code>vllm/</code> has 2,907 Python files and about 1.13 million lines; the Python files in <code>tests/</code> have about 0.77 million lines. C++ and CUDA: 313 files, about 143,000 lines (kernels, not explained here). Rust: 375 files, about 152,000 lines (an experimental front end). Method: the files of <code>git ls-files</code> at the pinned commit, grouped by extension (<code>.py</code>; <code>.cpp .cu .cuh .h .hpp</code>; <code>.rs</code>); a line is a newline, plus a last line without one. See {{link code/index}}.</td></tr>
+    <tr><th>Run it</th><td><code>vllm serve &lt;model&gt;</code>, for example <code>vllm serve Qwen/Qwen3-0.6B</code>. The command <code>vllm</code> is a console script ({{cite pyproject.toml:42-43}}). The server listens on port 8000 by default ({{cite vllm/entrypoints/common/cli_args.py:286}}).</td></tr>
   </tbody>
 </table>
 
 <h2 id="system-map">The system map</h2>
-<p>The map shows the main parts and the order in which a request goes through them. Each title is a link. Grey links are pages that are not written yet.</p>
-<!-- TEMPLATE: Build the clickable map in HTML/CSS (numbered boxes for the request path, a side column for parts that every step uses, a colour stripe for where the code runs, a legend). Put shared styles in assets/site.css. -->
-<ol>
-  <li>{{link concepts/openai-server | 1 · The API server}} (<code>vllm/entrypoints/openai/</code>)</li>
-  <li>{{link concepts/engine-client | 2 · AsyncLLM}} (<code>vllm/v1/engine/async_llm.py</code>)</li>
-  <li>{{link concepts/engine-core-loop | 3 · The engine core}} (<code>vllm/v1/engine/core.py</code>)</li>
-</ol>
-<x-simplified><p>The map is a simple picture. Say here what it leaves out.</p></x-simplified>
+<p>The map shows the path of one streaming chat request through <code>vllm serve</code>, and the parts that every step uses. Each box is a link. Click a box to open its page. Grey links are pages that are not written yet. The coloured stripe on the left of a box shows the process that runs the code.</p>
+
+<div class="sm" role="group" aria-label="vLLM system map">
+<div class="sm-grid">
+<div class="sm-col">
+  <p class="sm-col-title">The path of one chat request</p>
+
+  <div class="sm-box sm-api">
+    <p class="sm-p">API server process</p>
+    <p class="sm-t">{{link concepts/openai-server | 1 · The API server gets POST /v1/chat/completions}}</p>
+    <p class="sm-f">vllm/entrypoints/openai/chat_completion/api_router.py · serving.py</p>
+    <p class="sm-d">A FastAPI route gives the request to <code>OpenAIServingChat</code>. It checks the model name and calls the renderer (box 2). Then it makes the <code>SamplingParams</code>.</p>
+    <p class="sm-m">Code: {{cite vllm/entrypoints/openai/chat_completion/api_router.py:43-44 | the route}} · {{cite vllm/entrypoints/openai/chat_completion/api_router.py:63-67 | handler}} · {{cite vllm/entrypoints/openai/chat_completion/serving.py:278-285 | check, render}} · {{cite vllm/entrypoints/openai/chat_completion/serving.py:366-369 | sampling params}} · Also: {{link learn/openai-api | the OpenAI API}} · {{link tours/life-of-a-chat-request | Tour 1}}</p>
+  </div>
+  <div class="sm-arrow">a <code>ChatCompletionRequest</code></div>
+
+  <div class="sm-box sm-api">
+    <p class="sm-p">API server process</p>
+    <p class="sm-t">{{link concepts/renderers-and-chat-templates | 2 · The renderer applies the chat template}}</p>
+    <p class="sm-f">vllm/renderers/ (online_renderer.py · base.py · hf.py)</p>
+    <p class="sm-d">Turns the chat messages into one prompt with the model's chat template, then into token ids. It also sets the arrival time of the request.</p>
+    <p class="sm-m">Code: {{cite vllm/renderers/base.py:1380-1396 | render_chat_async}} · Also: {{link learn/hf-checkpoints | checkpoint files}}</p>
+  </div>
+  <div class="sm-arrow">token ids, then <code>SamplingParams</code> from <code>OpenAIServingChat</code></div>
+
+  <div class="sm-box sm-api">
+    <p class="sm-p">API server process</p>
+    <p class="sm-t">{{link concepts/engine-client | 3 · AsyncLLM adds the request}}</p>
+    <p class="sm-f">vllm/v1/engine/async_llm.py · input_processor.py</p>
+    <p class="sm-d">The input processor makes an <code>EngineCoreRequest</code>. <code>AsyncLLM</code> registers a queue for the outputs of this request, then sends it to the engine core.</p>
+    <p class="sm-m">Code: {{cite vllm/v1/engine/async_llm.py:483 | process_inputs}} · {{cite vllm/v1/engine/async_llm.py:581-584 | queue and send}} · Also: {{link code/v1-engine-async-llm | async_llm.py}} · {{link concepts/data-contracts | data contracts}}</p>
+  </div>
+  <div class="sm-arrow"><code>EngineCoreRequest</code></div>
+
+  <div class="sm-box sm-ipc">
+    <p class="sm-p">From the API server to the engine core</p>
+    <p class="sm-t">{{link concepts/architecture-overview | 4 · ZMQ and msgpack carry the request}}</p>
+    <p class="sm-f">vllm/v1/engine/core_client.py → vllm/v1/engine/core.py</p>
+    <p class="sm-d">The {{term engine-core-client}} encodes the request with {{term msgpack}} and sends it on a {{term zmq}} ROUTER socket. An input thread in the engine core process receives it.</p>
+    <p class="sm-m">Code: {{cite vllm/v1/engine/core_client.py:1333-1335 | send}} · {{cite vllm/v1/engine/core_client.py:1284 | msgpack}} · {{cite vllm/v1/engine/core_client.py:673-679 | ROUTER}} · {{cite vllm/v1/engine/core.py:1244-1254 | input thread}} · Also: {{link learn/processes-and-ipc | processes and IPC}}</p>
+  </div>
+  <div class="sm-arrow">the request in the waiting queue</div>
+
+  <div class="sm-box sm-core">
+    <p class="sm-p">Engine core process</p>
+    <p class="sm-t">{{link concepts/scheduler | 5 · EngineCore runs a step: the scheduler picks the work}}</p>
+    <p class="sm-f">vllm/v1/engine/core.py · vllm/v1/core/sched/scheduler.py</p>
+    <p class="sm-d">Each step schedules, executes the model and updates the requests. By default, async scheduling is on, and the loop runs <code>step_with_batch_queue</code>. The scheduler gives each request a number of tokens from the {{term token-budget}} and KV cache blocks for them.</p>
+    <p class="sm-m">Code: {{cite vllm/v1/engine/core.py:698-812 | step_with_batch_queue}} · {{cite vllm/v1/engine/core.py:227-229 | step_fn}} · {{cite vllm/config/vllm.py:1664-1698 | async default}} · {{cite vllm/config/vllm.py:587-597 | batch queue size}} · Also: {{link concepts/engine-core-loop | the core loop}} · {{link concepts/async-scheduling | async scheduling}} · {{link tours/engine-step | one step}}</p>
+  </div>
+  <div class="sm-arrow"><code>SchedulerOutput</code>: a direct call with one GPU; a shared-memory message queue to every worker process with more GPUs</div>
+
+  <div class="sm-box sm-wrk">
+    <p class="sm-p">Worker: engine core process (1 GPU) or one process per GPU</p>
+    <p class="sm-t">{{link concepts/model-runner | 6 · The worker and Model Runner V2 run the model}}</p>
+    <p class="sm-f">vllm/v1/executor/uniproc_executor.py · multiproc_executor.py · vllm/v1/worker/gpu_worker.py · vllm/v1/worker/gpu/model_runner.py</p>
+    <p class="sm-d">The {{term model-runner}} builds the input tensors and the attention metadata. Then it runs the forward pass. At the default level O2, a decode batch with 1 token per request replays a FULL CUDA graph, and another batch uses PIECEWISE graphs. A batch larger than the largest captured size runs without a graph. The attention backend can lower the mode at start-up.</p>
+    <p class="sm-m">Code: {{cite vllm/v1/worker/gpu/model_runner.py:1742 | execute_model}} · {{cite vllm/v1/worker/gpu/model_runner.py:2024-2070 | graph or eager}} · {{cite vllm/config/vllm.py:310 | O2 mode}} · {{cite vllm/v1/worker/gpu/cudagraph_utils.py:523-553 | dispatch}} · {{cite vllm/v1/worker/gpu/model_runner.py:754-763 | lower mode}} · Also: {{link concepts/executors-and-workers | executors}} · {{link concepts/attention-backends | attention backends}} · {{link tours/forward-pass | one forward pass}}</p>
+  </div>
+  <div class="sm-arrow">logits</div>
+
+  <div class="sm-box sm-wrk">
+    <p class="sm-p">Worker: same process as box 6</p>
+    <p class="sm-t">{{link concepts/sampling-and-logits-processors | 7 · The sampler picks the next token}}</p>
+    <p class="sm-f">vllm/v1/worker/gpu/sample/sampler.py</p>
+    <p class="sm-d">Picks one token per request from the logits. With speculative decoding, a rejection sampler checks the draft tokens.</p>
+    <p class="sm-m">Code: {{cite vllm/v1/worker/gpu/model_runner.py:1663-1670 | sampler call}} · Also: {{link concepts/speculative-decoding | speculative decoding}} · {{link concepts/structured-outputs | structured outputs}}</p>
+  </div>
+  <div class="sm-arrow">sampled token ids → <code>update_from_output</code> in the engine core → <code>EngineCoreOutputs</code> over ZMQ to the API server</div>
+
+  <div class="sm-box sm-api">
+    <p class="sm-p">API server process</p>
+    <p class="sm-t">{{link code/v1-engine-output-processor | 8 · The output processor and the SSE stream}}</p>
+    <p class="sm-f">vllm/v1/engine/output_processor.py · chat_completion/serving.py</p>
+    <p class="sm-d">An output task in <code>AsyncLLM</code> detokenizes the new tokens and fills the queue of each request. The stream generator writes {{term sse}} chunks, and at the end <code>data: [DONE]</code>.</p>
+    <p class="sm-m">Code: {{cite vllm/v1/engine/async_llm.py:875-910 | output_handler}} · {{cite vllm/v1/engine/output_processor.py:728 | process_outputs}} · {{cite vllm/entrypoints/openai/chat_completion/serving.py:508 | [DONE]}} · Also: {{link concepts/tool-and-reasoning-parsers | tool and reasoning parsers}}</p>
+  </div>
+</div>
+
+<div class="sm-col sm-side">
+  <p class="sm-col-title">Around every step</p>
+  <div class="sm-box sm-all">
+    <p class="sm-p">Every process</p>
+    <p class="sm-t">{{link concepts/config-system | Configuration and environment variables}}</p>
+    <p class="sm-f">vllm/config/ · vllm/engine/arg_utils.py · vllm/envs.py</p>
+    <p class="sm-d">The CLI flags become one {{term vllm-config}}. Environment variables <code>VLLM_*</code> change behaviour in every process.</p>
+    <p class="sm-m">Code: {{cite vllm/config/vllm.py:348 | VllmConfig}} · {{cite vllm/envs.py:618 | envs}} · Also: {{link reference/serve-flags | flags}} · {{link reference/env-vars | env vars}}</p>
+  </div>
+  <div class="sm-box sm-all">
+    <p class="sm-p">Every process</p>
+    <p class="sm-t">{{link concepts/plugin-loading | Plugins and current_platform}}</p>
+    <p class="sm-f">vllm/plugins/ · vllm/platforms/</p>
+    <p class="sm-d">Each process loads the plugin groups that it needs. <code>current_platform</code> is the one platform object of a process.</p>
+    <p class="sm-m">Code: {{cite vllm/plugins/__init__.py:77-90 | load_general_plugins}} · Also: {{link concepts/plugin-map | plugin map}} · {{link concepts/platform-plugins | platforms}} · {{link code/plugins-init | plugins/__init__.py}}</p>
+  </div>
+  <div class="sm-box sm-core">
+    <p class="sm-p">Engine core process</p>
+    <p class="sm-t">{{link concepts/kv-cache-manager | KV cache manager and prefix caching}}</p>
+    <p class="sm-f">vllm/v1/core/kv_cache_manager.py · block_pool.py</p>
+    <p class="sm-d">The scheduler owns it. It gives blocks to requests and reuses the cached blocks of a shared prompt prefix. Prefix caching is on by default for generative decoder-only and hybrid models.</p>
+    <p class="sm-m">Code: {{cite vllm/v1/core/sched/scheduler.py:329 | made by the scheduler}} · {{cite vllm/engine/arg_utils.py:3062-3063 | default}} · {{cite vllm/config/model.py:2276-2291 | which models}} · Also: {{link concepts/prefix-caching | prefix caching}} · {{link concepts/hybrid-kv-cache | hybrid KV cache}}</p>
+  </div>
+  <div class="sm-box sm-api">
+    <p class="sm-p">API server process</p>
+    <p class="sm-t">{{link concepts/metrics-and-observability | Metrics and logging}}</p>
+    <p class="sm-f">vllm/v1/metrics/ · /metrics route</p>
+    <p class="sm-d">Stat loggers in <code>AsyncLLM</code> record the request metrics. The API server shows them in Prometheus format at <code>/metrics</code>.</p>
+    <p class="sm-m">Code: {{cite vllm/v1/engine/async_llm.py:204-213 | stat loggers}} · {{cite vllm/entrypoints/serve/instrumentator/metrics.py:77 | /metrics}} · Also: {{link learn/serving-metrics | serving metrics}}</p>
+  </div>
+  <div class="sm-box sm-wrk">
+    <p class="sm-p">Worker (same process as box 6)</p>
+    <p class="sm-t">{{link concepts/compile-and-cuda-graphs | torch.compile and CUDA graphs}}</p>
+    <p class="sm-f">vllm/compilation/ · vllm/v1/worker/gpu/model_runner.py</p>
+    <p class="sm-d">At the default level O2, the worker compiles the model with <code>torch.compile</code> and captures FULL and PIECEWISE CUDA graphs at start-up. A later step replays a graph when the batch fits a captured size. <code>--enforce-eager</code> turns both off.</p>
+    <p class="sm-m">Code: {{cite vllm/config/vllm.py:434 | O2 default}} · {{cite vllm/config/vllm.py:1806-1810 | compile mode}} · {{cite vllm/config/vllm.py:310 | graph mode}} · {{cite vllm/config/vllm.py:1745-1747 | enforce eager}} · {{cite vllm/v1/worker/gpu/model_runner.py:1074 | capture_model}} · Also: {{link concepts/tuning | tuning}} · {{link tours/serve-startup | start-up tour}}</p>
+  </div>
+</div>
+</div>
+<p class="sm-legend"><span><span class="sm-sw sm-api"></span>API server process (front end)</span><span><span class="sm-sw sm-core"></span>engine core process</span><span><span class="sm-sw sm-wrk"></span>worker (in the engine core process with one GPU; one process per GPU with more)</span><span><span class="sm-sw sm-ipc"></span>crosses a process boundary</span><span><span class="sm-sw sm-all"></span>every process</span></p>
+</div>
+
+<p><strong>How to read the map.</strong> Follow the left column from 1 to 8. Boxes 1 to 3 and 8 run in the API server process, the {{term front-end}}. Box 5 runs in the {{term engine-core}} process. Boxes 6 and 7 run in a {{term worker}}, which owns one GPU. With one GPU, the worker runs inside the engine core process. With more GPUs, each worker is a separate process. Box 4 and the end of the arrow after box 7 cross a process boundary. The arrow after box 5 crosses one only when there are worker processes. The right column shows parts that every step uses. The page {{link tours/life-of-a-chat-request}} walks the same path in 16 stops.</p>
+<x-simplified>
+<p>The map shows the default layout of <code>vllm serve</code> with one API server and one data-parallel rank. The full truth has more parts:</p>
+<ul>
+  <li>In <code>vllm serve</code>, the engine core always runs in its own process: <code>AsyncLLM</code> always makes a multiprocess client ({{cite vllm/v1/engine/async_llm.py:193}}). The variable <code>VLLM_ENABLE_V1_MULTIPROCESSING</code> (default <code>1</code>, {{cite vllm/envs.py:1442-1443}}) decides this only for the offline <code>LLMEngine</code> ({{cite vllm/v1/engine/llm_engine.py:170}}, {{cite vllm/v1/engine/llm_engine.py:186-188}}).</li>
+  <li>With one GPU, the executor is <code>uni</code> ({{cite vllm/config/parallel.py:1099-1100}}). It runs the worker inside the engine core process ({{cite vllm/v1/executor/uniproc_executor.py:68}}). With more GPUs on one node, the executor is <code>mp</code>. It sends each step to all worker processes through a shared-memory message queue ({{cite vllm/v1/executor/multiproc_executor.py:342-353}}, {{cite vllm/v1/executor/multiproc_executor.py:428}}).</li>
+  <li>Async scheduling is on by default. It is off for pooling models and with some incompatible options ({{cite vllm/config/vllm.py:1664-1698}}). With async scheduling and Model Runner V2, the batch queue holds 2 steps on one GPU ({{cite vllm/config/vllm.py:587-597}}). So the engine core runs <code>step_with_batch_queue</code> instead of <code>step</code> ({{cite vllm/v1/engine/core.py:205-211}}, {{cite vllm/v1/engine/core.py:227-229}}). This version does not wait for a step right after it starts it, so the CPU work of the next step overlaps the GPU work. {{link concepts/async-scheduling}} explains it.</li>
+  <li>Not shown: several API servers, one engine core per data-parallel rank, the data-parallel coordinator, Ray, and the KV transfer between instances. The pages {{link concepts/data-parallel-serving}} and {{link concepts/disaggregated-prefill}} explain them.</li>
+</ul>
+</x-simplified>
 
 <h2 id="start-here">Start here</h2>
-<ul>
-  <li><strong>A. New to the domain.</strong> Read {{link learn/ml-basics-recap}} first. Then follow {{link tours/life-of-a-chat-request}}.</li>
-  <li><strong>B. You know the domain.</strong> Start with {{link tours/life-of-a-chat-request}}. Then read the concept pages.</li>
-  <li><strong>C. You study one part.</strong> Use the search (press <kbd>/</kbd>) or {{link code/index}}.</li>
+<p>Choose the path that matches your goal. Each path is a list of pages in reading order.</p>
+<ul class="paths">
+  <li>
+    <h3>A. New to vLLM serving</h3>
+    <ol>
+      <li>{{link learn/ml-basics-recap}}</li>
+      <li>{{link learn/what-is-vllm}}</li>
+      <li>{{link tours/life-of-a-chat-request | Tour 1: Life of a chat request}}</li>
+      <li>{{link concepts/architecture-overview}}</li>
+      <li>{{link concepts/scheduler}}</li>
+      <li>{{link concepts/kv-cache-manager}}</li>
+      <li>{{link concepts/openai-server}}</li>
+      <li>{{link concepts/tuning}}</li>
+    </ol>
+  </li>
+  <li>
+    <h3>B. Run it in production</h3>
+    <ol>
+      <li>{{link learn/serving-metrics}}</li>
+      <li>{{link concepts/tuning}}</li>
+      <li>{{link concepts/metrics-and-observability}}</li>
+      <li>{{link concepts/benchmarking}}</li>
+      <li>{{link concepts/deployment-recipes}}</li>
+      <li>{{link concepts/troubleshooting}}</li>
+    </ol>
+    <p>Then read {{link concepts/data-parallel-serving}} to scale out.</p>
+  </li>
+  <li>
+    <h3>C. Write a plugin</h3>
+    <ol>
+      <li>{{link learn/python-entry-points}}</li>
+      <li>{{link concepts/plugin-map}}</li>
+      <li>{{link concepts/plugin-loading}}</li>
+      <li>{{link concepts/platform-plugins}}</li>
+      <li>{{link concepts/custom-ops}}</li>
+      <li>{{link tours/life-of-a-plugin | Tour: Life of a plugin}}</li>
+      <li>{{link tours/build-a-toy-plugin | Tour: Build a toy plugin}}</li>
+    </ol>
+  </li>
+  <li>
+    <h3>D. Read the code</h3>
+    <ul>
+      <li><strong>A file:</strong> {{link code/index}}, then a module page such as {{link code/plugins-init | plugins/__init__.py}}.</li>
+      <li><strong>The tours, in code order:</strong> {{link tours/life-of-a-chat-request | a chat request}} · {{link tours/serve-startup | start-up}} · {{link tours/engine-step | one engine step}} · {{link tours/forward-pass | one forward pass}} · {{link tours/multi-gpu-step | one step across GPUs}}</li>
+      <li><strong>Settings:</strong> {{link reference/serve-flags}} · {{link reference/env-vars}} · {{link reference/config-classes}}</li>
+    </ul>
+  </li>
 </ul>
 
 <h2 id="how-to-use">How to use this site</h2>
 <ul>
-  <li><strong>Levels.</strong> Each page has a level: Beginner, Intermediate or Advanced.</li>
-  <li><strong>Two depths on each page.</strong> A page starts with a plain explanation and a diagram. Then it shows the real code. <strong>Deep dive</strong> boxes give the full detail.</li>
-  <li><strong>Check yourself.</strong> Most pages end with 3 to 5 questions. Click "Show answer" to see the answer.</li>
-  <li><strong>Search.</strong> Press <kbd>/</kbd>, then type a word, a file name or a setting.</li>
-  <li><strong>Glossary.</strong> Words with a dotted line, such as {{term engine-core}}, have a short definition. {{link reference/glossary}} lists all terms.</li>
-  <li><strong>Code.</strong> The build copies every code excerpt from the repository. Every {{term citation}} opens the file at commit <code>{{project short_sha}}</code>.</li>
+  <li><strong>Levels.</strong> Each page has a badge: <span class="level level-beginner level-sm">Beginner</span>, <span class="level level-intermediate level-sm">Intermediate</span> or <span class="level level-advanced level-sm">Advanced</span>. A "Before you read" box lists the pages to read first.</li>
+  <li><strong>Two depths on each page.</strong> A page starts with one sentence, a plain explanation and a diagram. Then it shows the real code. <strong>Deep dive</strong> boxes give the full detail: types, shapes, edge cases and environment variables.</li>
+  <li><strong>Check yourself.</strong> Most pages end with 3 to 5 questions. Answer each one, then click "Show answer".</li>
+  <li><strong>Search.</strong> Press <kbd>/</kbd>, then type a word, a file name or an environment variable.</li>
+  <li><strong>Glossary.</strong> Words with a dotted line, such as {{term engine-core}}, are glossary terms. Point to them, or tap them on a phone, to see a short definition. {{link reference/glossary}} lists all terms.</li>
+  <li><strong>Code.</strong> The build copies every code excerpt from the repository. Every {{term citation}} opens the file on GitHub at commit <code>{{project short_sha}}</code>.</li>
+  <li><strong>DeepInfer links.</strong> A link with a small "↗" opens DeepInfer Explained or GitHub in a new tab.</li>
+  <li><strong>Grey entries</strong> in the menu are pages that are not written yet. Diagrams open at full size when you click them.</li>
+</ul>
+
+<h2 id="out-of-scope">What this site does not explain</h2>
+<ul>
+  <li><strong>Kernel internals.</strong> The site shows how vLLM selects and calls a kernel (a device program), but not how the kernel works inside: not <code>csrc/</code> ({{cite csrc/}}), and not the Triton, CUDA, CuTe or Helion kernel code.</li>
+  <li><strong>Legacy code.</strong> V0 is gone; only aliases remain, for example <code>AsyncLLMEngine = AsyncLLM</code> ({{cite vllm/engine/async_llm_engine.py:6}}). Model Runner V2 is the default. Model Runner V1 ({{cite vllm/v1/worker/gpu_model_runner.py}}) gets one note on {{link concepts/model-runner}}.</li>
+  <li><strong>Outside libraries</strong> such as PyTorch, FlashAttention, FlashInfer, NCCL, Ray, ZMQ and FastAPI.</li>
+  <li><strong>One paragraph only</strong> (on {{link learn/what-is-vllm}}): the experimental Rust front end ({{cite rust/}}) and the per-family model packages in <code>vllm/models/</code> ({{cite vllm/models/}}). The special code of single model families is also out of scope; <code>llama.py</code> is the one model example.</li>
 </ul>
 
 <h2 id="code-version">The code version this site explains</h2>
-<p>This site explains one exact {{term commit}} of {{project name}}. Use this version when you study the code with the site.</p>
+<p>This site explains one exact {{term commit}} of the vLLM repository. The repository has 23,594 commits at this point. It has no git submodules, so a clone and a checkout are enough. Use this version when you study the code with the site.</p>
 <x-version />

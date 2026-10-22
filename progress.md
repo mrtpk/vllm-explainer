@@ -50,6 +50,10 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
 
+- FINAL-PASS TODO: tours/life-of-a-chat-request cites core_client.py:1338-1340 (abort_requests_async) — check it is the intended topic. Any page that says the engine core is separate because of VLLM_ENABLE_V1_MULTIPROCESSING, or 'worker process (one per GPU)' without the TP=1 uni case.
+
+- TODO (tooling): gen_metrics.py intro sentence suggests every model_name/engine label is marked †, but only helper-class metrics are (r1 writer). Fix in final pass.
+
 - FINAL-PASS TODO: no page may say VLLM_PLUGINS filters all groups, or that the registry subprocess is OOT-only/always runs (sent to home writer for plugins-init.html). Later pages: platform-plugins, oot-models, plugin-map, life-of-a-plugin.
 
 - FINAL-PASS TODO: every page that states a default (chunked prefill, prefix caching, max_num_seqs, max_num_batched_tokens, cudagraph mode, async scheduling) must cite the EngineArgs/arg_utils override, not only the config dataclass. Source of truth: notes/facts.md "Processes and defaults".
@@ -57,7 +61,7 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 - FACT-CHECK FOCUS (all batches): b0 defect rate was ~41% (39/95). Brief every writer: check arg_utils overrides for defaults; FlashInfer sampler default; async scheduling default.
 
 - DECISION 1a questions: site/ is committed (as DeepInfer) at stage ends; code/v1-attention-backend merges backend.py + selector.py (OK); nav titles OK.
-- QUEUE (max 2 running): fact check r1 reference pages (when r1 writer is done); then full build in plan §12 order: B1a, B2a, B1b, B2b, B3a, ...
+- QUEUE (max 2 running): full build in plan §12 order: B1a, B2a, B1b, B2b, B3a, ...
 
 - FAQ material from b0: docs/design/metrics.md queue-time wording, arrival_time wording, TPOT formula differ from code (see notes/facts.md Conflicts).
 
@@ -79,7 +83,9 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-22 19:18 | 1b basics samples (b0) | done 19:34: learn/ml-basics-recap, learn/serving-metrics, diagram b0_serving_timeline, glossary b0.json (7 terms) |
 | 2026-10-22 19:35 | Fact check b0 | done 19:47: ~95 claims, 39 defects fixed (14 citation, 6 value, 13 logic, 6 missing source). Main lesson: defaults cited to config dataclasses are overridden in arg_utils. |
 | 2026-10-22 19:47 | 1b home page + code/plugins-init (c1) | done 20:04; supervisor checked map screenshot (good) |
-| 2026-10-22 20:05 | Fact check home + plugins-init | running |
+| 2026-10-22 20:05 | Fact check home + plugins-init | done ~20:25: ~230 claims, 47 defects. Supervisor fixed the import chain on plugin-loading (lines 172-173). |
+| 2026-10-22 19:50 | r1 reference pages | done ~20:15: 4 pages, generators filled, --check OK, build 0 errors |
+| 2026-10-22 20:16 | Fact check r1 | running |
 | 2026-10-22 19:18 | 1b Tour 1 (t1) | done 19:45: 16 stops, 3 diagrams, request_stepper.js, t1.json (12 terms); not browser-checked by writer |
 | 2026-10-22 19:46 | Fact check t1 (+ browser check of stepper) | done ~20:00: ~230 claims, 38 defects (11 citation, 6 value, 9 logic, 3 default source, 9 other). Stepper OK at 1280/390, no overflow. |
 | 2026-10-22 19:49 | Fact check concepts/plugin-loading (+ folder descriptions) | done ~19:58: ~80 claims, 30 defects fixed (8 citation, 11 value/condition, 4 logic, 3 missing source, 5 glossary/folder). Open question answered (platform before general plugins in every process). |
