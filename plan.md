@@ -201,22 +201,40 @@ Writer → separate fact checker → commit per batch. `progress.md` updated aft
 | 1c | Fact check of all samples; site check | fact checkers + supervisor |
 | 1d | ~~Stop for user review~~ — removed 2026-10-22 (user: run unattended). Supervisor reviews samples and continues. | supervisor |
 
-## 12. Full build (after approval) — batches
-| Batch | Pages |
-|---|---|
-| B1 Basics | rest of learn/ |
-| B2 Engine | architecture-overview, engine-client, engine-core-loop, data-contracts, async-scheduling + module pages |
-| B3 Scheduler + KV | scheduler, kv-cache-manager, prefix-caching, hybrid-kv-cache + modules + scheduler/prefix visuals; Tour 3 |
-| B4 Plugins I | plugin-map, platform-plugins, platform-interface, oot-models, model-interfaces + modules; Tour 5 |
-| B5 Plugins II | custom-ops, attention-backend-selection, quantization-plugins, kv-connectors, frontend-plugins, engine-hooks; Tour 6; chooser visual |
-| B6 Model execution | model-definition, weight-loading, forward-context, attention-backends, compile-and-cuda-graphs, tp-layers + modules; Tour 4 |
-| B7 Serving features | openai-server, renderers, parsers, structured-outputs, spec-decode, sampling, lora-serving, multimodal, pooling |
-| B8 Scale | config-system, distributed-groups, data-parallel-serving, expert-parallel-moe, disaggregated-prefill; Tours 2, 7 |
-| B9 Operating | tuning, metrics, benchmarking, deployment-recipes, troubleshooting; tuning visual |
-| B10 Reference | serve-flags, config-classes, metrics, extension-points, vllm-vs-deepinfer, FAQ |
-| F Final | consistency pass + site check + README |
+## 12. Full build (after Phase 1) — batches (supervisor, 2026-10-22 20:06)
 
-Waves follow the agent limit: each writer is followed by its fact checker; never more running agents than the limit.
+Pipeline per batch: writer (template C) → `build.py --preview` 0 errors for its pages → separate fact checker
+(template D) → supervisor merges facts, builds, commits. **Max 2 agents at a time** (user rule after 19:56):
+normally one writer + one fact checker of the previous batch. Batch prefix = diagram prefix = glossary file.
+Model pages to copy: concept `concepts/plugin-loading`, tour `tours/life-of-a-chat-request`, module `code/plugins-init`,
+basics `learn/serving-metrics`, reference `reference/env-vars`.
+
+| # | Batch | Pages | Visual |
+|---|---|---|---|
+| 1 | B1a Basics I | learn/what-is-vllm, learn/openai-api, learn/processes-and-ipc, learn/python-entry-points, learn/pytorch-for-serving | – |
+| 2 | B2a Engine front | concepts/architecture-overview, concepts/engine-client, concepts/data-contracts; code/v1-engine-async-llm, code/v1-engine-core-client, code/v1-engine-input-processor, code/v1-engine-output-processor | – |
+| 3 | B1b Basics II | learn/prefix-caching, learn/tp-pp-in-practice, learn/quantized-checkpoints, learn/lora-adapters, learn/hf-checkpoints | – |
+| 4 | B2b Engine core | concepts/engine-core-loop, concepts/async-scheduling, concepts/executors-and-workers; code/v1-engine-core, code/v1-executor-multiproc-executor, code/v1-worker-gpu-worker; tours/engine-step | – |
+| 5 | B3a Scheduler + KV | concepts/scheduler, concepts/kv-cache-manager; code/v1-core-sched-scheduler, code/v1-core-kv-cache-manager, code/v1-core-block-pool | scheduler simulator |
+| 6 | B3b Prefix + hybrid | concepts/prefix-caching, concepts/hybrid-kv-cache; code/v1-core-kv-cache-utils | prefix cache explorer |
+| 7 | B4a Platforms | concepts/plugin-map, concepts/platform-plugins, concepts/platform-interface; code/platforms-init, code/platforms-interface | plugin loading timeline |
+| 8 | B4b Models + ops | concepts/oot-models, concepts/model-interfaces, concepts/custom-ops; code/model-executor-custom-op, code/model-executor-models-registry | – |
+| 9 | B5 Feature registries | concepts/attention-backend-selection, concepts/quantization-plugins, concepts/kv-connectors, concepts/frontend-plugins, concepts/engine-hooks; code/distributed-kv-transfer-kv-connector-factory | CustomOp/backend chooser |
+| 10 | B5t Plugin tours | tours/life-of-a-plugin, tours/build-a-toy-plugin | – |
+| 11 | B6a Model code | concepts/model-definition, concepts/weight-loading, concepts/tp-layers; code/model-executor-models-llama, code/model-executor-layers-linear | – |
+| 12 | B6b Execution | concepts/model-runner, concepts/forward-context, concepts/attention-backends, concepts/compile-and-cuda-graphs; code/v1-worker-gpu-model-runner, code/forward-context, code/model-executor-layers-attention-attention, code/v1-attention-backend | – |
+| 13 | B6t Forward tour | tours/forward-pass | – |
+| 14 | B7a Serving front | concepts/openai-server, concepts/renderers-and-chat-templates, concepts/tool-and-reasoning-parsers, concepts/structured-outputs; code/entrypoints-openai-chat-completion-serving, code/entrypoints-cli-serve | – |
+| 15 | B7b Serving features | concepts/speculative-decoding, concepts/sampling-and-logits-processors, concepts/lora-serving, concepts/multimodal-serving, concepts/pooling-and-embeddings | – |
+| 16 | B8a Config | concepts/config-system; code/engine-arg-utils, code/config-vllm, code/envs; tours/serve-startup | – |
+| 17 | B8b Scale | concepts/distributed-groups, concepts/data-parallel-serving, concepts/expert-parallel-moe, concepts/disaggregated-prefill; code/distributed-parallel-state, code/distributed-device-communicators-shm-broadcast; tours/multi-gpu-step | – |
+| 18 | B9 Operating | concepts/tuning, concepts/metrics-and-observability, concepts/benchmarking, concepts/deployment-recipes, concepts/troubleshooting | tuning playground |
+| 19 | B10 Reference | reference/extension-points, reference/vllm-vs-deepinfer, reference/faq | – |
+| F | Final | consistency pass (template E) + site check (template F) + README | – |
+
+Already done in Phase 1: home, learn/ml-basics-recap, learn/serving-metrics, concepts/plugin-loading,
+tours/life-of-a-chat-request, code/plugins-init, code/index, reference/env-vars, serve-flags, config-classes, metrics.
+Priority if time is short: B1a → B2a → B2b → B3a → B4a → B9 → the rest.
 
 ## 13. Deferred pages
 (none)
