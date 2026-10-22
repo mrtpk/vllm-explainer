@@ -17,13 +17,13 @@ Status tags: [W] = from a writer report, not yet fact-checked; [FC] = confirmed 
 
 ## Processes and defaults
 - VLLM_ENABLE_V1_MULTIPROCESSING defaults True (envs.py:~162) → EngineCore in its own process. world_size 1 → executor "uni", worker inside EngineCore process (config/parallel.py:~1099-1100). [S]
-- Prefix caching on by default, hash sha256 (config/cache.py:~254-256). [S]
-- Block size default 16 (config/cache.py:~182, 459-460); if unset, Platform.update_block_size_for_backend picks a size all backends support (platforms/interface.py:~771-781). [W b0]
-- Chunked prefill on (config/scheduler.py:~134). stream_interval default 1 (config/scheduler.py:~216). [W b0]
-- `vllm serve` scheduler defaults by GPU memory (engine/arg_utils.py:~2961-2993): ≥160 GiB → 16384 tokens / 1024 seqs; ≥70 GiB and not A100/GB10 → 8192 / 1024; else 2048 / 256. [W b0]
-- max_num_scheduled_tokens defaults to max_num_batched_tokens (scheduler.py:~138-142). RUNNING scheduled first (scheduler.py:~713-715), then WAITING (~956). [W b0]
-- Default optimization level O2 (config/vllm.py:~434); O2 → cudagraph_mode FULL_AND_PIECEWISE (vllm.py:~310). [W b0]
-- Expert parallelism off by default (config/parallel.py:~190). [W b0]
+- Prefix caching: dataclass default True + sha256 (config/cache.py:~254-256), but the real default comes from EngineArgs: arg_utils.py:~3062-3063 from model.py:~2275-2291 → off for encoder-decoder and attention-free models. [FC b0]
+- Block size default 16 (config/cache.py:~182, 459-460); if unset, Platform.update_block_size_for_backend picks a size all backends support (platforms/interface.py:~771-781). [FC b0]
+- Chunked prefill: config/scheduler.py:~134 is only the dataclass default; real default = model_config.is_chunked_prefill_supported (arg_utils.py:~3031-3035; model.py:~2229-2236) → on for generative non-encoder-decoder models. NEVER cite only the config dataclass for a default: check EngineArgs/arg_utils overrides. stream_interval default 1 (config/scheduler.py:~216). [FC b0]
+- `vllm serve` (usage context OPENAI_API_SERVER) scheduler defaults by GPU memory (engine/arg_utils.py:~2961-2993): ≥160 GiB (checked first) → 16384 tokens / 1024 seqs; ≥70 GiB and device name not containing A100/GB10 → 8192 / 1024; else 2048 / 256. LLM class gets 16384/1024, 16384/1024, 8192/256. --performance-mode throughput doubles both (~3171-3175); TPU and CPU override (~2995-3024). [FC b0]
+- max_num_scheduled_tokens defaults to max_num_batched_tokens (scheduler.py:~138-142). RUNNING scheduled first (scheduler.py:~713-715), then WAITING (~956). [FC b0]
+- Default optimization level O2 (config/vllm.py:~434); O2 → cudagraph_mode FULL_AND_PIECEWISE (vllm.py:~310). [FC b0]
+- Expert parallelism off by default (config/parallel.py:~190). [FC b0]
 - Scheduler has no prefill/decode phase: comment at scheduler.py:~624-633. Preemption = recompute (num_computed_tokens=0, scheduler.py:~1658). [S]
 
 ## Plugins
@@ -33,17 +33,51 @@ Status tags: [W] = from a writer report, not yet fact-checked; [FC] = confirmed 
 - EngineCore.__init__ calls load_general_plugins (v1/engine/core.py:~130-132). [S]
 
 ## Metrics and timing (from b0)
-- arrival_time = time.time() at the start of render_chat_async, before the chat template (renderers/base.py:~1380; template ~1385-1388; tokenize ~1396). [W b0]
-- Event types QUEUED, SCHEDULED, PREEMPTED (v1/engine/__init__.py:~176-181), monotonic clock (~196-200); EngineCoreOutputs.timestamp = time.monotonic() in __post_init__ (~296-297). QUEUED in Scheduler.add_request (scheduler.py:~2746-2747); SCHEDULED one monotonic value per schedule() (~664, ~1420-1422); PREEMPTED (~1696-1697). [W b0]
-- TTFT (Prometheus) = front-end time.time() at output handling − arrival_time (v1/metrics/stats.py:~477-478, 505-507, 524-527; async_llm.py:~879-885). ITL = gap between engine-core timestamps (stats.py:~551-558). Finished: e2e, queued, prefill, decode, inference; TPOT = decode/(n−1), 0 if n ≤ 1 (stats.py:~585-616). Only the first SCHEDULED counts (stats.py:~576-578). [W b0]
-- Scheduler emits EngineCoreOutput only with new tokens, pooler output or stop (scheduler.py:~2293-2295). [W b0]
-- Histograms v1/metrics/loggers.py:~930-1003; observations ~1284-1287, ~1293-1307, ~1324-1326; bucket families ~831-839; buckets.py defaults: request latency 0.3–7680 s, TTFT 1 ms–2560 s, ITL 10 ms–80 s; custom_histogram_buckets (config/observability.py:~70). /metrics at entrypoints/serve/instrumentator/metrics.py:~77. VLLM_LOG_STATS_INTERVAL 10 s (envs.py:~874-878). [W b0]
-- --enable-per-request-metrics off by default (entrypoints/common/cli_args.py:~150-151); with --disable-log-stats → ValueError (~536-542). Its time_to_first_token_ms = first_token_ts − scheduled_ts (generate/base/serving.py:~73-74) — the prefill interval, not histogram TTFT. Streaming: only in the final usage chunk (chat_completion/serving.py:~873-885). [W b0]
-- vllm bench serve: entrypoints/cli/benchmark/serve.py:~10-21; time.perf_counter client timing (benchmarks/lib/endpoint_request_func.py:~443-501); benchmarks/serve.py: TPOT excludes 1-token requests (~654-660), goodput (~669-689), percentiles np.percentile (~782-806); --request-rate inf, --burstiness 1.0, --percentile-metrics ttft,tpot,itl, --metric-percentiles 99, --goodput keys ttft/tpot/e2el in ms (~1745-1879). [W b0]
+- arrival_time = time.time() at the start of render_chat_async, before the chat template (renderers/base.py:~1380; template ~1385-1388; tokenize ~1396). [FC b0]
+- Event types QUEUED, SCHEDULED, PREEMPTED (v1/engine/__init__.py:~176-181), monotonic clock (~196-200); EngineCoreOutputs.timestamp = time.monotonic() in __post_init__ (~296-297). QUEUED in Scheduler.add_request (scheduler.py:~2746-2747); SCHEDULED one monotonic value per schedule() (~664, ~1420-1422); PREEMPTED (~1696-1697). [FC b0]
+- TTFT (Prometheus) = front-end time.time() at output handling − arrival_time (v1/metrics/stats.py:~477-478, 505-507, 524-527; async_llm.py:~879-885). ITL = gap between engine-core timestamps (stats.py:~551-558). Finished: e2e, queued, prefill, decode, inference; TPOT = decode/(n−1), 0 if n ≤ 1 (stats.py:~585-616). Only the first SCHEDULED counts (stats.py:~576-578). [FC b0]
+- Scheduler emits EngineCoreOutput only with new tokens, pooler output or stop (scheduler.py:~2293-2295). [FC b0]
+- Histograms v1/metrics/loggers.py:~930-1003; observations ~1284-1287, ~1293-1307, ~1324-1326; bucket families ~831-839; buckets.py defaults: request latency 0.3–7680 s, TTFT 1 ms–2560 s, ITL 10 ms–80 s; custom_histogram_buckets (config/observability.py:~70). /metrics at entrypoints/serve/instrumentator/metrics.py:~77. VLLM_LOG_STATS_INTERVAL 10 s (envs.py:~874-878). [FC b0]
+- --enable-per-request-metrics off by default (entrypoints/common/cli_args.py:~150-151); with --disable-log-stats → ValueError (~536-542). Its time_to_first_token_ms = first_token_ts − scheduled_ts (generate/base/serving.py:~73-74) — the prefill interval, not histogram TTFT. Streaming: only in the final usage chunk (chat_completion/serving.py:~873-885). [FC b0]
+- vllm bench serve: entrypoints/cli/benchmark/serve.py:~10-21; time.perf_counter client timing (benchmarks/lib/endpoint_request_func.py:~443-501); benchmarks/serve.py: TPOT excludes 1-token requests (~654-660), goodput (~669-689), percentiles np.percentile (~782-806); --request-rate inf, --burstiness 1.0, --percentile-metrics ttft,tpot,itl, --metric-percentiles 99, --goodput keys ttft/tpot/e2el in ms (~1745-1879). [FC b0]
+
+## Plugins (from 1a foundation, concepts/plugin-loading)
+- vllm.logits_processors: MRV2 loads it in v1/worker/gpu/sample/logits_processor/loader.py:~37-74 with entry_points() directly (~46) → VLLM_PLUGINS ignored; import error → RuntimeError (~62-66); V1-interface class → ValueError (~67-72). Called from model_runner.py load_model (~463-466). Front end also loads it in InputProcessor.__init__ (input_processor.py:~58-62, ~93-107); validate_logits_processors_parameters IS called (input_processor.py:~109-112) — survey claim "no caller" was wrong. [W 1a]
+- Endpoint plugin factory errors logged and skipped (plugins/__init__.py:~137-141); required_tasks gate (~143-154). [W 1a]
+- Front end: general plugins first load while the CLI builds parsers (cli/main.py:~100-110 → cli/serve.py:~172 → common/cli_args.py:~466 → arg_utils.py:~3243). current_platform imported at module level in arg_utils.py:~122 → in the front end the platform resolves before general plugins (derived). [W 1a]
+- EngineCore loads plugins (core.py:~132) before the executor (~147). One GPU: uni executor, init_worker inside EngineCore process (uniproc_executor.py:~68). [W 1a]
+- Start method: CLI sets spawn (entrypoints/common/startup.py:~148-149, from cli/main.py:~67-68); env default fork (envs.py:~938-940); get_mp_context (utils/system_utils.py:~185-200), _maybe_force_spawn (~123-162); engine core procs (v1/engine/utils.py:~256), workers (multiproc_executor.py:~723). [W 1a]
+- VLLM_PLUGINS re-read on every access (envs.py:~2297-2298) until enable_envs_cache (~2308-2326). No space stripping in the comma split (derived). [W 1a]
+- General group logs at DEBUG, other groups INFO (plugins/__init__.py:~48-50); VLLM_LOGGING_LEVEL default INFO (envs.py:~860). [W 1a]
+- Platform detector exception → DEBUG log, plugin ignored (platforms/__init__.py:~255-265); the single active OOT detector is called again at ~278, outside try. [W 1a]
+- Built-in LoRA resolvers: filesystem resolver raises ValueError if VLLM_LORA_RESOLVER_CACHE_DIR is not a dir (plugins/lora_resolvers/filesystem_resolver.py:~51-57) → start-up stops; HF Hub resolver needs lora_hf_hub_resolver in VLLM_PLUGINS (hf_hub_resolver.py:~129-145). [W 1a]
+- IO processor: function error → warning; no usable plugin → ValueError (plugins/io_processors/__init__.py:~64-84). Stat logger not StatLoggerBase → TypeError (v1/metrics/loggers.py:~88-94). register_model overwrite → DEBUG log only (registry.py:~1179-1185). [W 1a]
+- docs/design/plugin_system.md:~7 says every process loads the plugin: only true for general + platform groups (FAQ). [W 1a]
+
+## Online request path (from Tour 1 writer; being fact-checked)
+- Default online path: AsyncScheduler + step_with_batch_queue. Async scheduling on by default (config/vllm.py:~1664-1698); MRV2 max_concurrent_batches = pp_size+1 → 2 on one GPU (~587-597); batch queue → step_fn = step_with_batch_queue (core.py:~205-211, ~227-229); get_scheduler_cls → AsyncScheduler (config/scheduler.py:~231-238). [W t1]
+- engine_client.generate() only builds an async generator; StreamingResponse is returned before AsyncLLM.add_request runs → HTTP 200 before the engine sees the request (chat_completion/serving.py:~396-426; generate/base/serving.py _preflight docstring ~169-181). [W t1]
+- Request id: assign_request_id appends 8 random chars, keeps external_req_id (input_processor.py:~354-371); VLLM_DISABLE_REQUEST_ID_RANDOMIZATION turns it off (~364-369). [W t1]
+- Async placeholders: +1 on decode schedule (sched/async_scheduler.py:~45-47), −1 on token arrival (~71-73); used in running pass (scheduler.py:~759-763). MRV2 previous token from req_states.last_sampled_tokens on GPU (gpu/model_runner.py:~1493-1500), written in post_update (~1715-1726). [W t1]
+- Chat template + tokenize in a thread pool (renderers/hf.py:~1011-1013; renderers/base.py:~156-158); VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT default 30 s (envs.py:~817-818); HF template returns text, not ids (online_renderer.py:~774-781). [W t1]
+- gpu_memory_utilization default 0.92 (config/cache.py:~212). [W t1]
+- DP: non-MoE → independent EngineCoreProc per rank; MoE → DPEngineCoreProc (core.py:~1537-1543). One node DP=1 IPC uses ipc:// (v1/engine/utils.py:~1139-1151); engine identity = DP rank as 2 little-endian bytes (core_client.py:~749-751). [W t1]
+- check_stop order: EOS, stop token ids, max_model_len/max_tokens, min_tokens, repetition (sched/utils.py:~98-140). Prefix-cache hit ≤ num_tokens−1, full blocks only (kv_cache_manager.py:~289-300). Single API server runs in the CLI process (cli/serve.py:~154-156). [W t1]
+
+## Added after the b0 fact check (2026-10-22)
+- Async scheduling on by default (config/vllm.py:~1664-1698) → engine core uses step_with_batch_queue (core.py:~227-229; vllm.py:~587-597), not step(). [FC b0]
+- FlashInfer sampler on by default (envs.py:~886-890; sampler.py:~88-90, ~304-315); it replaces top-k/top-p + Gumbel when requests use top-k/top-p, none is greedy or seeded, none needs processed logprobs (~339-345). [FC b0]
+- QUEUED/SCHEDULED/PREEMPTED events recorded only when log_stats is on (scheduler.py:~2746, ~1420, ~1696). [FC b0]
+- Client-disconnect aborts skip finished stats (async_llm.py:~807-809, ~955; output_processor.py:~633). [FC b0]
+- LLM class defaults disable_log_stats=True (entrypoints/llm.py:~225-226). [FC b0]
+- KV cache dtype auto = model dtype for most models (cache.py:~232-240; DeepSeek V3.2 defaults to fp8). [FC b0]
+- MLA models use MLAAttention, not Attention. [FC b0]
+- bench serve ranges: flags ~1745-1765, ~1847-1857, ~1858-1866, ~1867-1878; goodput ~669-692. [FC b0]
 
 ## Conflicts and resolutions (docs vs code — FAQ material)
-- docs/design/metrics.md:~212 says queue time runs to the "most recent SCHEDULED"; code keeps the first (stats.py:~576-578). Pages follow the code. [W b0]
-- docs/design/metrics.md:~262-263 says arrival_time starts when tokenization begins; code sets it before the chat template. [W b0]
-- docs give TPOT as (e2e−TTFT)/(n−1) from front-end times; code uses decode_time/(n−1) from engine-core timestamps. [W b0]
+- docs/design/metrics.md:~69-70 calls ITL a wall-clock gap between streamed outputs; code uses engine-core monotonic timestamps per engine output (stats.py:~554-556); --stream-interval does not change Prometheus ITL. [FC b0]
+- docs/design/metrics.md:~212 says queue time runs to the "most recent SCHEDULED"; code keeps the first (stats.py:~576-578). Pages follow the code. [FC b0]
+- docs/design/metrics.md:~262-263 says arrival_time starts when tokenization begins; code sets it before the chat template. [FC b0]
+- docs give TPOT as (e2e−TTFT)/(n−1) from front-end times; code uses decode_time/(n−1) from engine-core timestamps. [FC b0]
 - docs/design/custom_op.md:~11, ~285: register_oot("name") form raises TypeError. [S]
 - docs/design/plugin_system.md: no vllm.logits_processors group; no OOT-wins rule; line ~144 possibly stale. [survey]

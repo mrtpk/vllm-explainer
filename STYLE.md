@@ -508,7 +508,7 @@ same thing on every page:
 | Use | Do not use (for this meaning) |
 |---|---|
 | **request** (what a client sends; the engine core object is `Request`, `vllm/v1/request.py`) | job, query, sequence (V1 has no sequence object) |
-| **step** (one `EngineCore.step()`: schedule, execute, update) | iteration, tick, round (except "speculative round") |
+| **step** (one engine step: schedule, execute, sample, update. By default the engine core uses `step_with_batch_queue`, not `step()`) | iteration, tick, round (except "speculative round") |
 | **front end** (noun) / **front-end** (adjective): the API server process with FastAPI and `AsyncLLM` | frontend, client process, process 0 |
 | **API server** (the FastAPI/uvicorn app of `vllm serve`) / **OpenAI-compatible server** (its OpenAI routes) | web server, HTTP engine |
 | **`AsyncLLM`** (the front-end engine object of `vllm serve`) | async engine, `AsyncLLMEngine` (an alias) |

@@ -1,0 +1,102 @@
+---
+title: What you need from DeepInfer Explained
+nav_title: Basics recap (DeepInfer)
+level: Beginner
+prerequisites: none
+related: learn/what-is-vllm, learn/serving-metrics, learn/prefix-caching, learn/tp-pp-in-practice, concepts/scheduler, concepts/kv-cache-manager, concepts/model-runner
+summary: This site does not teach the LLM basics again. This page gives a one-line recap of each of the 12 basics pages of DeepInfer Explained, with a link, and one line on what vLLM does differently.
+---
+<x-sentence>This site builds on the 12 basics pages of DeepInfer Explained; this page recaps each one in one line and says what vLLM does differently.</x-sentence>
+
+<h2>The idea</h2>
+<p>DeepInfer Explained is a sister site. Its part "Learn the basics" teaches the general ideas of LLM inference: tokens, attention, the KV cache, batching and more. These ideas are the same in every engine. This site does not explain them again.</p>
+<p>Use this page in two ways:</p>
+<ul>
+  <li><strong>As a check.</strong> Read the recap lines. If a line is not clear to you, read the DeepInfer page first. Each link opens the DeepInfer site in a new tab.</li>
+  <li><strong>As a map.</strong> The last column says where vLLM is different from DeepInfer. Each line cites the vLLM code and names the page of this site that explains it.</li>
+</ul>
+<p><strong>An everyday comparison.</strong> Think of a second car from a new maker. You already know how to drive. You only need to learn where this car puts the controls, and what it does in a different way. The comparison stops here: vLLM also adds parts that DeepInfer does not have at all, for example prefix caching and an OpenAI-compatible server.</p>
+<p>Two facts touch every row of the table. First, <code>vllm serve</code> runs an API server process and a separate engine core process ({{cite vllm/v1/engine/async_llm.py:188-193}}). With one GPU, the worker runs inside the engine core process ({{cite vllm/config/parallel.py:1099-1100}}). Second, Model Runner V2 runs the model by default ({{cite vllm/config/vllm.py:730-748}}).</p>
+
+<h2>The 12 basics, and what vLLM changes</h2>
+<table>
+  <thead><tr><th>#</th><th>DeepInfer page</th><th>Recap (one line)</th><th>What is different in vLLM</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>{{deepinfer learn/what-an-llm-does | What an LLM does}}</td>
+      <td>An LLM gives a probability to every possible next token; an engine runs it in a loop: pick a token, add it, run again.</td>
+      <td>One <code>EngineCore.step()</code> schedules, runs the model and updates all requests of the batch ({{cite vllm/v1/engine/core.py:657-686}}). Async scheduling is on by default when the configuration allows it ({{cite vllm/config/vllm.py:1664-1698}}). Then the engine core uses <code>step_with_batch_queue()</code>, which schedules the next batch before the current batch ends ({{cite vllm/v1/engine/core.py:227-229}}, {{cite vllm/config/vllm.py:591-593}}). See {{link concepts/engine-core-loop}}.</td></tr>
+    <tr><td>2</td><td>{{deepinfer learn/tokens | Tokens and tokenizers}}</td>
+      <td>A tokenizer cuts text into tokens from a fixed vocabulary and gives each token an integer id.</td>
+      <td>The API server applies the chat template and tokenizes before the engine core gets the request ({{cite vllm/renderers/base.py:1385-1396}}). Detokenization is incremental, in the output processor of the front end ({{cite vllm/v1/engine/output_processor.py:307-310}}, {{cite vllm/v1/engine/async_llm.py:180}}). See {{link learn/openai-api}}.</td></tr>
+    <tr><td>3</td><td>{{deepinfer learn/transformer | Inside a transformer}}</td>
+      <td>Embedding, then a stack of layers (attention + MLP, with norms and residuals), then one score per vocabulary token.</td>
+      <td>Most model families have one Python file in <code>vllm/model_executor/models/</code>. A registry maps the <code>architectures</code> name of <code>config.json</code> to a file and a class. Several names can share one class: <code>InternLM3ForCausalLM</code> also uses <code>llama.py</code> ({{cite vllm/model_executor/models/registry.py:140}}, {{cite vllm/model_executor/models/registry.py:152}}). The layer stack is in classes such as <code>LlamaDecoderLayer</code> ({{cite vllm/model_executor/models/llama.py:251}}). See {{link concepts/model-definition}}.</td></tr>
+    <tr><td>4</td><td>{{deepinfer learn/attention | Attention, step by step}}</td>
+      <td>Each token scores its query against earlier keys, applies softmax, and mixes the values; GQA and MLA make the KV cache smaller.</td>
+      <td>Most models use the <code>Attention</code> layer class ({{cite vllm/model_executor/layers/attention/attention.py:229}}); MLA models use <code>MLAAttention</code> ({{cite vllm/model_executor/layers/attention/mla_attention.py:426}}). vLLM selects an attention backend (FlashAttention, FlashInfer, ...) from the head size, the dtype, the KV cache dtype, MLA and other layer properties ({{cite vllm/v1/attention/selector.py:109-122}}). See {{link concepts/attention-backends}}.</td></tr>
+    <tr><td>5</td><td>{{deepinfer learn/prefill-decode | Prefill and decode}}</td>
+      <td>Prefill reads the whole prompt in one pass (compute-bound); decode adds one token per step (memory-bound).</td>
+      <td>The scheduler has no prefill phase and no decode phase. One step can mix prompt chunks and decode tokens ({{cite vllm/v1/core/sched/scheduler.py:624-633}}). See {{link concepts/scheduler}}.</td></tr>
+    <tr><td>6</td><td>{{deepinfer learn/kv-cache | The KV cache}}</td>
+      <td>The engine keeps the keys and values of earlier tokens in fixed-size blocks, with a block table per request.</td>
+      <td>Blocks have 16 tokens by default; the attention backend can select another size ({{cite vllm/config/cache.py:182}}, {{cite vllm/platforms/interface.py:771-781}}). Prefix caching is on by default for most generative models ({{cite vllm/config/cache.py:254}}, {{cite vllm/engine/arg_utils.py:3062-3063}}, {{cite vllm/config/model.py:2275-2291}}). See {{link learn/prefix-caching}}.</td></tr>
+    <tr><td>7</td><td>{{deepinfer learn/sampling | Sampling: temperature, top-k, top-p}}</td>
+      <td>Sampling turns logits into probabilities, removes unlikely tokens (top-k, top-p) and draws one token with a seeded random number.</td>
+      <td>Model Runner V2 samples on the GPU. In the general path, it applies top-k/top-p, then draws with a Gumbel sample from the request seed and the token position ({{cite vllm/v1/worker/gpu/sample/sampler.py:347-358}}). A request without a seed gets a random seed ({{cite vllm/v1/worker/gpu/sample/states.py:54-58}}). On supported hardware, a fused FlashInfer (or XPU) sampler can replace this path ({{cite vllm/v1/worker/gpu/sample/sampler.py:339-345}}). It does so only when requests use top-k or top-p, no request is greedy or has a seed, and no request needs processed logprobs ({{cite vllm/v1/worker/gpu/sample/sampler.py:304-315}}). See {{link concepts/sampling-and-logits-processors}}.</td></tr>
+    <tr><td>8</td><td>{{deepinfer learn/batching | Batching}}</td>
+      <td>Continuous batching makes a new packed batch in each step; chunked prefill splits a long prompt over steps.</td>
+      <td>The scheduler serves running requests first, then waiting ones, in one token budget ({{cite vllm/v1/core/sched/scheduler.py:713-715}}, {{cite vllm/v1/core/sched/scheduler.py:956}}). Chunked prefill is on by default for generative models that are not encoder-decoder models ({{cite vllm/engine/arg_utils.py:3031-3035}}, {{cite vllm/config/model.py:2229-2236}}). See {{link learn/serving-metrics}}.</td></tr>
+    <tr><td>9</td><td>{{deepinfer learn/gpus-kernels | GPUs, kernels, and speed}}</td>
+      <td>A GPU runs kernels on many cores; speed depends on memory traffic, math and launch cost; CUDA graphs remove launch cost.</td>
+      <td>vLLM compiles the model with <code>torch.compile</code> at every optimization level above O0 ({{cite vllm/config/vllm.py:1806-1810}}). The default level O2 sets <code>cudagraph_mode</code> to <code>FULL_AND_PIECEWISE</code> ({{cite vllm/config/vllm.py:434}}, {{cite vllm/config/vllm.py:310}}). See {{link concepts/compile-and-cuda-graphs}}.</td></tr>
+    <tr><td>10</td><td>{{deepinfer learn/parallelism | Parallelism basics}}</td>
+      <td>Work splits by requests (DP), matrices (TP), layers (PP), tokens (CP) or experts (EP); collectives move the data.</td>
+      <td>vLLM has TP and PP groups; DeepInfer has neither. The rank grid is <code>(-1, DP, PP, PCP, TP)</code> ({{cite vllm/distributed/parallel_state.py:2157-2163}}). See {{link learn/tp-pp-in-practice}}.</td></tr>
+    <tr><td>11</td><td>{{deepinfer learn/moe | Mixture of Experts (MoE)}}</td>
+      <td>A router sends each token to a few of many expert MLPs, so each token uses only a small part of the weights.</td>
+      <td>MoE layers come from the function <code>FusedMoEFactory</code> ({{cite vllm/model_executor/layers/fused_moe/layer.py:92}}). Expert parallelism is off by default; then MoE layers use tensor parallelism ({{cite vllm/config/parallel.py:190-191}}). See {{link concepts/expert-parallel-moe}}.</td></tr>
+    <tr><td>12</td><td>{{deepinfer learn/number-formats | Number formats: BF16, FP8, FP4}}</td>
+      <td>A format sets the bits for sign, exponent and mantissa; FP8 and FP4 use block scales to keep accuracy.</td>
+      <td>vLLM loads many quantized checkpoint formats: FP8, AWQ, GPTQ, compressed-tensors, MXFP4 and more ({{cite vllm/model_executor/layers/quantization/__init__.py:15-49}}). The KV cache dtype <code>auto</code> uses the model dtype for most models ({{cite vllm/config/cache.py:232-240}}). See {{link learn/quantized-checkpoints}}.</td></tr>
+  </tbody>
+</table>
+<x-note title="Basics that are new on this site"><p>DeepInfer has no prefix cache, no TP or PP group, no OpenAI server and no LoRA adapters. So this site explains them in full: {{link learn/prefix-caching}}, {{link learn/tp-pp-in-practice}}, {{link learn/openai-api}}, {{link learn/lora-adapters}}. Serving metrics are also new: {{link learn/serving-metrics}}.</p></x-note>
+
+<h2>Deep dive</h2>
+<x-deepdive title="Defaults that make vLLM numbers differ from DeepInfer numbers">
+<p>The DeepInfer pages use DeepInfer's settings in their examples. These vLLM defaults change the numbers. Each row cites the vLLM line.</p>
+<table>
+  <thead><tr><th>Setting</th><th>vLLM default</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>KV block size</td><td>16 tokens (DeepInfer: 128). A backend can select another size when you do not set <code>--block-size</code>.</td><td>{{cite vllm/config/cache.py:459-460}}, {{cite vllm/platforms/interface.py:771-781}}</td></tr>
+    <tr><td>Prefix caching</td><td>on for most generative models (not encoder-decoder or attention-free models); block hash <code>sha256</code></td><td>{{cite vllm/config/cache.py:254-256}}, {{cite vllm/config/model.py:2275-2291}}</td></tr>
+    <tr><td>Chunked prefill</td><td>on for generative models (not encoder-decoder)</td><td>{{cite vllm/engine/arg_utils.py:3031-3035}}</td></tr>
+    <tr><td>Step kinds</td><td>mixed: prompt chunks and decode tokens in one step</td><td>{{cite vllm/v1/core/sched/scheduler.py:624-633}}</td></tr>
+    <tr><td>Token budget for <code>vllm serve</code> on a GPU</td><td>2,048, 8,192 or 16,384 tokens, by GPU memory. <code>--performance-mode throughput</code> doubles the value.</td><td>{{cite vllm/engine/arg_utils.py:2960-2993}}, {{cite vllm/engine/arg_utils.py:3171-3175}}</td></tr>
+    <tr><td><code>max_num_seqs</code> for <code>vllm serve</code> on a GPU</td><td>256 or 1,024, by GPU memory</td><td>{{cite vllm/engine/arg_utils.py:2960-2993}}</td></tr>
+    <tr><td>Preemption</td><td>free all blocks of the request, set its computed tokens to 0, put it at the front of the waiting queue</td><td>{{cite vllm/v1/core/sched/scheduler.py:1676-1700}}</td></tr>
+    <tr><td>CUDA graphs</td><td><code>FULL_AND_PIECEWISE</code> at the default optimization level O2</td><td>{{cite vllm/config/vllm.py:310}}, {{cite vllm/config/vllm.py:434}}</td></tr>
+    <tr><td>Expert parallelism</td><td>off</td><td>{{cite vllm/config/parallel.py:190-191}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Worked example.</strong> A request with a prompt of 1,000 tokens needs ⌈1,000 / 16⌉ = 63 blocks in vLLM with the default size. With DeepInfer's 128-token blocks, it needs ⌈1,000 / 128⌉ = 8 blocks. The memory is almost the same; only the number and size of the blocks change.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>The DeepInfer code is not the vLLM code.</strong> The "In DeepInfer" parts of the DeepInfer pages cite DeepInfer files. Use them only for the idea. For vLLM behaviour, use the citations on this site.</li>
+  <li><strong>DeepInfer's step kinds do not apply.</strong> A DeepInfer step is a prefill step or a decode step. A vLLM step can be both ({{cite vllm/v1/core/sched/scheduler.py:624-633}}). Do not expect separate prefill and decode step times in vLLM metrics.</li>
+</ul>
+<p><strong>Why it matters.</strong> The rest of this site uses the basics without a new explanation. A gap in the basics makes the concept pages hard to follow.</p>
+
+<x-quiz>
+  <x-q level="easy">Which DeepInfer page explains block tables and preemption, and what is the default block size in vLLM?
+    <x-a><p>{{deepinfer learn/kv-cache | The KV cache}}. vLLM uses 16 tokens per block by default ({{cite vllm/config/cache.py:182}}). The attention backend can select another size when you do not set one ({{cite vllm/platforms/interface.py:771-781}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A DeepInfer step is a prefill step or a decode step. Can one vLLM step hold decode tokens of 50 requests and a chunk of a new prompt?
+    <x-a><p>Yes. The vLLM scheduler has no prefill or decode phase. It gives tokens to each request until its computed tokens catch up ({{cite vllm/v1/core/sched/scheduler.py:624-633}}). It serves the running requests first, then the waiting ones with the rest of the token budget ({{cite vllm/v1/core/sched/scheduler.py:713-715}}, {{cite vllm/v1/core/sched/scheduler.py:956}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You start <code>vllm serve</code> on one H100 with 80 GB and set no scheduler flags. What are the token budget and <code>max_num_seqs</code>?
+    <x-a><p>8,192 tokens and 1,024 requests. <code>vllm serve</code> uses the usage context <code>OPENAI_API_SERVER</code> ({{cite vllm/entrypoints/launchers/api_server/entry.py:72}}, {{cite vllm/entrypoints/launchers/api_server/entry.py:82}}). An H100 with 80 GB reports about 79 GiB (inferred, not in the repo). That is 70 GiB or more and less than 160 GiB, and the GPU is not an A100 or a GB10. So the "H100 and H200" defaults apply ({{cite vllm/engine/arg_utils.py:2970-2983}}). This is true with the default <code>--performance-mode</code>; the mode <code>throughput</code> doubles both values ({{cite vllm/engine/arg_utils.py:3171-3175}}).</p></x-a>
+  </x-q>
+</x-quiz>

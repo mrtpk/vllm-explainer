@@ -1,0 +1,238 @@
+---
+title: Serving metrics: TTFT, TPOT, ITL, throughput, goodput
+nav_title: Serving metrics
+level: Beginner
+prerequisites: learn/ml-basics-recap
+related: concepts/metrics-and-observability, concepts/benchmarking, concepts/tuning, concepts/scheduler, reference/metrics, tours/life-of-a-chat-request
+summary: Serving metrics tell how fast a server answers one user (TTFT, TPOT, ITL, E2E latency) and how much work it does for all users (throughput, goodput). vLLM measures them in the API server and the engine core, and vllm bench serve measures them at the client.
+---
+<x-sentence>Serving metrics measure how long one user waits for tokens, and how many tokens and good requests the server makes per second.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>The timeline of one request</h3>
+<p>A chat request goes through the same events every time. A client sends it. The server turns the messages into tokens. The request waits in a queue. Then the engine runs the prefill of the prompt and makes the first output token ({{deepinfer learn/prefill-decode | Prefill and decode}}). After that, each step adds one more token. The request ends with the last token.</p>
+<p>Each latency metric is the time between two of these events:</p>
+<ul>
+  <li><strong>Time to first token</strong> ({{term ttft}}): from arrival to the first output token. The user sees nothing before it. Queue time and prefill time are both inside TTFT.</li>
+  <li><strong>Time per output token</strong> ({{term tpot}}): the time from the first to the last token, divided by the number of tokens after the first. It is one number per request.</li>
+  <li><strong>Inter-token latency</strong> ({{term itl}}): the time between two outputs that follow each other. A request with 101 output tokens gives 100 ITL samples.</li>
+  <li><strong>End-to-end latency</strong> ({{term e2e-latency | E2E latency}}): from arrival to the last token. E2E = TTFT + TPOT × (output tokens − 1).</li>
+</ul>
+<p>TPOT and ITL look the same, but they are not. TPOT is an average for one request. ITL keeps every gap, so one long gap stays visible. A long gap is a <em>stall</em>: for example, a step that also runs a long prefill of another request.</p>
+
+<h3>Many requests: throughput, concurrency, goodput</h3>
+<p>A server has many users at the same time. Three numbers describe all of them together:</p>
+<ul>
+  <li><strong>{{term request-throughput | Request throughput}}</strong>: finished requests per second. <strong>{{term token-throughput | Token throughput}}</strong>: output tokens per second (or input plus output tokens per second).</li>
+  <li><strong>{{term concurrency | Concurrency}}</strong>: the number of requests in the server at one time. More concurrency gives bigger batches.</li>
+  <li><strong>{{term goodput | Goodput}}</strong>: requests per second that meet every {{term slo}} (service level objective). An SLO is a limit, for example "TTFT ≤ 500 ms and TPOT ≤ 50 ms".</li>
+</ul>
+<p>Throughput alone can hide bad service. A server can finish many requests per second while half of them wait for 10 seconds. Goodput counts only the requests that the users find fast enough.</p>
+
+<h3>Percentiles: p50 and p99</h3>
+<p>A mean hides the slow requests. A {{term percentile}} does not. The p50 (median) is the value that half of the samples are below. The p99 is the value that 99 % of the samples are below. SLOs often use p99, because 1 in 100 samples is at or above the p99 value. With 1,000 requests, that is 10 slow requests.</p>
+<p><strong>A worked example.</strong> One request has 100 ITL gaps. 99 gaps are 18 ms and one gap is 218 ms (a stall). The mean ITL is (99 × 18 + 218) / 100 = 20 ms, and TPOT is also 20 ms. The p50 is 18 ms. The maximum is 218 ms. One stall changes the mean only by 2 ms, but the user sees a pause of 0.2 s.</p>
+
+<h3>The latency and throughput trade-off</h3>
+<p>Batching puts the tokens of many requests into one step. The model reads its weights once for the whole batch ({{deepinfer learn/batching | Batching}}). So a bigger batch gives many more tokens per second, but each step takes a little longer. Each step is one ITL gap for every request in the batch.</p>
+<p><strong>A worked example (illustrative numbers).</strong> Assume that a decode step takes 15 ms plus 0.1 ms per request in the batch.</p>
+<table>
+  <thead><tr><th>Requests in the batch</th><th>Step time = ITL</th><th>Output tokens per second</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>15.1 ms</td><td>66</td></tr>
+    <tr><td>32</td><td>18.2 ms</td><td>1,758</td></tr>
+    <tr><td>128</td><td>27.8 ms</td><td>4,604</td></tr>
+    <tr><td>256</td><td>40.6 ms</td><td>6,305</td></tr>
+  </tbody>
+</table>
+<p>From 1 to 256 requests, throughput grows by about 95 times. ITL grows only by about 2.7 times. With the SLO "TPOT ≤ 50 ms", all four batch sizes are good, so the largest batch gives the most goodput. With "TPOT ≤ 20 ms", only batches of up to 50 requests meet the SLO.</p>
+<x-simplified><p>A real step time also depends on attention, which reads the KV cache of each request, and on prefill chunks in the same step. The linear formula is only an example. Measure your own server with <code>vllm bench serve</code>.</p></x-simplified>
+<p>New requests also move the trade-off. A prefill chunk in a step makes that step longer for every running request. A bigger token budget gives a shorter TTFT for long prompts, but longer ITL stalls for the others.</p>
+
+<h3>An everyday comparison</h3>
+<p>Think of a restaurant. TTFT is the time until the first dish comes to the table. ITL is the time between two dishes. Throughput is the number of guests that the kitchen serves in one hour. Goodput counts only the guests who got every dish in time. A cook can make 20 plates of the same dish at once. This serves more guests per hour, but each guest waits a little longer for each dish.</p>
+<p>The comparison stops here: a kitchen cooks each dish only once. An LLM server must read all model weights again for each step. That is why a bigger batch costs so little extra time.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b0_serving_timeline" alt="Panel 1: one request on a time line with the events arrival_time at 0 ms, QUEUED at 5 ms, SCHEDULED at 55 ms, first token at 200 ms and last token at 2,200 ms. Coloured bands show render, waiting, prefill and decode. Brackets show TTFT 200 ms, decode time 2,000 ms with TPOT 20 ms, E2E latency 2,200 ms, queue 50 ms, prefill 145 ms, and two ITL gaps, one of them long. Panel 2: three boxes from left to right, the benchmark client with perf_counter, the API server with time.time, and the engine core process with time.monotonic, joined by HTTP and ZMQ arrows. Panel 3: five requests A to E as bars on a time axis from 0 to 8 seconds; A, B and E are good, C misses the TTFT SLO and D misses the TPOT SLO; throughput 0.625 and goodput 0.375 requests per second." caption="Figure: each latency metric is the time between two events of one request (panel 1). Three processes measure them with three clocks (panel 2). Goodput counts only the requests that meet every SLO (panel 3). All numbers are a made-up example. Click the diagram to zoom." />
+<p>Read panel 1 from left to right. The brackets above the line are the metrics that a user feels. The brackets below the line split TTFT into its parts. Panel 2 shows that vLLM subtracts only timestamps that come from the same process. The API server does the subtraction for the engine-core timestamps too. Panel 3 is the worked example of the deep dive "Worked example: five requests in one benchmark run".</p>
+
+<h2>In vLLM</h2>
+<p>This is a basics page, so this part gives only pointers. The pages {{link concepts/metrics-and-observability}} and {{link concepts/benchmarking}} explain the full code.</p>
+<ol>
+  <li><strong>The engine core marks the events.</strong> When statistics are on, the scheduler records a <code>QUEUED</code> event when a request enters it ({{cite vllm/v1/core/sched/scheduler.py:2746-2747}}). It records <code>SCHEDULED</code> with one timestamp per <code>schedule()</code> call ({{cite vllm/v1/core/sched/scheduler.py:664}}, {{cite vllm/v1/core/sched/scheduler.py:1420-1422}}). Every <code>EngineCoreOutputs</code> carries one <code>time.monotonic()</code> timestamp for its new tokens ({{cite vllm/v1/engine/__init__.py:296-297}}).</li>
+  <li><strong>The front end turns the events into metrics.</strong> <code>IterationStats</code> in the {{term front-end}} computes TTFT at the first output of a request and one ITL sample at each later output. It computes E2E, queue, prefill, decode and TPOT when a request finishes. The <code>PrometheusStatLogger</code> puts them into histograms, for example <code>vllm:time_to_first_token_seconds</code> ({{cite vllm/v1/metrics/loggers.py:930-935}}).</li>
+  <li><strong>The benchmark measures at the client.</strong> <code>vllm bench serve</code> sends streamed requests and times the {{term sse}} chunks ({{cite vllm/benchmarks/lib/endpoint_request_func.py:466-486}}). Then <code>calculate_metrics()</code> reports throughput, goodput, mean, median and percentiles ({{cite vllm/benchmarks/serve.py:602-812}}).</li>
+</ol>
+<x-code file="vllm/v1/metrics/stats.py" lines="509-558" highlight="524-527,551-558" caption="<code>IterationStats.update_from_output()</code> runs once per request per engine output. TTFT uses the front-end clock and <code>arrival_time</code>. ITL uses the engine-core timestamps of two outputs that follow each other." />
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Which clock, which process: where each timestamp comes from">
+<p>vLLM computes an interval only from two timestamps of the same process. The design document gives the reason: monotonic clocks of two processes have different start points ({{cite docs/design/metrics.md:177-182}}).</p>
+<table>
+  <thead><tr><th>Timestamp</th><th>Process</th><th>Clock</th><th>Set where</th></tr></thead>
+  <tbody>
+    <tr><td><code>arrival_time</code></td><td>API server</td><td><code>time.time()</code></td><td>first line of <code>render_chat_async()</code>, before the chat template and tokenization ({{cite vllm/renderers/base.py:1380}}); copied into the engine input ({{cite vllm/renderers/base.py:1274}})</td></tr>
+    <tr><td><code>queued_ts</code></td><td>engine core</td><td><code>time.monotonic()</code></td><td><code>Scheduler.add_request()</code> ({{cite vllm/v1/core/sched/scheduler.py:2746-2747}}, {{cite vllm/v1/engine/__init__.py:196-200}})</td></tr>
+    <tr><td><code>scheduled_ts</code></td><td>engine core</td><td><code>time.monotonic()</code></td><td>one value at the start of <code>schedule()</code> for all new requests of the step ({{cite vllm/v1/core/sched/scheduler.py:664}})</td></tr>
+    <tr><td>output timestamp</td><td>engine core</td><td><code>time.monotonic()</code></td><td>when <code>EngineCoreOutputs</code> is made, after the step ({{cite vllm/v1/engine/__init__.py:296-297}}). It becomes <code>first_token_ts</code> and <code>last_token_ts</code> ({{cite vllm/v1/metrics/stats.py:551-558}}).</td></tr>
+    <tr><td><code>iteration_timestamp</code></td><td>API server</td><td><code>time.time()</code></td><td>when the output handler gets one batch of outputs from the engine core ({{cite vllm/v1/engine/async_llm.py:879-885}}, {{cite vllm/v1/metrics/stats.py:477-478}})</td></tr>
+  </tbody>
+</table>
+<p>So TTFT and E2E latency are front-end intervals: <code>iteration_timestamp − arrival_time</code> ({{cite vllm/v1/metrics/stats.py:505-507}}). They include the chat template, tokenization, the trip to the engine core and back, and the wait. They do not include HTTP parsing before rendering, detokenization after the output arrives, or the network to the client. Queue, prefill, decode, ITL and TPOT are engine-core intervals.</p>
+<p>The design document says: <em>"Currently <code>arrival_time</code> starts when tokenization begins."</em> ({{cite docs/design/metrics.md:262-263}}). In the code, it starts a little earlier: before the chat template (<code>render_messages_async</code>, {{cite vllm/renderers/base.py:1385-1388}}).</p>
+<p><strong>Chunked prefill.</strong> The scheduler sends an output for a request only when it has new tokens, a pooling output or a stop ({{cite vllm/v1/core/sched/scheduler.py:2293-2295}}). A prompt chunk that makes no token sends nothing. So the first output, and the end of TTFT, comes after the last chunk of the prompt.</p>
+</x-deepdive>
+
+<x-deepdive title="How vLLM computes each interval, line by line">
+<p>When a request finishes, the output processor calls <code>update_from_finished_request()</code> ({{cite vllm/v1/engine/output_processor.py:885-887}}):</p>
+<x-code file="vllm/v1/metrics/stats.py" lines="585-616" />
+<ol>
+  <li><strong>Line 594.</strong> E2E latency = front-end time now − <code>arrival_time</code>.</li>
+  <li><strong>Line 597.</strong> Queue time = first <code>SCHEDULED</code> − <code>QUEUED</code>.</li>
+  <li><strong>Line 601.</strong> Prefill time = first token − first <code>SCHEDULED</code>. A preemption during prefill stays inside this interval (comment on line 600).</li>
+  <li><strong>Line 605.</strong> Decode time = last token − first token.</li>
+  <li><strong>Line 609.</strong> Inference time = last token − first <code>SCHEDULED</code>.</li>
+  <li><strong>Lines 612-616.</strong> TPOT = decode time / (generated tokens − 1). The first token comes from prefill, so it is not counted. A request with 0 or 1 output token gets TPOT 0.</li>
+</ol>
+<p><strong>Docs and code differ on TPOT and ITL.</strong> The design document gives TPOT as (E2E latency − TTFT) / (output tokens − 1) ({{cite docs/design/metrics.md:55}}). The code divides the decode interval instead (lines 605 and 612-616). The document also calls each ITL sample a "wall-clock gap" between streamed outputs ({{cite docs/design/metrics.md:69-70}}). The code uses the monotonic timestamps of two engine outputs ({{cite vllm/v1/metrics/stats.py:554-556}}).</p>
+<p><strong>Why "first" SCHEDULED.</strong> A preempted request is scheduled again later. The code keeps only the first value: <code>if req_stats.scheduled_ts == 0.0:  # ignore preemptions</code> ({{cite vllm/v1/metrics/stats.py:576-578}}). The design document instead says "between <code>QUEUED</code> and most recent <code>SCHEDULED</code>" ({{cite docs/design/metrics.md:212}}). The code wins: queue time does not grow after a preemption, but prefill or decode time does.</p>
+<p><strong>A {{term preemption}}</strong> frees all blocks of the request and sets <code>num_computed_tokens</code> to 0. The request goes back to the front of the waiting queue ({{cite vllm/v1/core/sched/scheduler.py:1676-1700}}). It records a <code>PREEMPTED</code> event, which counts in <code>vllm:num_preemptions</code> ({{cite vllm/v1/metrics/stats.py:580-583}}).</p>
+<p><strong>Worked example (the request of the diagram).</strong> <code>arrival_time</code> = 0, <code>queued_ts</code> = 5 ms, <code>scheduled_ts</code> = 55 ms, first token = 200 ms, last token = 2,200 ms, 101 output tokens. Then queue = 50 ms, prefill = 145 ms and TTFT = 200 ms. Decode = 2,000 ms, inference = 2,145 ms, TPOT = 2,000 / 100 = 20 ms and E2E = 2,200 ms.</p>
+<x-simplified><p>The diagram puts all timestamps on one axis. In the code, <code>arrival_time</code> uses the wall clock of the API server, and the other four use the monotonic clock of the engine core. vLLM never subtracts one from the other.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="The Prometheus histograms: names, samples and buckets">
+<p>The API server serves Prometheus metrics at <code>/metrics</code> ({{cite vllm/entrypoints/serve/instrumentator/metrics.py:77}}). A {{term prometheus-histogram}} counts samples in buckets. Each name gets the series <code>_bucket</code>, <code>_sum</code> and <code>_count</code>.</p>
+<table>
+  <thead><tr><th>Metric</th><th>One sample is</th><th>Observed at</th><th>Bucket family</th></tr></thead>
+  <tbody>
+    <tr><td><code>vllm:time_to_first_token_seconds</code></td><td>TTFT of one request</td><td>{{cite vllm/v1/metrics/loggers.py:1284-1285}}</td><td><code>time_to_first_token</code></td></tr>
+    <tr><td><code>vllm:inter_token_latency_seconds</code></td><td>one gap between two outputs</td><td>{{cite vllm/v1/metrics/loggers.py:1286-1287}}</td><td><code>inter_token_latency</code></td></tr>
+    <tr><td><code>vllm:request_time_per_output_token_seconds</code></td><td>TPOT of one finished request</td><td>{{cite vllm/v1/metrics/loggers.py:1324-1326}}</td><td><code>inter_token_latency</code></td></tr>
+    <tr><td><code>vllm:e2e_request_latency_seconds</code></td><td>E2E of one finished request</td><td>{{cite vllm/v1/metrics/loggers.py:1293-1295}}</td><td><code>request_latency</code></td></tr>
+    <tr><td><code>vllm:request_queue_time_seconds</code>, <code>_prefill_time_</code>, <code>_decode_time_</code>, <code>_inference_time_</code></td><td>one interval of one finished request</td><td>{{cite vllm/v1/metrics/loggers.py:1296-1307}}</td><td><code>request_latency</code></td></tr>
+  </tbody>
+</table>
+<p>The bucket families are in one file ({{cite vllm/v1/metrics/loggers.py:831-839}}). The TTFT buckets go from 1 ms to 2,560 s ({{cite vllm/v1/metrics/buckets.py:57-80}}). The ITL buckets go from 10 ms to 80 s ({{cite vllm/v1/metrics/buckets.py:84-104}}). The request-latency buckets go from 0.3 s to 7,680 s ({{cite vllm/v1/metrics/buckets.py:30-52}}). You can replace a family with the config field <code>custom_histogram_buckets</code> ({{cite vllm/config/observability.py:70}}, {{cite vllm/v1/metrics/buckets.py:232-233}}).</p>
+<p><strong>Why buckets matter.</strong> Prometheus estimates a percentile from the bucket counts. With the default ITL buckets, all gaps between 10 ms and 25 ms fall into one bucket. So a p99 ITL from Prometheus is only as exact as the bucket edges.</p>
+<p><strong>Throughput counters and the log line.</strong> The counters <code>vllm:prompt_tokens</code> and <code>vllm:generation_tokens</code> grow by the tokens of each output ({{cite vllm/v1/metrics/loggers.py:1262-1272}}). The <code>LoggingStatLogger</code> also writes a log line with "Avg prompt throughput" and "Avg generation throughput" ({{cite vllm/v1/metrics/loggers.py:283-284}}). It divides the tokens by the time since the last log ({{cite vllm/v1/metrics/loggers.py:169-174}}). The API server writes this line every <code>VLLM_LOG_STATS_INTERVAL</code> seconds, default 10 ({{cite vllm/envs.py:874-878}}, {{cite vllm/entrypoints/launchers/utils/server_utils.py:79-84}}).</p>
+<p><strong>Turn off.</strong> The API server gives <code>--disable-log-stats</code> to <code>AsyncLLM</code> ({{cite vllm/entrypoints/launchers/api_server/entry.py:99}}). Then <code>AsyncLLM</code> makes no default stat loggers. A stat-logger plugin still turns statistics on, but only for the plugin loggers ({{cite vllm/v1/engine/async_llm.py:158-159}}, {{cite vllm/v1/engine/async_llm.py:204-210}}).</p>
+</x-deepdive>
+
+<x-deepdive title="vllm bench serve: how the client measures">
+<p><code>vllm bench serve</code> is a subcommand that calls <code>vllm/benchmarks/serve.py</code> ({{cite vllm/entrypoints/cli/benchmark/serve.py:10-21}}). It sends requests to a running server and times them at the client.</p>
+<p><strong>One request.</strong> For the chat API, the client sends <code>"stream": true</code> with usage in the last chunk ({{cite vllm/benchmarks/lib/endpoint_request_func.py:423-432}}). It starts a <code>time.perf_counter()</code> clock before the POST ({{cite vllm/benchmarks/lib/endpoint_request_func.py:443-445}}). Then:</p>
+<ol>
+  <li>TTFT = the time of the first SSE chunk with output − start (line 477).</li>
+  <li>Each later chunk with output adds one ITL sample: the gap to the previous chunk with output (lines 481, 486).</li>
+  <li>The usage chunk gives the output token count, but it does not move the end time (lines 484-490).</li>
+  <li>Latency (E2EL) = the time of the last output chunk − start ({{cite vllm/benchmarks/lib/endpoint_request_func.py:501}}).</li>
+</ol>
+<p><strong>All requests.</strong> <code>calculate_metrics()</code> computes ({{cite vllm/benchmarks/serve.py:654-660}}, {{cite vllm/benchmarks/serve.py:778-781}}):</p>
+<ul>
+  <li>TPOT per request = (latency − TTFT) / (output tokens − 1). Requests with 1 output token are not in the TPOT statistics.</li>
+  <li>Request throughput = completed / duration. Output token throughput = output tokens / duration. Total token throughput = (input + output tokens) / duration.</li>
+  <li>The duration is the wall time of the whole run, from the start of the benchmark to the last result ({{cite vllm/benchmarks/serve.py:1048}}, {{cite vllm/benchmarks/serve.py:1123}}).</li>
+  <li>Mean, median, standard deviation and the selected percentiles, with <code>np.percentile</code> ({{cite vllm/benchmarks/serve.py:782-806}}).</li>
+</ul>
+<p><strong>Goodput.</strong> A request is good when every given SLO value is greater than or equal to its measured value ({{cite vllm/benchmarks/serve.py:669-692}}). Request goodput = good requests / duration. A request with 1 output token has TPOT 0 for this check.</p>
+<x-code file="vllm/benchmarks/serve.py" lines="669-692" />
+<p><strong>The main flags.</strong></p>
+<table>
+  <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--request-rate</code></td><td><code>inf</code></td><td>Requests per second. <code>inf</code> sends all requests at time 0. Otherwise the arrivals follow a Poisson process or a gamma distribution ({{cite vllm/benchmarks/serve.py:1745-1753}}).</td></tr>
+    <tr><td><code>--burstiness</code></td><td><code>1.0</code></td><td>1 = Poisson. Below 1 = more bursts, above 1 = more even arrivals ({{cite vllm/benchmarks/serve.py:1754-1764}}).</td></tr>
+    <tr><td><code>--max-concurrency</code></td><td>none</td><td>A semaphore that limits requests in flight. The wait for it is reported as client queue time, not as TTFT ({{cite vllm/benchmarks/serve.py:1678-1690}}, {{cite vllm/benchmarks/serve.py:1001-1016}}).</td></tr>
+    <tr><td><code>--percentile-metrics</code></td><td><code>ttft,tpot,itl</code> (generation)</td><td>Which metrics get percentiles. <code>e2el</code> and the client-queue metrics are also allowed. The default for pooling models is <code>e2el</code> ({{cite vllm/benchmarks/serve.py:1847-1857}}, {{cite vllm/benchmarks/serve.py:2255-2263}}).</td></tr>
+    <tr><td><code>--metric-percentiles</code></td><td><code>99</code></td><td>Which percentiles, for example <code>50,90,99</code> ({{cite vllm/benchmarks/serve.py:1858-1866}}).</td></tr>
+    <tr><td><code>--goodput</code></td><td>none</td><td>SLOs as <code>KEY:VALUE</code> in ms; keys <code>ttft</code>, <code>tpot</code>, <code>e2el</code> ({{cite vllm/benchmarks/serve.py:1867-1878}}).</td></tr>
+  </tbody>
+</table>
+<p>An example command (not in the repo):</p>
+<pre><code class="language-bash">vllm bench serve --model meta-llama/Llama-3.1-8B-Instruct \
+  --request-rate 4 --num-prompts 200 \
+  --metric-percentiles 50,99 --goodput ttft:500 tpot:50</code></pre>
+</x-deepdive>
+
+<x-deepdive title="Worked example: five requests in one benchmark run">
+<p>This is a made-up workload (panel 3 of the diagram). The run lasts 8.0 s. The SLO is <code>--goodput ttft:500 tpot:50</code>.</p>
+<table>
+  <thead><tr><th>Request</th><th>Input tokens</th><th>Output tokens</th><th>TTFT</th><th>TPOT</th><th>E2E</th><th>Good?</th></tr></thead>
+  <tbody>
+    <tr><td>A</td><td>1,000</td><td>101</td><td>200 ms</td><td>20 ms</td><td>2,200 ms</td><td>yes</td></tr>
+    <tr><td>B</td><td>500</td><td>51</td><td>150 ms</td><td>25 ms</td><td>1,400 ms</td><td>yes</td></tr>
+    <tr><td>C</td><td>2,000</td><td>201</td><td>650 ms</td><td>22 ms</td><td>5,050 ms</td><td>no (TTFT)</td></tr>
+    <tr><td>D</td><td>800</td><td>101</td><td>300 ms</td><td>55 ms</td><td>5,800 ms</td><td>no (TPOT)</td></tr>
+    <tr><td>E</td><td>300</td><td>1</td><td>120 ms</td><td>(0 for goodput)</td><td>120 ms</td><td>yes</td></tr>
+  </tbody>
+</table>
+<p>Check one row: E2E of A = 200 + (101 − 1) × 20 = 2,200 ms.</p>
+<ul>
+  <li><strong>Request throughput</strong> = 5 / 8.0 = 0.625 req/s.</li>
+  <li><strong>Output token throughput</strong> = 455 / 8.0 = 56.9 tok/s. <strong>Total token throughput</strong> = (4,600 + 455) / 8.0 = 631.9 tok/s.</li>
+  <li><strong>Request goodput</strong> = 3 / 8.0 = 0.375 req/s. Throughput says 0.625, but only 60 % of the requests met the SLO.</li>
+  <li><strong>TTFT</strong>: sorted 120, 150, 200, 300, 650. Mean 284 ms, median 200 ms. <code>np.percentile</code> interpolates in a straight line by default. The p99 is at index 0.99 × 4 = 3.96, so p99 = 300 + 0.96 × (650 − 300) = 636 ms.</li>
+  <li><strong>TPOT</strong>: E has 1 output token, so only A to D count: 20, 22, 25, 55. Mean 30.5 ms, median 23.5 ms. The p99 is at index 0.99 × 3 = 2.97, so p99 = 25 + 0.97 × (55 − 25) = 54.1 ms.</li>
+  <li><strong>Average concurrency</strong> = the sum of all E2E times / duration = 14.57 s / 8.0 s = 1.8 requests in flight.</li>
+</ul>
+<p>The mean TTFT (284 ms) is below the SLO, but one request in five missed it. This is why SLOs use percentiles or goodput, not means.</p>
+</x-deepdive>
+
+<x-deepdive title="Batching knobs in vLLM that move the trade-off">
+<p>The vLLM scheduler has no prefill phase and no decode phase. Each step gives tokens to requests until their computed tokens catch up with their known tokens ({{cite vllm/v1/core/sched/scheduler.py:624-633}}). So one step can hold decode tokens and prefill chunks together.</p>
+<ol>
+  <li>The step starts with the {{term token-budget}} <code>max_num_scheduled_tokens</code> ({{cite vllm/v1/core/sched/scheduler.py:642}}). This is normally <code>max_num_batched_tokens</code> ({{cite vllm/v1/core/sched/scheduler.py:138-142}}).</li>
+  <li>It first serves the running requests ({{cite vllm/v1/core/sched/scheduler.py:713-715}}).</li>
+  <li>It then takes waiting requests with the rest of the budget ({{cite vllm/v1/core/sched/scheduler.py:956}}). {{term chunked-prefill | Chunked prefill}} is on by default for generative models that are not encoder-decoder models ({{cite vllm/engine/arg_utils.py:3031-3035}}). So a long prompt takes only the rest of the budget.</li>
+</ol>
+<p><strong>Defaults for <code>vllm serve</code></strong> (usage context <code>OPENAI_API_SERVER</code>) on a GPU depend on the GPU memory ({{cite vllm/engine/arg_utils.py:2960-2993}}). They apply only when you do not set the flag. <code>--performance-mode throughput</code> doubles both values ({{cite vllm/engine/arg_utils.py:3171-3175}}). TPU and CPU platforms have other values ({{cite vllm/engine/arg_utils.py:2995-3024}}).</p>
+<table>
+  <thead><tr><th>GPU</th><th><code>max_num_batched_tokens</code></th><th><code>max_num_seqs</code></th></tr></thead>
+  <tbody>
+    <tr><td>160 GiB or more (for example B200)</td><td>16,384</td><td>1,024</td></tr>
+    <tr><td>70 GiB or more, not A100, not GB10 (for example H100)</td><td>8,192</td><td>1,024</td></tr>
+    <tr><td>other GPUs</td><td>2,048</td><td>256</td></tr>
+  </tbody>
+</table>
+<p>The vLLM optimization guide gives the direction. A smaller <code>max_num_batched_tokens</code> (for example 2,048) gives a better ITL, and a larger one gives a better TTFT ({{cite docs/configuration/optimization.md:64-65}}). <code>max_num_seqs</code> limits the requests that run at the same time, so it limits the batch and the concurrency inside the engine ({{cite vllm/v1/core/sched/scheduler.py:130-137}}). The page {{link concepts/tuning}} explains both with the code.</p>
+</x-deepdive>
+
+<x-deepdive title="Per-request metrics in the API response">
+<p>With <code>--enable-per-request-metrics</code> (default off, {{cite vllm/entrypoints/common/cli_args.py:150-151}}), the response has a <code>metrics</code> object. In streaming, it comes in the final usage chunk. The server sends that chunk only when usage is on: <code>stream_options.include_usage</code> or <code>--enable-force-include-usage</code>. The server leaves the object out when <code>n</code> is more than 1 ({{cite vllm/entrypoints/openai/chat_completion/serving.py:873-885}}). The flag needs engine statistics: with <code>--disable-log-stats</code>, start-up fails ({{cite vllm/entrypoints/common/cli_args.py:536-542}}).</p>
+<x-warning title="time_to_first_token_ms is not the TTFT of the histogram"><p>The field <code>time_to_first_token_ms</code> is first token − <code>scheduled_ts</code> ({{cite vllm/entrypoints/generate/base/serving.py:73-74}}). That is the prefill interval. It does not include the queue time or the chat template and tokenization. The histogram <code>vllm:time_to_first_token_seconds</code> starts at <code>arrival_time</code>.</p></x-warning>
+<p>The other fields: <code>queue_time_ms</code> = <code>scheduled_ts − queued_ts</code>; <code>generation_time_ms</code> = decode interval; <code>mean_itl_ms</code> = decode interval / (tokens − 1); <code>tokens_per_second</code> = all output tokens / inference interval ({{cite vllm/entrypoints/generate/base/serving.py:76-89}}). <code>vllm bench serve</code> reads <code>queue_time_ms</code> and <code>time_to_first_token_ms</code> from this object when the server sends it ({{cite vllm/benchmarks/lib/endpoint_request_func.py:110-125}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Client and server numbers do not match.</strong> The client TTFT includes the network, HTTP parsing and the SSE send ({{cite vllm/benchmarks/lib/endpoint_request_func.py:443-477}}). The server TTFT starts at rendering ({{cite vllm/renderers/base.py:1380}}). Compare each metric only with the same metric from the same place.</li>
+  <li><strong>ITL and TPOT differ with bundled tokens.</strong> With speculative decoding, one output can hold several tokens. ITL then has fewer, longer gaps, and TPOT spreads the time over all tokens ({{cite docs/benchmarking/cli.md:145-159}}). A <code>--stream-interval</code> above 1 also bundles tokens in the stream ({{cite vllm/config/scheduler.py:216-220}}). This changes the client ITL. The Prometheus ITL does not change, because the front end records it for each engine output before it applies the interval ({{cite vllm/v1/engine/output_processor.py:775}}).</li>
+  <li><strong>TPOT of short requests.</strong> Prometheus records TPOT 0 for a request with 1 output token ({{cite vllm/v1/metrics/stats.py:612-616}}), but <code>vllm bench serve</code> leaves such requests out of its TPOT statistics ({{cite vllm/benchmarks/serve.py:655-659}}). The design document notes the same difference ({{cite docs/design/metrics.md:76-79}}).</li>
+  <li><strong>A benchmark with <code>--request-rate inf</code></strong> sends all requests at time 0 ({{cite vllm/benchmarks/serve.py:1749-1750}}). It measures the highest throughput, but TTFT then includes a long queue. Use a finite rate, or <code>--max-concurrency</code>, to measure the latency that users see.</li>
+  <li><strong>Requests that the client stops are missing.</strong> When a client disconnects, <code>AsyncLLM</code> calls <code>abort()</code> ({{cite vllm/v1/engine/async_llm.py:807-809}}). The output processor then removes the request state and does not record a finished request ({{cite vllm/v1/engine/async_llm.py:955}}, {{cite vllm/v1/engine/output_processor.py:631-636}}). So such a request is not in the E2E, queue, prefill, decode or TPOT histograms.</li>
+  <li><strong>Means hide stalls.</strong> One 218 ms stall in 100 gaps moves the mean ITL by only 2 ms. Watch p99 ITL and the <code>vllm:num_preemptions</code> counter ({{cite vllm/v1/metrics/loggers.py:1259-1261}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Every tuning choice in vLLM moves TTFT, ITL and throughput against each other. You can only tune well when you know what each number measures, where it is measured, and which SLO your users need.</p>
+
+<x-quiz>
+  <x-q level="easy">A request has TTFT 300 ms, 51 output tokens and E2E latency 1,300 ms. What is its TPOT?
+    <x-a><p>TPOT = (E2E − TTFT) / (output tokens − 1) = (1,300 − 300) / 50 = 20 ms. This is the formula of <code>vllm bench serve</code> ({{cite vllm/benchmarks/serve.py:655-657}}). The Prometheus TPOT uses the engine-core decode interval instead of E2E − TTFT. It also does not count the first token, because the first token comes from prefill ({{cite vllm/v1/metrics/stats.py:611-616}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">A run finishes 100 requests in 20 s. 80 of them meet every SLO. What are the request throughput and the request goodput?
+    <x-a><p>Throughput = 100 / 20 = 5 req/s. Goodput = 80 / 20 = 4 req/s ({{cite vllm/benchmarks/serve.py:778-779}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does vLLM take the queue time from engine-core timestamps, and not from API server timestamps?
+    <x-a><p>Only the engine core sees the <code>QUEUED</code> and <code>SCHEDULED</code> events. An interval must use two timestamps of the same process, because monotonic clocks of two processes have different start points ({{cite docs/design/metrics.md:177-182}}). So the engine core records both events with <code>time.monotonic()</code> ({{cite vllm/v1/engine/__init__.py:196-200}}), and the front end subtracts them ({{cite vllm/v1/metrics/stats.py:597}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A request waits 2 s, runs its prefill, is preempted during decode, waits 1 s more, and finishes. Which Prometheus interval gets the extra 1 s: queue time, prefill time or decode time?
+    <x-a><p>Decode time (and inference time). The code keeps only the first <code>SCHEDULED</code> timestamp ({{cite vllm/v1/metrics/stats.py:577-578}}). So queue time stays 2 s. Decode time = last token − first token ({{cite vllm/v1/metrics/stats.py:605}}), and the extra wait is between these two tokens. The ITL histogram also gets one long gap.</p></x-a>
+  </x-q>
+  <x-q level="hard">You enable <code>--enable-per-request-metrics</code>. A response says <code>time_to_first_token_ms</code> = 120, but your Prometheus TTFT for the same request is about 900 ms. Give a reason from the code.
+    <x-a><p>The response field is first token − <code>scheduled_ts</code> ({{cite vllm/entrypoints/generate/base/serving.py:73-74}}): the prefill interval only. The histogram TTFT is front-end time − <code>arrival_time</code> ({{cite vllm/v1/metrics/stats.py:525}}), and <code>arrival_time</code> is set before the chat template ({{cite vllm/renderers/base.py:1380}}). So the difference of about 780 ms is the time before <code>scheduled_ts</code> (rendering, the trip to the engine core, the queue). It also has the trip of the first output back to the front end. Compare it with <code>queue_time_ms</code> in the same response to see the queue part.</p></x-a>
+  </x-q>
+</x-quiz>
