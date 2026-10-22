@@ -1,0 +1,299 @@
+---
+title: v1/core/sched/scheduler.py: the Scheduler
+nav_title: v1/core/sched/scheduler.py
+level: Advanced
+prerequisites: concepts/scheduler, concepts/kv-cache-manager
+related: concepts/scheduler, concepts/kv-cache-manager, concepts/async-scheduling, concepts/data-contracts, code/v1-core-kv-cache-manager, code/v1-core-block-pool, code/v1-engine-core, tours/engine-step
+summary: vllm/v1/core/sched/scheduler.py holds the Scheduler class (3,539 lines). schedule() shares the token budget between running and waiting requests and builds the SchedulerOutput; update_from_output() appends the sampled tokens, stops requests and builds the EngineCoreOutputs.
+---
+<h2>Purpose</h2>
+<p><code>vllm/v1/core/sched/scheduler.py</code> decides, once per {{term engine-step}}, which requests run and how many tokens each gets, and it applies the results of each step to the requests.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/v1/core/sched/scheduler.py</code>, 3,539 lines of Python. One class, <code>Scheduler</code> ({{cite vllm/v1/core/sched/scheduler.py:85}}), with 64 methods.</td></tr>
+    <tr><th>Main class</th><td><code>Scheduler(SchedulerInterface)</code>. The default subclass for serving is <code>AsyncScheduler</code> in <code>async_scheduler.py</code> ({{cite vllm/v1/core/sched/async_scheduler.py:14}}).</td></tr>
+    <tr><th>Runs in</th><td>The {{term engine-core}} process, in its main thread (the busy loop). One scheduler per engine core, so one per data parallel rank. Pure Python on the CPU.</td></tr>
+    <tr><th>Called by</th><td><code>EngineCore</code> in <code>vllm/v1/engine/core.py</code>: <code>schedule</code>, <code>update_from_output</code>, <code>add_request</code>, <code>finish_requests</code>, <code>get_grammar_bitmask</code>, statistics.</td></tr>
+    <tr><th>Calls</th><td><code>KVCacheManager</code>, the request queues, <code>EncoderCacheManager</code>, <code>StructuredOutputManager</code>, the KV and EC connectors (scheduler side), <code>check_stop</code>, the KV event publisher.</td></tr>
+    <tr><th>Not in this file</th><td>Placeholders for async scheduling (<code>async_scheduler.py</code>), the queues (<code>request_queue.py</code>), <code>check_stop</code> (<code>sched/utils.py</code>), the output dataclasses (<code>sched/output.py</code>), all block logic (<code>kv_cache_manager.py</code> and below), the busy loop (<code>core.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/scheduler}} explains the algorithm with figures and a simulator. This page is a map of the file and a line-by-line reading of its two main methods.</p>
+
+<h2>Where it sits</h2>
+<p>The file is long, but it has a clear order. Use this map to find a section:</p>
+<table>
+  <thead><tr><th>Lines</th><th>Section</th></tr></thead>
+  <tbody>
+    <tr><td>{{cite vllm/v1/core/sched/scheduler.py:1-83}}</td><td>Imports and the logger.</td></tr>
+    <tr><td>{{cite vllm/v1/core/sched/scheduler.py:86-472}}</td><td><code>__init__</code>: limits (129-160), KV connector (162-205), queues and request dict (214-254), encoder cache (256-285), speculative decoding (286-323), <code>KVCacheManager</code> (325-361), PP and prefill cadence (363-404), Mamba (406-440), deferred frees (442-448), metrics and pause state (450-472).</td></tr>
+    <tr><td>{{cite vllm/v1/core/sched/scheduler.py:474-620}}</td><td>Chunk helpers: Mamba block alignment, the local prefix-cache lookup, the MTP prefill lookahead.</td></tr>
+    <tr><td>{{cite vllm/v1/core/sched/scheduler.py:622-1643}}</td><td><code>schedule()</code>: setup (622-712), running pass (713-954), waiting pass (956-1479), checks (1481-1502), building the output (1504-1643).</td></tr>
+    <tr><td>{{cite vllm/v1/core/sched/scheduler.py:1645-1837}}</td><td>Helpers of <code>schedule()</code>: <code>_preempt_request</code>, <code>_update_after_schedule</code>, streaming sessions, <code>_make_cached_request_data</code>.</td></tr>
+    <tr><td>{{cite vllm/v1/core/sched/scheduler.py:1839-2084}}</td><td>Encoder inputs (multimodal): which items to run, budget, cache.</td></tr>
+    <tr><td>{{cite vllm/v1/core/sched/scheduler.py:2086-2115}}</td><td><code>get_grammar_bitmask</code>.</td></tr>
+    <tr><td>{{cite vllm/v1/core/sched/scheduler.py:2117-2523}}</td><td><code>update_from_output()</code>.</td></tr>
+    <tr><td>{{cite vllm/v1/core/sched/scheduler.py:2525-2703}}</td><td>Helpers of the update: blocked statuses, re-queue, stops, token append, encoder frees, draft tokens.</td></tr>
+    <tr><td>{{cite vllm/v1/core/sched/scheduler.py:2705-2938}}</td><td>Bookkeeping: counts, usage, <code>add_request</code>, <code>finish_requests</code>, freeing, pause state, <code>has_*</code>.</td></tr>
+    <tr><td>{{cite vllm/v1/core/sched/scheduler.py:2940-3090}}</td><td>Cache resets, statistics, shutdown.</td></tr>
+    <tr><td>{{cite vllm/v1/core/sched/scheduler.py:3092-3539}}</td><td>KV connector methods: finished transfers, remote KV waits, invalid blocks.</td></tr>
+  </tbody>
+</table>
+<x-diagram name="b3a_schedule_passes" alt="Panel 1, the running pass: num_new tokens and caps, allocate_slots, preemption of running.pop() when blocks are short. Panel 2, the waiting pass: only without preemption, max_num_seqs, skips, prefix hit, chunked prefill, allocate_slots with the whole sequence. Panel 3: SchedulerOutput, _update_after_schedule, AsyncScheduler placeholders." caption="Figure: the flow of <code>schedule()</code> (lines 622-1643), the same figure as on {{link concepts/scheduler}}." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Construction.</strong> <code>EngineCore.__init__</code> resolves the class with <code>get_scheduler_cls()</code> and builds it after the KV cache is sized ({{cite vllm/v1/engine/core.py:164}}, {{cite vllm/v1/engine/core.py:177-185}}). The class is <code>AsyncScheduler</code> when async scheduling is on ({{cite vllm/config/scheduler.py:231-239}}).</li>
+  <li><strong>Every step.</strong> <code>step_with_batch_queue</code> (the default) and <code>step</code> call <code>schedule()</code>, <code>get_grammar_bitmask()</code> and <code>update_from_output()</code> ({{cite vllm/v1/engine/core.py:725}}, {{cite vllm/v1/engine/core.py:740-742}}, {{cite vllm/v1/engine/core.py:783}}; {{cite vllm/v1/engine/core.py:667-681}}).</li>
+  <li><strong>New requests and aborts.</strong> <code>EngineCore.add_request</code> and <code>abort_requests</code> ({{cite vllm/v1/engine/core.py:548}}, {{cite vllm/v1/engine/core.py:554-559}}).</li>
+  <li><strong>Speculative decoding.</strong> <code>update_draft_token_ids</code> and <code>update_draft_token_ids_in_output</code> ({{cite vllm/v1/engine/core.py:696}}, {{cite vllm/v1/engine/core.py:801}}).</li>
+  <li><strong>Load reporting.</strong> <code>get_request_counts</code> and <code>get_kv_cache_usage</code> for the DP coordinator ({{cite vllm/v1/engine/core.py:1627-1631}}).</li>
+  <li><strong>Utilities.</strong> <code>reset_prefix_cache</code> ({{cite vllm/v1/engine/core.py:874}}).</li>
+</ul>
+<p>The interface of all these methods is the abstract class <code>SchedulerInterface</code> ({{cite vllm/v1/core/sched/interface.py:38}}). A custom class from <code>--scheduler-cls</code> must implement it ({{link concepts/engine-hooks}}).</p>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>KVCacheManager</code>: <code>get_computed_blocks</code>, <code>allocate_slots</code>, <code>free</code>, <code>cache_blocks</code>, <code>usage</code> ({{cite vllm/v1/core/sched/scheduler.py:329-347}}). See {{link code/v1-core-kv-cache-manager}}.</li>
+  <li><code>create_request_queue</code> for <code>waiting</code> and <code>kv_holding_waiting</code> ({{cite vllm/v1/core/sched/scheduler.py:224-228}}).</li>
+  <li><code>check_stop</code> from <code>sched/utils.py</code> ({{cite vllm/v1/core/sched/scheduler.py:56}}, {{cite vllm/v1/core/sched/scheduler.py:2603}}).</li>
+  <li><code>StructuredOutputManager</code>: <code>grammar_bitmask</code>, <code>accept_tokens</code>, <code>validate_tokens</code> ({{cite vllm/v1/core/sched/scheduler.py:2103-2107}}, {{cite vllm/v1/core/sched/scheduler.py:2279-2281}}, {{cite vllm/v1/core/sched/scheduler.py:2664}}).</li>
+  <li>The KV connector with the SCHEDULER role, only when <code>--kv-transfer-config</code> is set ({{cite vllm/v1/core/sched/scheduler.py:172-181}}).</li>
+  <li>The encoder cache manager, the KV event publisher and the stats classes ({{cite vllm/v1/core/sched/scheduler.py:197-200}}, {{cite vllm/v1/core/sched/scheduler.py:283-285}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>Scheduler.__init__</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:86}}</td><td>reads the limits, builds the queues, the connectors and the <code>KVCacheManager</code></td></tr>
+    <tr><td><code>schedule</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:622}}</td><td>the running and waiting passes; returns a <code>SchedulerOutput</code></td></tr>
+    <tr><td><code>_preempt_request</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:1658}}</td><td>frees the blocks, sets <code>num_computed_tokens = 0</code>, status <code>PREEMPTED</code>, front of waiting</td></tr>
+    <tr><td><code>_update_after_schedule</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:1703}}</td><td>advances <code>num_computed_tokens</code>, sets <code>is_prefill_chunk</code>; <code>AsyncScheduler</code> extends it</td></tr>
+    <tr><td><code>_make_cached_request_data</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:1780}}</td><td>the diff for requests that the workers already know</td></tr>
+    <tr><td><code>_try_schedule_encoder_inputs</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:1876}}</td><td>which images or audio items to encode in this step</td></tr>
+    <tr><td><code>get_grammar_bitmask</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:2086}}</td><td>the token masks of structured output requests for this step</td></tr>
+    <tr><td><code>update_from_output</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:2117}}</td><td>applies a <code>ModelRunnerOutput</code>; returns <code>EngineCoreOutputs</code> per front end</td></tr>
+    <tr><td><code>_handle_stopped_request</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:2564}}</td><td>finished, or (for resumable sessions) back to waiting</td></tr>
+    <tr><td><code>_update_request_with_output</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:2591}}</td><td>appends tokens one by one and runs <code>check_stop</code></td></tr>
+    <tr><td><code>update_draft_token_ids</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:2647}}</td><td>stores the drafts for the next step (synchronous path)</td></tr>
+    <tr><td><code>get_request_counts</code>, <code>get_kv_cache_usage</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:2705-2711}}</td><td>numbers for load balancing and metrics</td></tr>
+    <tr><td><code>add_request</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:2716}}</td><td>puts a new request in the waiting queue, or feeds a streaming session</td></tr>
+    <tr><td><code>finish_requests</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:2749}}</td><td>aborts from outside: removes from the queues, frees the blocks</td></tr>
+    <tr><td><code>_free_request</code>, <code>_free_blocks</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:2814-2849}}</td><td>connector hooks, encoder cache, <code>finished_req_ids</code>, then the blocks</td></tr>
+    <tr><td><code>_free_request_blocks</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:2866}}</td><td>frees now, or defers while a step may still write the blocks</td></tr>
+    <tr><td><code>reset_prefix_cache</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:2940}}</td><td>optionally preempts all running requests, then resets the cache</td></tr>
+    <tr><td><code>make_stats</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:3015}}</td><td><code>SchedulerStats</code>: counts, KV cache usage, prefix-cache stats</td></tr>
+    <tr><td><code>_handle_blocked_waiting_request</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:3275}}</td><td>promotes a request whose grammar or remote KV is ready</td></tr>
+    <tr><td><code>_update_from_kv_xfer_finished</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:3312}}</td><td>marks finished remote loads; frees blocks after finished sends</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>__init__</code>: the limits</h3>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="129-160" highlight="130,133-137,138-142,153-160" />
+<ol>
+  <li><strong>Line 130.</strong> <code>max_num_running_reqs</code> is <code>max_num_seqs</code>. The end of <code>schedule()</code> asserts it ({{cite vllm/v1/core/sched/scheduler.py:1496}}).</li>
+  <li><strong>Lines 133-137.</strong> <code>max_num_active_reqs</code>: the admission limit of the waiting pass.</li>
+  <li><strong>Lines 138-142.</strong> The token budget. See the real defaults on {{link concepts/scheduler}}.</li>
+  <li><strong>Lines 153-160.</strong> Generative models keep one slot for the sampled token; pooling and diffusion models do not.</li>
+</ol>
+<p>The rest of <code>__init__</code> builds the queues ({{cite vllm/v1/core/sched/scheduler.py:216-232}}) and the <code>KVCacheManager</code> ({{cite vllm/v1/core/sched/scheduler.py:329-347}}). It raises <code>ValueError</code> for an unknown policy ({{cite vllm/v1/core/sched/scheduler.py:217-222}}).</p>
+
+<h3><code>schedule</code>: an overview</h3>
+<p>The method is about 1,000 lines. The deep dive below reads it in parts. In short:</p>
+<ol>
+  <li>Set the two budgets: <code>token_budget</code> and <code>input_budget</code> ({{cite vllm/v1/core/sched/scheduler.py:642-648}}).</li>
+  <li>Running pass: tokens, blocks, preemption ({{cite vllm/v1/core/sched/scheduler.py:713-943}}).</li>
+  <li>Waiting pass, only without preemption ({{cite vllm/v1/core/sched/scheduler.py:956-1479}}).</li>
+  <li>Checks, the <code>SchedulerOutput</code>, connector metadata ({{cite vllm/v1/core/sched/scheduler.py:1481-1634}}).</li>
+  <li><code>_update_after_schedule</code> ({{cite vllm/v1/core/sched/scheduler.py:1641-1643}}).</li>
+</ol>
+
+<h3><code>_update_after_schedule</code>: the counters move</h3>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1703-1735" highlight="1716-1717,1721-1723,1734-1735" />
+<ol>
+  <li><strong>Lines 1704-1712.</strong> The comment gives the reason for the order: the output must carry the old counts, and the counters move now so that a prefill can continue in the next step at once.</li>
+  <li><strong>Lines 1716-1717.</strong> <code>num_computed_tokens</code> moves forward optimistically; <code>num_in_flight_tokens</code> remembers what is not confirmed.</li>
+  <li><strong>Lines 1721-1723.</strong> A prefill chunk is a request that still misses tokens after this step.</li>
+  <li><strong>Lines 1734-1735.</strong> New sets, not <code>clear()</code>: the output that just left still points to the old sets.</li>
+</ol>
+
+<h3><code>update_from_output</code>: an overview</h3>
+<p>For each request in <code>num_scheduled_tokens</code>, the method:</p>
+<ol>
+  <li>skips requests that finished during the step (for example, aborted) ({{cite vllm/v1/core/sched/scheduler.py:2184-2192}});</li>
+  <li>rolls back rejected draft tokens ({{cite vllm/v1/core/sched/scheduler.py:2203-2221}});</li>
+  <li>appends the new tokens and checks for a stop ({{cite vllm/v1/core/sched/scheduler.py:2258-2262}});</li>
+  <li>lets the grammar accept the tokens ({{cite vllm/v1/core/sched/scheduler.py:2279-2290}});</li>
+  <li>frees stopped requests and makes an <code>EngineCoreOutput</code> when there is something to send ({{cite vllm/v1/core/sched/scheduler.py:2293-2295}}, {{cite vllm/v1/core/sched/scheduler.py:2316-2341}}).</li>
+</ol>
+<p>After the loop it removes stopped requests from the queues, fails requests with errors, updates the connectors, publishes KV events and attaches the stats ({{cite vllm/v1/core/sched/scheduler.py:2388-2523}}).</p>
+
+<h3><code>_update_request_with_output</code>: append and stop</h3>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="2591-2611" highlight="2599,2603,2607-2609" />
+<ol>
+  <li><strong>Line 2599.</strong> Each token is appended alone; the request updates its block hashes ({{cite vllm/v1/request.py:272-283}}).</li>
+  <li><strong>Line 2603.</strong> <code>check_stop</code> runs after every token, so a stop in the middle of several accepted tokens is found ({{cite vllm/v1/core/sched/utils.py:98-140}}).</li>
+  <li><strong>Lines 2607-2609.</strong> Tokens after the stop are cut, and <code>num_computed_tokens</code> drops by their number.</li>
+</ol>
+<p><code>AsyncScheduler</code> overrides this method: it removes the placeholders of the new tokens and caches the full blocks ({{cite vllm/v1/core/sched/async_scheduler.py:59-80}}).</p>
+
+<h3><code>add_request</code> and <code>finish_requests</code></h3>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="2730-2747" highlight="2733-2734,2746-2747" />
+<p>A new request goes into the waiting queue (or into <code>kv_holding_waiting</code> when it already holds blocks) and into the <code>requests</code> dict ({{cite vllm/v1/core/sched/scheduler.py:2556-2562}}). Its <code>QUEUED</code> event is recorded only when stats are on.</p>
+<p><code>finish_requests</code> handles aborts from outside. It removes the requests from all queues at once, sets the finished status, and frees them ({{cite vllm/v1/core/sched/scheduler.py:2776-2812}}). With <code>None</code> it finishes every request. A request that waits for a remote KV load may keep its blocks until the load ends (lines 2802-2807).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="schedule(), part 1: setup and the running pass">
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="635-683" />
+<ol>
+  <li><strong>Lines 635-641.</strong> The lists and dicts that the method fills: new, resumed and running requests, preempted requests, new blocks and token counts per request.</li>
+  <li><strong>Lines 642-648.</strong> <code>token_budget</code> limits the scheduled tokens; <code>input_budget</code> limits the input rows, which include <code>draft_slots</code> per request: 1 for a separate draft model, more for parallel drafting, else 0 ({{cite vllm/config/speculative.py:1977-1995}}). A full pause sets the budget to 0.</li>
+  <li><strong>Lines 664-666.</strong> One monotonic timestamp for all <code>SCHEDULED</code> and <code>PREEMPTED</code> events of this call.</li>
+  <li><strong>Lines 670-672.</strong> Data parallel prefill throttling: on a throttled step, defer prefills while decodes run.</li>
+  <li><strong>Lines 677-689.</strong> The long-prefill cap is 0 when only one request exists, and the adaptive mode raises it to a fair share.</li>
+</ol>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="713-777" />
+<ol>
+  <li><strong>Lines 715-718.</strong> The loop runs while budget is left, over <code>self.running</code> by index, because preemption shortens the list.</li>
+  <li><strong>Lines 720-734.</strong> Async scheduling: a request whose in-flight tokens already reach <code>max_tokens</code> gets no extra step.</li>
+  <li><strong>Lines 736-757.</strong> Three more skips: PP decode cadence, deferred prefill chunks, and encoder data that a connector has not delivered.</li>
+  <li><strong>Lines 759-777.</strong> The number of tokens and its caps.</li>
+</ol>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="831-914" highlight="852-858,861-862,889-890,898-904" />
+<ol>
+  <li><strong>Lines 833-842.</strong> <code>allocate_slots</code> with the lookahead tokens of the drafter. Success leaves the loop.</li>
+  <li><strong>Lines 844-848.</strong> A KV connector may free blocks soon; then the scheduler does not preempt and gives up on this request for now.</li>
+  <li><strong>Lines 852-858.</strong> The victim: highest <code>(priority, arrival_time)</code>, or the last running request.</li>
+  <li><strong>Lines 861-862.</strong> With deferred block freeing (a KV consumer with overlapping steps), a victim whose blocks cannot be freed yet does not help.</li>
+  <li><strong>Lines 864-888.</strong> Priority only: if the victim was already scheduled in this step, its tokens, blocks, drafts and encoder budget go back.</li>
+  <li><strong>Lines 892-900.</strong> Preempt; stop retrying when the victim is the request itself.</li>
+  <li><strong>Lines 902-904.</strong> Still no blocks: the running pass ends.</li>
+  <li><strong>Lines 906-914.</strong> Record the request and reduce both budgets.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="schedule(), part 2: the waiting pass">
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1011-1024" />
+<p>Only a request with <code>num_computed_tokens == 0</code> looks up the prefix cache. <code>shared_prefix_boundary</code> matters only for hybrid models. The connector part (lines 1026-1099) asks for an external hit, aligned to whole blocks, and decides whether the load is asynchronous.</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1171-1231" highlight="1171-1174,1191,1196-1215,1217-1218,1222-1229,1231" />
+<ol>
+  <li><strong>Lines 1171-1174.</strong> An asynchronous KV load schedules 0 tokens now.</li>
+  <li><strong>Lines 1175-1178.</strong> Deferred prefill on a throttled step stops the pass.</li>
+  <li><strong>Line 1191.</strong> <code>num_tokens</code>, not <code>num_prompt_tokens</code>: a resumed request recomputes its output tokens too.</li>
+  <li><strong>Lines 1196-1215.</strong> With speculative decoding, a 1-token request in a decode-only step is padded to <code>1 + num_spec_tokens</code> rows, to keep a uniform batch.</li>
+  <li><strong>Lines 1222-1229.</strong> Chunked prefill off and too many tokens: stop the pass.</li>
+</ol>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1305-1346" highlight="1320-1337,1339-1346" />
+<ol>
+  <li><strong>Lines 1305-1315.</strong> An async load reserves the blocks that other in-flight prefills still need, so two loads cannot block each other.</li>
+  <li><strong>Lines 1320-1337.</strong> <code>allocate_slots</code> adopts the prefix hit and checks the whole sequence (<code>full_sequence_must_fit</code>).</li>
+  <li><strong>Lines 1339-1346.</strong> No blocks: stop the waiting pass, after a cleanup of the encoder cache.</li>
+</ol>
+<p>Lines 1413-1467 move the request to the running queue (see {{link concepts/scheduler}}, Step 5). Lines 1469-1473 put skipped requests back at the front of their queues.</p>
+</x-deepdive>
+
+<x-deepdive title="schedule(), part 3: checks and the output">
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1481-1516" highlight="1483,1494-1496,1505-1507" />
+<ol>
+  <li><strong>Line 1483.</strong> The sum of all scheduled tokens never exceeds the budget.</li>
+  <li><strong>Lines 1494-1502.</strong> Invariants: no negative budget, no more running requests than <code>max_num_seqs</code>.</li>
+  <li><strong>Lines 1505-1516.</strong> Model Runner V2: resumed requests travel as new requests, with all their token ids (<code>req._all_token_ids</code>) and block ids.</li>
+</ol>
+<p>Lines 1527-1534 build <code>CachedRequestData</code> for running and resumed requests: the new block ids (or <code>None</code>), the computed tokens and the output count ({{cite vllm/v1/core/sched/scheduler.py:1780-1837}}). Lines 1561-1570 collect copy-on-write block copies of partial prefix hits. Lines 1588-1609 build the <code>SchedulerOutput</code>. Then the connectors add their metadata (1615-1631), and <code>_update_after_schedule</code> runs last (1641-1643).</p>
+</x-deepdive>
+
+<x-deepdive title="update_from_output(), line by line">
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="2170-2201" highlight="2175,2181-2183,2184-2192,2198" />
+<ol>
+  <li><strong>Line 2175.</strong> The tokens of this step are no longer in flight.</li>
+  <li><strong>Lines 2176-2180.</strong> A request preempted after this step started gets "stale" output: it is delivered but does not change the counters.</li>
+  <li><strong>Lines 2181-2192.</strong> Skip failed KV loads and requests that finished meanwhile (an abort during the step).</li>
+  <li><strong>Line 2198.</strong> <code>req_id_to_index</code> maps the request to its row of the runner output.</li>
+</ol>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="2203-2221" highlight="2211-2212,2217-2221" />
+<p>Accepted drafts = sampled tokens − 1 (the bonus token). The rejected drafts roll back <code>num_computed_tokens</code> and the placeholders.</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="2258-2295" highlight="2259-2262,2263-2266,2279-2290,2293-2295" />
+<ol>
+  <li><strong>Lines 2259-2262.</strong> Generation: append and <code>check_stop</code>.</li>
+  <li><strong>Lines 2263-2266.</strong> Pooling: the request stops as soon as it has output.</li>
+  <li><strong>Lines 2279-2290.</strong> If the grammar rejects a sampled token, the request ends with <code>FINISHED_ERROR</code> and an error log.</li>
+  <li><strong>Lines 2293-2295.</strong> Output only for new tokens, pooler output or a stop. A prefill chunk sends nothing.</li>
+</ol>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="2316-2341" highlight="2320-2323,2335-2336" />
+<p>The finish reason is read before <code>_handle_stopped_request</code>, because a streaming session can go back to waiting. A finished request is freed at once; its id goes into <code>finished_req_ids</code> for the next <code>SchedulerOutput</code>, so the workers drop its state ({{cite vllm/v1/core/sched/scheduler.py:2836}}).</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="2388-2397" />
+<p>The stopped requests leave the queues in one pass, which is cheaper than one removal per request. Then come errors (2399-2425), connector updates (2427-2467), KV events (2469-2484) and the result: one <code>EngineCoreOutputs</code> per front end (<code>client_index</code>), with the stats on only one of them ({{cite vllm/v1/core/sched/scheduler.py:2486-2523}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Data flow: types in and out">
+<table>
+  <thead><tr><th>Value</th><th>Type</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>self.running</code></td><td><code>list[Request]</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:232}}</td></tr>
+    <tr><td><code>self.waiting</code>, <code>self.kv_holding_waiting</code></td><td><code>RequestQueue</code> (FCFS deque or priority heap)</td><td>{{cite vllm/v1/core/sched/scheduler.py:224-228}}</td></tr>
+    <tr><td><code>self.requests</code></td><td><code>dict[str, Request]</code>, all unfinished requests</td><td>{{cite vllm/v1/core/sched/scheduler.py:215}}</td></tr>
+    <tr><td><code>num_scheduled_tokens</code></td><td><code>dict[str, int]</code>, request id to tokens</td><td>{{cite vllm/v1/core/sched/scheduler.py:641}}</td></tr>
+    <tr><td><code>req_to_new_blocks</code></td><td><code>dict[str, KVCacheBlocks]</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:640}}</td></tr>
+    <tr><td>return of <code>schedule</code></td><td><code>SchedulerOutput</code></td><td>{{cite vllm/v1/core/sched/output.py:231-313}}</td></tr>
+    <tr><td>input of <code>update_from_output</code></td><td><code>SchedulerOutput</code> of that step, <code>ModelRunnerOutput</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:2117-2121}}</td></tr>
+    <tr><td>return of <code>update_from_output</code></td><td><code>dict[int, EngineCoreOutputs]</code>, by front-end index</td><td>{{cite vllm/v1/core/sched/scheduler.py:2488-2491}}</td></tr>
+  </tbody>
+</table>
+<p>The scheduler is not thread-safe and needs no lock: the busy loop of the main thread makes every call. The input thread only puts requests into a queue that the main thread reads ({{link concepts/engine-core-loop}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Unknown <code>--scheduling-policy</code></td><td><code>ValueError</code> at start-up</td><td>{{cite vllm/v1/core/sched/scheduler.py:217-222}}</td></tr>
+    <tr><td>A waiting request with an unexpected status</td><td><code>RuntimeError</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:1423-1428}}</td></tr>
+    <tr><td>Grammar compilation failed</td><td>the request finishes with <code>FINISHED_ERROR</code> and a <code>validation_error</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:3296-3301}}, {{cite vllm/v1/core/sched/scheduler.py:2399-2425}}</td></tr>
+    <tr><td>The grammar rejects a sampled token</td><td>ERROR log; <code>FINISHED_ERROR</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:2279-2290}}</td></tr>
+    <tr><td><code>reset_prefix_cache(reset_running_requests=True)</code> still fails</td><td><code>RuntimeError</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:2969-2975}}</td></tr>
+    <tr><td>Remote KV load failed, policy <code>recompute</code> (default)</td><td>recompute the missing tokens</td><td>{{cite vllm/v1/core/sched/scheduler.py:3444-3457}}</td></tr>
+    <tr><td>Remote KV load failed, policy <code>fail</code></td><td>the request finishes with an error</td><td>{{cite vllm/v1/core/sched/scheduler.py:2404-2405}}</td></tr>
+    <tr><td>Budget or <code>max_num_seqs</code> broken by a bug</td><td><code>AssertionError</code></td><td>{{cite vllm/v1/core/sched/scheduler.py:1483}}, {{cite vllm/v1/core/sched/scheduler.py:1494-1496}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Configuration that this file reads">
+<p>The file reads no environment variable. It reads these config fields (defaults and flags on {{link concepts/scheduler}}):</p>
+<ul>
+  <li><code>scheduler_config</code>: <code>max_num_seqs</code>, <code>max_num_active_seqs</code>, <code>max_num_scheduled_tokens</code>, <code>max_num_batched_tokens</code>, <code>long_prefill_token_threshold(_adaptive)</code>, <code>enable_chunked_prefill</code>, <code>policy</code>, <code>prefill_schedule_interval</code>, <code>scheduler_reserve_full_isl</code>, <code>watermark</code>, <code>async_scheduling</code> ({{cite vllm/v1/core/sched/scheduler.py:129-145}}, {{cite vllm/v1/core/sched/scheduler.py:380-404}}).</li>
+  <li><code>cache_config</code>: <code>num_gpu_blocks</code>, <code>enable_prefix_caching</code>, <code>block_size</code>, Mamba options ({{cite vllm/v1/core/sched/scheduler.py:207-210}}, {{cite vllm/v1/core/sched/scheduler.py:333}}).</li>
+  <li><code>kv_transfer_config</code>, <code>ec_transfer_config</code>, <code>kv_events_config</code>, <code>speculative_config</code>, <code>lora_config</code>, <code>observability_config</code> ({{cite vllm/v1/core/sched/scheduler.py:97-117}}).</li>
+</ul>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/scheduler}}: the algorithm, with figures and a simulator.</li>
+  <li>{{link concepts/kv-cache-manager}}: what <code>allocate_slots</code> and <code>free</code> do.</li>
+  <li>{{link concepts/async-scheduling}}: <code>AsyncScheduler</code> and the placeholders.</li>
+  <li>{{link concepts/data-contracts}}: <code>SchedulerOutput</code> and <code>EngineCoreOutputs</code>.</li>
+  <li>{{link tours/engine-step}}: one step through this file with real numbers.</li>
+  <li>{{link code/v1-core-kv-cache-manager}} and {{link code/v1-core-block-pool}}: the next files down.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">In which process and thread does <code>Scheduler.schedule()</code> run?
+    <x-a><p>In the engine core process, in its main thread, called by the step function of the busy loop ({{cite vllm/v1/engine/core.py:725}}). There is one scheduler per engine core.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>_update_after_schedule</code> run after the <code>SchedulerOutput</code> is built, and not before?
+    <x-a><p>The output must carry the counts from before the step, so that the worker knows which input ids and positions to use. The comment at {{cite vllm/v1/core/sched/scheduler.py:1704-1712}} gives this reason. The call is the last line of <code>schedule()</code> ({{cite vllm/v1/core/sched/scheduler.py:1641-1643}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A request samples 3 tokens in one step (2 accepted drafts and a bonus token). The second token is EOS. What does <code>update_from_output</code> send?
+    <x-a><p>Two tokens. <code>_update_request_with_output</code> runs <code>check_stop</code> after each token, finds EOS at the second, and cuts the list there ({{cite vllm/v1/core/sched/scheduler.py:2598-2610}}). The request is freed and the output carries <code>finish_reason</code> stop.</p></x-a>
+  </x-q>
+  <x-q level="hard">With the priority policy, the victim of a preemption was already scheduled earlier in the same running pass. What does the scheduler undo?
+    <x-a><p>It removes the victim from <code>scheduled_running_reqs</code>, gives its tokens back to <code>token_budget</code> and <code>input_budget</code> (with the draft slots), drops its new blocks and draft tokens from the plan, and restores the encoder budget. It also moves <code>req_index</code> back when the victim was before the current request ({{cite vllm/v1/core/sched/scheduler.py:864-888}}). With FCFS this cannot happen, because the victim is the last request.</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,202 @@
+---
+title: The KV cache manager: blocks, the block pool and memory sizing
+nav_title: The KV cache manager
+level: Advanced
+prerequisites: concepts/scheduler, learn/prefix-caching
+related: concepts/scheduler, concepts/prefix-caching, concepts/hybrid-kv-cache, concepts/executors-and-workers, concepts/model-runner, code/v1-core-kv-cache-manager, code/v1-core-block-pool, code/v1-core-kv-cache-utils, tours/engine-step, concepts/tuning
+summary: In the engine core, the KVCacheManager hands out KV blocks to the scheduler through a coordinator, one single-type manager per KV cache group and one BlockPool. The workers only receive block ids. The number of blocks comes from a memory profile at start-up.
+---
+<x-sentence>The engine core keeps a ledger of KV blocks: who holds them, which are cached and which are free. The GPU tensors live in the workers.</x-sentence>
+
+<h2>The idea</h2>
+<p>The KV cache is split into fixed blocks, and each request has a table of its blocks ({{deepinfer learn/kv-cache | The KV cache}}, {{deepinfer concepts/paged-kv-cache | Paged KV cache}}). In vLLM the blocks are 16 tokens by default. This page explains who manages them in vLLM, and how.</p>
+
+<p>The manager runs in the {{term engine-core}} process, next to the {{term scheduler}}. It never touches GPU memory. It keeps one small Python object per block, a {{term kv-cache-block}}, with an id, a reference count and an optional hash. The real KV tensors live in the workers, one copy per GPU. The scheduler decides; the workers only receive block ids in the {{term scheduler-output}} and write into those blocks.</p>
+
+<p>The manager has four layers. <code>KVCacheManager</code> is the API that the scheduler calls. A <code>KVCacheCoordinator</code> spreads each call over the {{term kv-cache-group | KV cache groups}}. A <code>SingleTypeKVCacheManager</code> per group knows the rules of one attention type, for example full attention or a sliding window. One {{term block-pool}} owns all blocks and the {{term free-block-queue}}. A plain decoder model such as Llama has one group, so the coordinator is a thin wrapper.</p>
+
+<p>The pool shares blocks through reference counts. Two requests with the same prefix can point to the same full block. The block returns to the free queue only when its count reaches 0. A free block keeps its hash, so it can still serve a prefix-cache hit until the pool reuses it ({{link learn/prefix-caching}}). How many blocks exist is decided once, at start-up, from a memory profile of the GPU.</p>
+
+<p><strong>An everyday comparison.</strong> Think of a warehouse office. The office keeps a ledger of shelf numbers: who rents which shelf, which shelves hold a well-known kit, and which are empty. The workers in the warehouse only get shelf numbers and do the lifting. The comparison stops at the empty shelves. An empty shelf in vLLM still holds its old contents. A new tenant who needs the same kit can take it as it is.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b3a_kv_manager" alt="Panel 1: the Scheduler calls the KVCacheManager, which calls a KVCacheCoordinator (NoPrefixCache, Unitary or Hybrid). The coordinator owns one BlockPool and one SingleTypeKVCacheManager per KV cache group. The single-type manager keeps req_to_blocks (the block table) and num_cached_block. The BlockPool keeps blocks, the free block queue in LRU order, the hash-to-block map and the null block. Panel 2: allocate_slots for a request with 61 tokens, 48 of them hit in the prefix cache in blocks 7, 3 and 12, and 13 new tokens. Step 1 counts: cdiv(61, 16) = 4 blocks, 3 hits, so 1 new block, plus the hits with ref_cnt 0 count against the free blocks; if they do not fit, return None. Step 2 touches the hit blocks and takes block 40 from the front of the free queue: the block table is 7, 3, 12, 40. Step 3 caches full blocks: 61 // 16 = 3, already cached; it returns the new block 40. Panel 3: free returns the blocks in reverse order 40, 12, 3, 7; ref_cnt goes down; block 40 without a hash goes to the front of the free queue, the hashed blocks 12, 3, 7 to the end." caption="Figure: the four layers of the KV cache manager (1), one <code>allocate_slots</code> call for the request of Tour 1 (2), and what <code>free</code> does when the request ends (3)." />
+<p>Read panel 1 from left to right and down: each layer owns the next. Panel 2 is the call that Tour 1 makes at stop 10 ({{link tours/life-of-a-chat-request#stop-10 | Tour 1, stop 10}}). Panel 3 shows why cached blocks survive a free. They go to the end of the queue, and the pool takes new blocks from the front.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: who builds what</h3>
+<p>The scheduler builds the manager in its <code>__init__</code>, with the KV cache configuration from start-up and the prefix caching flag:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="329-347" highlight="329-333" />
+<p>The manager builds the coordinator ({{cite vllm/v1/core/kv_cache_manager.py:167-180}}). The factory picks one of three classes: no prefix caching, exactly one KV cache group, or several groups:</p>
+<x-code file="vllm/v1/core/kv_cache_coordinator.py" lines="995-1024" highlight="995,1009" />
+<p>Every coordinator makes one <code>BlockPool</code> with <code>kv_cache_config.num_blocks</code> blocks, and one single-type manager per KV cache group, all on the same pool. The only exception is the host group of HiSparse, which replaces the pool of its manager with a private host pool ({{cite vllm/v1/core/single_type_kv_cache_manager.py:2231-2247}}). For this reason a block remembers its pool, and <code>free_blocks</code> sends a block of another pool back to that pool ({{cite vllm/v1/core/block_pool.py:792-794}}, {{cite vllm/v1/core/block_pool.py:808-809}}).</p>
+<x-code file="vllm/v1/core/kv_cache_coordinator.py" lines="119-125" />
+<x-code file="vllm/v1/core/kv_cache_coordinator.py" lines="157-172" highlight="158,162" />
+<p>A registry maps each spec class to a manager class: <code>FullAttentionSpec</code> and <code>MLAAttentionSpec</code> to <code>FullAttentionManager</code>, <code>SlidingWindowSpec</code> to <code>SlidingWindowManager</code>, <code>MambaSpec</code> to <code>MambaManager</code>, and more ({{cite vllm/v1/core/single_type_kv_cache_manager.py:2645-2715}}). A platform can register its own specs ({{cite vllm/v1/core/single_type_kv_cache_manager.py:2717-2719}}). Models with several groups (for example sliding window plus full attention) are the topic of {{link concepts/hybrid-kv-cache}}.</p>
+
+<h3>Step 2: KVCacheBlock and the BlockPool</h3>
+<x-code file="vllm/v1/core/kv_cache_utils.py" lines="161-186" highlight="166,168,175,182-183,186" />
+<p>A block has an id from 0 to <code>num_gpu_blocks - 1</code> and a reference count. It has a hash only when it is full and cached, and two links for the free queue. The pool makes all blocks at once, puts them all in the free queue, and takes out block 0:</p>
+<x-code file="vllm/v1/core/block_pool.py" lines="171-188" highlight="172-174,178,181,187-188" />
+<p>Block 0 becomes the {{term null-block}}. No request gets it as a real block. Managers put it in block tables at places that hold no data, for example blocks that a sliding window has left ({{cite vllm/v1/core/single_type_kv_cache_manager.py:311-312}}). So a pool of N blocks has N − 1 usable blocks.</p>
+<p>The free queue is a doubly linked list through the blocks themselves, so it can remove a block from the middle in O(1) ({{cite vllm/v1/core/kv_cache_utils.py:258-279}}). Its order is the LRU order of prefix caching, which {{link learn/prefix-caching}} explains in its deep dive "Free blocks, LRU order and eviction".</p>
+
+<h3>Step 3: allocate_slots, the count</h3>
+<p>The scheduler calls {{term allocate-slots}} for every scheduled request. A running request passes only <code>num_new_tokens</code>. A new request also passes its prefix-cache hit. The method first counts, and changes nothing until it knows that the blocks fit:</p>
+<x-code file="vllm/v1/core/kv_cache_manager.py" lines="499-544" highlight="501-507,512-516,522-539,541-544" />
+<ol>
+  <li><strong>Lines 501-507.</strong> The tokens that already have KV values: the computed tokens, plus the new prefix-cache hit, plus tokens from a KV connector.</li>
+  <li><strong>Lines 512-516.</strong> A watermark (default 0) applies only to waiting and preempted requests, and only when other requests run.</li>
+  <li><strong>Lines 522-539.</strong> The admission gate for new requests: all their tokens (at most <code>max_model_len</code>) must fit, not only the first chunk (<code>scheduler_reserve_full_isl</code>, default True). Sliding-window and chunked-local groups cap this count, because they free blocks as the request moves on ({{cite vllm/v1/core/single_type_kv_cache_manager.py:215-227}}). The scheduler passes the flag only in the waiting pass.</li>
+  <li><strong>Lines 541-544.</strong> The slots needed: computed plus new tokens, plus <code>num_lookahead_tokens</code> for speculative decoding, at most <code>max_model_len</code>.</li>
+</ol>
+<p>The single-type manager turns slots into blocks. For a running request, it is the difference between the blocks needed and the blocks held:</p>
+<x-code file="vllm/v1/core/single_type_kv_cache_manager.py" lines="214-236" highlight="214,230-236" />
+<p>For a new request, it also counts the prefix-cache hits that are free right now (<code>ref_cnt == 0</code>). The request will take them out of the free queue, so they use up free capacity too ({{cite vllm/v1/core/single_type_kv_cache_manager.py:256-266}}).</p>
+
+<h3>Step 4: allocate_slots, the changes</h3>
+<x-code file="vllm/v1/core/kv_cache_manager.py" lines="546-579" highlight="555-559,561-579" />
+<x-code file="vllm/v1/core/kv_cache_manager.py" lines="581-618" highlight="581-593,595-600,604-605,612-616" />
+<ol>
+  <li><strong>Lines 555-559.</strong> Blocks that the attention no longer reads (outside a sliding window) go back first, so the pool has more free blocks. For full attention this does nothing.</li>
+  <li><strong>Lines 561-579.</strong> The count, then the check: not enough free blocks means <code>return None</code>. Nothing has changed yet. The scheduler then preempts a request or stops its waiting pass.</li>
+  <li><strong>Lines 581-593.</strong> A new request adopts its prefix-cache hit. The manager touches the hit blocks (<code>ref_cnt += 1</code>, out of the free queue). Then it puts them at the start of the request's {{term block-table}} ({{cite vllm/v1/core/single_type_kv_cache_manager.py:303-318}}).</li>
+  <li><strong>Lines 595-600.</strong> New blocks for the rest. The single-type manager takes them from the front of the free queue ({{cite vllm/v1/core/single_type_kv_cache_manager.py:400-410}}). The pool removes an old hash from a reused block (this is the eviction) and sets <code>ref_cnt</code> to 1 ({{cite vllm/v1/core/block_pool.py:681-700}}).</li>
+  <li><strong>Lines 604-605.</strong> With an asynchronous KV load, the blocks are not cached yet: the data is not there.</li>
+  <li><strong>Lines 612-616.</strong> The blocks that are now full get a hash, so later requests can hit them. Draft tokens are left out: the count stops at <code>request.num_tokens</code>.</li>
+</ol>
+<p>The return value holds only the new blocks of this call. For a new request, the scheduler reads all its blocks with <code>get_blocks()</code> instead ({{cite vllm/v1/core/sched/scheduler.py:1432-1434}}).</p>
+
+<h3>Step 5: free, in reverse order</h3>
+<p>When a request finishes or is preempted, the scheduler calls <code>free()</code> ({{cite vllm/v1/core/sched/scheduler.py:2866-2872}}). Each single-type manager gives its blocks back, last block first:</p>
+<x-code file="vllm/v1/core/single_type_kv_cache_manager.py" lines="590-598" highlight="597-598" />
+<p><code>BlockPool.free_blocks</code> lowers each <code>ref_cnt</code>. A block that reaches 0 goes back into the free queue: at the front without a hash, at the end with a hash ({{cite vllm/v1/core/block_pool.py:776-807}}). A block that another request still uses stays out of the queue. Because the last block comes first, the tail of a cached prefix is evicted before its head. Prefix caching itself (hashes, lookup, eviction) is the topic of {{link concepts/prefix-caching}}.</p>
+
+<h3>Step 6: how the block ids reach the worker</h3>
+<p>The manager returns <code>KVCacheBlocks</code>, a tuple with one list per KV cache group. The scheduler turns it into ids:</p>
+<x-code file="vllm/v1/core/kv_cache_manager.py" lines="100-107" />
+<p>A new request carries all its ids in <code>NewRequestData.block_ids</code>. A running request carries only the ids of new blocks in <code>CachedRequestData.new_block_ids</code>, or <code>None</code> when it got no new block ({{cite vllm/v1/core/sched/output.py:47}}, {{cite vllm/v1/core/sched/output.py:140-150}}, {{cite vllm/v1/core/sched/scheduler.py:1821-1823}}). Model Runner V2 writes them into its block tables on the GPU. It overwrites the row of a new request and appends to the row of a running one:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1238-1240" />
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1261-1269" highlight="1266-1269" />
+<p>The block table is an <code>int32</code> tensor <code>[max_num_reqs, max_num_blocks]</code> per KV cache group ({{cite vllm/v1/worker/gpu/block_table.py:65-71}}). The slot of a token is <code>block_id × block_size + offset</code> ({{cite vllm/v1/worker/gpu/block_table.py:409}}). A preempted request leaves the runner like a finished one ({{cite vllm/v1/worker/gpu/model_runner.py:1178-1185}}). When it resumes, it comes back as a new request with a fresh list of block ids ({{cite vllm/v1/core/sched/scheduler.py:1505-1507}}). The page {{link concepts/model-runner}} explains the runner side.</p>
+
+<h3>Step 7: how many blocks, from the memory profile</h3>
+<p>The number of blocks is fixed once, in <code>EngineCore._initialize_kv_caches</code>. Each worker measures the memory that is left for the KV cache ({{cite vllm/v1/engine/core.py:297-301}}). The executor and worker pages explain the {{term profile-run}} and the formula ({{link concepts/executors-and-workers}}):</p>
+<x-diagram name="b2b_memory_profile" alt="Panel 1: a bar for 80 GiB of total memory: 73.6 GiB requested (0.92 × 80) and 6.4 GiB not used. A second bar splits the 73.6 GiB: 16.0 GiB total consumed (15.0 weights plus 1.0 buffers and non-torch memory), 2.5 GiB transient peak headroom from the activations of the profile run, 0.5 GiB CUDA graph estimate, and 54.6 GiB KV cache. Panel 2: the formula rows: requested 73.6, total consumed 16.0, peak headroom 2.5, non-KV memory 18.5, available KV 73.6 − 18.5 − 0.5 = 54.6 GiB, bytes per block 2 MiB, 27,955 blocks, 447,280 tokens." caption="Figure: how the worker splits an 80 GiB GPU for an 8B BF16 model (from {{link code/v1-worker-gpu-worker}}). The GiB values are illustrative; the formula is from the code." />
+<p>Then the engine core divides the bytes by the bytes of one block, over all layers of the group:</p>
+<x-code file="vllm/v1/core/kv_cache_planning.py" lines="1607-1612" />
+<p>The engine core gets <code>bytes_per_block</code> from a probe layout with one block. For a plain model, that is the sum of the page sizes of all layers. A helper computes the same divisor directly ({{cite vllm/v1/core/kv_cache_planning.py:251-262}}):</p>
+<x-code file="vllm/v1/core/kv_cache_planning.py" lines="587-593" />
+<p>The page of one layer is <code>num_kv_heads × block_size × (head_size + head_size_v) × dtype bytes</code> ({{cite vllm/v1/kv_cache_interface.py:571-579}}, {{cite vllm/v1/kv_cache_interface.py:254-255}}). With several workers (TP), every worker gets the smallest block count of all workers ({{cite vllm/v1/core/kv_cache_planning.py:1622-1636}}). The result goes into <code>cache_config.num_gpu_blocks</code>, which the scheduler reads ({{cite vllm/v1/engine/core.py:324-325}}, {{cite vllm/v1/core/sched/scheduler.py:207-208}}).</p>
+<p>Two settings change the input of this division:</p>
+<ul>
+  <li><code>--gpu-memory-utilization</code>, default 0.92: the share of the whole GPU that this vLLM instance may use, for weights, activations and KV cache together ({{cite vllm/config/cache.py:212-221}}).</li>
+  <li><code>--kv-cache-memory-bytes</code>: a fixed KV cache size per GPU. The worker then skips the memory measurement, and <code>gpu_memory_utilization</code> has no effect ({{cite vllm/config/cache.py:371-378}}, {{cite vllm/v1/worker/gpu_worker.py:653-679}}).</li>
+</ul>
+
+<h3>Step 8: what "KV cache usage" means</h3>
+<p>The usage that vLLM reports is the share of blocks that are not in the free queue:</p>
+<x-code file="vllm/v1/core/block_pool.py" lines="881-892" highlight="889,892" />
+<p>When stats are on, the scheduler puts this value into its stats every step ({{cite vllm/v1/core/sched/scheduler.py:3023-3024}}, {{cite vllm/v1/core/sched/scheduler.py:3050}}). The front end shows it as the gauge <code>vllm:kv_cache_usage_perc</code>, with values from 0 to 1 in spite of its name ({{cite vllm/v1/metrics/loggers.py:619-623}}). The log line shows "GPU KV cache usage: x%" ({{cite vllm/v1/metrics/loggers.py:314-320}}).</p>
+<x-note title="Cached prefix blocks count as free">
+<p>A free block that still holds a cached prefix is in the free queue, so it counts as free. A server with a warm prefix cache can show a low {{term kv-cache-usage}} while most blocks still hold useful data. The usage tells you how close the running requests are to preemption, not how full the prefix cache is.</p>
+</x-note>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The block layout of allocate_slots">
+<p>The docstring of <code>allocate_slots</code> draws the token ranges of one call ({{cite vllm/v1/core/kv_cache_manager.py:420-452}}):</p>
+<pre><code class="language-none">| comp | new_comp | ext_comp | new | lookahead |
+comp      = request.num_computed_tokens          (blocks already held)
+new_comp  = num_new_computed_tokens              (local prefix-cache hit, this call)
+ext_comp  = num_external_computed_tokens         (KV connector hit)
+new       = num_new_tokens                       (to compute; may include draft tokens)
+lookahead = num_lookahead_tokens                 (slots for the drafter)</code></pre>
+<p>Allocated: everything after <code>comp</code>. Computed in this step: <code>new</code> and <code>lookahead</code>. Cached: up to <code>min(comp + new_comp + ext_comp + new, request.num_tokens)</code> ({{cite vllm/v1/core/kv_cache_manager.py:612-615}}).</p>
+<p>The method raises <code>ValueError</code> when a call asks for 0 new tokens and adopts no computed tokens ({{cite vllm/v1/core/kv_cache_manager.py:474-482}}). With prefix-cache retention of some groups (Mamba, sliding window), the hit is first cut to the reused prefix (lines 484-497).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: Llama-3.1-8B on one 80 GiB GPU">
+<p>Llama-3.1-8B has 32 layers, 8 KV heads and a head size of 128; the KV cache is BF16 (2 bytes). These model values are from its Hugging Face config (inferred, not in the vLLM repo).</p>
+<ol>
+  <li><strong>One layer, one block.</strong> 8 heads × 16 tokens × (128 + 128) × 2 bytes = 65,536 bytes = 64 KiB ({{cite vllm/v1/kv_cache_interface.py:571-579}}).</li>
+  <li><strong>One block, all layers.</strong> 32 × 64 KiB = 2 MiB ({{cite vllm/v1/core/kv_cache_planning.py:587-593}}).</li>
+  <li><strong>Blocks.</strong> With 54.6 GiB available (figure above): 55,910 MiB / 2 MiB = 27,955 blocks ({{cite vllm/v1/core/kv_cache_planning.py:1610-1612}}). Block 0 is the null block, so 27,954 blocks can hold tokens.</li>
+  <li><strong>Tokens.</strong> 27,955 × 16 = 447,280 token slots.</li>
+  <li><strong>Concurrency.</strong> With <code>max_model_len</code> 131,072, one full-length request needs 8192 blocks. 27,955 / 8192 = 3.41. The start-up log prints "GPU KV cache size: 447,280 tokens, Maximum concurrency for 131,072 tokens per request: 3.41x" ({{cite vllm/v1/core/kv_cache_utils.py:1090-1108}}, {{cite vllm/v1/core/kv_cache_utils.py:1015-1047}}).</li>
+</ol>
+<p>The capacity log counts all <code>num_blocks</code>, including the null block (derived from the lines above). The difference of one block does not matter in practice.</p>
+<p>At runtime, a chat request with 2000 prompt tokens and 500 output tokens holds <code>cdiv(2500, 16) = 157</code> blocks at its end. That is 0.56 % of the pool. Its <code>KVCacheBlock</code> objects take some bytes of CPU memory each; the KV data (314 MiB) is on the GPU (derived).</p>
+</x-deepdive>
+
+<x-deepdive title="Reference counts and sharing, step by step">
+<p>Request R1 has a 40-token prompt; R2 arrives later with the same first 32 tokens. Block size 16, prefix caching on.</p>
+<table>
+  <thead><tr><th>Event</th><th>R1 blocks (ref_cnt)</th><th>Free queue</th></tr></thead>
+  <tbody>
+    <tr><td>R1 admitted: 3 new blocks a, b, c</td><td>a(1) b(1) c(1)</td><td>a, b, c removed from the front</td></tr>
+    <tr><td>R1 prefill done: a, b full, cached (c has 8 tokens)</td><td>a(1)# b(1)# c(1)</td><td>-</td></tr>
+    <tr><td>R2 admitted: hit a, b (touch), 1 new block d</td><td>a(2)# b(2)# shared; c(1); d(1) for R2</td><td>d removed</td></tr>
+    <tr><td>R1 finishes after 4 output tokens (c not full): free c, b, a</td><td>a(1)# b(1)#; c(0) to the front</td><td>c at the front</td></tr>
+    <tr><td>R2 finishes (d not full): free d, b, a</td><td>a(0)# b(0)# to the end, d(0) to the front</td><td>d, c, ..., b, a</td></tr>
+  </tbody>
+</table>
+<p><code>#</code> marks a block with a hash. Lines: touch ({{cite vllm/v1/core/block_pool.py:752-770}}), free ({{cite vllm/v1/core/block_pool.py:776-807}}). Block a and b now wait at the end of the queue. A third request with the same 32 tokens would hit them. A request that needs many new blocks would first take d and c, and only later evict b and a.</p>
+</x-deepdive>
+
+<x-deepdive title="Errors and edge cases">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>No memory left for the KV cache at start-up</td><td><code>ValueError</code> "No available memory for the cache blocks"</td><td>{{cite vllm/v1/core/kv_cache_planning.py:56-64}}</td></tr>
+    <tr><td>One request of <code>max_model_len</code> does not fit</td><td><code>ValueError</code> with an estimated maximum model length</td><td>{{cite vllm/v1/core/kv_cache_planning.py:68-87}}</td></tr>
+    <tr><td><code>allocate_slots</code> finds too few free blocks</td><td>returns <code>None</code>; the scheduler preempts or waits</td><td>{{cite vllm/v1/core/kv_cache_manager.py:575-579}}</td></tr>
+    <tr><td><code>get_new_blocks</code> asked for more than are free</td><td><code>ValueError</code> (the count check above prevents it)</td><td>{{cite vllm/v1/core/block_pool.py:678-679}}</td></tr>
+    <tr><td><code>reset_prefix_cache</code> while blocks are in use</td><td>WARNING log, returns False</td><td>{{cite vllm/v1/core/block_pool.py:841-848}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Configuration fields">
+<table>
+  <thead><tr><th>Flag / field</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--gpu-memory-utilization</code></td><td>0.92 ({{cite vllm/config/cache.py:212}})</td><td>share of the GPU for this instance; the KV cache gets what is left</td></tr>
+    <tr><td><code>--kv-cache-memory-bytes</code></td><td><code>None</code> ({{cite vllm/config/cache.py:371}})</td><td>fixed KV cache size per GPU; skips the measurement</td></tr>
+    <tr><td><code>--num-gpu-blocks-override</code></td><td><code>None</code> ({{cite vllm/config/cache.py:248}})</td><td>replaces the computed block count ({{cite vllm/v1/core/kv_cache_planning.py:242-248}})</td></tr>
+    <tr><td><code>--block-size</code></td><td>16 if no backend needs another size (see {{link concepts/attention-backends}})</td><td>tokens per block</td></tr>
+    <tr><td><code>--enable-prefix-caching</code></td><td>on for generative decoder models (see {{link learn/prefix-caching}})</td><td>off → <code>KVCacheCoordinatorNoPrefixCache</code> ({{cite vllm/v1/core/kv_cache_coordinator.py:995-1008}})</td></tr>
+    <tr><td><code>watermark</code></td><td>0.0</td><td>free blocks kept when a waiting request starts ({{cite vllm/v1/core/kv_cache_manager.py:205-208}})</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Start-up fails with "No available memory for the cache blocks".</strong> The weights and the profile run used all of <code>gpu_memory_utilization</code>. Raise the value, or lower <code>max_num_batched_tokens</code> (it sets the size of the profile run) ({{cite vllm/v1/core/kv_cache_planning.py:56-64}}).</li>
+  <li><strong>Start-up fails because one request of <code>max_model_len</code> does not fit.</strong> Lower <code>--max-model-len</code> to the estimate in the error, or add memory ({{cite vllm/v1/core/kv_cache_planning.py:68-87}}).</li>
+  <li><strong>Many preemptions.</strong> The pool is too small for the running requests. See {{link concepts/scheduler}}.</li>
+  <li><strong>Another process on the same GPU.</strong> <code>gpu_memory_utilization</code> is a share of the whole GPU, and the worker checks at start-up that this much memory is free ({{link concepts/executors-and-workers}}). Two instances on one GPU need two shares that add up to less than 1.</li>
+  <li><strong>The usage metric looks low, but prefix hits drop.</strong> Cached blocks count as free (Step 8); new requests evict them from the front of the free queue.</li>
+</ul>
+<p><strong>Why it matters.</strong> The number of blocks sets how many tokens can be in flight at the same time. Too few blocks give preemptions and short batches; prefix-cache hits save blocks and prefill time. To tune memory, you must know where the block count comes from and what the usage metric counts.</p>
+
+<x-quiz>
+  <x-q level="easy">Which process holds the <code>KVCacheBlock</code> objects, and which holds the KV tensors?
+    <x-a><p>The engine core process holds the <code>KVCacheBlock</code> objects in the <code>BlockPool</code> of the scheduler's manager ({{cite vllm/v1/core/sched/scheduler.py:329}}, {{cite vllm/v1/core/block_pool.py:171-174}}). The workers hold the KV tensors on their GPUs and only receive block ids ({{cite vllm/v1/worker/gpu/model_runner.py:1266-1269}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Why does a pool of 1000 blocks give requests at most 999?
+    <x-a><p>The pool takes block 0 out of the free queue at start-up and makes it the null block ({{cite vllm/v1/core/block_pool.py:184-188}}). The usage formula also leaves it out ({{cite vllm/v1/core/block_pool.py:888-892}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A running request has 32 computed tokens and 3 blocks of 16. It gets 1 new token. How many new blocks does <code>allocate_slots</code> take, and why?
+    <x-a><p>None. It needs <code>cdiv(32 + 1, 16) = 3</code> blocks and holds 3, so the difference is 0 ({{cite vllm/v1/core/single_type_kv_cache_manager.py:214}}, {{cite vllm/v1/core/single_type_kv_cache_manager.py:230-236}}). It needs a 4th block only when it reaches 49 tokens.</p></x-a>
+  </x-q>
+  <x-q level="medium">The usage gauge shows 0.10, but the prefix-cache hit rate falls. How can both be true?
+    <x-a><p>Usage counts only blocks outside the free queue ({{cite vllm/v1/core/block_pool.py:881-892}}). Cached blocks with <code>ref_cnt</code> 0 are in the free queue, and <code>get_new_blocks</code> evicts them from the front when new requests need blocks ({{cite vllm/v1/core/block_pool.py:681-700}}). A low usage says nothing about how many cached prefixes survive.</p></x-a>
+  </x-q>
+  <x-q level="hard">A new request has 3 prefix-cache hit blocks that are free (ref_cnt 0) and needs 1 more block. The pool has exactly 3 free blocks. Does <code>allocate_slots</code> succeed?
+    <x-a><p>No. The count adds the free hit blocks to the new blocks: 1 + 3 = 4 ({{cite vllm/v1/core/single_type_kv_cache_manager.py:256-266}}). The 3 free blocks in the queue are exactly the hit blocks, so <code>4 &gt; 3</code> and the method returns <code>None</code>. The admission gate finds this first; the second check would give the same result ({{cite vllm/v1/core/kv_cache_manager.py:537-539}}, {{cite vllm/v1/core/kv_cache_manager.py:575-579}}). Touching the hits would take them out of the free queue, and nothing would be left for the new block.</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,262 @@
+---
+title: The V1 scheduler: one token budget, no phases
+nav_title: The scheduler
+level: Advanced
+prerequisites: tours/life-of-a-chat-request, concepts/engine-core-loop
+related: concepts/kv-cache-manager, concepts/async-scheduling, concepts/prefix-caching, concepts/engine-hooks, concepts/data-contracts, tours/engine-step, code/v1-core-sched-scheduler, code/v1-core-kv-cache-manager, concepts/tuning
+summary: In each engine step, Scheduler.schedule() shares one token budget: first among the running requests, then among the waiting ones. It has no prefill or decode phase, it preempts the last running request when KV blocks run out, and update_from_output() appends the sampled tokens.
+scripts: viz/scheduler_sim.js
+---
+<x-sentence>In each step, the scheduler gives each request the tokens it misses, running requests first, until the token budget or the KV blocks run out.</x-sentence>
+
+<h2>The idea</h2>
+<p>The {{term scheduler}} lives in the {{term engine-core}} process. Once per {{term engine-step}}, it decides which requests run and how many of their tokens. DeepInfer Explained teaches the basics: continuous batching and chunked prefill ({{deepinfer learn/batching | Batching}}), and KV blocks and preemption ({{deepinfer learn/kv-cache | The KV cache}}). It also shows a scheduler with both ({{deepinfer concepts/scheduler | The scheduler}}). This page explains what vLLM does differently.</p>
+
+<p>The vLLM scheduler has no prefill phase and no decode phase. Each request has two numbers: {{term num-computed-tokens}} (tokens whose KV values are in the cache) and its number of tokens (prompt plus output). The scheduler gives each request the difference, as far as the {{term token-budget}} allows. A new prompt asks for many tokens, so it gets a prefill. A request in the middle of its answer asks for one token, so it gets a decode. A long prompt that does not fit gets a part of it: that is {{term chunked-prefill}}. One rule covers all three cases.</p>
+
+<p>Each call of <code>schedule()</code> has two passes. The first pass serves the {{term running-queue}}, from the front. The second pass starts requests from the {{term waiting-queue}}, but only if the first pass did not preempt anything. Each scheduled request also needs KV blocks. When the blocks run out, the scheduler takes away all the blocks of the last running request. That request must compute its tokens again later: this is {{term recompute-preemption}}. After the GPU step, <code>update_from_output()</code> appends the sampled tokens and finishes the requests that must stop.</p>
+
+<p><strong>An everyday comparison.</strong> Think of a print shop that can print 16 pages per hour. Each job asks for the pages that it still needs. The shop serves the jobs that it already started first, then new jobs. A job also needs paper trays (the KV blocks). When the trays run out, the shop takes all the trays of the newest job, and that job must start again later. The comparison stops here. In vLLM, a restarted request can often get some of its old work back from the prefix cache. Also, a print job does not make its own next input.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b3a_schedule_passes" alt="Panel 1, the running pass: for each running request, num_new = num_tokens_with_spec + num_output_placeholders - num_computed_tokens, capped by long_prefill_token_threshold, the token budget and max_model_len; num_new == 0 means continue. Then allocate_slots; if it returns None, preempt running.pop() for FCFS or the max (priority, arrival) request for the priority policy, free its blocks, set num_computed_tokens to 0, and retry; stop the pass if the victim is the request itself. Panel 2, the waiting pass: only if nothing was preempted and len(running) is below max_num_seqs; skip requests whose grammar or KV load is not ready and LoRA requests over max_loras; look up the prefix cache, compute num_new, stop the pass if chunked prefill is off and the prompt does not fit; allocate_slots must fit all tokens, None stops the pass, success moves the request to running. Panel 3: SchedulerOutput, then _update_after_schedule advances num_computed_tokens, then AsyncScheduler adds output placeholders." caption="Figure: one call of <code>Scheduler.schedule()</code>. The running pass (1) and the waiting pass (2) share one token budget. The plan (3) leaves before the counters move." />
+<p>Read the panels from top to bottom. Blue boxes are the running pass, violet boxes the waiting pass, and the amber box is preemption. Note the two exits that differ: in the running pass, a request with 0 tokens is skipped (<code>continue</code>). In the waiting pass, the first request that does not fit stops the whole pass (<code>break</code>).</p>
+
+<h3>A worked example: three steps</h3>
+<x-diagram name="b3a_three_steps" alt="Three panels for steps 1 to 3 with a token budget of 16, block size 4 and 8 free blocks. Step 1: A takes 10 tokens and blocks 1-3, B takes a 6-token chunk and blocks 4-5, C waits. Step 2: A decodes 1 token, B takes its last 6 prompt tokens and block 6, C starts with 6 tokens and blocks 7-8; 13 of 16 tokens used, 0 blocks free. Step 3: A decodes, B needs a fourth block, none is free, so C is preempted; its blocks 8 and 7 are freed and B gets block 8; there is no waiting pass in this step." caption="Figure: three calls of <code>schedule()</code> with small, illustrative numbers. Step 3 preempts C, the last request in the running queue." />
+<x-simplified><p>The figure and the simulator below run each step synchronously: the token of step k is known before step k+1 is scheduled. The default <code>AsyncScheduler</code> plans step k+1 first and uses placeholders ({{link concepts/async-scheduling}}). They also have no prefix cache, no EOS and no speculative decoding.</p></x-simplified>
+
+<h3>Try it yourself</h3>
+<x-viz id="scheduler-sim" title="Scheduler simulator" caption="Change the settings or add requests, then press <em>Step</em>. <em>Back</em> and every settings change replay the run from step 0, so the result depends only on the inputs. A simplified model: see the rules below." />
+<p>The simulator follows these rules of the real code. It leaves out everything in the box above.</p>
+<ol>
+  <li>The running pass goes first, from the front of <code>self.running</code>, while budget is left ({{cite vllm/v1/core/sched/scheduler.py:713-715}}).</li>
+  <li>A request gets <code>num_tokens - num_computed_tokens</code> tokens, at most the rest of the budget ({{cite vllm/v1/core/sched/scheduler.py:759-768}}).</li>
+  <li>A request needs <code>ceil((num_computed_tokens + new) / block_size)</code> blocks in total ({{cite vllm/v1/core/single_type_kv_cache_manager.py:214}}, {{cite vllm/v1/core/single_type_kv_cache_manager.py:401-402}}).</li>
+  <li>If blocks are short, the scheduler preempts the last running request, and stops the pass if that was the request itself ({{cite vllm/v1/core/sched/scheduler.py:857-858}}, {{cite vllm/v1/core/sched/scheduler.py:889-904}}).</li>
+  <li>The waiting pass runs only if nothing was preempted ({{cite vllm/v1/core/sched/scheduler.py:957}}), and only while fewer than <code>max_num_seqs</code> requests run ({{cite vllm/v1/core/sched/scheduler.py:979-981}}).</li>
+  <li>A waiting request starts only if all its tokens fit in free blocks ({{cite vllm/v1/core/kv_cache_manager.py:522-539}}). If not, or if chunked prefill is off and the prompt does not fit the budget, the pass stops ({{cite vllm/v1/core/sched/scheduler.py:1222-1229}}, {{cite vllm/v1/core/sched/scheduler.py:1339-1346}}).</li>
+  <li>Freed blocks go to the front of the free queue in reverse order ({{cite vllm/v1/core/single_type_kv_cache_manager.py:597-598}}, {{cite vllm/v1/core/block_pool.py:797-807}}).</li>
+  <li>A request that reaches the end of its known tokens samples one token. It stops at <code>max_tokens</code> ({{cite vllm/v1/core/sched/utils.py:114-119}}).</li>
+</ol>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the request state that the scheduler reads</h3>
+<p>The scheduler works on <code>Request</code> objects (<code>vllm/v1/request.py</code>). Three counters drive every decision:</p>
+<x-code file="vllm/v1/request.py" lines="294-304" />
+<p><code>num_tokens</code> is the prompt plus the output tokens so far. <code>num_tokens_with_spec</code> adds the draft tokens of speculative decoding. <code>num_computed_tokens</code> starts at 0 ({{cite vllm/v1/request.py:184}}). The comment at the top of <code>schedule()</code> states the rule with these names:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="622-633" highlight="624-633" />
+<p>The status of a request is an <code>IntEnum</code>. Every value after <code>PREEMPTED</code> means "finished":</p>
+<x-code file="vllm/v1/request.py" lines="370-393" highlight="379-380,392-393" />
+<p>A request with structured output starts in <code>WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR</code>, not <code>WAITING</code> ({{cite vllm/v1/request.py:116-117}}). Its grammar compiles in a thread pool, and the waiting pass skips the request until the grammar is ready (Step 5).</p>
+
+<h3>Step 2: the token budget and max_num_seqs</h3>
+<p>The budget of one step is <code>max_num_scheduled_tokens</code>. When you do not set it, the scheduler uses <code>max_num_batched_tokens</code>:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="129-142" highlight="130,138-142" />
+<p>The dataclass defaults (2048 tokens, 128 sequences) are only test values ({{cite vllm/config/scheduler.py:41-43}}, {{cite vllm/config/scheduler.py:48-53}}). For <code>vllm serve</code>, the engine arguments pick the real defaults from the GPU memory ({{cite vllm/engine/arg_utils.py:2960-2993}}):</p>
+<table>
+  <thead><tr><th>GPU memory</th><th><code>max_num_batched_tokens</code></th><th><code>max_num_seqs</code></th></tr></thead>
+  <tbody>
+    <tr><td>160 GiB or more (for example B200)</td><td>16384</td><td>1024</td></tr>
+    <tr><td>70 GiB or more, not A100, not GB10 (for example H100)</td><td>8192</td><td>1024</td></tr>
+    <tr><td>other GPUs (for example A100)</td><td>2048</td><td>256</td></tr>
+  </tbody>
+</table>
+<p><code>--performance-mode throughput</code> doubles both values when you did not set them ({{cite vllm/engine/arg_utils.py:3171-3175}}). Some later rules can change an unset value again, for example when chunked prefill is off, the token default is at least <code>max_model_len</code> ({{cite vllm/engine/arg_utils.py:3177-3221}}). TPU and CPU have their own defaults ({{cite vllm/engine/arg_utils.py:2995-3024}}). <code>max_num_seqs</code> limits the length of the running queue: the scheduler asserts it after each call ({{cite vllm/v1/core/sched/scheduler.py:1496}}). The waiting pass uses <code>max_num_active_seqs</code>, which is <code>max_num_seqs</code> unless you set a smaller value ({{cite vllm/v1/core/sched/scheduler.py:133-137}}). The page {{link concepts/tuning}} explains how to choose these values.</p>
+
+<h3>Step 3: the running pass</h3>
+<p>The running pass walks <code>self.running</code> from the front while budget is left ({{cite vllm/v1/core/sched/scheduler.py:713-715}}). For each request it computes the missing tokens and caps them:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="759-777" highlight="759-763,764-765,766-768,772-777" />
+<ol>
+  <li><strong>Lines 759-763.</strong> The missing tokens. <code>num_output_placeholders</code> counts tokens that a started step will sample; it is 0 without {{term async-scheduling}}.</li>
+  <li><strong>Lines 764-765.</strong> The {{term long-prefill-threshold}}. Its default is 0, which means no cap ({{cite vllm/config/scheduler.py:79-84}}). The scheduler also ignores it when only one request is running or waiting ({{cite vllm/v1/core/sched/scheduler.py:677-683}}).</li>
+  <li><strong>Lines 766-768.</strong> The rest of the budget. <code>input_budget</code> is <code>max_num_batched_tokens</code>. <code>draft_slots</code> is 0 without speculative decoding and for most drafting methods. It is 1 for a separate draft model, and more for parallel drafting ({{cite vllm/v1/core/sched/scheduler.py:644-645}}, {{cite vllm/config/speculative.py:1977-1995}}).</li>
+  <li><strong>Lines 772-777.</strong> The position must stay below <code>max_model_len</code>; one slot stays free for the sampled token.</li>
+</ol>
+<p>When the result is 0, the scheduler skips the request and goes on to the next one. The comment explains the choice:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="811-829" highlight="825-829" />
+<p>With async scheduling, a request can skip a step for one more reason. When its in-flight tokens surely reach <code>max_tokens</code>, the scheduler plans no extra step ({{cite vllm/v1/core/sched/scheduler.py:720-734}}).</p>
+
+<h3>Step 4: KV blocks, and preemption when they run out</h3>
+<p>Each request then asks the KV cache manager for blocks with {{term allocate-slots}} ({{cite vllm/v1/core/sched/scheduler.py:833-842}}). The page {{link concepts/kv-cache-manager}} explains that call. If it returns <code>None</code>, the scheduler picks a victim:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="850-858" />
+<p>With the default policy (<code>fcfs</code>), the victim is the last request in the running queue. That is usually the request that started last. With the <code>priority</code> policy, it is the request with the largest <code>(priority, arrival_time)</code>: the lowest priority, and among equals the latest arrival. The victim leaves the running queue, and <code>_preempt_request</code> resets it:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1671-1701" highlight="1676,1679-1680,1700-1701" />
+<ol>
+  <li><strong>Line 1676.</strong> All KV blocks of the request go back to the block pool. Only with a consumer KV connector and overlapping steps does the scheduler hold them until the running step ends ({{cite vllm/v1/core/sched/scheduler.py:187-193}}, {{cite vllm/v1/core/sched/scheduler.py:2866-2875}}).</li>
+  <li><strong>Lines 1679-1680.</strong> The status becomes <code>PREEMPTED</code>, and <code>num_computed_tokens</code> becomes 0. The output tokens stay in the request. So when it runs again, it computes the prompt and its output tokens again: this is recompute.</li>
+  <li><strong>Lines 1683-1694.</strong> With async scheduling, tokens of a started step can still arrive. They are marked stale, so they do not change the reset counters.</li>
+  <li><strong>Lines 1700-1701.</strong> The request goes to the front of the waiting queue, and its id goes into <code>preempted_req_ids</code> of the next <code>SchedulerOutput</code>.</li>
+</ol>
+<p>Then the scheduler tries <code>allocate_slots</code> again. If the victim was the request itself, the running pass stops ({{cite vllm/v1/core/sched/scheduler.py:898-904}}). The blocks keep their hashes when prefix caching is on. So the preempted request can find its own full blocks again in the prefix cache, if no other request has reused them ({{link concepts/prefix-caching}}).</p>
+
+<h3>Step 5: the waiting pass</h3>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="956-989" highlight="957,969,972-974,979-981,986-989" />
+<ol>
+  <li><strong>Line 957.</strong> The waiting pass runs only if the running pass preempted nothing. It makes no sense to start a new request when a running one just lost its blocks.</li>
+  <li><strong>Lines 972-974.</strong> Waiting requests that still hold KV blocks (for example after a remote KV load) go first, from <code>kv_holding_waiting</code>.</li>
+  <li><strong>Lines 979-981.</strong> The <code>max_num_seqs</code> limit (through <code>max_num_active_seqs</code>).</li>
+  <li><strong>Lines 986-989.</strong> A request whose grammar is not compiled yet, or whose remote KV has not arrived, is skipped for this step. The pass continues with the next request ({{cite vllm/v1/core/sched/scheduler.py:3275-3310}}).</li>
+</ol>
+<p>A LoRA request is also skipped when <code>max_loras</code> different adapters already run and its adapter is not one of them ({{cite vllm/v1/core/sched/scheduler.py:998-1009}}). A request with <code>num_computed_tokens == 0</code> then looks up the prefix cache ({{cite vllm/v1/core/sched/scheduler.py:1016-1024}}). A KV connector can add tokens from an external cache. An asynchronous load parks the request in <code>WAITING_FOR_REMOTE_KVS</code> until the data arrives ({{cite vllm/v1/core/sched/scheduler.py:1384-1411}}, {{link concepts/kv-connectors}}). Next, the number of tokens, and the rule for chunked prefill:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1191" />
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1217-1231" highlight="1222-1229,1231" />
+<p>With chunked prefill on, the request takes the rest of the budget and continues in the next step. With chunked prefill off, a prompt that does not fit stops the pass. Chunked prefill is on by default for generative models that are not encoder-decoder models ({{cite vllm/engine/arg_utils.py:3031-3035}}, {{cite vllm/config/model.py:2229-2236}}).</p>
+<p>The request then calls <code>allocate_slots</code> with <code>full_sequence_must_fit=True</code> by default, so all its tokens must fit in free blocks, not only the first chunk ({{cite vllm/config/scheduler.py:190-194}}, {{cite vllm/v1/core/sched/scheduler.py:1320-1337}}). If the call fails, the pass stops ({{cite vllm/v1/core/sched/scheduler.py:1339-1346}}). If it succeeds, the request moves to the running queue:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1413-1439" highlight="1415,1423-1426,1435-1439" />
+
+<h3>Step 6: speculative tokens use the same budget</h3>
+<p>Draft tokens are part of <code>num_tokens_with_spec</code> (Step 1), so the running pass counts them in the same budget. After the request is scheduled, the scheduler keeps only the draft tokens that fit and moves them into <code>scheduled_spec_decode_tokens</code>:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="916-932" highlight="918-923,928" />
+<p>Rejected drafts roll back <code>num_computed_tokens</code> later, in <code>update_from_output</code> ({{cite vllm/v1/core/sched/scheduler.py:2206-2221}}). The page {{link concepts/speculative-decoding}} explains the methods.</p>
+
+<h3>Step 7: the SchedulerOutput, then the counters move</h3>
+<p>At the end, <code>schedule()</code> builds the {{term scheduler-output}}:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1588-1609" />
+<p>With Model Runner V2, a resumed request travels as a new request, with all its block ids ({{cite vllm/v1/core/sched/scheduler.py:1505-1516}}). Only after the output exists does <code>_update_after_schedule</code> advance the counters:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1713-1735" highlight="1716,1721-1723" />
+<p>A request is a prefill chunk when it still has tokens to compute after this step (line 1721). With the default <code>AsyncScheduler</code>, every request that is not a prefill chunk also gets an {{term output-placeholder}} for the token that the step will sample ({{cite vllm/v1/core/sched/async_scheduler.py:32-47}}). That is why the running pass adds <code>num_output_placeholders</code> (Step 3). The page {{link concepts/async-scheduling}} explains the overlap. All fields of the output are on {{link concepts/data-contracts}}.</p>
+
+<h3>Step 8: update_from_output appends tokens and finishes requests</h3>
+<p>When the step's result arrives, the engine core calls <code>update_from_output</code>. For each scheduled request, it takes the sampled tokens and checks for a stop:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="2591-2611" highlight="2599,2603,2608-2609" />
+<p><code>check_stop</code> tests in this order: EOS, a stop token id, the length limits (<code>max_model_len</code> or <code>max_tokens</code>), then <code>min_tokens</code> and repetition detection ({{cite vllm/v1/core/sched/utils.py:98-140}}). A finished request frees its blocks ({{cite vllm/v1/core/sched/scheduler.py:2316-2323}}), and leaves the running queue ({{cite vllm/v1/core/sched/scheduler.py:2390-2391}}). The scheduler makes an <code>EngineCoreOutput</code> only for requests with new tokens, a pooler output or a stop ({{cite vllm/v1/core/sched/scheduler.py:2293-2295}}). So a prefill chunk sends nothing to the front end. Tour {{link tours/engine-step}} follows this method with real numbers.</p>
+
+<h3>Step 9: the scheduling policy</h3>
+<p>The {{term scheduling-policy}} is <code>--scheduling-policy</code>, with <code>fcfs</code> as the default ({{cite vllm/config/scheduler.py:159-165}}). It selects the class of the waiting queue:</p>
+<x-code file="vllm/v1/core/sched/request_queue.py" lines="200-207" />
+<p>The FCFS queue is a <code>deque</code>: new requests go to the end, preempted requests to the front ({{cite vllm/v1/core/sched/request_queue.py:78-94}}). The priority queue is a heap ordered by <code>Request.__lt__</code>: smaller <code>priority</code> first, then earlier <code>arrival_time</code>, then the request id ({{cite vllm/v1/core/sched/request_queue.py:131-157}}, {{cite vllm/v1/request.py:357-367}}).</p>
+<p>A client sets the priority with the <code>priority</code> field of the request body. The header <code>X-Vllm-Priority</code> overrides the field when it holds an integer ({{cite vllm/entrypoints/generate/base/serving.py:254-265}}).</p>
+<x-warning title="A priority without the priority policy is ignored, not rejected">
+<p>The field description says that a priority other than 0 raises an error when the server does not use priority scheduling ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:393-402}}). No code raises this error. With <code>fcfs</code>, the queue simply appends the request ({{cite vllm/v1/core/sched/request_queue.py:78-80}}), and the priority has no effect.</p>
+</x-warning>
+
+<h3>Step 10: replace the scheduler with scheduler_cls</h3>
+<p><code>--scheduler-cls</code> takes a class or a <code>"module.Class"</code> path. Without it, vLLM picks <code>AsyncScheduler</code> when async scheduling is on, else <code>Scheduler</code>:</p>
+<x-code file="vllm/config/scheduler.py" lines="231-256" highlight="232-239,247-253" />
+<p>The engine core builds the class in <code>EngineCore.__init__</code> ({{cite vllm/v1/engine/core.py:164}}, {{cite vllm/v1/engine/core.py:177-185}}). The warning on lines 247-253 is a real trap: a custom class that subclasses <code>Scheduler</code> instead of <code>AsyncScheduler</code> loses the placeholders of async scheduling. The page {{link concepts/engine-hooks}} lists this hook with the other engine hooks.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The running pass, line by line">
+<p>Lines of <code>vllm/v1/core/sched/scheduler.py</code>, in the order that they run for one running request:</p>
+<ol>
+  <li><strong>642-648.</strong> <code>token_budget = max_num_scheduled_tokens</code>; <code>input_budget = max_num_batched_tokens</code>. A full pause (<code>PAUSED_ALL</code>) sets the budget to 0.</li>
+  <li><strong>666.</strong> <code>kv_cache_manager.new_step_starts()</code> tells the managers that a step begins.</li>
+  <li><strong>670-711.</strong> Prefill throttling for data parallel MoE and the local <code>prefill_schedule_interval</code> (default 1, so off) ({{cite vllm/config/scheduler.py:203-209}}). When it is active, running prefill chunks wait for a later step, and decodes still run (lines 742-746).</li>
+  <li><strong>713-718.</strong> The loop. It breaks when <code>input_budget</code> cannot hold one more token plus the draft slots.</li>
+  <li><strong>720-734.</strong> Async scheduling: skip a request whose in-flight tokens already reach <code>max_tokens</code>.</li>
+  <li><strong>736-740.</strong> Model Runner V2 with PP and async scheduling: a request decodes at most every <code>pp_size</code> steps.</li>
+  <li><strong>748-757.</strong> An encoder-cache connector can hold a multimodal request back.</li>
+  <li><strong>759-777.</strong> The token count and its four caps (Step 3).</li>
+  <li><strong>780-809.</strong> Mamba block alignment, encoder inputs and the MTP lookahead can lower the count further.</li>
+  <li><strong>811-829.</strong> A count of 0: <code>continue</code>.</li>
+  <li><strong>831-904.</strong> <code>allocate_slots</code> and the preemption loop. With a KV connector that has pending block frees, the loop stops without a preemption (lines 844-848).</li>
+  <li><strong>906-914.</strong> The request is scheduled: <code>num_scheduled_tokens[req_id] = num_new_tokens</code>; both budgets go down.</li>
+  <li><strong>916-943.</strong> Draft tokens (Step 6) and encoder inputs.</li>
+  <li><strong>945-954.</strong> The LoRA ids of all running requests, for the <code>max_loras</code> check of the waiting pass.</li>
+</ol>
+<p>With the <code>priority</code> policy, the victim can be a request that this pass already scheduled. Then the scheduler gives its tokens back to both budgets and removes its blocks and draft tokens from the plan (lines 864-888). With FCFS this cannot happen: the victim is the last request, and the pass has not reached it yet.</p>
+</x-deepdive>
+
+<x-deepdive title="The waiting pass, line by line">
+<ol>
+  <li><strong>958-967.</strong> <code>skip_request</code> moves a request out of the queue for this step only. Skipped requests go back to the front of their queue at the end (lines 1469-1473), so they keep their place.</li>
+  <li><strong>969-981.</strong> Loop while budget is left; queue choice; <code>max_num_active_seqs</code>.</li>
+  <li><strong>986-996.</strong> Blocked statuses, and stale output of a preempted request that is still in flight.</li>
+  <li><strong>998-1009.</strong> LoRA: skip.</li>
+  <li><strong>1016-1146.</strong> First admission (<code>num_computed_tokens == 0</code>): local prefix-cache hit, then the KV connector hit, then bookkeeping for statistics.</li>
+  <li><strong>1147-1158.</strong> A request that already has computed tokens (after a remote KV load, or a streaming-input session) uses them.</li>
+  <li><strong>1171-1283.</strong> The token count. An async KV load schedules 0 tokens. With speculative decoding, a waiting request with only 1 token to compute can be padded to <code>1 + num_spec_tokens</code>. This happens only when no prefill chunk runs in the step, and keeps a uniform batch for CUDA graphs (lines 1196-1215). Then the long-prefill cap, the chunked-prefill rule and the budget.</li>
+  <li><strong>1320-1346.</strong> <code>allocate_slots</code>, with the prefix-cache hit and <code>full_sequence_must_fit</code>. <code>None</code>: <code>break</code>.</li>
+  <li><strong>1378-1382.</strong> Prefix-cache statistics are recorded only for admitted requests.</li>
+  <li><strong>1413-1467.</strong> The request moves to <code>running</code>. Its status before the move decides the list: <code>WAITING</code> goes to <code>scheduled_new_reqs</code>, <code>PREEMPTED</code> to <code>scheduled_resumed_reqs</code>.</li>
+</ol>
+<p>Note the asymmetry. In the waiting pass, a request that does not fit stops the pass. A smaller request behind it does not get a chance in this step. Only skipped requests (blocked, LoRA, 0 tokens) let the pass continue.</p>
+</x-deepdive>
+
+<x-deepdive title="Preemption: cost, metrics and what comes back">
+<p><strong>What the victim loses.</strong> All its KV blocks and its <code>num_computed_tokens</code>. It keeps its prompt and output tokens. Take a victim with a 1000-token prompt and 200 output tokens. Without a prefix-cache hit, it must compute 1200 tokens again when it resumes (derived from lines 1680 and 1191). The waiting pass treats it like a new request. It looks up the prefix cache, because <code>num_computed_tokens</code> is 0, and all its tokens must fit.</p>
+<p><strong>What comes back.</strong> <code>_free_request_blocks</code> frees the blocks in reverse order ({{cite vllm/v1/core/sched/scheduler.py:2866-2875}}, {{cite vllm/v1/core/single_type_kv_cache_manager.py:597-598}}). Blocks with a hash go to the end of the free queue. Blocks without a hash, for example the partial last block, go to the front ({{cite vllm/v1/core/block_pool.py:776-807}}). So the full blocks stay in the prefix cache as long as nobody needs their memory. If they survive, the resumed request hits them and computes only the rest.</p>
+<p><strong>How you see it.</strong> The scheduler records a <code>PREEMPTED</code> event when stats are on ({{cite vllm/v1/core/sched/scheduler.py:1696-1697}}). The front end counts these events in <code>vllm:num_preemptions</code> ({{cite vllm/v1/metrics/loggers.py:738-745}}). The periodic log line adds "Preemptions: N" when N is above 0 ({{cite vllm/v1/metrics/loggers.py:310-312}}).</p>
+<p><strong>Docs and code.</strong> <code>docs/configuration/optimization.md</code> shows a WARNING line "Sequence group 0 is preempted by PreemptionMode.RECOMPUTE mode ..." ({{cite docs/configuration/optimization.md:33-35}}). The V1 scheduler does not log a line per preemption: <code>_preempt_request</code> has no log call ({{cite vllm/v1/core/sched/scheduler.py:1658-1701}}). Watch the metric or the "Preemptions" field instead. The same page says that recompute is the default mode in V1 ({{cite docs/configuration/optimization.md:47}}). In the V1 code it is the only mode: <code>_preempt_request</code> always frees the blocks and resets <code>num_computed_tokens</code> ({{cite vllm/v1/core/sched/scheduler.py:1676-1680}}).</p>
+<p><strong>Other preemptions.</strong> <code>reset_prefix_cache(reset_running_requests=True)</code> preempts every running request, from the end, with their stale output dropped ({{cite vllm/v1/core/sched/scheduler.py:2950-2960}}).</p>
+</x-deepdive>
+
+<x-deepdive title="The worked example, continued">
+<p>The simulator continues the figure with the same rules. Values right after each step (budget 16, block size 4, 8 blocks):</p>
+<table>
+  <thead><tr><th>Step</th><th>Scheduled (tokens)</th><th>Free blocks after</th><th>What happens</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>A 10, B 6</td><td>3</td><td>A finishes its prompt and samples token 1. B is a chunk. C waits: no budget left.</td></tr>
+    <tr><td>2</td><td>A 1, B 6, C 6</td><td>0</td><td>B ends its prompt; C starts. 13 of 16 tokens used.</td></tr>
+    <tr><td>3</td><td>A 1, B 1</td><td>1</td><td>B needs block 4 of its 13 tokens: preempt C. No waiting pass.</td></tr>
+    <tr><td>4</td><td>A 1, B 1</td><td>4</td><td>A needs a 4th block and takes the last free one. C needs 2 blocks for its 7 tokens: 0 free, the pass stops. A reaches <code>max_tokens</code> and frees 4 blocks.</td></tr>
+    <tr><td>5</td><td>B 1, C 7</td><td>6</td><td>C resumes and recomputes 7 tokens (6 prompt + 1 output). B finishes.</td></tr>
+  </tbody>
+</table>
+<p>The real engine has prefix caching on. After step 3, C's first block (block 7: 4 prompt tokens, full and hashed) waits at the end of the free queue. But in step 4, A takes the last free block, and that is block 7: <code>get_new_blocks</code> evicts its hash ({{cite vllm/v1/core/block_pool.py:681-691}}). So in this example C computes all 7 tokens again in the real engine too. With one more free block, block 7 would survive, and C would compute only 3 tokens (derived).</p>
+</x-deepdive>
+
+<x-deepdive title="Configuration fields of the scheduler">
+<table>
+  <thead><tr><th>Flag / field</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--max-num-batched-tokens</code></td><td>by GPU memory (Step 2)</td><td><code>input_budget</code>; also the default token budget ({{cite vllm/config/scheduler.py:48-53}})</td></tr>
+    <tr><td><code>max_num_scheduled_tokens</code></td><td><code>None</code> → <code>max_num_batched_tokens</code></td><td>the token budget; can be lower when the model appends tokens, for example drafts ({{cite vllm/config/scheduler.py:55-60}}, {{cite vllm/config/vllm.py:2320-2327}})</td></tr>
+    <tr><td><code>--max-num-seqs</code></td><td>by GPU memory (Step 2)</td><td>size of the running queue and of the model runner ({{cite vllm/config/scheduler.py:62-67}})</td></tr>
+    <tr><td><code>max_num_active_seqs</code></td><td><code>None</code> → <code>max_num_seqs</code></td><td>admission limit of the waiting pass only ({{cite vllm/config/scheduler.py:69-77}})</td></tr>
+    <tr><td><code>--long-prefill-token-threshold</code></td><td>0 (off)</td><td>cap per request and step ({{cite vllm/config/scheduler.py:79-84}}); <code>long_prefill_token_threshold_adaptive</code> raises it to a fair share ({{cite vllm/config/scheduler.py:86-90}})</td></tr>
+    <tr><td><code>--enable-chunked-prefill</code></td><td>on for generative non-encoder-decoder models</td><td>chunking in the waiting pass ({{cite vllm/engine/arg_utils.py:3031-3035}})</td></tr>
+    <tr><td><code>--scheduling-policy</code></td><td><code>fcfs</code></td><td>queue order and victim (Step 9)</td></tr>
+    <tr><td><code>--scheduler-reserve-full-isl</code></td><td>True</td><td>a new request starts only if all its tokens fit ({{cite vllm/config/scheduler.py:190-194}})</td></tr>
+    <tr><td><code>watermark</code></td><td>0.0</td><td>fraction of blocks kept free when a waiting request starts ({{cite vllm/config/scheduler.py:196-201}}, {{cite vllm/v1/core/kv_cache_manager.py:509-516}})</td></tr>
+    <tr><td><code>prefill_schedule_interval</code></td><td>1</td><td>prefill only every N steps ({{cite vllm/config/scheduler.py:203-209}})</td></tr>
+    <tr><td><code>--async-scheduling</code></td><td><code>None</code> → on in most cases</td><td>chooses <code>AsyncScheduler</code> ({{cite vllm/config/vllm.py:1664-1698}})</td></tr>
+    <tr><td><code>--scheduler-cls</code></td><td><code>None</code></td><td>your own class (Step 10)</td></tr>
+    <tr><td><code>max_num_queued_reqs</code>, <code>max_num_queued_tokens</code></td><td><code>None</code></td><td>checked in <code>AsyncLLM</code> in the API server, not here ({{cite vllm/v1/engine/async_llm.py:352-382}}); the field docs say the client gets HTTP 503 ({{cite vllm/config/scheduler.py:92-132}})</td></tr>
+  </tbody>
+</table>
+<p>The scheduler checks some combinations at start-up: <code>max_num_batched_tokens</code> must be at least <code>max_model_len</code> when chunked prefill is off, and at least <code>max_num_seqs</code> ({{cite vllm/config/scheduler.py:317-336}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Parts of schedule() that this page skips">
+<ul>
+  <li><strong>Encoder inputs</strong> (images, audio): a separate encoder compute budget and encoder cache; a chunk can stop before an image that does not fit ({{cite vllm/v1/core/sched/scheduler.py:1876-1903}}).</li>
+  <li><strong>Mamba "align" mode</strong>: chunks end on block boundaries so that states can be cached ({{cite vllm/v1/core/sched/scheduler.py:474-488}}). See {{link concepts/hybrid-kv-cache}}.</li>
+  <li><strong>Pause states</strong>: <code>PAUSED_ALL</code> schedules nothing; <code>PAUSED_NEW</code> admits only requests that hold blocks ({{cite vllm/v1/core/sched/scheduler.py:646-648}}, {{cite vllm/v1/core/sched/scheduler.py:970-974}}).</li>
+  <li><strong>Streaming-input sessions</strong> (<code>resumable</code> requests): a stopped turn waits in <code>WAITING_FOR_STREAMING_REQ</code> for the next input ({{cite vllm/v1/core/sched/scheduler.py:2564-2589}}).</li>
+  <li><strong>KV load failures</strong> of a connector: the scheduler recomputes the bad blocks or fails the request, by <code>kv_load_failure_policy</code> ({{cite vllm/v1/core/sched/scheduler.py:184-185}}, {{cite vllm/v1/core/sched/scheduler.py:3444-3457}}).</li>
+</ul>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Many preemptions.</strong> The KV cache is too small for the running requests. Each preemption throws away computed work. Watch <code>vllm:num_preemptions</code>. Raise <code>--gpu-memory-utilization</code>, or lower <code>--max-num-seqs</code> ({{link concepts/kv-cache-manager}}).</li>
+  <li><strong>Decodes slow down during a long prompt.</strong> A prompt chunk can take the whole rest of the budget, so the step gets long for every request in it. <code>--long-prefill-token-threshold</code> caps one request's share ({{cite vllm/v1/core/sched/scheduler.py:764-765}}).</li>
+  <li><strong>Head-of-line blocking.</strong> The first waiting request that does not fit stops the waiting pass ({{cite vllm/v1/core/sched/scheduler.py:1339-1346}}). With chunked prefill off, a long prompt at the front stops it too ({{cite vllm/v1/core/sched/scheduler.py:1222-1229}}).</li>
+  <li><strong>Requests wait with free memory.</strong> <code>max_num_seqs</code> requests already run ({{cite vllm/v1/core/sched/scheduler.py:979-981}}), or the LoRA requests wait for an adapter slot ({{cite vllm/v1/core/sched/scheduler.py:998-1009}}).</li>
+  <li><strong>The priority field does nothing.</strong> The server runs <code>fcfs</code>. Start it with <code>--scheduling-policy priority</code>.</li>
+  <li><strong>A custom scheduler is slower.</strong> It subclasses <code>Scheduler</code>, so async scheduling is lost ({{cite vllm/config/scheduler.py:247-253}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> The scheduler sets the shape of every step: how many tokens, which requests, how much of a prompt. TTFT, inter-token latency and throughput all follow from these choices. When you tune <code>max_num_batched_tokens</code> or <code>max_num_seqs</code>, or read the preemption metric, you change or watch this one function.</p>
+
+<x-quiz>
+  <x-q level="easy">Does the vLLM scheduler have a prefill phase and a decode phase?
+    <x-a><p>No. Each request asks for <code>num_tokens_with_spec - num_computed_tokens</code> tokens, and the scheduler gives them from one budget. A new prompt asks for many tokens, a decoding request for one ({{cite vllm/v1/core/sched/scheduler.py:624-633}}, {{cite vllm/v1/core/sched/scheduler.py:759-768}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">With the default policy, which request does the scheduler preempt when a running request cannot get blocks?
+    <x-a><p>The last request in the running queue: <code>self.running.pop()</code> ({{cite vllm/v1/core/sched/scheduler.py:889-890}}). With the <code>priority</code> policy, it is the request with the largest <code>(priority, arrival_time)</code> ({{cite vllm/v1/core/sched/scheduler.py:852-856}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">In a step, the running pass preempts one request. A short new request waits, and 2000 tokens of budget are left. Does the short request start in this step?
+    <x-a><p>No. The waiting pass runs only when nothing was preempted in this step ({{cite vllm/v1/core/sched/scheduler.py:957}}). The budget stays unused.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does the running pass use <code>continue</code> for a request with 0 tokens, while the waiting pass uses <code>break</code> when <code>allocate_slots</code> fails?
+    <x-a><p>A running request with 0 tokens (for example, all its tokens are in flight) must not block the requests behind it. The comment says that the scheduler gives up strict FCFS for this ({{cite vllm/v1/core/sched/scheduler.py:825-829}}). In the waiting pass, a failed allocation means the free blocks are short, so the scheduler stops admitting new requests ({{cite vllm/v1/core/sched/scheduler.py:1339-1346}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A request has a 1000-token prompt and 200 output tokens when it is preempted. Prefix caching is on, block size 16, and no other request reused its blocks. How many tokens does it compute when it resumes, at the minimum?
+    <x-a><p><code>_preempt_request</code> sets <code>num_computed_tokens</code> to 0 ({{cite vllm/v1/core/sched/scheduler.py:1680}}), so the waiting pass looks up the prefix cache again ({{cite vllm/v1/core/sched/scheduler.py:1017-1024}}). The request has 1200 tokens. Its full blocks were cached and stay cached until reused. The lookup returns full blocks only, up to <code>num_tokens - 1</code> = 1199 tokens ({{cite vllm/v1/core/kv_cache_manager.py:289-300}}): 74 blocks = 1184 tokens. So it computes at least 1200 − 1184 = 16 tokens. This assumes that every full block was cached; with async scheduling, the blocks of the last in-flight tokens may not be cached yet (derived).</p></x-a>
+  </x-q>
+</x-quiz>

@@ -110,8 +110,11 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-22 21:01 | B2a fact check | done ~21:35: ~270 claims, 37 defects. Supervisor REJECTED its 'last-slice abort bug' (abort is inside the loop) and removed the note from 3 pages; supervisor fixed the msgspec claim on processes-and-ipc. |
 | 2026-10-22 21:37 | B2b writer | done ~22:10; 5 diagrams, b2b.json 9 terms |
 | 2026-10-22 22:11 | B2b fact check | done ~22:45: ~380 claims, ~73 defects. NOTE: it started 3 forks itself (the 'unknown agents'); briefs now forbid sub-agents. |
-| 2026-10-22 22:32 | B3a writer (scheduler, kv-cache-manager + 3 modules + scheduler simulator) | running (told: no sub-agents) |
-| 2026-10-22 22:47 | B4a writer (plugin-map, platform-plugins, platform-interface + 2 modules + plugin timeline) | running |
+| 2026-10-22 22:32 | B3a writer (scheduler, kv-cache-manager + 3 modules + scheduler simulator) | done ~23:10; 4 diagrams, b3a.json 12 terms; core block-pool term reworded by supervisor |
+| 2026-10-22 23:11 | B3a fact check | done ~23:40: ~260 claims, 25 defects; simulator verified |
+| 2026-10-22 23:41 | B3b writer | running |
+| 2026-10-22 22:47 | B4a writer (plugin-map, platform-plugins, platform-interface + 2 modules + plugin timeline) | done ~23:25; 3 diagrams, b4a.json 5 terms |
+| 2026-10-22 23:26 | B4a fact check | running |
 | 2026-10-22 19:18 | 1b Tour 1 (t1) | done 19:45: 16 stops, 3 diagrams, request_stepper.js, t1.json (12 terms); not browser-checked by writer |
 | 2026-10-22 19:46 | Fact check t1 (+ browser check of stepper) | done ~20:00: ~230 claims, 38 defects (11 citation, 6 value, 9 logic, 3 default source, 9 other). Stepper OK at 1280/390, no overflow. |
 | 2026-10-22 19:49 | Fact check concepts/plugin-loading (+ folder descriptions) | done ~19:58: ~80 claims, 30 defects fixed (8 citation, 11 value/condition, 4 logic, 3 missing source, 5 glossary/folder). Open question answered (platform before general plugins in every process). |

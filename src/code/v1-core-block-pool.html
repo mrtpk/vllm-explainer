@@ -1,0 +1,169 @@
+---
+title: v1/core/block_pool.py: BlockPool and the prefix-cache map
+nav_title: v1/core/block_pool.py
+level: Advanced
+prerequisites: concepts/kv-cache-manager, learn/prefix-caching
+related: concepts/kv-cache-manager, concepts/prefix-caching, code/v1-core-kv-cache-manager, code/v1-core-kv-cache-utils, code/v1-core-sched-scheduler
+summary: vllm/v1/core/block_pool.py holds BlockPool, the owner of every KVCacheBlock of an engine core. It hands out blocks from the free queue, frees them in eviction order, keeps the hash-to-block map of the prefix cache, emits KV cache events and computes the KV cache usage.
+---
+<h2>Purpose</h2>
+<p><code>vllm/v1/core/block_pool.py</code> owns all <code>KVCacheBlock</code> objects of one engine core: which are free, which are in use, and which full blocks can serve a prefix-cache hit.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/v1/core/block_pool.py</code>, 905 lines of Python. Two classes.</td></tr>
+    <tr><th>Main classes</th><td><code>BlockPool</code> ({{cite vllm/v1/core/block_pool.py:136}}) and <code>BlockHashToBlockMap</code> ({{cite vllm/v1/core/block_pool.py:35}}).</td></tr>
+    <tr><th>Runs in</th><td>The {{term engine-core}} process, main thread. One pool per KV cache coordinator, so one per scheduler, shared by all KV cache groups. The only exception is the host group of HiSparse, which gets a private host pool ({{cite vllm/v1/core/single_type_kv_cache_manager.py:2231-2247}}). CPU only.</td></tr>
+    <tr><th>Called by</th><td>The <code>SingleTypeKVCacheManager</code>s (<code>single_type_kv_cache_manager.py</code>), the coordinator, <code>KVCacheManager</code>, and the scheduler for deferred frees.</td></tr>
+    <tr><th>Calls</th><td><code>FreeKVCacheBlockQueue</code> and the hash helpers of <code>kv_cache_utils.py</code>; the KV event types of <code>vllm/distributed/kv_events.py</code>; an optional metrics collector.</td></tr>
+    <tr><th>Not in this file</th><td>The block class and the free queue (<code>kv_cache_utils.py</code>), the hit search (single-type managers), the decision when to cache (managers), the GPU memory (workers).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b3a_free_queue" alt="Panel 1: the free block queue as a doubly linked list from a fake head to a fake tail: blocks 9 and 40 without a hash at the front, blocks 15 and 21 without a hash, then blocks 12, 3 and 7 with a hash at the end. get_new_blocks takes from the front with popleft_n; freed blocks without a hash are added at the front with prepend_n; freed blocks with a hash at the end with append_n; touch on a cached hit removes a block from the middle in O(1). Panel 2: the life of a block: allocated (popped, old hash evicted, ref_cnt 1, hashed when full), shared or freed (touch adds 1, free subtracts 1, at 0 it goes back to the queue with its hash), hit again (touch removes it from the queue) or reused (popped again, hash evicted). Block 0 is the null block and never enters this cycle." caption="Figure: the order of the free queue (1) and the life of one block (2)." />
+<p>Read panel 1 from left to right: the pool reuses the front first. Panel 2 shows that a free block can still be a prefix-cache hit until the pool pops it again.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li>The coordinator builds one pool with <code>kv_cache_config.num_blocks</code> blocks ({{cite vllm/v1/core/kv_cache_coordinator.py:119-125}}).</li>
+  <li>Single-type managers call <code>get_new_blocks</code>, <code>touch</code>, <code>free_blocks</code>, <code>cache_full_blocks</code> and <code>get_cached_block</code> ({{cite vllm/v1/core/single_type_kv_cache_manager.py:303-306}}, {{cite vllm/v1/core/single_type_kv_cache_manager.py:406}}, {{cite vllm/v1/core/single_type_kv_cache_manager.py:531-539}}, {{cite vllm/v1/core/single_type_kv_cache_manager.py:597-598}}, {{cite vllm/v1/core/single_type_kv_cache_manager.py:794}}).</li>
+  <li><code>KVCacheManager</code> reads <code>get_usage</code> and <code>take_events</code>, and calls <code>evict_blocks</code> ({{cite vllm/v1/core/kv_cache_manager.py:234}}, {{cite vllm/v1/core/kv_cache_manager.py:672}}, {{cite vllm/v1/core/kv_cache_manager.py:703}}).</li>
+  <li>The scheduler frees deferred blocks directly ({{cite vllm/v1/core/sched/scheduler.py:2884}}, {{cite vllm/v1/core/sched/scheduler.py:2901}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>FreeKVCacheBlockQueue</code>: <code>popleft</code>, <code>popleft_n</code>, <code>remove</code>, <code>prepend_n</code>, <code>append_n</code> ({{cite vllm/v1/core/kv_cache_utils.py:258-484}}).</li>
+  <li>Hash helpers: <code>make_block_hash_with_group_id</code>, <code>resolve_block_hashes</code>, <code>generate_block_hash_extra_keys</code> ({{cite vllm/v1/core/block_pool.py:16-29}}).</li>
+  <li>The event types <code>BlockStored</code>, <code>BlockRemoved</code>, <code>AllBlocksCleared</code> ({{cite vllm/v1/core/block_pool.py:6-12}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>BlockHashToBlockMap</code></td><td>{{cite vllm/v1/core/block_pool.py:35-133}}</td><td>hash key → one block, or a dict of blocks with the same hash</td></tr>
+    <tr><td><code>BlockPool.__init__</code></td><td>{{cite vllm/v1/core/block_pool.py:157-196}}</td><td>all blocks, the free queue, the maps, the null block</td></tr>
+    <tr><td><code>get_cached_block</code></td><td>{{cite vllm/v1/core/block_pool.py:198-224}}</td><td>a cached block per group for one hash, or <code>None</code></td></tr>
+    <tr><td><code>cache_full_blocks</code></td><td>{{cite vllm/v1/core/block_pool.py:226-344}}</td><td>sets the hash of newly full blocks; emits <code>BlockStored</code></td></tr>
+    <tr><td><code>emit_cached_block_events</code></td><td>{{cite vllm/v1/core/block_pool.py:376-447}}</td><td>events for reused blocks (report mode "full")</td></tr>
+    <tr><td><code>cache_partial_block</code></td><td>{{cite vllm/v1/core/block_pool.py:449-563}}</td><td>a hit entry inside a larger block (fine-grained hashing)</td></tr>
+    <tr><td><code>move_block_hashes</code></td><td>{{cite vllm/v1/core/block_pool.py:648-664}}</td><td>moves cache entries to a copy-on-write block</td></tr>
+    <tr><td><code>get_new_blocks</code></td><td>{{cite vllm/v1/core/block_pool.py:666-700}}</td><td>pops blocks from the front; evicts their old hash; <code>ref_cnt = 1</code></td></tr>
+    <tr><td><code>unpin_blocks</code></td><td>{{cite vllm/v1/core/block_pool.py:708-727}}</td><td>releases blocks that stay readable until reused (connectors)</td></tr>
+    <tr><td><code>touch</code></td><td>{{cite vllm/v1/core/block_pool.py:752-770}}</td><td><code>ref_cnt += 1</code>; out of the free queue if it was free</td></tr>
+    <tr><td><code>free_blocks</code></td><td>{{cite vllm/v1/core/block_pool.py:776-809}}</td><td><code>ref_cnt -= 1</code>; at 0: front (no hash) or end (hash)</td></tr>
+    <tr><td><code>evict_blocks</code></td><td>{{cite vllm/v1/core/block_pool.py:811-829}}</td><td>removes hashes by block id (KV connector)</td></tr>
+    <tr><td><code>reset_prefix_cache</code></td><td>{{cite vllm/v1/core/block_pool.py:831-870}}</td><td>drops every hash, only when no block is in use</td></tr>
+    <tr><td><code>get_num_free_blocks</code>, <code>get_usage</code></td><td>{{cite vllm/v1/core/block_pool.py:872-892}}</td><td>free count; KV cache usage</td></tr>
+    <tr><td><code>take_events</code></td><td>{{cite vllm/v1/core/block_pool.py:894-905}}</td><td>drains the KV event queue</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>__init__</code>: all blocks at once, and the null block</h3>
+<x-code file="vllm/v1/core/block_pool.py" lines="166-188" highlight="172-174,178,181-182,187-188" />
+<ol>
+  <li><strong>Lines 172-174.</strong> One <code>KVCacheBlock</code> per id, all made at start-up. A block remembers its pool, because a deferred free can hold blocks of two pools (the GPU pool and a HiSparse host pool) ({{cite vllm/v1/core/kv_cache_utils.py:169-172}}).</li>
+  <li><strong>Line 178.</strong> All blocks start in the free queue, in id order.</li>
+  <li><strong>Lines 181-182.</strong> The prefix-cache map, and a second map for blocks with more than one hash entry.</li>
+  <li><strong>Lines 187-188.</strong> The first block (id 0) leaves the queue and becomes the {{term null-block}}. Its <code>ref_cnt</code> is not kept, so <code>free_blocks</code> skips it ({{cite vllm/v1/core/block_pool.py:790-791}}).</li>
+</ol>
+
+<h3><code>get_new_blocks</code>: take from the front</h3>
+<x-code file="vllm/v1/core/block_pool.py" lines="666-700" highlight="678-679,681,687-691" />
+<ol>
+  <li><strong>Lines 678-679.</strong> A request for more blocks than are free raises <code>ValueError</code>. Callers count first, so this means a bug.</li>
+  <li><strong>Line 681.</strong> <code>popleft_n</code>: the front of the queue is the eviction end.</li>
+  <li><strong>Lines 687-691.</strong> With prefix caching, a popped block may still hold a hash; <code>_maybe_evict_cached_block</code> removes it from the map and emits <code>BlockRemoved</code> ({{cite vllm/v1/core/block_pool.py:729-750}}). This is the only eviction path in normal serving. Then <code>ref_cnt</code> goes from 0 to 1.</li>
+</ol>
+
+<h3><code>free_blocks</code>: back in eviction order</h3>
+<x-code file="vllm/v1/core/block_pool.py" lines="776-809" highlight="790-791,795-802,805,807" />
+<ol>
+  <li><strong>Lines 790-794.</strong> The null block is skipped; a block of another pool goes to its own pool.</li>
+  <li><strong>Lines 795-802.</strong> <code>ref_cnt -= 1</code>. At 0, a block without a hash (or any block with prefix caching off) goes to the "evict first" list; a hashed block to the "evict last" list.</li>
+  <li><strong>Line 805.</strong> <code>prepend_n</code>: unhashed blocks at the front, reused next. The comment names GPU locality as a reason.</li>
+  <li><strong>Line 807.</strong> <code>append_n</code>: cached blocks at the end, in the order given. Callers pass the blocks of a request in reverse, so the tail of a prefix is evicted before its head.</li>
+</ol>
+<p>A block that another request still uses keeps <code>ref_cnt &gt; 0</code> and stays out of the queue.</p>
+
+<h3><code>touch</code> and <code>cache_full_blocks</code></h3>
+<x-code file="vllm/v1/core/block_pool.py" lines="752-770" highlight="762-768" />
+<p><code>touch</code> is how a hit takes a block: it removes the block from the middle of the free queue when the block was free (O(1) in the linked list), and adds a reference. <code>cache_full_blocks</code> gives each newly full block its hash key (block hash + group id) and inserts it in the map ({{cite vllm/v1/core/block_pool.py:261-301}}). It skips null blocks and blocks that a mask leaves out, for example sliding-window blocks that can never serve a hit ({{cite vllm/v1/core/block_pool.py:273-278}}).</p>
+
+<h3><code>get_usage</code>: the KV cache usage metric</h3>
+<x-code file="vllm/v1/core/block_pool.py" lines="881-892" />
+<p>The null block is left out of the total. Free blocks with a cached prefix count as free. This value becomes <code>vllm:kv_cache_usage_perc</code> ({{link concepts/kv-cache-manager}}, Step 8).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data layout: KVCacheBlock and the two maps">
+<table>
+  <thead><tr><th>Field / structure</th><th>Type</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>KVCacheBlock.block_id</code></td><td><code>int</code>, 0 .. num_gpu_blocks − 1</td><td>index of the block in the KV tensors of every worker ({{cite vllm/v1/core/kv_cache_utils.py:165-166}})</td></tr>
+    <tr><td><code>ref_cnt</code></td><td><code>int</code></td><td>requests that hold the block; 0 = in the free queue (except the null block)</td></tr>
+    <tr><td><code>_block_hash</code></td><td><code>BlockHashWithGroupId | None</code></td><td>bytes of the block hash plus the group id; set only when full and cached ({{cite vllm/v1/core/kv_cache_utils.py:173-178}})</td></tr>
+    <tr><td><code>prev_free_block</code>, <code>next_free_block</code></td><td><code>KVCacheBlock | None</code></td><td>links of the free queue; <code>None</code> when not in the queue</td></tr>
+    <tr><td><code>is_null</code></td><td><code>bool</code></td><td>True only for block 0</td></tr>
+    <tr><td><code>cached_block_hash_to_block</code></td><td><code>dict[key, KVCacheBlock | dict[int, KVCacheBlock]]</code></td><td>the prefix cache; a dict of blocks only when two blocks have the same hash ({{cite vllm/v1/core/block_pool.py:57-60}})</td></tr>
+    <tr><td><code>cached_block_hashes_by_block</code></td><td><code>dict[int, set[key]]</code></td><td>extra keys of a block (partial entries), so eviction removes them all</td></tr>
+  </tbody>
+</table>
+<p>The class uses <code>@dataclass(slots=True)</code>, so each block has no <code>__dict__</code> ({{cite vllm/v1/core/kv_cache_utils.py:161}}). With 27,955 blocks (an 8B model on an 80 GiB GPU, {{link concepts/kv-cache-manager}}), the pool holds 27,955 such objects plus 2 fake queue ends.</p>
+<p>Why can two blocks have the same hash? The map does not deduplicate: when a block becomes full, the pool does not look for an identical cached block, so that block ids in the block tables never change ({{cite vllm/v1/core/block_pool.py:48-52}}). Two requests that computed the same block at the same time both keep their own copy.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: eight blocks, two requests">
+<p>A pool of 9 blocks (block 0 is null), block size 4, prefix caching on. Free queue at start: <code>1 2 3 4 5 6 7 8</code>. (Derived from the methods above.)</p>
+<ol>
+  <li>R1 (10 tokens) gets 3 blocks: <code>get_new_blocks(3)</code> → 1, 2, 3. Queue: <code>4 5 6 7 8</code>. Blocks 1 and 2 are full: <code>cache_full_blocks</code> sets their hashes.</li>
+  <li>R2 has the same first 8 tokens and 12 tokens in total. Hit: blocks 1, 2 → <code>touch</code>: ref_cnt 2 each (they were not in the queue). New: 1 block → 4. Queue: <code>5 6 7 8</code>.</li>
+  <li>R1 ends after one output token: <code>free_blocks([3, 2, 1])</code>. Block 3 (no hash): ref_cnt 0, to the front. Blocks 2, 1: ref_cnt 1, stay out. Queue: <code>3 5 6 7 8</code>.</li>
+  <li>R2 ends after one output token: <code>free_blocks([4, 2, 1])</code>. Block 4 is full (tokens 8-11) and hashed. All three reach 0 and have a hash: append in order 4, 2, 1. Queue: <code>3 5 6 7 8 4 2 1</code>.</li>
+  <li>R3 needs 6 blocks: it pops 3, 5, 6, 7, 8, 4. Block 4 loses its hash (eviction). Blocks 2 and 1 survive at the end, so the first 8 tokens are still a possible hit.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="KV cache events">
+<p>With <code>--kv-events-config</code> and <code>enable_kv_cache_events</code>, the pool queues an event for each change of the prefix cache: <code>BlockStored</code> when blocks get hashes ({{cite vllm/v1/core/block_pool.py:303-344}}), <code>BlockRemoved</code> when a hash goes ({{cite vllm/v1/core/block_pool.py:611-624}}), and <code>AllBlocksCleared</code> on a reset ({{cite vllm/v1/core/block_pool.py:867-868}}). The scheduler drains them in <code>update_from_output</code> and publishes one batch per step ({{cite vllm/v1/core/sched/scheduler.py:2469-2484}}). External routers use these events to know which prefixes an engine has cached.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>num_gpu_blocks</code> not a positive int</td><td><code>AssertionError</code></td><td>{{cite vllm/v1/core/block_pool.py:166}}</td></tr>
+    <tr><td><code>get_new_blocks</code> beyond the free count</td><td><code>ValueError</code></td><td>{{cite vllm/v1/core/block_pool.py:678-679}}</td></tr>
+    <tr><td><code>popleft</code> on an empty queue</td><td><code>ValueError</code> "No free blocks available"</td><td>{{cite vllm/v1/core/kv_cache_utils.py:320-325}}</td></tr>
+    <tr><td><code>evict_blocks</code> with an id out of range</td><td><code>AssertionError</code> that blames the KV connector</td><td>{{cite vllm/v1/core/block_pool.py:823-827}}</td></tr>
+    <tr><td><code>reset_prefix_cache</code> with blocks in use</td><td>WARNING log, returns <code>False</code></td><td>{{cite vllm/v1/core/block_pool.py:841-848}}</td></tr>
+    <tr><td>A wrong type in the hash map</td><td><code>AssertionError</code></td><td>{{cite vllm/v1/core/block_pool.py:132-133}}</td></tr>
+  </tbody>
+</table>
+<p>The file reads no environment variable. Its only settings are the constructor arguments: <code>num_gpu_blocks</code>, <code>enable_caching</code>, <code>hash_block_size</code>, <code>enable_kv_cache_events</code> ({{cite vllm/v1/core/block_pool.py:157-165}}).</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/kv-cache-manager}}: how the pool fits under the manager, memory sizing and usage.</li>
+  <li>{{link learn/prefix-caching}} and {{link concepts/prefix-caching}}: what the hash map is for.</li>
+  <li>{{link code/v1-core-kv-cache-utils}}: <code>KVCacheBlock</code>, the free queue and the hash functions.</li>
+  <li>{{link code/v1-core-kv-cache-manager}}: the API above the pool.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Where does <code>get_new_blocks</code> take blocks from, and what happens to an old hash?
+    <x-a><p>From the front of the free queue with <code>popleft_n</code> ({{cite vllm/v1/core/block_pool.py:681}}). With prefix caching, it removes the old hash of each block from the map: this is the eviction ({{cite vllm/v1/core/block_pool.py:687-691}}, {{cite vllm/v1/core/block_pool.py:729-750}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does a freed block without a hash go to the front of the queue, and a block with a hash to the end?
+    <x-a><p>A block without a hash can never be a prefix-cache hit, so reusing it first costs nothing. A hashed block may serve a later hit, so it waits as long as possible (LRU) ({{cite vllm/v1/core/block_pool.py:797-807}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">In the worked example of the deep dive, why do blocks 2 and 1 survive R3 while block 4 does not, although all three were freed at the same time?
+    <x-a><p>R2 freed its blocks in reverse order, <code>[4, 2, 1]</code> ({{cite vllm/v1/core/single_type_kv_cache_manager.py:597-598}}). All three had a hash, so <code>append_n</code> added them to the end in that order ({{cite vllm/v1/core/block_pool.py:807}}). Block 4 is nearer the front, so R3 popped it first. The tail of a prefix goes before its head, which keeps the more shareable head longer.</p></x-a>
+  </x-q>
+</x-quiz>
