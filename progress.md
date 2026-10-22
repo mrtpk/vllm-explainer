@@ -15,7 +15,13 @@ This file is the memory of the project. A new session must be able to continue f
 | Full build (plan §12) | not started | |
 | F Final pass | not started | |
 
+## RESUME NOTES
+
+(none — work is running normally. If a usage limit cuts agents off: list here the batch, the agent role, the partial files, and the resume order.)
+
 ## Done
+
+- 2026-10-22 20:10: USER INSTRUCTION: quotas can run out; resume work after hitting quotas, about an hour later, unattended. Supervisor set an hourly session cron (job 3603c11b, minute :17, session-only, expires after 7 days) that reads this file, continues cut-off agents, keeps ≤2 agents running, and commits fact-checked batches.
 
 - 2026-10-22 19:20: USER INSTRUCTION: "You dont need to stop for me. RUn unattented. This is okay because I already approve deepinfer explainer strcuture and coloring" → no Phase 1 stop; run the full build unattended; still no push.
 
