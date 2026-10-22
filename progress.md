@@ -1,7 +1,7 @@
 # vLLM Explainer — Progress
 
 Last update: 2026-10-22 19:10
-Current phase: **1b/1c Samples + fact checks** (after 19:56: max 2 agents) — plan approved ("go", 2026-10-22 19:13). Running (4/4): foundation agent, reference-generators agent, 1b basics samples (learn/ml-basics-recap, learn/serving-metrics), 1b Tour 1 (tours/life-of-a-chat-request + request_stepper visual). The two 1b writers started early, in parallel with 1a (they may need small fixes after STYLE.md lands).
+Current phase: **Full build** (plan §12; max 2 agents). Phase 1 samples done except the r1 fact check. — plan approved ("go", 2026-10-22 19:13). Running (4/4): foundation agent, reference-generators agent, 1b basics samples (learn/ml-basics-recap, learn/serving-metrics), 1b Tour 1 (tours/life-of-a-chat-request + request_stepper visual). The two 1b writers started early, in parallel with 1a (they may need small fixes after STYLE.md lands).
 
 This file is the memory of the project. A new session must be able to continue from it alone.
 
@@ -11,7 +11,7 @@ This file is the memory of the project. A new session must be able to continue f
 |---|---|---|
 | 0a Survey | done | 4 surveys in `notes/survey/` (core-engine, plugins, model-execution, serving-config-distributed); spot-checked |
 | 0b Plan approval | done | approved 2026-10-22 ("go"); committed dd25917 |
-| 1 Foundation + samples | running | 1a foundation agent (STYLE, nav, core glossary, {{deepinfer}} tag, concepts/plugin-loading); generators agent (tools/gen_env_vars, gen_serve_flags, gen_config_classes, gen_metrics → notes/generated/*.json) |
+| 1 Foundation + samples | done 20:35 (all samples written + fact-checked) | 1a foundation agent (STYLE, nav, core glossary, {{deepinfer}} tag, concepts/plugin-loading); generators agent (tools/gen_env_vars, gen_serve_flags, gen_config_classes, gen_metrics → notes/generated/*.json) |
 | Full build (plan §12) | not started | |
 | F Final pass | not started | |
 
@@ -50,9 +50,11 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
 
+- FINAL-PASS TODO (from r1 FC): learn/ml-basics-recap ~99-100 H100 quiz states 8192/1024 without the reported-memory assumption (≥70 and <160 GiB from the driver); learn/serving-metrics ~198 tier table "max" wording; any page saying kv_cache_dtype auto = model dtype; any page saying VllmConfig holds all configs; any page saying VLLM_USE_V2_MODEL_RUNNER always wins.
+- Browser check: shot.js needs LD_LIBRARY_PATH=/tmp/claude-1000/vllm-foundation/libroot/usr/lib/x86_64-linux-gnu.
+
 - FINAL-PASS TODO: tours/life-of-a-chat-request cites core_client.py:1338-1340 (abort_requests_async) — check it is the intended topic. Any page that says the engine core is separate because of VLLM_ENABLE_V1_MULTIPROCESSING, or 'worker process (one per GPU)' without the TP=1 uni case.
 
-- TODO (tooling): gen_metrics.py intro sentence suggests every model_name/engine label is marked †, but only helper-class metrics are (r1 writer). Fix in final pass.
 
 - FINAL-PASS TODO: no page may say VLLM_PLUGINS filters all groups, or that the registry subprocess is OOT-only/always runs (sent to home writer for plugins-init.html). Later pages: platform-plugins, oot-models, plugin-map, life-of-a-plugin.
 
@@ -61,7 +63,7 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 - FACT-CHECK FOCUS (all batches): b0 defect rate was ~41% (39/95). Brief every writer: check arg_utils overrides for defaults; FlashInfer sampler default; async scheduling default.
 
 - DECISION 1a questions: site/ is committed (as DeepInfer) at stage ends; code/v1-attention-backend merges backend.py + selector.py (OK); nav titles OK.
-- QUEUE (max 2 running): full build in plan §12 order: B1a, B2a, B1b, B2b, B3a, ...
+- QUEUE (max 2 running): after r1 FC → B2a writer; after B1a writer → B1a FC; then B1b, B2b, B3a ... (plan §12 order). Pattern: one writer + one fact checker at a time.
 
 - FAQ material from b0: docs/design/metrics.md queue-time wording, arrival_time wording, TPOT formula differ from code (see notes/facts.md Conflicts).
 
@@ -85,7 +87,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-22 19:47 | 1b home page + code/plugins-init (c1) | done 20:04; supervisor checked map screenshot (good) |
 | 2026-10-22 20:05 | Fact check home + plugins-init | done ~20:25: ~230 claims, 47 defects. Supervisor fixed the import chain on plugin-loading (lines 172-173). |
 | 2026-10-22 19:50 | r1 reference pages | done ~20:15: 4 pages, generators filled, --check OK, build 0 errors |
-| 2026-10-22 20:16 | Fact check r1 | running |
+| 2026-10-22 20:16 | Fact check r1 | done ~20:35: ~235 claims, ~40 defects; generators unchanged except gen_metrics † text; --check OK |
+| 2026-10-22 20:26 | B1a writer (what-is-vllm, openai-api, processes-and-ipc, python-entry-points, pytorch-for-serving) | running |
 | 2026-10-22 19:18 | 1b Tour 1 (t1) | done 19:45: 16 stops, 3 diagrams, request_stepper.js, t1.json (12 terms); not browser-checked by writer |
 | 2026-10-22 19:46 | Fact check t1 (+ browser check of stepper) | done ~20:00: ~230 claims, 38 defects (11 citation, 6 value, 9 logic, 3 default source, 9 other). Stepper OK at 1280/390, no overflow. |
 | 2026-10-22 19:49 | Fact check concepts/plugin-loading (+ folder descriptions) | done ~19:58: ~80 claims, 30 defects fixed (8 citation, 11 value/condition, 4 logic, 3 missing source, 5 glossary/folder). Open question answered (platform before general plugins in every process). |

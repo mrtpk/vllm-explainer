@@ -37,6 +37,7 @@ What the script does:
 Label names: the stat loggers pass labelnames=["model_name", "engine"]
 (vllm/v1/metrics/loggers.py:499) into every helper class. When a call uses that parameter
 (`labelnames`, `self._labelnames`), the table shows "model_name, engine" and marks it.
+PrometheusStatLogger itself uses a local list with the same two names; those rows are not marked.
 
 Hidden / deprecated metrics: ObservabilityConfig.show_hidden_metrics (vllm/config/observability.py:32)
 is True only when --show-hidden-metrics-for-version equals the previous minor version
@@ -602,8 +603,11 @@ def render(data: dict) -> str:
     hm = data["show_hidden_metrics"]
     out = [f"<p>{data['count']} metric names that start with <code>vllm:</code>, declared in vLLM code: "
            f"{bt['counter']} counters, {bt['gauge']} gauges, {bt['histogram']} histograms. "
-           f"Labels marked † are the <code>labelnames</code> that the stat logger passes in "
-           f"({va.cite(*_split(data['base_labels_site']))}). "
+           f"The stat loggers use the labels <code>model_name</code> and <code>engine</code> "
+           f"({va.cite(*_split(data['base_labels_site']))}). A † marks these two labels only where a "
+           f"helper class (speculative decoding, performance, KV connectors) gets them through its "
+           f"<code>labelnames</code> parameter. Most <code>PrometheusStatLogger</code> metrics have the "
+           f"same two labels, without a †. "
            f"{len(data['deprecated'])} metrics are marked deprecated; "
            + ("no metric checks <code>show_hidden_metrics</code> at this commit." if not hm["gating_reads"]
               else f"{len(hm['gating_reads'])} places read <code>show_hidden_metrics</code>.")
