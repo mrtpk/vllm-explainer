@@ -63,7 +63,7 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 - FACT-CHECK FOCUS (all batches): b0 defect rate was ~41% (39/95). Brief every writer: check arg_utils overrides for defaults; FlashInfer sampler default; async scheduling default.
 
 - DECISION 1a questions: site/ is committed (as DeepInfer) at stage ends; code/v1-attention-backend merges backend.py + selector.py (OK); nav titles OK.
-- QUEUE (max 2 running): after r1 FC → B2a writer; after B1a writer → B1a FC; then B1b, B2b, B3a ... (plan §12 order). Pattern: one writer + one fact checker at a time.
+- QUEUE (max 2 running): after B1a writer → B1a FC; after B2a writer → B2a FC; then B1b, B2b, B3a ... (plan §12 order). Pattern: one writer + one fact checker at a time.
 
 - FAQ material from b0: docs/design/metrics.md queue-time wording, arrival_time wording, TPOT formula differ from code (see notes/facts.md Conflicts).
 
@@ -89,6 +89,7 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-22 19:50 | r1 reference pages | done ~20:15: 4 pages, generators filled, --check OK, build 0 errors |
 | 2026-10-22 20:16 | Fact check r1 | done ~20:35: ~235 claims, ~40 defects; generators unchanged except gen_metrics † text; --check OK |
 | 2026-10-22 20:26 | B1a writer (what-is-vllm, openai-api, processes-and-ipc, python-entry-points, pytorch-for-serving) | running |
+| 2026-10-22 20:36 | B2a writer (architecture-overview, engine-client, data-contracts + 4 engine module pages) | running |
 | 2026-10-22 19:18 | 1b Tour 1 (t1) | done 19:45: 16 stops, 3 diagrams, request_stepper.js, t1.json (12 terms); not browser-checked by writer |
 | 2026-10-22 19:46 | Fact check t1 (+ browser check of stepper) | done ~20:00: ~230 claims, 38 defects (11 citation, 6 value, 9 logic, 3 default source, 9 other). Stepper OK at 1280/390, no overflow. |
 | 2026-10-22 19:49 | Fact check concepts/plugin-loading (+ folder descriptions) | done ~19:58: ~80 claims, 30 defects fixed (8 citation, 11 value/condition, 4 logic, 3 missing source, 5 glossary/folder). Open question answered (platform before general plugins in every process). |
