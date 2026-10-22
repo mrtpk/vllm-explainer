@@ -1,0 +1,151 @@
+---
+title: PyTorch for serving: custom ops and torch.compile
+nav_title: PyTorch for serving
+level: Intermediate
+prerequisites: learn/what-is-vllm, learn/ml-basics-recap
+related: concepts/compile-and-cuda-graphs, concepts/forward-context, concepts/custom-ops, concepts/model-definition, code/model-executor-models-llama, tours/forward-pass
+summary: The PyTorch you need to read vLLM's model code - nn.Module and forward, custom operators registered with torch.library, FX graphs, torch.compile (Dynamo for capture, Inductor for code generation), graph breaks, and how vLLM combines them with CUDA graphs.
+---
+<x-sentence>vLLM writes models as PyTorch modules, hides attention in one custom op, and compiles the rest with torch.compile before it replays CUDA graphs.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>Modules and forward</h3>
+<p>A PyTorch model is a tree of <code>nn.Module</code> objects. Each module holds its <strong>parameters</strong> (the weights, <code>nn.Parameter</code> tensors) and its child modules. Its <code>forward()</code> method computes the output from the input. When you call <code>module(x)</code>, PyTorch calls <code>forward(x)</code>. The parameters and some extra tensors (buffers) form the <strong>state</strong> of the module; a checkpoint is a saved copy of that state.</p>
+<p>vLLM models are such trees. For example, <code>LlamaMLP</code> has two linear layers and an activation, and its <code>forward()</code> calls them in order ({{cite vllm/model_executor/models/llama.py:82-122}}). The basics of the transformer layers are on {{deepinfer learn/transformer | Inside a transformer}}.</p>
+
+<h3>Ops, kernels and streams</h3>
+<p>Each tensor operation (an <em>op</em>, for example a matrix multiply) runs as one or more kernels on the GPU. The CPU only starts (launches) the kernels; the GPU runs them in order on a stream. A program can use several streams and synchronize them with events ({{deepinfer learn/gpus-kernels | GPUs, kernels, and speed}}). vLLM does this, for example, to copy the sampled tokens to the CPU on a separate copy stream. It records an event after the copy and waits for that event only when it needs the tokens ({{cite vllm/v1/worker/gpu/async_utils.py:134-140}}, {{cite vllm/v1/worker/gpu/async_utils.py:171-174}}).</p>
+
+<h3>Custom ops: one opaque box</h3>
+<p>Code can register its own operator with <code>torch.library</code>. Then <code>torch.ops.&lt;namespace&gt;.&lt;name&gt;(...)</code> calls it, and PyTorch treats it like a built-in op. vLLM registers its ops in the namespace <code>vllm</code> ({{cite vllm/utils/torch_utils.py:1056}}). The most important one is attention: <code>torch.ops.vllm.unified_attention_with_output</code> ({{cite vllm/model_executor/layers/attention/attention.py:573-580}}). For the compiler, this {{term torch-library-op}} is one opaque node. The compiler does not look inside it. The page {{link concepts/forward-context}} explains how the op finds its KV cache and metadata without arguments for them.</p>
+
+<h3>Compile: capture, then generate code</h3>
+<p>{{term torch-compile}} has two halves:</p>
+<ol>
+  <li><strong>{{term dynamo}}</strong> watches the Python code of <code>forward()</code> when it runs, and records the tensor ops as an {{term fx-graph}}: a list of nodes, one per op.</li>
+  <li>A <strong>backend</strong> turns the graph into code. The default backend, <strong>{{term inductor}}</strong>, fuses many small ops into fewer, larger kernels, for example Triton kernels on NVIDIA GPUs.</li>
+</ol>
+<p>Some Python cannot be captured, for example a branch on a tensor value. That place is a {{term graph-break}}. Plain <code>torch.compile</code> then splits the function into several graphs and runs the rest in Python. vLLM does not allow this: it compiles with <code>fullgraph=True</code> ({{cite vllm/compilation/wrapper.py:168-175}}).</p>
+
+<h3>CUDA graphs on top</h3>
+<p>A {{term cuda-graph}} records a series of kernel launches once and replays them with one call. This removes most of the launch cost of small decode steps ({{deepinfer concepts/cuda-graphs | CUDA graphs}}). vLLM captures CUDA graphs for the compiled pieces and, for pure decode batches, for the whole forward pass. The page {{link concepts/compile-and-cuda-graphs}} explains the full design.</p>
+
+<h3>An everyday comparison</h3>
+<p>Think of a cook who follows a recipe. Eager mode reads the recipe line by line, every time. Compilation rewrites the recipe once: it joins steps that use the same pan. A CUDA graph is a video of the cook; next time, the kitchen plays the video. Attention is one step that the rewrite must not touch, so it stays a sealed box in the recipe.</p>
+<p>The comparison stops here: a video plays the same moves with the same food. A CUDA graph also reads the same memory addresses every time, so vLLM must copy each new input into the same buffers before a replay.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b1a_eager_compiled_replay" alt="Panel 1, eager: Python LlamaAttention.forward calls qkv_proj, rotary_emb, attn and o_proj; the PyTorch dispatcher handles one call per op; the GPU runs many small kernels with gaps. Panel 2, compiled: Dynamo reads the bytecode and records an FX graph with fullgraph=True; the VllmBackend split_graph step splits the graph at splitting ops such as vllm::unified_attention_with_output; Inductor compiles each piece into fused Triton kernels and caches them. Panel 3, graph replay: at start-up vLLM captures PIECEWISE graphs for the pieces and FULL graphs for the whole model; each step a uniform one-token decode batch up to the largest captured size uses FULL, other batches use PIECEWISE, and too large batches run eager; the GPU replays one graph per piece with attention between the pieces." caption="Figure: the same forward pass in three forms. Eager runs op by op (panel 1). torch.compile captures and fuses the ops, split at attention (panel 2). CUDA graphs replay the recorded launches (panel 3)." />
+<p>Read the panels from top to bottom: each one adds a layer on top of the one before. The violet box in panel 2 is the vLLM part: it cuts the graph at the attention op. That cut is why panel 3 has PIECEWISE graphs, with attention between the pieces.</p>
+
+<h2>In vLLM</h2>
+<p>This is a basics page, so this part gives only pointers. The page {{link concepts/compile-and-cuda-graphs}} explains the compile and capture code.</p>
+<ol>
+  <li><strong>The decorator.</strong> <code>@support_torch_compile</code> on a model class marks which <code>forward()</code> arguments have a dynamic first dimension, for example <code>input_ids</code> ({{cite vllm/model_executor/models/llama.py:337-347}}). It adds <code>TorchCompileWithNoGuardsWrapper</code> as a base class ({{cite vllm/compilation/decorators.py:360-367}}).</li>
+  <li><strong>The compile call.</strong> The wrapper calls <code>torch.compile(forward, fullgraph=True, dynamic=False, backend=...)</code> ({{cite vllm/compilation/wrapper.py:168-175}}). In the default mode the backend is <code>VllmBackend</code> ({{cite vllm/config/compilation.py:1123-1134}}).</li>
+  <li><strong>The custom op helper.</strong> <code>direct_register_custom_op()</code> registers an op in the <code>vllm</code> library ({{cite vllm/utils/torch_utils.py:1059-1096}}).</li>
+</ol>
+<x-code file="vllm/model_executor/models/llama.py" lines="224-234" caption="<code>LlamaAttention.forward()</code>: plain PyTorch calls. <code>self.attn(q, k, v)</code> ends in the opaque custom op." />
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="nn.Module in vLLM: LlamaMLP, line by line">
+<x-code file="vllm/model_executor/models/llama.py" lines="82-122" highlight="95-111,118-122" />
+<ol>
+  <li><strong>Lines 95-101.</strong> <code>gate_up_proj</code> is one linear layer for two matrices, the gate and the up projection. <code>output_sizes=[intermediate_size] * 2</code> stacks them. With tensor parallelism, each rank holds a slice of the columns ({{deepinfer learn/parallelism | Parallelism basics}}).</li>
+  <li><strong>Lines 103-110.</strong> <code>down_proj</code> is a row-parallel linear layer. With <code>reduce_results=True</code>, it ends with an all-reduce over the TP ranks.</li>
+  <li><strong>Line 116.</strong> <code>SiluAndMul</code> is a {{term custom-op}}: a vLLM layer that selects a CUDA kernel or a PyTorch version ({{cite vllm/model_executor/layers/activation.py:116}}).</li>
+  <li><strong>Lines 118-122.</strong> <code>forward()</code> calls the three layers. The activation goes through <code>maybe_fused_act_quant()</code>: for a quantized <code>down_proj</code>, it can use one kernel for the activation and the input quantization; else it calls <code>SiluAndMul</code> ({{cite vllm/model_executor/layers/fusion/fused_act_quant.py:196-205}}). The linear layers return a pair; the second value (an optional bias) is not used here.</li>
+</ol>
+<p><strong>Shapes.</strong> vLLM flattens the batch: the first dimension is the number of tokens in the step, not the number of requests ({{deepinfer learn/batching | Batching}}).</p>
+<p><strong>Worked example</strong> (sizes from the <code>config.json</code> of Llama-3.1-8B: hidden size 4,096, intermediate size 14,336; inferred, not in the repo). A step has 256 tokens and TP = 1, in BF16:</p>
+<ol>
+  <li><code>x</code>: <code>[256, 4096]</code>.</li>
+  <li><code>gate_up_proj</code>: weight <code>[28672, 4096]</code> (2 × 14,336 rows), output <code>[256, 28672]</code>.</li>
+  <li><code>SiluAndMul</code>: <code>silu(first half) × second half</code>, output <code>[256, 14336]</code>.</li>
+  <li><code>down_proj</code>: weight <code>[4096, 14336]</code>, output <code>[256, 4096]</code>.</li>
+</ol>
+<p>The two weights hold 28,672 × 4,096 + 4,096 × 14,336 = 176,160,768 parameters, which is 352 MB in BF16. With TP = 2, each rank holds half of each weight and computes <code>[256, 14336]</code> after <code>gate_up_proj</code>.</p>
+<p>The weights are not loaded in <code>__init__</code>. vLLM makes the modules first and fills the parameters later from the checkpoint; see {{link concepts/weight-loading}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Custom ops with torch.library: direct_register_custom_op()">
+<p>PyTorch has the public decorator <code>torch.library.custom_op</code>. vLLM uses its own helper, because the docstring says that <code>custom_op</code> "can have significant overhead" ({{cite vllm/utils/torch_utils.py:1068-1071}}):</p>
+<x-code file="vllm/utils/torch_utils.py" lines="1055-1096" highlight="1056,1085-1096" />
+<ol>
+  <li><strong>Line 1056.</strong> One <code>Library("vllm", "FRAGMENT")</code> object holds all vLLM ops. "FRAGMENT" means that other code can add ops to the same namespace.</li>
+  <li><strong>Lines 1082-1083.</strong> <code>mutates_args</code> lists the arguments that the op writes into. The compiler must know them, so it does not reorder or remove the op.</li>
+  <li><strong>Lines 1085-1088.</strong> The dispatch key comes from the platform: <code>"CUDA"</code> on NVIDIA ({{cite vllm/platforms/cuda.py:230}}), <code>"CPU"</code> by default ({{cite vllm/platforms/interface.py:145}}).</li>
+  <li><strong>Line 1090.</strong> <code>infer_schema</code> reads the type hints of the Python function and writes the op schema, for example <code>(Tensor query, Tensor key, ...) -&gt; ()</code>.</li>
+  <li><strong>Lines 1093-1094.</strong> <code>define</code> adds the schema; <code>impl</code> binds the Python function for the dispatch key.</li>
+  <li><strong>Lines 1095-1096.</strong> A <em>fake</em> implementation only makes empty output tensors with the right shapes. Dynamo calls it during capture instead of the real kernel (general PyTorch behaviour). The helper registers it only when the caller gives one.</li>
+</ol>
+<p><strong>Attention as an opaque op.</strong> vLLM registers <code>unified_attention_with_output</code> with <code>mutates_args=["output", "output_block_scale"]</code> ({{cite vllm/model_executor/layers/attention/attention.py:799-803}}). It returns nothing; it writes the result into <code>output</code>. Inside, it gets the attention metadata, the layer and the KV cache from the forward context ({{cite vllm/model_executor/layers/attention/attention.py:705-723}}). A second op, <code>unified_kv_cache_update</code>, writes the new keys and values into the cache first. It runs only when the attention backend does not write the KV cache in its own forward ({{cite vllm/model_executor/layers/attention/attention.py:564-572}}). It returns an empty tensor only to make a data dependency: the attention op takes it as an argument, so the compiler keeps the order ({{cite vllm/model_executor/layers/attention/attention.py:726-732}}, {{cite vllm/model_executor/layers/attention/attention.py:777-782}}).</p>
+<p><strong>Which platforms use the opaque op.</strong> The layer calls <code>torch.ops.vllm.*</code> only when <code>current_platform.opaque_attention_op()</code> is true. Otherwise it calls the Python functions directly ({{cite vllm/model_executor/layers/attention/attention.py:436-440}}, {{cite vllm/model_executor/layers/attention/attention.py:542-580}}). The base class returns false ({{cite vllm/platforms/interface.py:1286-1290}}); CUDA, ROCm, CPU and XPU return true ({{cite vllm/platforms/cuda.py:595-596}}, {{cite vllm/platforms/rocm.py:1231-1232}}, {{cite vllm/platforms/cpu.py:640-641}}, {{cite vllm/platforms/xpu.py:609-610}}).</p>
+<x-note title="Two meanings of 'custom op'"><p>A <code>torch.library</code> op (this section) is a PyTorch operator. A vLLM <code>CustomOp</code> (for example <code>SiluAndMul</code>) is an <code>nn.Module</code> class that selects a kernel per platform. The page {{link concepts/custom-ops}} explains the second kind.</p></x-note>
+</x-deepdive>
+
+<x-deepdive title="torch.compile, FX graphs and graph breaks">
+<p><strong>What Dynamo records.</strong> When the compiled function runs for the first time, Dynamo follows its Python bytecode. It records each tensor op as a node of a <code>torch.fx.Graph</code>. The graph has a placeholder node per input, a <code>call_function</code> node per op, and an output node. vLLM's split code walks these nodes ({{cite vllm/compilation/backends.py:576-600}}). Python that does not touch tensors (for example a loop over the layers) runs during capture and leaves only its tensor ops in the graph.</p>
+<p><strong>Guards and dynamic shapes.</strong> Plain <code>torch.compile</code> adds guards: checks that run before each call and compile again when, for example, a shape changes. vLLM drops the guards in its own modes ({{cite vllm/compilation/wrapper.py:126-146}}). It marks the token dimension as dynamic instead, from <code>dynamic_arg_dims</code> ({{cite vllm/model_executor/models/llama.py:337-346}}). So one graph serves every number of tokens.</p>
+<p><strong>A graph break, by example</strong> (plain PyTorch, not vLLM code):</p>
+<pre><code class="language-python">import torch
+
+def f(x):
+    y = x.sin()
+    if y.sum() > 0:        # Python branch on a tensor value
+        return y.cos()
+    return y
+
+torch.compile(f)(torch.randn(8))                  # works: two graphs and a Python branch
+torch.compile(f, fullgraph=True)(torch.randn(8))  # fails: fullgraph does not allow the break</code></pre>
+<p>Dynamo cannot know the value of <code>y.sum()</code> during capture. Without <code>fullgraph</code>, it ends the graph before the branch, runs the branch in Python, and starts a new graph. With <code>fullgraph=True</code>, it raises an error instead. vLLM uses <code>fullgraph=True</code> ({{cite vllm/compilation/wrapper.py:168-175}}). So model code that vLLM compiles must not branch on tensor values in <code>forward()</code>.</p>
+<p><strong>Where the work goes.</strong> In the default mode, the backend is <code>VllmBackend</code> ({{cite vllm/config/compilation.py:1123-1134}}). It splits the FX graph at the splitting ops. By default these are the attention ops in <code>_attention_ops</code> ({{cite vllm/config/compilation.py:766-788}}, {{cite vllm/config/compilation.py:1184}}). When Inductor graph partition is off (the O2 default), they also include the two KV cache update ops ({{cite vllm/config/compilation.py:1191}}, {{cite vllm/config/compilation.py:1212-1213}}, {{cite vllm/config/vllm.py:311}}). Then Inductor compiles each piece. The design document says that all compilation finishes before the server takes requests, and that vLLM caches the results ({{cite docs/design/torch_compile.md:18-28}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Compilation modes and CUDA graph modes in vLLM">
+<table>
+  <thead><tr><th>CompilationMode</th><th>Meaning ({{cite vllm/config/compilation.py:37-50}})</th></tr></thead>
+  <tbody>
+    <tr><td><code>NONE</code> (0)</td><td>No <code>torch.compile</code>; eager PyTorch.</td></tr>
+    <tr><td><code>STOCK_TORCH_COMPILE</code> (1)</td><td>The standard <code>torch.compile</code> pipeline.</td></tr>
+    <tr><td><code>DYNAMO_TRACE_ONCE</code> (2)</td><td>One Dynamo trace, no compile again.</td></tr>
+    <tr><td><code>VLLM_COMPILE</code> (3)</td><td>vLLM's Inductor-based backend with caching, piecewise compilation and custom passes.</td></tr>
+  </tbody>
+</table>
+<p><strong>Defaults.</strong> The default optimization level is O2 ({{cite vllm/config/vllm.py:434}}). Above O0, an unset mode becomes <code>VLLM_COMPILE</code> ({{cite vllm/config/vllm.py:1806-1810}}). O2 sets the CUDA graph mode <code>FULL_AND_PIECEWISE</code> ({{cite vllm/config/vllm.py:310}}). <code>--enforce-eager</code> sets both the compile mode and the CUDA graph mode to <code>NONE</code> ({{cite vllm/config/vllm.py:1745-1747}}).</p>
+<p><strong>CUDA graph modes.</strong> <code>NONE</code>, <code>PIECEWISE</code> and <code>FULL</code> are run-time modes. <code>FULL_DECODE_ONLY</code> and <code>FULL_AND_PIECEWISE</code> are pairs: one mode for pure decode batches, one for mixed batches ({{cite vllm/config/compilation.py:53-69}}). Each step, the model runner looks for a captured graph for the padded token count, and falls back to <code>NONE</code> when none fits ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:523-553}}). In the common case (no speculative decoding), a FULL decode graph is captured for batches where each request has 1 new token ({{cite vllm/v1/worker/gpu/model_runner.py:442-445}}, {{cite vllm/v1/worker/gpu/cudagraph_utils.py:333-339}}). A batch matches it only with that uniform length and at most the captured token count ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:125-138}}). Other batches use PIECEWISE graphs.</p>
+<x-simplified><p>With speculative decoding the decode query length is larger, and a "varlen decode" variant accepts mixed lengths ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:302-317}}). The page {{link concepts/compile-and-cuda-graphs}} covers these cases.</p></x-simplified>
+<p><strong>Worked example</strong> (illustrative numbers). A decode step of a 32-layer model starts about 15 kernels per layer in eager mode: 480 launches. At about 5 µs of CPU time per launch, that is 2.4 ms per step. A step of a small model on a fast GPU can take less than that, so the GPU would wait for the CPU. With a FULL CUDA graph, the CPU starts one replay instead.</p>
+<x-simplified><p>The kernel count and the launch time are round numbers for the example, not measured. Fusion in Inductor also lowers the kernel count. The page {{link concepts/compile-and-cuda-graphs}} explains the capture sizes, the padding and the attention backends that lower the graph mode.</p></x-simplified>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Slow first start.</strong> Compilation runs at start-up, before the server takes requests ({{cite docs/design/torch_compile.md:28}}). CUDA graph capture also runs at start-up. Later starts reuse the cache. <code>VLLM_DISABLE_COMPILE_CACHE=1</code> turns the cache off ({{cite vllm/envs.py:375}}), so every start compiles again.</li>
+  <li><strong>A graph break in your own model.</strong> This applies to a model class with <code>@support_torch_compile</code>. With <code>fullgraph=True</code>, a branch on a tensor value or an unsupported Python call stops compilation with an error ({{cite vllm/compilation/wrapper.py:168-175}}). Move such logic out of <code>forward()</code>, or run with <code>--enforce-eager</code> to find the problem.</li>
+  <li><strong>A custom op without a fake implementation.</strong> In PyTorch, an op that returns new tensors needs a fake implementation, so that Dynamo knows the output shapes during capture (general PyTorch rule). With the vLLM helper, you give it as <code>fake_impl</code> ({{cite vllm/utils/torch_utils.py:1095-1096}}), as for <code>unified_kv_cache_update</code> ({{cite vllm/model_executor/layers/attention/attention.py:759-764}}). The attention op is registered without a fake implementation; it returns nothing and writes into <code>output</code> ({{cite vllm/model_executor/layers/attention/attention.py:799-803}}).</li>
+  <li><strong>A missing <code>mutates_args</code>.</strong> An op that writes into an argument without saying so can be reordered or removed by the compiler. vLLM lists <code>output</code> for attention ({{cite vllm/model_executor/layers/attention/attention.py:802}}).</li>
+  <li><strong><code>--enforce-eager</code> in production.</strong> It turns off both compilation and CUDA graphs ({{cite vllm/config/vllm.py:1745-1747}}). Use it to debug, not to serve: small decode steps become much slower.</li>
+</ul>
+<p><strong>Why it matters.</strong> Every model file in vLLM is written for this pipeline. Know what the compiler sees. Then you can read the model code, write a model plugin that compiles, and explain the start-up time of <code>vllm serve</code>.</p>
+
+<x-quiz>
+  <x-q level="easy">What are the two halves of <code>torch.compile</code>, and what does each do?
+    <x-a><p>Dynamo captures the Python code as an FX graph. A backend, by default Inductor, turns the graph into fused kernels. In vLLM's default mode, the backend is <code>VllmBackend</code>, which splits the graph and then compiles the pieces ({{cite vllm/config/compilation.py:1123-1134}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Which flag turns off both <code>torch.compile</code> and CUDA graphs?
+    <x-a><p><code>--enforce-eager</code>. It sets the compile mode and the CUDA graph mode to <code>NONE</code> ({{cite vllm/config/vllm.py:1745-1747}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why is attention registered as a <code>torch.library</code> op on CUDA, and not left as plain PyTorch code?
+    <x-a><p>The compiler then sees attention as one opaque node. vLLM splits the graph at that node, so the pieces around it can be compiled and captured as PIECEWISE CUDA graphs ({{cite vllm/config/compilation.py:766-769}}). The op reads its KV cache and metadata from the forward context ({{cite vllm/model_executor/layers/attention/attention.py:705-722}}). CUDA returns true for <code>opaque_attention_op()</code> ({{cite vllm/platforms/cuda.py:595-596}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Your model plugin has <code>if positions.max() &gt; 4096:</code> in the <code>forward()</code> of a class with <code>@support_torch_compile</code>. What happens at start-up with default flags, and why?
+    <x-a><p>Compilation fails with an error. The branch depends on a tensor value, so Dynamo cannot capture it: it is a graph break. vLLM compiles with <code>fullgraph=True</code> ({{cite vllm/compilation/wrapper.py:168-175}}), and <code>VLLM_COMPILE</code> is the default above O0 ({{cite vllm/config/vllm.py:1806-1810}}). Move the check out of <code>forward()</code>, or use a tensor operation such as <code>torch.where</code>.</p></x-a>
+  </x-q>
+  <x-q level="hard">In the <code>LlamaMLP</code> worked example, how many parameters does one rank hold with TP = 4, and what is the shape after <code>gate_up_proj</code> for 256 tokens?
+    <x-a><p>Each rank holds a quarter of each weight: 176,160,768 / 4 = 44,040,192 parameters (88 MB in BF16). After <code>gate_up_proj</code> the shape is <code>[256, 7168]</code>: 2 × 14,336 / 4 columns. The column split comes from <code>MergedColumnParallelLinear</code> ({{cite vllm/model_executor/models/llama.py:95-101}}), and <code>down_proj</code> then reduces the results over the ranks ({{cite vllm/model_executor/models/llama.py:103-110}}).</p></x-a>
+  </x-q>
+</x-quiz>

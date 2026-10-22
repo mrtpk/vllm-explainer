@@ -1,0 +1,145 @@
+---
+title: What vLLM is today
+nav_title: What vLLM is today
+level: Beginner
+prerequisites: learn/ml-basics-recap
+related: concepts/architecture-overview, learn/openai-api, learn/processes-and-ipc, concepts/platform-plugins, reference/vllm-vs-deepinfer, tours/life-of-a-chat-request
+summary: vLLM is an inference and serving engine for LLMs. At this commit it has one engine, V1. You use it through vllm serve (an OpenAI-compatible HTTP server, the main path of this site) or through the offline LLM class. Both reach the same engine core.
+---
+<x-sentence>vLLM is an engine that runs LLMs and serves them over HTTP; one engine core, V1, sits behind both of its entry points.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>What vLLM is</h3>
+<p>vLLM calls itself "a fast and easy-to-use library for LLM inference and serving" ({{cite README.md:24}}). The package description says "a high-throughput and memory-efficient inference and serving engine for LLMs" ({{cite pyproject.toml:22}}). An inference engine runs a trained model and makes its tokens. It adds batching, a KV cache and a scheduler around the model ({{deepinfer learn/what-an-llm-does | What an LLM does}}). A serving engine also accepts requests from many users over the network and streams the answers back.</p>
+<p>This site explains vLLM as a <strong>serving</strong> engine. The main path is the command <code>vllm serve</code>. It starts an {{term openai-compatible-server}}: "Launch a local OpenAI-compatible API server to serve LLM completions via HTTP" ({{cite vllm/entrypoints/cli/serve.py:39-40}}). Any client that can talk to the OpenAI API can then talk to your model.</p>
+
+<h3>One engine: V1</h3>
+<p>vLLM has exactly one engine at this commit: the {{term v1-engine}} in <code>vllm/v1/</code>. The older V0 engine is gone. Only two old names remain, and both are aliases of V1 classes:</p>
+<ul>
+  <li><code>vllm.engine.async_llm_engine.AsyncLLMEngine = AsyncLLM</code> ({{cite vllm/engine/async_llm_engine.py:4-6}}).</li>
+  <li><code>vllm.engine.llm_engine.LLMEngine = V1LLMEngine</code> ({{cite vllm/engine/llm_engine.py:4-6}}).</li>
+</ul>
+<p>So when you read "AsyncLLMEngine" in old examples, it is the V1 {{term async-llm}}. This site uses only the V1 names.</p>
+
+<h3>Two ways to use it</h3>
+<ol>
+  <li><strong>Online serving with <code>vllm serve</code></strong> (this site). An HTTP client sends a request, for example <code>POST /v1/chat/completions</code>. The API server turns it into an engine request and streams the tokens back. The page {{link learn/openai-api}} explains the API.</li>
+  <li><strong>Offline inference with the <code>LLM</code> class</strong> (a side note). Your Python script makes <code>LLM(model=...)</code> and calls <code>generate()</code> or <code>chat()</code>. There is no HTTP server. The class builds a V1 <code>LLMEngine</code> ({{cite vllm/entrypoints/llm.py:341-343}}). Its own docstring says that it "is intended to be used for offline inference" ({{cite vllm/entrypoints/llm.py:171-173}}).</li>
+</ol>
+
+<h3>What runs where</h3>
+<p>One <code>vllm serve</code> deployment is a group of processes. Each one has its own job:</p>
+<ul>
+  <li>The {{term front-end}} (the API server process) runs the HTTP routes, the chat template, the tokenizer and <code>AsyncLLM</code>.</li>
+  <li>The {{term engine-core}} process runs the {{term scheduler}} and the KV cache manager in a loop. It tells the workers what to compute in each {{term engine-step}}.</li>
+  <li>The {{term worker | workers}} own the GPUs and run the model. With one GPU, the worker is an object inside the engine core process.</li>
+</ul>
+<p>The page {{link concepts/architecture-overview}} explains this split in full. The page {{link learn/processes-and-ipc}} explains how the processes talk to each other.</p>
+
+<h3>An everyday comparison</h3>
+<p>Think of a restaurant. The waiter (the front end) takes orders from many tables and brings the dishes back. The head chef (the engine core) decides which dishes to cook in the next round. The cooks at the stoves (the workers) do the cooking. A take-away counter (the <code>LLM</code> class) uses the same kitchen, but without waiters.</p>
+<p>The comparison stops here: a real kitchen cooks each dish once. Without speculative decoding, vLLM makes at most one new token per request in each step, and repeats the step until each answer is complete.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b1a_two_entry_points" alt="Panel 1, online: an HTTP client box, an API server process box (uvicorn and FastAPI routes, OpenAIServingChat, AsyncLLM, AsyncMPClient) and an engine core process box (EngineCoreProc busy loop, scheduler, executor, workers, GPUs). Arrows: HTTP from the client to the API server, ZMQ from the API server to the engine core, and outputs back. Panel 2, offline: your Python script calls LLM.generate, which goes to an LLMEngine in your process. The LLMEngine uses a SyncMPClient over ZMQ by default, or an InprocClient in the same process, to reach the same engine core class." caption="Figure: vllm serve and the LLM class are two entry points. Both reach the same EngineCore class. This site follows the upper path." />
+<p>Read panel 1 from left to right: this is the path of every request on this site. Panel 2 shows the offline path. It shares the engine core, but the front end is your own script. The blue, amber and violet colours mark the online front end, the offline path and the shared engine core.</p>
+
+<h2>In vLLM</h2>
+<p>This is a basics page, so this part gives only pointers. The tour {{link tours/life-of-a-chat-request}} follows one request through all of the code.</p>
+<ol>
+  <li><strong>The command.</strong> The package installs one {{term console-script}}, <code>vllm</code>, that calls <code>vllm.entrypoints.cli.main:main</code> ({{cite pyproject.toml:42-43}}). With one API server, <code>vllm serve</code> runs the server in the same process as the command ({{cite vllm/entrypoints/cli/serve.py:154-156}}).</li>
+  <li><strong>The front end.</strong> The API server makes an <code>AsyncLLM</code> ({{cite vllm/entrypoints/launchers/api_server/entry.py:94-99}}). <code>AsyncLLM</code> always starts the engine core in a separate process, through <code>make_async_mp_client</code> ({{cite vllm/v1/engine/async_llm.py:193-201}}). The page {{link concepts/engine-client}} explains it.</li>
+  <li><strong>The engine core.</strong> <code>EngineCoreProc</code> in <code>vllm/v1/engine/core.py</code> runs the busy loop. The page {{link concepts/engine-core-loop}} explains it.</li>
+</ol>
+<x-code file="vllm/engine/async_llm_engine.py" lines="1-7" title="All that is left of the V0 async engine" caption="The old name is one line. It points to the V1 <code>AsyncLLM</code>." />
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The offline LLM class: how it reaches the engine core">
+<p>The <code>LLM</code> class is a side path on this site. It differs from <code>vllm serve</code> in three ways:</p>
+<ol>
+  <li>It uses the synchronous V1 <code>LLMEngine</code>, not <code>AsyncLLM</code> ({{cite vllm/entrypoints/llm.py:341-343}}).</li>
+  <li><code>LLMEngine</code> turns on multiprocess mode when <code>VLLM_ENABLE_V1_MULTIPROCESSING</code> is true ({{cite vllm/v1/engine/llm_engine.py:186-188}}). The default is <code>"1"</code> ({{cite vllm/envs.py:1442-1444}}). Then the client is a <code>SyncMPClient</code> with ZMQ and an engine core process. With <code>VLLM_ENABLE_V1_MULTIPROCESSING=0</code>, the client is an <code>InprocClient</code>, and the engine core runs in your process ({{cite vllm/v1/engine/core_client.py:128-136}}).</li>
+  <li>It has statistics off by default ({{cite vllm/entrypoints/llm.py:225-226}}).</li>
+</ol>
+<p><code>AsyncLLM</code> does not read <code>VLLM_ENABLE_V1_MULTIPROCESSING</code>. It always calls <code>make_async_mp_client</code> ({{cite vllm/v1/engine/async_llm.py:193}}), and an asyncio client without multiprocessing raises <code>NotImplementedError</code> ({{cite vllm/v1/engine/core_client.py:114-118}}). So for <code>vllm serve</code>, the engine core is always a separate process.</p>
+<x-code file="vllm/v1/engine/core_client.py" lines="98-136" highlight="114-118,128-136" caption="<code>EngineCoreClient.make_client()</code>: the three client types. <code>AsyncLLM</code> uses the first branch; the <code>LLM</code> class uses one of the other two." />
+</x-deepdive>
+
+<x-deepdive title="Hardware: built-in platforms and platform plugins">
+<p>vLLM supports NVIDIA GPUs, AMD GPUs, Intel GPUs and x86, ARM and PowerPC CPUs. It also lists hardware plugins, for example Google TPUs, Intel Gaudi, IBM Spyre and Huawei Ascend ({{cite README.md:51}}).</p>
+<p>In the code, each process selects one {{term platform}} object, <code>current_platform</code>. The selection works like this ({{cite vllm/platforms/__init__.py:240-292}}):</p>
+<ol>
+  <li>If <code>VLLM_TARGET_DEVICE</code> is <code>cpu</code>, the CPU platform wins at once ({{cite vllm/platforms/__init__.py:244-248}}).</li>
+  <li>vLLM loads the {{term out-of-tree}} platform plugins of the entry-point group <code>vllm.platform_plugins</code> ({{cite vllm/platforms/__init__.py:250}}).</li>
+  <li>It calls every built-in detector and every plugin detector. A detector returns a class name or <code>None</code>. The five built-in detectors are <code>tpu</code>, <code>cuda</code>, <code>rocm</code>, <code>xpu</code> and <code>cpu</code> ({{cite vllm/platforms/__init__.py:231-237}}).</li>
+  <li>One active plugin wins over the built-in detectors. Two active plugins, or two active built-in detectors, raise <code>RuntimeError</code>. No active detector gives <code>UnspecifiedPlatform</code> ({{cite vllm/platforms/__init__.py:272-292}}).</li>
+</ol>
+<p>The TPU platform class itself lives in a separate package, <code>tpu_inference</code> ({{cite vllm/platforms/tpu.py:9-19}}). The pages {{link concepts/platform-plugins}} and {{link concepts/plugin-loading}} explain the plugins.</p>
+</x-deepdive>
+
+<x-deepdive title="What is new compared with DeepInfer">
+<p>DeepInfer "was originally built primarily on vLLM" ({{deepinfer index | DeepInfer Explained}}). Much of its design looks like a simple vLLM. The table lists the main differences. The vLLM column cites the vLLM code. The page {{link reference/vllm-vs-deepinfer}} gives the full comparison.</p>
+<table>
+  <thead><tr><th>Topic</th><th>DeepInfer</th><th>vLLM at this commit</th></tr></thead>
+  <tbody>
+    <tr><td>How you use it</td><td>Offline only: your script calls <code>LLM.generate()</code>, and the engine loop calls <code>step()</code> ({{deepinfer concepts/engine-step-loop | Offline API and the step loop}})</td><td>Online first: <code>vllm serve</code> starts an OpenAI-compatible HTTP server ({{cite vllm/entrypoints/cli/serve.py:39-40}}). The <code>LLM</code> class also exists ({{cite vllm/entrypoints/llm.py:341-343}}).</td></tr>
+    <tr><td>Processes</td><td>The engine loop and the driver worker run in your script process; context-parallel followers run in their own processes ({{deepinfer code/worker | Worker}})</td><td>A front-end process and an engine core process, joined by ZMQ sockets ({{cite vllm/v1/engine/core_client.py:672-682}}); more worker processes with TP &gt; 1</td></tr>
+    <tr><td>Models</td><td>One model, DeepSeek-V4.1-Flash ({{deepinfer concepts/model-map | Model map}})</td><td>"200+ model architectures" ({{cite README.md:53-60}}), found by architecture name in the model registry ({{cite vllm/model_executor/models/registry.py:73}}, {{cite vllm/model_executor/models/registry.py:1565}})</td></tr>
+    <tr><td>Hardware</td><td>NVIDIA SM100 and Huawei Ascend 950 ({{deepinfer concepts/hardware-platforms | NVIDIA and Ascend}})</td><td>Five built-in platform detectors plus out-of-tree platform plugins ({{cite vllm/platforms/__init__.py:231-237}}, {{cite vllm/platforms/__init__.py:250}})</td></tr>
+    <tr><td>Scheduler</td><td>C++; each step is a prefill batch or a decode batch, never both ({{deepinfer concepts/scheduler | The scheduler}})</td><td>Python; no prefill or decode phase, so one step can mix both ({{cite vllm/v1/core/sched/scheduler.py:624-633}})</td></tr>
+    <tr><td>KV cache blocks</td><td>128 tokens per block; no prefix cache in the release ({{deepinfer concepts/paged-kv-cache | Paged KV cache}})</td><td>Default 16 tokens, which the platform can change for the attention backend ({{cite vllm/config/cache.py:182}}, {{cite vllm/platforms/interface.py:771-781}}). Prefix caching is on by default when the model supports it ({{cite vllm/engine/arg_utils.py:3032}}, {{cite vllm/engine/arg_utils.py:3062-3063}}).</td></tr>
+    <tr><td>Parallelism</td><td>DP, CP and EP; no TP and no PP ({{deepinfer learn/parallelism | Parallelism basics}})</td><td>"Tensor, pipeline, data, expert, and context parallelism" ({{cite README.md:45}})</td></tr>
+    <tr><td>Plugins</td><td>No entry-point groups in its packaging files</td><td>Five plugin groups in <code>vllm/plugins/__init__.py</code> ({{cite vllm/plugins/__init__.py:16-30}}) plus <code>vllm.logits_processors</code> ({{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:34}})</td></tr>
+    <tr><td><code>torch.compile</code></td><td>Not used</td><td>On by default: optimization level O2 gives the mode <code>VLLM_COMPILE</code> ({{cite vllm/config/vllm.py:434}}, {{cite vllm/config/vllm.py:1806-1810}})</td></tr>
+  </tbody>
+</table>
+<x-simplified><p>The DeepInfer column is a summary of DeepInfer Explained. The rows "Plugins" and "<code>torch.compile</code>" come from a search of the DeepInfer repository for <code>entry_points</code> and <code>torch.compile</code>; both searches found nothing.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Release and version numbers">
+<p>The version is not written in a source file. The build reads it from git tags with <code>setuptools-scm</code> ({{cite pyproject.toml:8}}, {{cite pyproject.toml:49-50}}):</p>
+<ol>
+  <li><code>get_vllm_version()</code> calls <code>setuptools_scm.get_version()</code> with the command <code>git describe --dirty --tags --long --abbrev=40 --match v[0-9]*</code> ({{cite setup.py:26-35}}, {{cite setup.py:1360-1363}}). It writes the result to <code>vllm/_version.py</code>.</li>
+  <li>It adds a local suffix for the build target ({{cite setup.py:1364-1400}}). <code>VLLM_SKIP_VERSION_SUFFIX</code> turns this off. The suffixes are <code>+precompiled</code>, <code>+cu&lt;ver&gt;</code> when the CUDA version is not the main one, <code>+rocm&lt;ver&gt;</code>, <code>+tpu</code>, <code>+cpu</code>, <code>+xpu</code> or <code>+empty</code>. The main CUDA version is <code>13.0</code> by default ({{cite vllm/envs.py:624-626}}).</li>
+  <li><code>VLLM_VERSION_OVERRIDE</code> replaces the whole version ({{cite setup.py:1352-1358}}).</li>
+  <li>At run time, <code>vllm/version.py</code> imports <code>__version__</code> from <code>_version.py</code>. When that fails, it warns and uses <code>"dev"</code> ({{cite vllm/version.py:4-12}}).</li>
+</ol>
+<p><strong>Worked example.</strong> At the pinned commit, the <code>git describe</code> command of <code>setup.py</code> gives <code>v0.32.1rc0-307-g3e44c0db26...</code>. That is the tag <code>v0.32.1rc0</code>, then 307 commits, then <code>g</code> and the commit hash. The hash has all 40 hex digits, because of <code>--abbrev=40</code>. So this code comes after the 0.32.1 release candidate 0. The exact string that <code>setuptools-scm</code> makes from this (a <code>.dev307</code> version with the hash) depends on that library and is not in the vLLM repository.</p>
+<p>You can read the version in three places. <code>vllm --version</code> reads the installed package metadata ({{cite vllm/entrypoints/cli/main.py:92-97}}). <code>GET /version</code> on a running server returns <code>{"version": ...}</code> ({{cite vllm/entrypoints/serve/instrumentator/basic.py:53-56}}). Python code reads <code>vllm.__version__</code> ({{cite vllm/__init__.py:7}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Two parts with one paragraph each: the Rust front end and vllm/models/">
+<p><strong>The Rust front end.</strong> The folder <code>rust/</code> holds "a Rust drop-in alternative frontend for vLLM". It talks to the Python engine core processes "via ZMQ over the existing engine boundary", and its README calls it "experimental" and "not feature-complete" ({{cite rust/README.md:3-5}}). <code>VLLM_USE_RUST_FRONTEND=1</code> turns it on; the default is off ({{cite vllm/envs.py:1452-1456}}). Then <code>vllm serve</code> starts the Rust binary instead of the Python API server processes ({{cite vllm/entrypoints/cli/serve.py:346-361}}). This site does not explain it further.</p>
+<p><strong>The per-family model packages.</strong> Besides <code>vllm/model_executor/models/</code>, there is a second model tree, <code>vllm/models/</code>, with one package per model family, for example <code>deepseek_v4</code> and <code>qwen4_exp</code> ({{cite vllm/models/}}). The model registry points some architecture names to these packages, for example <code>"DeepseekV4ForCausalLM": ("vllm.models.deepseek_v4", ...)</code> ({{cite vllm/model_executor/models/registry.py:99}}). This site uses <code>llama.py</code> as its one model example and does not explain these packages.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Old tutorials.</strong> A tutorial that says "V0", <code>--use-v2-block-manager</code> or <code>AsyncLLMEngine</code> internals describes code that is gone. The two old class names still import, but they are V1 classes ({{cite vllm/engine/async_llm_engine.py:6}}, {{cite vllm/engine/llm_engine.py:6}}).</li>
+  <li><strong>Offline and online defaults differ.</strong> The <code>LLM</code> class turns statistics off by default ({{cite vllm/entrypoints/llm.py:225-226}}). It also gets other scheduler defaults than <code>vllm serve</code>, because the usage context differs ({{cite vllm/entrypoints/llm.py:341-343}}, {{cite vllm/engine/arg_utils.py:2960-2993}}). A benchmark with <code>LLM</code> does not tell you how <code>vllm serve</code> behaves.</li>
+  <li><strong>No platform found.</strong> When no detector is active, vLLM uses <code>UnspecifiedPlatform</code> ({{cite vllm/platforms/__init__.py:290-292}}), and later code fails. Check that the right GPU drivers or the platform plugin package are installed.</li>
+  <li><strong>Two platform plugins.</strong> Two installed and active platform plugins stop start-up with <code>RuntimeError</code> ({{cite vllm/platforms/__init__.py:272-276}}).</li>
+  <li><strong>A version string of <code>dev</code>.</strong> If <code>vllm/_version.py</code> is missing (for example, a source tree that was never built), the version is <code>"dev"</code> with a warning ({{cite vllm/version.py:6-12}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Know your entry point and its processes. Then you know which pages of this site apply to you, and which process owns each flag and each log line.</p>
+
+<x-quiz>
+  <x-q level="easy">Which command starts the OpenAI-compatible server, and which Python function does it call first?
+    <x-a><p><code>vllm serve</code>. The console script <code>vllm</code> calls <code>vllm.entrypoints.cli.main:main</code> ({{cite pyproject.toml:42-43}}), which dispatches to the <code>serve</code> subcommand ({{cite vllm/entrypoints/cli/main.py:116-117}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">An old example imports <code>AsyncLLMEngine</code>. Which class does it get?
+    <x-a><p>The V1 <code>AsyncLLM</code>. The module only contains the alias <code>AsyncLLMEngine = AsyncLLM</code> ({{cite vllm/engine/async_llm_engine.py:4-6}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You set <code>VLLM_ENABLE_V1_MULTIPROCESSING=0</code> and start <code>vllm serve</code>. Does the engine core now run inside the API server process?
+    <x-a><p>No. <code>AsyncLLM</code> always calls <code>make_async_mp_client</code> ({{cite vllm/v1/engine/async_llm.py:193}}). The variable only changes the <code>LLMEngine</code> of the offline <code>LLM</code> class ({{cite vllm/v1/engine/llm_engine.py:186-188}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A machine has an NVIDIA GPU and you install one out-of-tree platform plugin whose detector also returns a class name. Which platform does vLLM select, and what happens with two such plugins?
+    <x-a><p>The plugin platform: when exactly one out-of-tree plugin is active, it wins over the built-in CUDA detector ({{cite vllm/platforms/__init__.py:277-279}}). With two active plugins, start-up stops with <code>RuntimeError("Only one platform plugin can be activated ...")</code> ({{cite vllm/platforms/__init__.py:272-276}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You build vLLM from source with CUDA 12.9 at this commit. Which suffix does the version get, and why?
+    <x-a><p><code>+cu129</code>, unless <code>VLLM_SKIP_VERSION_SUFFIX</code> is set or the build uses precompiled extensions. The CUDA version 12.9 is not the main version <code>13.0</code> ({{cite vllm/envs.py:624-626}}). So the build adds <code>cu</code> and the first three digits of the version without dots ({{cite setup.py:1376-1382}}).</p></x-a>
+  </x-q>
+</x-quiz>

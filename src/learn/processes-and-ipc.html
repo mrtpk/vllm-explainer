@@ -1,0 +1,162 @@
+---
+title: Processes, ZMQ and shared memory
+nav_title: Processes and IPC
+level: Beginner
+prerequisites: learn/what-is-vllm
+related: concepts/architecture-overview, concepts/executors-and-workers, concepts/engine-client, concepts/data-parallel-serving, code/distributed-device-communicators-shm-broadcast, tours/life-of-a-chat-request
+summary: vllm serve splits its work over several processes. They talk through three channels - two ZMQ sockets with msgpack between the front end and the engine core, and a shared-memory ring buffer between the engine core and the workers. This page explains the basics of each channel.
+---
+<x-sentence>vllm serve runs as several processes that talk through ZMQ sockets and a shared-memory ring buffer, so CPU work does not slow the GPU loop.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>Why one engine uses several processes</h3>
+<p>Python runs the bytecode of only one thread at a time in a process: the global interpreter lock (GIL) does this. A serving engine has a lot of CPU work. It parses HTTP and JSON, applies the chat template, tokenizes and detokenizes text, and schedules the next step. If all of this shared one process with the loop that feeds the GPU, the GPU would wait for Python.</p>
+<p>vLLM therefore splits the work. The design document says that V1 "uses a multi-process architecture to separate concerns and maximize throughput" ({{cite docs/design/arch_overview.md:69}}):</p>
+<ul>
+  <li>The <strong>API server process</strong> (the {{term front-end}}) does the HTTP and text work.</li>
+  <li>The <strong>engine core process</strong> runs the scheduler loop. It does no HTTP or text work, so it can start the next step at once. With one GPU, it also holds the worker.</li>
+  <li>A <strong>worker process</strong> owns one GPU when there are two or more GPUs per engine.</li>
+  <li>For more front-end CPU, <code>--api-server-count</code> starts several API server processes that share the same engine cores ({{cite docs/design/arch_overview.md:75}}).</li>
+</ul>
+<p>A crash or a slow request in one process also stays in that process. For example, a slow chat template does not stop the engine loop.</p>
+
+<h3>How processes talk</h3>
+<p>Processes do not share Python objects. To send an object, one process turns it into bytes, and the other process turns the bytes back into an object. vLLM uses three channels:</p>
+<ol>
+  <li><strong>Requests in:</strong> a {{term zmq}} socket pair ROUTER → DEALER, from the front end to the engine core.</li>
+  <li><strong>Outputs back:</strong> a ZMQ socket pair PUSH → PULL, from the engine core to the front end.</li>
+  <li><strong>Work for the GPUs:</strong> a shared-memory ring buffer, <code>MessageQueue</code>, from the engine core to all workers.</li>
+</ol>
+<p>Channels 1 and 2 carry {{term msgpack}} bytes. Channel 3 carries Python pickle bytes. With one GPU there is no channel 3: the worker is an object inside the engine core process.</p>
+
+<h3>An everyday comparison</h3>
+<p>Think of a restaurant again. The waiter puts each order slip into a slot in the kitchen wall (channel 1). The kitchen puts ready dishes on a counter for the waiter (channel 2). The head chef writes the next round on one whiteboard that all cooks can read at the same time (channel 3).</p>
+<p>The comparison stops here: a slip is the order itself. A ZMQ message is only a copy in bytes, and the receiver must decode it into a new object.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b1a_three_channels" alt="Panel 1: the API server process (AsyncMPClient, ROUTER and PULL sockets bound to ipc paths, a msgpack encoder and decoder) sends an ADD message to the engine core process. The message frames are: identity two zero bytes for DP rank 0, type byte 0x00 for ADD, the msgpack EngineCoreRequest, and raw tensor buffers of 256 bytes or more. The engine core has an input thread with a DEALER socket, the busy loop and an output thread with a PUSH socket. Channel 2 goes back from PUSH to PULL with EngineCoreOutputs. Panel 2: the engine core's MultiprocExecutor enqueues a pickled RPC tuple into a ShmRingBuffer in /dev/shm with 10 chunks of 16 MiB and flag bytes; two worker processes VllmWorker-0 and VllmWorker-1 dequeue it in worker_busy_loop. Replies go back through one MessageQueue per worker." caption="Figure: the three channels of vllm serve with TP = 2. ZMQ sockets join the front end and the engine core (panel 1). A shared-memory ring buffer joins the engine core and the workers (panel 2)." />
+<p>Read each panel from left to right. Panel 1 shows the frames of one message on its way to the engine core. Panel 2 shows that the engine core writes each step once, and all workers read the same bytes. The footnotes list what the picture leaves out.</p>
+
+<h2>In vLLM</h2>
+<p>This is a basics page, so this part gives only pointers. The pages {{link concepts/architecture-overview}}, {{link concepts/engine-client}} and {{link concepts/executors-and-workers}} explain the code in full.</p>
+<ol>
+  <li><strong>Front-end sockets.</strong> <code>MPClient</code> binds a ROUTER socket for inputs and a PULL socket for outputs ({{cite vllm/v1/engine/core_client.py:672-682}}). It encodes requests with <code>MsgpackEncoder</code> and decodes outputs with <code>MsgpackDecoder(EngineCoreOutputs)</code> ({{cite vllm/v1/engine/core_client.py:731-732}}).</li>
+  <li><strong>Engine-core sockets.</strong> The engine core runs two IO threads next to its busy loop. The code comment gives the reason: socket IO releases the GIL, so the threads overlap with the GPU work ({{cite vllm/v1/engine/core.py:1238-1265}}).</li>
+  <li><strong>Worker queue.</strong> <code>MultiprocExecutor</code> makes one <code>MessageQueue</code> for all workers ({{cite vllm/v1/executor/multiproc_executor.py:165-172}}). Each worker reads it in <code>worker_busy_loop()</code> ({{cite vllm/v1/executor/multiproc_executor.py:1041-1048}}).</li>
+</ol>
+<x-code file="vllm/v1/engine/core.py" lines="1238-1265" highlight="1239,1244,1256" caption="The engine core starts an input thread and an output thread. The busy loop on the main thread only reads and writes Python queues." />
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Start methods: fork, spawn and what vLLM selects">
+<p>Python's <code>multiprocessing</code> has three {{term start-method | start methods}}. The vLLM design document compares them ({{cite docs/design/multiprocessing.md:22-46}}):</p>
+<ul>
+  <li><strong>fork</strong> copies the parent process. It is fast, but it does not work well with libraries that already started threads or CUDA.</li>
+  <li><strong>{{term spawn}}</strong> starts a new interpreter that imports its modules again. It works with CUDA. But code that uses vLLM as a library needs an <code>if __name__ == "__main__":</code> guard.</li>
+  <li><strong>forkserver</strong> has the same guard problem as spawn.</li>
+</ul>
+<p>vLLM reads the method from <code>VLLM_WORKER_MULTIPROC_METHOD</code>, with the default <code>fork</code> ({{cite vllm/envs.py:938-940}}). The real choice follows these steps:</p>
+<ol>
+  <li><strong>The CLI sets spawn.</strong> When you run the <code>vllm</code> command and the variable is not set, <code>cli_env_setup()</code> sets it to <code>spawn</code> ({{cite vllm/entrypoints/common/startup.py:147-149}}). The comment explains that vLLM sets it only here, because spawn can break library code without a <code>__main__</code> guard ({{cite vllm/entrypoints/common/startup.py:137-140}}). <code>vllm snapshot</code> skips this setup ({{cite vllm/entrypoints/cli/main.py:67-68}}).</li>
+  <li><strong>vLLM forces spawn when fork is not safe.</strong> <code>_maybe_force_spawn()</code> switches to spawn inside a Ray actor, with <code>--numa-bind</code>, when CUDA or XPU is already initialized, or on WSL ({{cite vllm/utils/system_utils.py:123-162}}).</li>
+  <li><strong>Each process manager asks for the context.</strong> <code>get_mp_context()</code> runs the check above and returns <code>multiprocessing.get_context(method)</code> ({{cite vllm/utils/system_utils.py:185-200}}). The engine core processes ({{cite vllm/v1/engine/utils.py:256}}) and the worker processes ({{cite vllm/v1/executor/multiproc_executor.py:723}}) use it.</li>
+  <li><strong>Extra API server processes always use spawn.</strong> <code>APIServerProcessManager</code> takes <code>multiprocessing.get_context("spawn")</code> directly ({{cite vllm/v1/utils.py:204}}, {{cite vllm/v1/utils.py:248-252}}).</li>
+</ol>
+<p>So with the default <code>vllm serve</code>, every child process starts with spawn. Each child imports vLLM again, so each child pays the import time of vLLM once more.</p>
+</x-deepdive>
+
+<x-deepdive title="ZMQ socket types and addresses">
+<p>ZMQ is a message library. A socket sends and receives whole messages, and a message can have several <em>frames</em>. The {{term zmq-socket-type}} decides the pattern. vLLM uses these types:</p>
+<table>
+  <thead><tr><th>Type</th><th>Pattern</th><th>Where vLLM uses it</th></tr></thead>
+  <tbody>
+    <tr><td>ROUTER (front end) → DEALER (engine core)</td><td>The ROUTER sends each message to one peer, chosen by an identity frame. The DEALER sets its identity.</td><td>Request input: the front end binds ROUTER ({{cite vllm/v1/engine/core_client.py:672-678}}). Each engine core connects a DEALER with its identity ({{cite vllm/v1/engine/core.py:1936-1941}}).</td></tr>
+    <tr><td>PUSH (engine core) → PULL (front end)</td><td>One-way. PUSH sends, PULL receives.</td><td>Outputs: the front end binds PULL ({{cite vllm/v1/engine/core_client.py:680-682}}); the engine core connects PUSH ({{cite vllm/v1/engine/core.py:2047-2050}}).</td></tr>
+    <tr><td>XPUB → XSUB</td><td>Publish to all subscribers. XPUB also sees the subscribe messages.</td><td>The DP coordinator publishes load statistics and wave state ({{cite vllm/v1/engine/coordinator.py:214-232}}). Only with DP &gt; 1.</td></tr>
+    <tr><td>XPUB (in <code>MessageQueue</code>)</td><td>Publish to all readers</td><td>Messages that do not fit into a ring slot, and readers on other nodes ({{cite vllm/distributed/device_communicators/shm_broadcast.py:522-529}}, {{cite vllm/distributed/device_communicators/shm_broadcast.py:550-556}})</td></tr>
+  </tbody>
+</table>
+<p><strong>Who binds.</strong> <code>make_zmq_socket()</code> binds by default for all types except PUSH, SUB and XSUB, which connect ({{cite vllm/utils/network_utils.py:366-367}}). It also sets the high-water marks of ROUTER, DEALER, PUSH and PULL to 0, which means no message limit ({{cite vllm/utils/network_utils.py:371-377}}).</p>
+<p><strong>Addresses.</strong> Sometimes all engine cores run on the same node as the front end. Then the addresses are <code>ipc://</code> paths: Unix sockets in <code>VLLM_RPC_BASE_PATH</code> (default: the temp folder) with a random UUID ({{cite vllm/v1/engine/utils.py:1148-1151}}, {{cite vllm/utils/network_utils.py:175-177}}, {{cite vllm/envs.py:731-733}}). Otherwise they are <code>tcp://host:0</code>, and the system picks the port ({{cite vllm/utils/network_utils.py:168-172}}).</p>
+<p><strong>Identities.</strong> The identity of an engine core is its DP rank as 2 little-endian bytes ({{cite vllm/v1/engine/core_client.py:749-751}}). So rank 0 is <code>b"\x00\x00"</code> and rank 3 is <code>b"\x03\x00"</code>. The front end puts the identity first in each message ({{cite vllm/v1/engine/core_client.py:1287-1294}}). ROUTER uses that frame to pick the peer and removes it, so the engine core receives <code>(type, data...)</code> ({{cite vllm/v1/engine/core.py:1979-1986}}).</p>
+<p><strong>Request types.</strong> The type frame is one byte: <code>ADD = 0x00</code>, <code>ABORT = 0x01</code>, <code>START_DP_WAVE = 0x02</code>, <code>UTILITY = 0x03</code> ({{cite vllm/v1/engine/__init__.py:300-308}}).</p>
+</x-deepdive>
+
+<x-deepdive title="msgpack with msgspec, and tensors out of band">
+<p>The messages between the front end and the engine core are <code>msgspec.Struct</code> classes. <code>EngineCoreRequest</code> uses <code>array_like=True</code>: msgpack writes it as a list of values in field order, without field names. <code>omit_defaults=True</code> leaves out fields that have their default value ({{cite vllm/v1/engine/__init__.py:113-128}}). In an array-like struct, msgspec can leave out only such fields at the end (general msgspec behaviour). <code>EngineCoreOutputs</code> uses the same options ({{cite vllm/v1/engine/__init__.py:266-271}}).</p>
+<p><code>MsgpackEncoder.encode()</code> returns a list of buffers, not one bytes object ({{cite vllm/v1/serial_utils.py:165-177}}):</p>
+<ol>
+  <li>Buffer 0 is the msgpack bytes of the object.</li>
+  <li>A CPU tensor or a NumPy array smaller than <code>VLLM_MSGPACK_ZERO_COPY_THRESHOLD</code> (default 256 bytes) goes inline into buffer 0 ({{cite vllm/envs.py:1704-1706}}, {{cite vllm/v1/serial_utils.py:242-245}}, {{cite vllm/v1/serial_utils.py:261-263}}).</li>
+  <li>A larger CPU tensor stays in its own memory. The encoder appends a view of it as an extra buffer, and writes only its index into buffer 0 ({{cite vllm/v1/serial_utils.py:266-270}}).</li>
+  <li>ZMQ sends all buffers as frames with <code>copy=False</code>, so large tensors are not copied into the message ({{cite vllm/v1/engine/core_client.py:1291-1294}}).</li>
+</ol>
+<p><strong>Worked example</strong> (illustrative shape). A multimodal request carries one image tensor of shape <code>[3, 336, 336]</code> in <code>float16</code>: 3 × 336 × 336 × 2 = 677,376 bytes. This uses the default <code>mm_tensor_ipc = "direct_rpc"</code> ({{cite vllm/config/multimodal.py:440-444}}); with <code>"torch_shm"</code>, the tensor goes through a separate shared-memory queue instead ({{cite vllm/v1/engine/core_client.py:725-728}}). This is more than 256 bytes, so the image goes as buffer 1, a separate frame after the msgpack frame. Buffer 0 holds only <code>("float16", (3, 336, 336), 1)</code>: the dtype, the shape and the buffer index ({{cite vllm/v1/serial_utils.py:271-272}}). A 32-token prompt is a list of 32 ints inside buffer 0.</p>
+<x-warning title="No pickle by default"><p>An object that the encoder does not know raises <code>TypeError</code>. Only <code>VLLM_ALLOW_INSECURE_SERIALIZATION=1</code> allows a pickle fallback ({{cite vllm/v1/serial_utils.py:220-234}}, {{cite vllm/envs.py:1710-1712}}). Pickle can run code when it decodes, so keep this off.</p></x-warning>
+</x-deepdive>
+
+<x-deepdive title="The shared-memory MessageQueue between the engine core and the workers">
+<p>With TP = 2 or more on one node, the engine core uses <code>MultiprocExecutor</code>. Each step, it sends the same call to every worker. A ZMQ message per worker would copy the data once per worker. <code>MessageQueue</code> writes it once into shared memory, and all workers read it.</p>
+<p><strong>The ring buffer.</strong> <code>ShmRingBuffer</code> has one writer and <code>n_reader</code> readers ({{cite vllm/distributed/device_communicators/shm_broadcast.py:265-279}}). Its memory has two parts ({{cite vllm/distributed/device_communicators/shm_broadcast.py:281-290}}):</p>
+<ul>
+  <li>data: <code>max_chunks × max_chunk_bytes</code>;</li>
+  <li>metadata: <code>max_chunks × (1 + n_reader)</code> bytes. Byte 0 of a chunk is the "written" flag. Then there is one "read" flag per reader.</li>
+</ul>
+<p>The writer may write a chunk when no one wrote it yet, or when all readers have read it. A reader may read a chunk that is written and that it did not read yet ({{cite vllm/distributed/device_communicators/shm_broadcast.py:292-310}}). So there is no lock.</p>
+<p><strong>Sizes.</strong> <code>MessageQueue</code> defaults to 10 chunks ({{cite vllm/distributed/device_communicators/shm_broadcast.py:492}}). <code>MultiprocExecutor</code> sets the chunk size from <code>VLLM_MQ_MAX_CHUNK_BYTES_MB</code>, default 16 ({{cite vllm/v1/executor/multiproc_executor.py:152}}, {{cite vllm/envs.py:1856-1858}}). With TP = 2, the buffer is 10 × 16 MiB = 160 MiB of data plus 10 × 3 = 30 flag bytes.</p>
+<p><strong>One write, step by step</strong> (<code>enqueue()</code>, {{cite vllm/distributed/device_communicators/shm_broadcast.py:900-966}}):</p>
+<ol>
+  <li>Pickle the object. The bytes of CPU tensors become pickle buffers. A buffer of 1 MiB or more goes out of band, as a separate buffer (lines 906-914, 915-922).</li>
+  <li>If all buffers fit into one chunk, write <code>0</code> (no overflow), the buffer count and each buffer with its length into the chunk (lines 947-961).</li>
+  <li>Otherwise write only the overflow flag <code>1</code>, and send the buffers through the XPUB socket (lines 943-946).</li>
+  <li>Wake the readers (line 963).</li>
+</ol>
+<p>The executor puts <code>(method, args, kwargs, output_rank)</code> into the queue ({{cite vllm/v1/executor/multiproc_executor.py:428}}). Each worker calls <code>getattr(self.worker, method)</code> with the arguments ({{cite vllm/v1/executor/multiproc_executor.py:1055-1064}}). Each worker has its own <code>MessageQueue(1, 1)</code> for its reply ({{cite vllm/v1/executor/multiproc_executor.py:625}}), and the executor reads only the replies that it needs ({{cite vllm/v1/executor/multiproc_executor.py:430-449}}).</p>
+<p>The model tensors between GPUs (for example the all-reduce of TP) do not use this queue. They use NCCL or a custom all-reduce. The page {{link concepts/executors-and-workers}} explains the executor.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: how many processes?">
+<p>The design document gives a formula: API servers + engine cores + GPU workers, plus one DP coordinator when DP &gt; 1 ({{cite docs/design/arch_overview.md:105-113}}).</p>
+<table>
+  <thead><tr><th>Command</th><th>API servers</th><th>Engine cores</th><th>Worker processes</th><th>Coordinator</th><th>Total</th></tr></thead>
+  <tbody>
+    <tr><td><code>vllm serve M</code> (1 GPU)</td><td>1 (the CLI process)</td><td>1</td><td>0: the worker is inside the engine core</td><td>0</td><td>2</td></tr>
+    <tr><td><code>vllm serve M -tp 4</code></td><td>1</td><td>1</td><td>4</td><td>0</td><td>6</td></tr>
+    <tr><td><code>vllm serve M -tp 2 -dp 4</code></td><td>4 (default = DP size), plus the CLI process that watches them</td><td>4</td><td>8</td><td>1</td><td>18</td></tr>
+  </tbody>
+</table>
+<p>The first row follows the code: with world size 1, the executor backend is <code>uni</code> ({{cite vllm/config/parallel.py:1099-1100}}), and <code>UniProcExecutor</code> makes the worker inside the engine core process ({{cite vllm/v1/executor/uniproc_executor.py:51-69}}). With one API server, the server runs in the CLI process ({{cite vllm/entrypoints/cli/serve.py:154-156}}). The API server count defaults to the DP size ({{cite vllm/entrypoints/cli/serve.py:124-130}}). With more than one API server, the CLI process does not serve HTTP. It starts the API server processes and waits for them, so it is one more process ({{cite vllm/entrypoints/cli/serve.py:366-390}}).</p>
+<x-note title="Docs and code differ for one GPU"><p>The design document says "1 worker process per GPU" ({{cite docs/design/arch_overview.md:89-91}}). With one GPU, the code makes no worker process. So the table of the document gives 3 processes, but the code starts 2. For <code>-tp 2 -dp 4</code>, the formula gives 17, but the code also keeps the CLI process, so there are 18.</p></x-note>
+<x-note title="Helper processes that the table does not count"><p>On Linux, the spawn start method of Python also starts one small resource-tracker process (general Python behaviour). A <code>ps</code> listing can show it next to the vLLM processes.</p></x-note>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A script without a <code>__main__</code> guard.</strong> With spawn, the child imports your main module again. Code at the top level runs again, and Python raises an error about the "bootstrapping phase" ({{cite docs/design/multiprocessing.md:126-146}}). Put your code under <code>if __name__ == "__main__":</code>.</li>
+  <li><strong>CUDA before fork.</strong> When your process already initialized CUDA, vLLM switches to spawn with a warning ({{cite vllm/utils/system_utils.py:145-162}}).</li>
+  <li><strong>A full or small <code>/tmp</code> or <code>/dev/shm</code>.</strong> The ipc sockets live in <code>VLLM_RPC_BASE_PATH</code> ({{cite vllm/envs.py:731-733}}). The ring buffer checks for free shared memory before it makes the buffer ({{cite vllm/distributed/device_communicators/shm_broadcast.py:332-335}}). Docker gives a small <code>/dev/shm</code> by default, so set a larger one.</li>
+  <li><strong>The engine core does not start in time.</strong> The front end waits for a ready message from each engine core. It raises <code>TimeoutError</code> after <code>VLLM_ENGINE_READY_TIMEOUT_S</code> seconds ({{cite vllm/v1/engine/core_client.py:757-761}}).</li>
+  <li><strong>A worker fails.</strong> When a worker replies with an error status, the executor raises <code>RuntimeError("Worker failed with error ...")</code>. When the call has a time limit and the reply does not come in time, it raises <code>TimeoutError</code> ({{cite vllm/v1/executor/multiproc_executor.py:440-448}}).</li>
+  <li><strong>Insecure serialization.</strong> <code>VLLM_ALLOW_INSECURE_SERIALIZATION=1</code> allows pickle in ZMQ messages ({{cite vllm/v1/serial_utils.py:220-234}}). Use it only on a trusted network.</li>
+</ul>
+<p><strong>Why it matters.</strong> CPU limits, shared memory, ports and start-up errors all depend on this process layout. When you know the channels, you can size the machine and read the logs of each process.</p>
+
+<x-quiz>
+  <x-q level="easy">Which ZMQ socket types carry requests from the front end to the engine core, and outputs back?
+    <x-a><p>Requests: ROUTER in the front end ({{cite vllm/v1/engine/core_client.py:672-678}}) to DEALER in the engine core ({{cite vllm/v1/engine/core.py:1936-1941}}). Outputs: PUSH in the engine core ({{cite vllm/v1/engine/core.py:2047-2050}}) to PULL in the front end ({{cite vllm/v1/engine/core_client.py:680-682}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">You start <code>vllm serve</code> from the command line and do not set <code>VLLM_WORKER_MULTIPROC_METHOD</code>. Which start method do the workers use?
+    <x-a><p>spawn. The CLI sets the variable to <code>spawn</code> when it is not set ({{cite vllm/entrypoints/common/startup.py:147-149}}), and <code>get_mp_context()</code> reads it ({{cite vllm/utils/system_utils.py:185-200}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A request carries a CPU tensor of 100 bytes and one of 10,000 bytes. How does the encoder send each?
+    <x-a><p>The 100-byte tensor is below the 256-byte threshold, so it goes inline in the msgpack buffer. The 10,000-byte tensor goes as an extra frame without a copy, and the msgpack buffer holds only its dtype, shape and frame index ({{cite vllm/v1/serial_utils.py:261-272}}, {{cite vllm/envs.py:1704-1706}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">TP = 4 runs on one node. How large is the data part of the worker ring buffer? How many flag bytes does it have? What happens with a 20 MiB message?
+    <x-a><p>Data: 10 chunks × 16 MiB = 160 MiB ({{cite vllm/distributed/device_communicators/shm_broadcast.py:492}}, {{cite vllm/v1/executor/multiproc_executor.py:152}}). Flags: 10 × (1 + 4) = 50 bytes ({{cite vllm/distributed/device_communicators/shm_broadcast.py:322-330}}). A 20 MiB message does not fit into one chunk. The writer sets the overflow flag in the chunk and sends the buffers through the XPUB socket ({{cite vllm/distributed/device_communicators/shm_broadcast.py:943-946}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">The design document predicts 3 processes for <code>vllm serve</code> on one GPU. How many does the code start, and why?
+    <x-a><p>2. With world size 1, the executor backend is <code>uni</code> ({{cite vllm/config/parallel.py:1099-1100}}), so the worker is an object in the engine core process ({{cite vllm/v1/executor/uniproc_executor.py:51-69}}). The other process is the API server in the CLI process ({{cite vllm/entrypoints/cli/serve.py:154-156}}). The document counts one worker process per GPU ({{cite docs/design/arch_overview.md:89-91}}).</p></x-a>
+  </x-q>
+</x-quiz>

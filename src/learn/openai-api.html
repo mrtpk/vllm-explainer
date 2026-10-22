@@ -1,0 +1,227 @@
+---
+title: The OpenAI-compatible API
+nav_title: OpenAI-compatible API
+level: Beginner
+prerequisites: learn/what-is-vllm
+related: concepts/openai-server, concepts/renderers-and-chat-templates, concepts/tool-and-reasoning-parsers, concepts/structured-outputs, tours/life-of-a-chat-request, learn/serving-metrics
+summary: vllm serve answers HTTP requests in the format of the OpenAI API. This page shows the routes that vLLM registers, the request fields that matter for serving, vLLM's extra fields, the SSE stream format, tool calls, reasoning output and errors.
+---
+<x-sentence>vllm serve accepts OpenAI-style JSON requests on HTTP routes such as /v1/chat/completions and answers with JSON or a stream of SSE events.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>A shared request format</h3>
+<p>Many client tools speak the HTTP API of OpenAI: the <code>openai</code> Python SDK, agent frameworks, benchmark tools and routers. vLLM accepts the same JSON. So you change only the base URL of the client, for example to <code>http://localhost:8000/v1</code>, and the client talks to your own model. The server listens on port 8000 by default ({{cite vllm/entrypoints/common/cli_args.py:286-287}}).</p>
+<p>Each {{term route}} is one HTTP method and one path. Two routes do most of the work:</p>
+<ul>
+  <li><strong><code>POST /v1/chat/completions</code></strong> takes a list of chat <code>messages</code>. The server turns them into one prompt with the {{term chat-template}} of the model. This is the main route for chat models and the route of all examples on this site.</li>
+  <li><strong><code>POST /v1/completions</code></strong> takes a raw <code>prompt</code>: a string, a list of strings, or token ids ({{cite vllm/entrypoints/openai/completion/protocol.py:53-59}}). There is no chat template.</li>
+</ul>
+<p>Other routes list the models (<code>GET /v1/models</code>), check health (<code>GET /health</code>), give Prometheus metrics (<code>/metrics</code>) and turn text into tokens (<code>POST /tokenize</code>). The first deep dive lists them all.</p>
+
+<h3>Chat roles and the chat template</h3>
+<p>A chat request is a list of messages. Each message has a <code>role</code> and <code>content</code>. The usual roles are <code>system</code>, <code>user</code>, <code>assistant</code> and <code>tool</code>. The model does not see JSON. The chat template, a Jinja template from the tokenizer files, writes the messages into one text with special tokens. Then the tokenizer turns that text into token ids ({{deepinfer learn/tokens | Tokens and tokenizers}}). The page {{link concepts/renderers-and-chat-templates}} explains how vLLM does this.</p>
+
+<h3>Streaming with server-sent events</h3>
+<p>With <code>"stream": true</code>, the server keeps the HTTP response open. It sends one {{term sse}} event for each new piece of text. Each event is one line <code>data: {...}</code> and a blank line. The last event is <code>data: [DONE]</code>. So the user sees the first words after the time to first token, not after the whole answer ({{link learn/serving-metrics}}).</p>
+
+<h3>An everyday comparison</h3>
+<p>Think of a standard order form in a chain of restaurants. Every kitchen accepts the same form, so a customer can order in any of them. vLLM is a new kitchen that accepts the standard form. It also reads some extra boxes on the form that only vLLM knows, for example <code>top_k</code>.</p>
+<p>The comparison stops here: a kitchen sends the whole meal at once. With streaming, vLLM sends the answer in many small parts while it still makes the rest.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b1a_api_shapes" alt="Panel 1: a JSON request body with model Qwen/Qwen3-0.6B, one user message Hi, max_completion_tokens 32, temperature 0.7, stream true, stream_options include_usage true and two vLLM extra fields, top_k 20 and chat_template_kwargs enable_thinking false. Pydantic checks the body first (HTTP 400 on error). An arrow goes to OpenAIServingChat, which checks the model name, applies the chat template, computes max_tokens and calls to_sampling_params. An arrow goes to SamplingParams with temperature 0.7, top_k 20, top_p from the model or 1.0, max_tokens 32 and output_kind DELTA. Panel 2: on the left the non-streamed JSON body with message content, finish_reason stop and usage; on the right the SSE stream: a first chunk with role assistant and empty content, content chunks Hello and !, a last chunk with empty content and finish_reason stop, a usage chunk with empty choices, and data: [DONE]." caption="Figure: the request fields become SamplingParams (panel 1). The client gets one JSON body, or a stream of SSE events that ends with a usage chunk and data: [DONE] (panel 2). The values are an example." />
+<p>Read panel 1 from left to right. Fields that the client does not send come from the model's <code>generation_config.json</code> first and from the OpenAI defaults second. Panel 2 shows the two answer forms of the same request. The deep dive "The stream, chunk by chunk" explains each SSE line.</p>
+
+<h2>In vLLM</h2>
+<p>This is a basics page, so this part gives only pointers. The page {{link concepts/openai-server}} explains the server code, and stops 1, 2 and 16 of {{link tours/life-of-a-chat-request}} follow one request through it.</p>
+<ol>
+  <li><strong>The route.</strong> <code>create_chat_completion()</code> in <code>vllm/entrypoints/openai/chat_completion/api_router.py</code> handles <code>POST /v1/chat/completions</code>. It returns a <code>JSONResponse</code>, or a <code>StreamingResponse</code> with the media type <code>text/event-stream</code> ({{cite vllm/entrypoints/openai/chat_completion/api_router.py:43-84}}).</li>
+  <li><strong>The request class.</strong> <code>ChatCompletionRequest</code> is a pydantic model. Its fields follow the order of the OpenAI documentation, and vLLM's extra fields come after them ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:225-228}}).</li>
+  <li><strong>The handler.</strong> <code>OpenAIServingChat._create_chat_completion()</code> renders the messages, computes <code>max_tokens</code>, makes <code>SamplingParams</code> and calls <code>engine_client.generate()</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:302-418}}).</li>
+</ol>
+<x-code file="vllm/entrypoints/openai/chat_completion/api_router.py" lines="43-84" highlight="43-44,66-69,79-84" caption="The chat route. An <code>ErrorResponse</code> becomes JSON with its own status code. A full response becomes JSON. A generator becomes an SSE stream." />
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The routes that vLLM registers">
+<p><code>build_app()</code> makes the FastAPI app and calls <code>register_api_routers()</code> ({{cite vllm/entrypoints/launchers/app.py:19-45}}). That function adds the routers in groups. Some groups depend on the tasks of the model or on a flag ({{cite vllm/entrypoints/launchers/api_server/routers.py:12-90}}). After that, endpoint plugins can add their own routes ({{cite vllm/entrypoints/launchers/app.py:47-51}}).</p>
+<table>
+  <thead><tr><th>Route</th><th>Defined at</th><th>When registered</th></tr></thead>
+  <tbody>
+    <tr><td><code>POST /v1/chat/completions</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/api_router.py:43-44}}</td><td>the model supports the task <code>generate</code> ({{cite vllm/entrypoints/launchers/api_server/routers.py:55-60}}, {{cite vllm/entrypoints/generate/api_router.py:21-26}})</td></tr>
+    <tr><td><code>POST /v1/chat/completions/batch</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/api_router.py:88-89}}</td><td>same</td></tr>
+    <tr><td><code>POST /v1/completions</code></td><td>{{cite vllm/entrypoints/openai/completion/api_router.py:37-38}}</td><td>same ({{cite vllm/entrypoints/generate/api_router.py:34-38}})</td></tr>
+    <tr><td><code>POST /v1/responses</code>, <code>GET /v1/responses/{id}</code>, <code>POST /v1/responses/{id}/cancel</code></td><td>{{cite vllm/entrypoints/openai/responses/api_router.py:48-49}}, {{cite vllm/entrypoints/openai/responses/api_router.py:80}}, {{cite vllm/entrypoints/openai/responses/api_router.py:110}}</td><td>same ({{cite vllm/entrypoints/generate/api_router.py:28-32}})</td></tr>
+    <tr><td><code>POST /v1/messages</code>, <code>POST /v1/messages/count_tokens</code> (Anthropic format)</td><td>{{cite vllm/entrypoints/anthropic/api_router.py:51-52}}, {{cite vllm/entrypoints/anthropic/api_router.py:89-90}}</td><td>same ({{cite vllm/entrypoints/generate/api_router.py:40-44}})</td></tr>
+    <tr><td><code>GET /v1/models</code></td><td>{{cite vllm/entrypoints/openai/models/api_router.py:20}}</td><td>always ({{cite vllm/entrypoints/launchers/api_server/routers.py:22-26}})</td></tr>
+    <tr><td><code>GET /health</code></td><td>{{cite vllm/entrypoints/serve/instrumentator/health.py:22}}</td><td>always ({{cite vllm/entrypoints/serve/instrumentator/__init__.py:7-14}})</td></tr>
+    <tr><td><code>/metrics</code> (Prometheus)</td><td>{{cite vllm/entrypoints/serve/instrumentator/metrics.py:56-81}}</td><td>always</td></tr>
+    <tr><td><code>GET /version</code>, <code>GET /load</code></td><td>{{cite vllm/entrypoints/serve/instrumentator/basic.py:53}}, {{cite vllm/entrypoints/serve/instrumentator/basic.py:30}}</td><td>always</td></tr>
+    <tr><td><code>POST /tokenize</code>, <code>POST /detokenize</code></td><td>{{cite vllm/entrypoints/serve/tokenize/api_router.py:35-36}}, {{cite vllm/entrypoints/serve/tokenize/api_router.py:61-62}}</td><td>always ({{cite vllm/entrypoints/serve/__init__.py:36-40}})</td></tr>
+    <tr><td><code>POST /v1/embeddings</code>, <code>/pooling</code>, <code>/score</code>, <code>/rerank</code> and others</td><td>{{cite vllm/entrypoints/pooling/embed/api_router.py:28-29}}, {{cite vllm/entrypoints/pooling/pooling/api_router.py:27-28}}</td><td>the model has a pooling task ({{cite vllm/entrypoints/launchers/api_server/routers.py:80-83}})</td></tr>
+    <tr><td><code>POST /v1/load_lora_adapter</code>, <code>/v1/unload_lora_adapter</code></td><td>{{cite vllm/entrypoints/serve/lora/api_router.py:63}}, {{cite vllm/entrypoints/serve/lora/api_router.py:81-82}}</td><td>only with <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code> ({{cite vllm/entrypoints/serve/lora/api_router.py:30-32}})</td></tr>
+    <tr><td><code>/reset_prefix_cache</code>, <code>/sleep</code>, <code>/collective_rpc</code> and other development routes</td><td>{{cite vllm/entrypoints/serve/__init__.py:43-65}}</td><td>only with <code>VLLM_SERVER_DEV_MODE</code> ({{cite vllm/entrypoints/launchers/api_server/routers.py:46-53}})</td></tr>
+  </tbody>
+</table>
+<p><strong>The health check.</strong> <code>GET /health</code> asks the engine client. It returns 200 when the engine is alive and 503 after an <code>EngineDeadError</code> ({{cite vllm/entrypoints/serve/instrumentator/health.py:22-33}}).</p>
+<p><strong>API keys.</strong> With <code>--api-key</code> (or <code>VLLM_API_KEY</code> when the flag is not set), a middleware checks the <code>Authorization: Bearer</code> header ({{cite vllm/entrypoints/serve/middleware/register.py:32-36}}). It guards only paths that start with <code>/v1</code>, <code>/v2</code>, <code>/inference</code> or <code>/cohere</code>, and answers 401 otherwise ({{cite vllm/entrypoints/serve/middleware/authenticate.py:11}}, {{cite vllm/entrypoints/serve/middleware/authenticate.py:59-60}}). So <code>/health</code> and <code>/metrics</code> stay open.</p>
+</x-deepdive>
+
+<x-deepdive title="Request fields that matter for serving">
+<p>The table lists the OpenAI fields of <code>ChatCompletionRequest</code> that change how the server works ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:228-249}}).</p>
+<table>
+  <thead><tr><th>Field</th><th>Default</th><th>What vLLM does with it</th></tr></thead>
+  <tbody>
+    <tr><td><code>model</code></td><td><code>None</code></td><td>Selects the served model name or a LoRA adapter. A wrong name gives an error response ({{cite vllm/entrypoints/openai/chat_completion/serving.py:278-281}}).</td></tr>
+    <tr><td><code>messages</code></td><td>required</td><td>The chat. The renderer applies the chat template ({{cite vllm/entrypoints/openai/chat_completion/serving.py:285}}).</td></tr>
+    <tr><td><code>max_completion_tokens</code>, <code>max_tokens</code></td><td><code>None</code></td><td><code>max_tokens</code> is marked as deprecated; the new field wins when both are set ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:234-239}}, {{cite vllm/entrypoints/openai/chat_completion/serving.py:349-357}}). See the next deep dive for the default.</td></tr>
+    <tr><td><code>temperature</code>, <code>top_p</code></td><td><code>None</code></td><td>Request value, else the server default, else 1.0 ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:692-700}}).</td></tr>
+    <tr><td><code>stream</code></td><td><code>False</code></td><td>True gives an SSE stream and <code>RequestOutputKind.DELTA</code>; false gives one body and <code>FINAL_ONLY</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:797-799}}).</td></tr>
+    <tr><td><code>stream_options</code></td><td><code>None</code></td><td><code>include_usage</code> adds a final usage chunk. <code>continuous_usage_stats</code> adds usage to every chunk, but only together with <code>include_usage</code>. The server flag <code>--enable-force-include-usage</code> turns on both for every stream ({{cite vllm/entrypoints/serve/utils/api_utils.py:273-285}}). Allowed only with <code>stream: true</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:845-856}}).</td></tr>
+    <tr><td><code>n</code></td><td><code>1</code></td><td>The number of answers per request ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:240}}).</td></tr>
+    <tr><td><code>stop</code></td><td><code>[]</code></td><td>Stop strings ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:244}}).</td></tr>
+    <tr><td><code>tools</code>, <code>tool_choice</code></td><td><code>None</code>, <code>"none"</code></td><td>Tool definitions. With <code>tools</code> and no <code>tool_choice</code>, the server sets <code>"auto"</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:975-978}}).</td></tr>
+    <tr><td><code>response_format</code></td><td><code>None</code></td><td>JSON mode or a JSON schema. It becomes structured-output parameters ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:728-733}}); see {{link concepts/structured-outputs}}.</td></tr>
+    <tr><td><code>logprobs</code>, <code>top_logprobs</code></td><td><code>False</code>, <code>0</code></td><td>When <code>logprobs</code> is true, the sampler returns <code>top_logprobs</code> alternatives per token ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:784-788}}).</td></tr>
+    <tr><td><code>user</code></td><td><code>None</code></td><td>Ignored: "this will be ignored by vLLM" ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:274-275}}).</td></tr>
+  </tbody>
+</table>
+<p><strong>vLLM's extra fields.</strong> These are not in the OpenAI specification. The OpenAI SDK sends them in its <code>extra_body</code> argument.</p>
+<ul>
+  <li>Sampling: <code>top_k</code>, <code>min_p</code>, <code>repetition_penalty</code>, <code>min_tokens</code>, <code>stop_token_ids</code>, <code>ignore_eos</code>, <code>use_beam_search</code> and others ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:278-288}}). The basics of these are on {{deepinfer learn/sampling | Sampling}}.</li>
+  <li>Chat template: <code>chat_template</code>, <code>chat_template_kwargs</code>, <code>add_generation_prompt</code>, <code>continue_final_message</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:324-377}}). For example, <code>"chat_template_kwargs": {"enable_thinking": false}</code> reaches a Qwen3 template.</li>
+  <li>Scheduling: <code>priority</code> (lower is earlier, default 0) ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:393-402}}). The field description says that a value other than 0 raises an error without priority scheduling. At this commit, no code raises that error: the default first-come-first-served queue does not use the value ({{cite vllm/v1/core/sched/request_queue.py:200-205}}).</li>
+  <li>Structured output: <code>structured_outputs</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:389-392}}).</li>
+  <li>Bookkeeping: <code>request_id</code> (default: a random id), <code>cache_salt</code>, <code>vllm_xargs</code> for custom extensions ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:403-410}}, {{cite vllm/entrypoints/openai/chat_completion/protocol.py:525-531}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Defaults: where temperature and max_tokens come from">
+<x-warning title="The model can change the default temperature"><p>A field that the client does not send does not always get the OpenAI default. The default <code>--generation-config auto</code> reads the model's <code>generation_config.json</code> first. Use <code>--generation-config vllm</code> for vLLM's neutral defaults.</p></x-warning>
+<p><strong>Sampling defaults.</strong> <code>to_sampling_params()</code> uses this order for each of seven fields: the request value, else the server default, else the OpenAI default ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:735-747}}). The OpenAI defaults are <code>temperature 1.0</code>, <code>top_p 1.0</code>, <code>top_k 0</code>, <code>min_p 0.0</code> and penalties that do nothing ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:692-700}}). The server default comes from <code>ModelConfig.get_diff_sampling_param()</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:181}}):</p>
+<ol>
+  <li>With <code>generation_config = "vllm"</code>, it reads no file. Otherwise it reads the model's generation config ({{cite vllm/config/model.py:1875-1877}}). The default is <code>"auto"</code> ({{cite vllm/config/model.py:358}}).</li>
+  <li><code>--override-generation-config</code> replaces single values ({{cite vllm/config/model.py:1879-1880}}).</li>
+  <li>It keeps only nine known keys, and it renames <code>max_new_tokens</code> to <code>max_tokens</code> ({{cite vllm/config/model.py:1882-1903}}).</li>
+  <li>It logs a warning when a generation config file changes the defaults ({{cite vllm/config/model.py:1906-1915}}).</li>
+</ol>
+<p><strong><code>max_tokens</code>.</strong> <code>get_max_tokens()</code> returns the smallest of these values that is set ({{cite vllm/entrypoints/serve/utils/api_utils.py:234-270}}):</p>
+<ul>
+  <li><code>max_model_len − prompt length</code>;</li>
+  <li>the request value, or <code>max_tokens</code> from the server default when the request has none;</li>
+  <li>an override: <code>max_new_tokens</code> from <code>--override-generation-config</code> when <code>--generation-config</code> is <code>auto</code> or <code>vllm</code>, else <code>max_new_tokens</code> from the generation config folder that you give ({{cite vllm/entrypoints/openai/chat_completion/serving.py:183-187}});</li>
+  <li>a platform limit.</li>
+</ul>
+<p><strong>Worked example.</strong> <code>max_model_len</code> is 4,096 and the rendered prompt has 13 tokens. A request without <code>max_completion_tokens</code> can make up to 4,096 − 13 = 4,083 tokens. With <code>"max_completion_tokens": 32</code>, it makes at most 32. A prompt of 4,100 tokens raises <code>ValueError("Input length (4100) exceeds model's maximum context length (4096).")</code> ({{cite vllm/entrypoints/serve/utils/api_utils.py:248-252}}). The renderer normally rejects such a prompt before this, with HTTP 400.</p>
+</x-deepdive>
+
+<x-deepdive title="The stream, chunk by chunk (worked example)">
+<p>Start a server with <code>vllm serve Qwen/Qwen3-0.6B</code>. Then send this request (example commands, not in the repo). The option <code>-N</code> turns off the output buffer of curl, so you see each event when it comes.</p>
+<pre><code class="language-bash">curl -N http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen3-0.6B",
+       "messages": [{"role": "user", "content": "Hi"}],
+       "max_completion_tokens": 32,
+       "stream": true,
+       "stream_options": {"include_usage": true},
+       "chat_template_kwargs": {"enable_thinking": false}}'</code></pre>
+<p>The reply has this form. The ids, times, text and token counts are illustrative; "..." stands for the <code>object</code>, <code>created</code> and <code>model</code> fields.</p>
+<pre><code class="language-none">data: {"id":"chatcmpl-3f9c...","object":"chat.completion.chunk","created":1761140000,"model":"Qwen/Qwen3-0.6B","choices":[{"index":0,"delta":{"role":"assistant","content":""},"logprobs":null,"finish_reason":null}],"prompt_token_ids":null,"prompt_text":null}
+
+data: {"id":"chatcmpl-3f9c...",...,"choices":[{"index":0,"delta":{"content":"Hello"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+data: {"id":"chatcmpl-3f9c...",...,"choices":[{"index":0,"delta":{"content":"!"},"logprobs":null,"finish_reason":null,"token_ids":null}]}
+
+...
+
+data: {"id":"chatcmpl-3f9c...",...,"choices":[{"index":0,"delta":{"content":""},"logprobs":null,"finish_reason":"stop","stop_reason":null,"token_ids":null,"weight_versions":null}]}
+
+data: {"id":"chatcmpl-3f9c...",...,"choices":[],"usage":{"prompt_tokens":13,"total_tokens":23,"completion_tokens":10},"system_fingerprint":"vllm-&lt;version&gt;-&lt;hash8&gt;"}
+
+data: [DONE]</code></pre>
+<ol>
+  <li><strong>The first chunk</strong> carries only the role and empty content ({{cite vllm/entrypoints/openai/chat_completion/serving.py:590-598}}).</li>
+  <li><strong>Each later chunk</strong> carries the new text of one engine output, in <code>delta.content</code>. Each chunk is serialized with <code>exclude_unset=True</code>, so only the fields that the code sets appear ({{cite vllm/entrypoints/openai/chat_completion/serving.py:497-503}}).</li>
+  <li><strong>The last content chunk</strong> has <code>finish_reason</code>. Its content is empty because the detokenizer does not decode the end token ({{cite vllm/v1/engine/detokenizer.py:107-111}}).</li>
+  <li><strong>The usage chunk</strong> has <code>choices: []</code> and <code>usage</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:854-903}}). With empty choices, the serializer also drops all <code>None</code> fields (<code>exclude_none=not chunk.choices</code>). The server sends it only with <code>include_usage</code> or <code>--enable-force-include-usage</code> ({{cite vllm/entrypoints/serve/utils/api_utils.py:276-285}}). When usage is on, the fingerprint moves from the last content chunk to this chunk ({{cite vllm/entrypoints/openai/chat_completion/serving.py:815-824}}).</li>
+  <li><strong><code>data: [DONE]</code></strong> always ends the stream, also after an error chunk ({{cite vllm/entrypoints/openai/chat_completion/serving.py:504-508}}).</li>
+</ol>
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="485-508" highlight="497-503,508" caption="The outer stream generator: one <code>data:</code> line and a blank line per chunk, then <code>data: [DONE]</code>." />
+<p><strong>Check the numbers.</strong> <code>total_tokens</code> = 13 + 10 = 23. The 10 output tokens are nine text tokens and the end token. The 13 prompt tokens come from the Qwen3 chat template around the word "Hi" (inferred, not in the repo).</p>
+<p><strong>Keep-alive comments.</strong> A proxy can close an idle stream. With <code>--sse-keep-alive-interval N</code> (default 0, off), the server sends the comment line <code>: keep-alive</code> after N idle seconds ({{cite vllm/entrypoints/common/cli_args.py:156-160}}, {{cite vllm/entrypoints/serve/utils/sse_keep_alive.py:18-33}}). SSE clients ignore comment lines.</p>
+</x-deepdive>
+
+<x-deepdive title="Chat roles in vLLM">
+<p>The type of one message is a union of three types ({{cite vllm/renderers/chat_utils/types.py:316-320}}). They are the OpenAI message types, a custom message type and the Harmony message type of gpt-oss models. The custom type has <code>role: Required[str]</code>, so vLLM accepts any role name that the chat template knows ({{cite vllm/renderers/chat_utils/types.py:284-288}}). It also has the extra keys <code>reasoning</code> (earlier thinking text) and <code>tools</code> ({{cite vllm/renderers/chat_utils/types.py:306-310}}).</p>
+<ul>
+  <li><code>add_generation_prompt</code> (default true) adds the start of an assistant turn to the prompt. <code>continue_final_message</code> instead continues the last assistant message. A request that sends both as <code>true</code> gets an error ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:1045-1055}}).</li>
+  <li>With <code>add_generation_prompt</code>, the role of the answer is <code>--response-role</code>, default <code>assistant</code>. Without it, the answer takes the role of the last message ({{cite vllm/entrypoints/common/cli_args.py:109-110}}, {{cite vllm/entrypoints/openai/chat_completion/serving.py:440-443}}).</li>
+</ul>
+<p>The page {{link concepts/renderers-and-chat-templates}} explains how the renderer finds and applies the template.</p>
+</x-deepdive>
+
+<x-deepdive title="Tool calls and reasoning content at the API level">
+<p><strong>Tool calls.</strong> The client sends <code>tools</code> (function definitions). The model writes a tool call as text in its own format. A <em>tool parser</em> turns that text into the OpenAI form <code>message.tool_calls[i] = {id, type: "function", function: {name, arguments}}</code> ({{cite vllm/entrypoints/generate/base/protocol.py:316-328}}).</p>
+<ol>
+  <li>For <code>tool_choice: "auto"</code>, start the server with <code>--enable-auto-tool-choice</code> and <code>--tool-call-parser &lt;name&gt;</code>. Without them, an <code>"auto"</code> request gets the error <code>"auto" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set</code> ({{cite vllm/renderers/online_renderer.py:260-271}}). The flag without a parser stops start-up ({{cite vllm/entrypoints/common/cli_args.py:524-525}}).</li>
+  <li><code>"required"</code> or a named function needs a <code>--tool-call-parser</code> too ({{cite vllm/renderers/online_renderer.py:272-281}}).</li>
+  <li>In a stream, a tool call comes in pieces as <code>delta.tool_calls</code>. Each piece has an <code>index</code>, and the name and the arguments can come in separate chunks ({{cite vllm/entrypoints/generate/base/protocol.py:331-342}}).</li>
+</ol>
+<p><strong>Reasoning content.</strong> Reasoning models write their thinking before the answer, for example between <code>&lt;think&gt;</code> tags. With <code>--reasoning-parser &lt;name&gt;</code> ({{cite vllm/engine/arg_utils.py:1136-1139}}), vLLM moves that text out of <code>content</code> into the vLLM-specific field <code>reasoning</code> of the message or the delta ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:79-80}}, {{cite vllm/entrypoints/generate/base/protocol.py:356-360}}). Without a parser, the thinking text stays in <code>content</code>. The request field <code>include_reasoning</code> (default true) controls whether the server returns it ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:271}}).</p>
+<p>The page {{link concepts/tool-and-reasoning-parsers}} explains the parsers and how to add your own.</p>
+</x-deepdive>
+
+<x-deepdive title="Errors: HTTP 400 and the error body">
+<p>Every error body has the same shape: <code>{"error": {"message", "type", "param", "code"}}</code> ({{cite vllm/entrypoints/serve/engine/protocol.py:79-87}}). The app registers its handlers in four layers ({{cite vllm/entrypoints/serve/exception_handling/register.py:26-42}}):</p>
+<ol>
+  <li><strong>FastAPI errors.</strong> A body that does not match the pydantic model gives <code>RequestValidationError</code>. The handler answers 400 with at most 10 error entries ({{cite vllm/entrypoints/serve/exception_handling/handlers/validation.py:149-195}}).</li>
+  <li><strong>vLLM errors.</strong> All vLLM error classes derive from <code>VLLMError</code> ({{cite vllm/exceptions.py:10-28}}). One handler, <code>vllm_error_handler()</code>, gets them all ({{cite vllm/entrypoints/serve/exception_handling/register.py:32}}, {{cite vllm/entrypoints/serve/exception_handling/handlers/vllm_error.py:18-25}}). <code>create_error_response()</code> then selects the status from the class. <code>VLLMValidationError</code> becomes 400 <code>BadRequestError</code> with <code>param</code> set ({{cite vllm/entrypoints/serve/exception_handling/error_response.py:43-46}}). <code>VLLMUnprocessableEntityError</code> becomes 422, and a not-found error becomes 404 ({{cite vllm/entrypoints/serve/exception_handling/error_response.py:47-54}}). A <code>GenerationError</code> keeps its own status: 500, or 503 for a retryable error ({{cite vllm/entrypoints/serve/exception_handling/error_response.py:60-67}}, {{cite vllm/exceptions.py:131-144}}). Other server errors become 500 ({{cite vllm/entrypoints/serve/exception_handling/error_response.py:68-77}}).</li>
+  <li><strong>Raw Python errors.</strong> <code>ValueError</code>, <code>TypeError</code> and <code>OverflowError</code> still become 400; <code>NotImplementedError</code> becomes 501 ({{cite vllm/entrypoints/serve/exception_handling/error_response.py:80-87}}).</li>
+  <li><strong>Anything else</strong> becomes 500. The one exception is a Jinja <code>TemplateError</code> from the chat template, which becomes 400 ({{cite vllm/entrypoints/serve/exception_handling/error_response.py:88-96}}).</li>
+</ol>
+<p><strong>Which handler answers a validator error.</strong> Many request checks are pydantic validators with <code>mode="before"</code> that raise <code>VLLMValidationError</code>. Examples are "Stream options can only be defined when <code>stream=True</code>" ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:845-856}}) and the <code>tool_choice</code> checks ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:959-1043}}). The path of such an error is not the path of a type error:</p>
+<ol>
+  <li><code>VLLMValidationError</code> is not a <code>ValueError</code> ({{cite vllm/exceptions.py:20}}, {{cite vllm/exceptions.py:28}}). Pydantic turns only a <code>ValueError</code> or an <code>AssertionError</code> of a validator into a <code>ValidationError</code>, and lets other exceptions pass unchanged (general pydantic rule). The tests of vLLM show this: building the request raises <code>VLLMValidationError</code> itself ({{cite tests/tool_use/test_chat_completion_request_validations.py:30-38}}).</li>
+  <li>So FastAPI does not make a <code>RequestValidationError</code>, and the validation handler of layer 1 does not run. The exception goes to <code>vllm_error_handler()</code> of layer 2, which calls <code>exception_handler()</code> and then <code>create_error_response()</code> ({{cite vllm/entrypoints/serve/exception_handling/handlers/vllm_error.py:24-25}}, {{cite vllm/entrypoints/serve/exception_handling/handlers/exception.py:14-24}}).</li>
+  <li>The message is <code>str(exc)</code>, and the class adds the parameter name to it ({{cite vllm/entrypoints/serve/exception_handling/error_response.py:22-24}}, {{cite vllm/exceptions.py:49-56}}). The server test expects a <code>BadRequestError</code> (HTTP 400) for this request ({{cite tests/entrypoints/openai/chat_completion/test_chat.py:406-415}}).</li>
+</ol>
+<p>The body for <code>"stream": false</code> with <code>stream_options</code> is then (the field order follows <code>ErrorInfo</code>):</p>
+<pre><code class="language-none">HTTP/1.1 400 Bad Request
+
+{"error": {"message": "Stream options can only be defined when `stream=True`. (parameter=stream_options)",
+           "type": "BadRequestError", "param": "stream_options", "code": 400}}</code></pre>
+<p>A field with a wrong type, for example <code>"n": "x"</code>, takes the other path. Pydantic raises a <code>ValidationError</code>, and FastAPI makes a <code>RequestValidationError</code>. The validation handler answers 400 with the message <code>"1 validation error: ..."</code> and a <code>param</code> such as <code>body.n</code> ({{cite vllm/entrypoints/serve/exception_handling/handlers/validation.py:167-195}}). That handler still looks for a <code>VLLMValidationError</code> inside the pydantic errors ({{cite vllm/entrypoints/serve/exception_handling/handlers/validation.py:158-165}}). Because the class is no longer a <code>ValueError</code>, this branch cannot match a validator error any more (derived from the class tree).</p>
+<x-warning title="An error after the first chunk is not an HTTP error"><p>A stream starts with HTTP 200. When an error happens later, the server cannot change the status. It sends the error as one more <code>data:</code> chunk and then <code>data: [DONE]</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:504-508}}). The docstring of the engine error handler says the same ({{cite vllm/entrypoints/serve/exception_handling/handlers/vllm_error.py:46-48}}). A client must check each chunk for an <code>error</code> object.</p></x-warning>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Unexpected sampling.</strong> The default <code>--generation-config auto</code> takes temperature, top-p and top-k from the model ({{cite vllm/config/model.py:1875-1903}}). Two servers with different models answer the same request with different defaults. Send the values that you need, or use <code>--generation-config vllm</code>.</li>
+  <li><strong>Very long answers.</strong> Without <code>max_completion_tokens</code>, a request can run to the end of the context ({{cite vllm/entrypoints/serve/utils/api_utils.py:253-270}}). One such request keeps a slot in the batch and much of the KV cache for a long time.</li>
+  <li><strong><code>stream_options</code> without <code>stream</code></strong> gives HTTP 400 ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:845-856}}).</li>
+  <li><strong>Tool calls in <code>content</code>.</strong> Without <code>--enable-auto-tool-choice</code> and a parser, the model's tool-call text is not parsed ({{cite vllm/entrypoints/openai/chat_completion/serving.py:1036-1040}}), and an <code>"auto"</code> request fails ({{cite vllm/renderers/online_renderer.py:265-271}}).</li>
+  <li><strong>Thinking text in the answer.</strong> A reasoning model without <code>--reasoning-parser</code> puts its thinking into <code>content</code>.</li>
+  <li><strong>Lost connection behind a proxy.</strong> A long queue or prefill sends no bytes. Set <code>--sse-keep-alive-interval</code> ({{cite vllm/entrypoints/common/cli_args.py:156-160}}).</li>
+  <li><strong>401 on /v1 routes only.</strong> With an API key, <code>/health</code> and <code>/metrics</code> stay open ({{cite vllm/entrypoints/serve/middleware/authenticate.py:11}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> The API is the contract with your users. Its defaults decide how long and how random the answers are, and its stream format decides what the client sees and when.</p>
+
+<x-quiz>
+  <x-q level="easy">Which route takes a list of chat messages, and which takes a raw prompt?
+    <x-a><p><code>POST /v1/chat/completions</code> takes <code>messages</code> and applies the chat template ({{cite vllm/entrypoints/openai/chat_completion/api_router.py:43-44}}). <code>POST /v1/completions</code> takes <code>prompt</code> ({{cite vllm/entrypoints/openai/completion/protocol.py:53-59}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">How does a streamed response end?
+    <x-a><p>With the line <code>data: [DONE]</code> and a blank line ({{cite vllm/entrypoints/openai/chat_completion/serving.py:508}}). With <code>include_usage</code>, a usage chunk with empty <code>choices</code> comes just before it.</p></x-a>
+  </x-q>
+  <x-q level="medium">A request sets no <code>temperature</code>. The model's <code>generation_config.json</code> has <code>"temperature": 0.6</code>. Which temperature does vLLM use with the default flags, and with <code>--generation-config vllm</code>?
+    <x-a><p>0.6 with the default <code>auto</code>, because the server default comes before the OpenAI default ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:741-747}}, {{cite vllm/config/model.py:1875-1877}}). With <code>vllm</code>, no file is read, so the OpenAI default 1.0 applies ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:692-700}}).</p></x-a>
+  </x-q>
+  <x-q level="hard"><code>max_model_len</code> is 8,192, the prompt has 8,000 tokens, the request asks for <code>max_completion_tokens: 500</code>, and the generation config has no <code>max_new_tokens</code>. How many tokens can the answer have?
+    <x-a><p>192. <code>get_max_tokens()</code> takes the minimum of 8,192 − 8,000 = 192 and 500 (and a platform limit, if any) ({{cite vllm/entrypoints/serve/utils/api_utils.py:253-270}}). The request does not fail; the answer ends with <code>finish_reason: "length"</code> after 192 tokens.</p></x-a>
+  </x-q>
+  <x-q level="hard">A client gets HTTP 200, then a stream that stops with an error. Why is the status not 500, and where is the error?
+    <x-a><p>The server sends the status with the first byte of the stream. A later error cannot change it. The stream generator catches the exception, sends it as one more <code>data:</code> chunk with an error object, and then sends <code>data: [DONE]</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:504-508}}).</p></x-a>
+  </x-q>
+</x-quiz>

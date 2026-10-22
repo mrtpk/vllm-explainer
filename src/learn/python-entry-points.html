@@ -1,0 +1,151 @@
+---
+title: Python entry points
+nav_title: Python entry points
+level: Beginner
+prerequisites: learn/what-is-vllm
+related: concepts/plugin-loading, concepts/plugin-map, code/plugins-init, tours/build-a-toy-plugin, reference/extension-points
+summary: An entry point is a name that an installed Python package publishes in its metadata, under a group. Other code finds it with importlib.metadata and loads the object it names. The vllm command and all vLLM plugins use this mechanism.
+---
+<x-sentence>An entry point is a named pointer to a Python object in the metadata of an installed package; other code finds and loads it.</x-sentence>
+
+<h2>The idea</h2>
+
+<h3>A name, a group and a target</h3>
+<p>When you install a Python package, the installer writes a small metadata folder next to the code. One file in that folder can list {{term entry-point | entry points}}. Each entry point has three parts:</p>
+<ul>
+  <li>a <strong>group</strong>, for example <code>vllm.general_plugins</code> or <code>console_scripts</code> (an {{term entry-point-group}});</li>
+  <li>a <strong>name</strong> inside the group, for example <code>lora_filesystem_resolver</code>;</li>
+  <li>a <strong>value</strong> of the form <code>module.path:attribute</code>, the object to load.</li>
+</ul>
+<p>Any program can ask: "Which entry points of group X are installed?" It gets the names and values without an import of the packages. Only when it calls <code>load()</code> on one entry point does Python import that module.</p>
+
+<h3>Two uses in vLLM</h3>
+<ol>
+  <li><strong>The <code>vllm</code> command.</strong> A {{term console-script}} is an entry point in the group <code>console_scripts</code>. The installer makes a small program called <code>vllm</code> that calls <code>vllm.entrypoints.cli.main:main</code> ({{cite pyproject.toml:42-43}}).</li>
+  <li><strong>Plugins.</strong> vLLM reads its own groups. A package that you install next to vLLM adds an entry point to such a group, and vLLM calls it at start-up. vLLM itself uses this for its two built-in LoRA resolvers ({{cite pyproject.toml:45-47}}).</li>
+</ol>
+<p>So the {{term plugin}} system of vLLM needs no configuration file. "Install the package" is enough. The page {{link concepts/plugin-loading}} explains when each process loads each group.</p>
+
+<h3>An everyday comparison</h3>
+<p>Think of the directory board in the hall of an office building. Each company writes its name and its room number on the board when it moves in. A visitor reads the board and then goes to the room. The visitor does not open every door to find the company.</p>
+<p>The comparison stops here: a visitor can only read the board. <code>load()</code> also "opens the door": it imports the module, and the import runs the module's top-level code.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b1a_entry_points" alt="Panel 1, install time: pyproject.toml of vLLM declares [project.scripts] vllm and [project.entry-points vllm.general_plugins] lora_filesystem_resolver. pip install or the build backend writes the .dist-info folder and a bin/vllm wrapper. The file entry_points.txt in vllm-version.dist-info lists the group console_scripts with vllm and the group vllm.general_plugins with lora_filesystem_resolver. Panel 2, run time: entry_points(group=vllm.general_plugins) reads metadata only and returns EntryPoints. Each EntryPoint has name lora_filesystem_resolver, value vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver and group vllm.general_plugins. ep.load() imports the module part, gets the attribute and returns a function object, and vLLM calls it." caption="Figure: an entry point goes from the source declaration into installed metadata (panel 1). At run time importlib.metadata finds it, and load() imports the target (panel 2)." />
+<p>Read panel 1 at install time and panel 2 at run time. The green box is the only link between them: a text file in the installed metadata. That is why a plugin works without a change to vLLM: the installer writes the file, and vLLM reads it.</p>
+
+<h2>In vLLM</h2>
+<p>This is a basics page, so this part gives only pointers. The concept page {{link concepts/plugin-loading}} and the module page {{link code/plugins-init}} explain the loading code in full.</p>
+<ol>
+  <li><strong>vLLM's own entry points.</strong> The <code>pyproject.toml</code> of vLLM declares the console script and two general plugins:
+    <x-code file="pyproject.toml" lines="42-47" title="pyproject.toml" lang="toml" /></li>
+  <li><strong>A plugin package in the tests.</strong> The test package <code>vllm_add_dummy_model</code> declares its entry point with <code>setup.py</code> ({{cite tests/plugins/vllm_add_dummy_model/setup.py:6-13}}). Its function registers extra model classes ({{cite tests/plugins/vllm_add_dummy_model/vllm_add_dummy_model/__init__.py:7-12}}).</li>
+  <li><strong>The loader.</strong> <code>load_plugins_by_group()</code> asks <code>importlib.metadata.entry_points(group=...)</code>, filters by name, and calls <code>load()</code> on each entry point ({{cite vllm/plugins/__init__.py:36-74}}).</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Declare an entry point: pyproject.toml or setup.py">
+<p><strong>pyproject.toml.</strong> The <code>[project]</code> table of the packaging standard has two places for entry points:</p>
+<ul>
+  <li><code>[project.scripts]</code>: each key becomes a console script ({{cite pyproject.toml:42-43}}). The installer writes it into the group <code>console_scripts</code>.</li>
+  <li><code>[project.entry-points."&lt;group&gt;"]</code>: any other group. The group name has dots, so it needs quotes ({{cite pyproject.toml:45-47}}).</li>
+</ul>
+<p><strong>setup.py.</strong> Older packages pass a dictionary to <code>setup()</code>: group name → list of <code>"name = module:attr"</code> strings. One package can fill several groups. The dummy platform plugin of the tests fills two groups at once ({{cite tests/plugins/vllm_add_dummy_platform/setup.py:6-18}}):</p>
+<x-code file="tests/plugins/vllm_add_dummy_platform/setup.py" lines="6-18" title="One package, two groups" />
+<p><strong>What the installer writes.</strong> In the installed <code>&lt;name&gt;-&lt;version&gt;.dist-info/</code> folder, the file <code>entry_points.txt</code> has one INI section per group. For vLLM it looks like this (the file is not in the repo; it comes from the build):</p>
+<pre><code class="language-none">[console_scripts]
+vllm = vllm.entrypoints.cli.main:main
+
+[vllm.general_plugins]
+lora_filesystem_resolver = vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver
+lora_hf_hub_resolver = vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver</code></pre>
+<p>An editable install (<code>pip install -e .</code>) also writes this file. So when you add or rename an entry point, install the package again. A change to the code of the target needs no new install.</p>
+</x-deepdive>
+
+<x-deepdive title="Read entry points with importlib.metadata: a tiny example">
+<p>vLLM needs Python 3.11 or newer ({{cite pyproject.toml:34}}). From Python 3.10, <code>importlib.metadata.entry_points(group=...)</code> returns only the entry points of one group. Each item is an <code>EntryPoint</code> with these attributes:</p>
+<table>
+  <thead><tr><th>Attribute</th><th>Example</th></tr></thead>
+  <tbody>
+    <tr><td><code>ep.group</code></td><td><code>"vllm.general_plugins"</code></td></tr>
+    <tr><td><code>ep.name</code></td><td><code>"lora_filesystem_resolver"</code></td></tr>
+    <tr><td><code>ep.value</code></td><td><code>"vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver"</code></td></tr>
+    <tr><td><code>ep.module</code>, <code>ep.attr</code></td><td>the parts before and after the colon</td></tr>
+    <tr><td><code>ep.load()</code></td><td>imports <code>ep.module</code>, then returns the attribute <code>ep.attr</code> of it</td></tr>
+  </tbody>
+</table>
+<p><strong>A tiny plugin package</strong> (example files, not in the repo). Two files are enough:</p>
+<pre><code class="language-toml"># my_vllm_plugin/pyproject.toml
+[project]
+name = "my-vllm-plugin"
+version = "0.1"
+
+[project.entry-points."vllm.general_plugins"]
+hello = "my_vllm_plugin:register"</code></pre>
+<pre><code class="language-python"># my_vllm_plugin/my_vllm_plugin/__init__.py
+def register():
+    print("hello from my_vllm_plugin")</code></pre>
+<p>Install it with <code>pip install -e my_vllm_plugin</code>. Then read the group from any Python process:</p>
+<pre><code class="language-python">from importlib.metadata import entry_points
+
+eps = entry_points(group="vllm.general_plugins")
+for ep in eps:
+    print(ep.name, "->", ep.value)
+
+ep = next(ep for ep in eps if ep.name == "hello")
+func = ep.load()   # imports my_vllm_plugin now
+func()             # prints "hello from my_vllm_plugin"</code></pre>
+<p>Install no other plugin of this group. Then the loop prints three lines: <code>hello</code> and the two LoRA resolvers of vLLM. The order of the lines depends on the order of the packages on <code>sys.path</code>; do not depend on it.</p>
+<x-simplified><p>This example calls only its own function. vLLM calls every function of the group (or the functions that <code>VLLM_PLUGINS</code> names), and it does that in each of its processes.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="How vLLM reads a group, line by line">
+<x-code file="vllm/plugins/__init__.py" lines="36-74" highlight="42,64,69-72" />
+<ol>
+  <li><strong>Line 40.</strong> <code>VLLM_PLUGINS</code> is a list of names, or <code>None</code> when the variable is not set ({{cite vllm/envs.py:1163-1167}}).</li>
+  <li><strong>Line 42.</strong> <code>entry_points(group=group)</code> reads the metadata of all installed packages. Nothing is imported yet.</li>
+  <li><strong>Lines 43-45.</strong> An empty group returns an empty dict.</li>
+  <li><strong>Lines 52-54.</strong> The loader logs each <code>ep.name</code> and <code>ep.value</code>: at DEBUG for <code>vllm.general_plugins</code>, at INFO for other groups.</li>
+  <li><strong>Line 64.</strong> The filter compares <code>ep.name</code>, not the package name, with <code>VLLM_PLUGINS</code>.</li>
+  <li><strong>Lines 68-72.</strong> <code>plugin.load()</code> imports the module. An exception is logged with <code>logger.exception</code>, and the loop goes on with the next plugin.</li>
+  <li><strong>Line 74.</strong> The result maps each name to the loaded object. The caller decides what to do with it. For general plugins, <code>load_general_plugins()</code> calls each function once per process ({{cite vllm/plugins/__init__.py:77-90}}).</li>
+</ol>
+<p><strong>The groups.</strong> vLLM reads five groups through this function ({{cite vllm/plugins/__init__.py:16-30}}). A sixth group, <code>vllm.logits_processors</code>, has its own loader that calls <code>entry_points()</code> directly ({{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:46}}). Which process loads which group, when, and what the loaded object must be, is the topic of {{link concepts/plugin-loading}}. This page does not repeat it.</p>
+</x-deepdive>
+
+<x-deepdive title="The console script vllm, and other uses of package metadata">
+<p>For each console script, the installer writes a small executable into the <code>bin/</code> folder of the environment (<code>Scripts\</code> on Windows). It imports <code>vllm.entrypoints.cli.main</code> and calls <code>main()</code>. So <code>vllm serve ...</code> and <code>python -m vllm.entrypoints.cli.main serve ...</code> run the same function ({{cite vllm/entrypoints/cli/main.py:122-123}}).</p>
+<p>The same metadata gives the version. <code>vllm --version</code> prints <code>importlib.metadata.version("vllm")</code>: the version of the installed distribution, not a constant in the code ({{cite vllm/entrypoints/cli/main.py:92-97}}).</p>
+<p><strong>Worked example.</strong> The value <code>vllm.entrypoints.cli.main:main</code> splits at the colon. The module part is <code>vllm.entrypoints.cli.main</code>, and the attribute part is <code>main</code>. So <code>ep.load()</code> does the same as <code>importlib.import_module("vllm.entrypoints.cli.main").main</code>. A value can also name a dotted attribute, for example <code>pkg.mod:Class.method</code>; then <code>load()</code> follows each dot.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>The plugin is installed in another environment.</strong> <code>entry_points()</code> reads only the packages on the <code>sys.path</code> of the running interpreter. Install the plugin with the same <code>pip</code> as vLLM.</li>
+  <li><strong>The metadata is old.</strong> You renamed the entry point or the function, but did not install the package again. The old name is still in <code>entry_points.txt</code>, and <code>load()</code> fails.</li>
+  <li><strong>A wrong value fails quietly.</strong> When <code>load()</code> raises, vLLM logs the exception and skips the plugin ({{cite vllm/plugins/__init__.py:68-72}}). The server starts without your plugin. Read the log for "Failed to load plugin".</li>
+  <li><strong><code>VLLM_PLUGINS</code> uses entry-point names.</strong> It matches <code>ep.name</code>, for example <code>register_dummy_model</code>, not the package name <code>vllm_add_dummy_model</code> ({{cite vllm/plugins/__init__.py:64}}, {{cite tests/plugins/vllm_add_dummy_model/setup.py:11}}).</li>
+  <li><strong>Heavy imports.</strong> <code>load()</code> runs the top-level code of the module, in every process that loads the group. Keep the module light and do the work inside the function.</li>
+  <li><strong>The function runs more than once.</strong> A general plugin runs in several processes. The docstring says that plugins "should be designed in a way that they can be loaded multiple times" ({{cite vllm/plugins/__init__.py:78-80}}). The test plugin checks before it registers a model ({{cite tests/plugins/vllm_add_dummy_model/vllm_add_dummy_model/__init__.py:11-12}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Every vLLM plugin starts as an entry point. When a plugin does not load, the reason is almost always one of the points above.</p>
+
+<x-quiz>
+  <x-q level="easy">What are the three parts of an entry point?
+    <x-a><p>A group (for example <code>vllm.general_plugins</code>), a name (for example <code>lora_filesystem_resolver</code>) and a value <code>module:attr</code> ({{cite pyproject.toml:45-47}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Which function and which group make the <code>vllm</code> command?
+    <x-a><p><code>vllm.entrypoints.cli.main:main</code>, declared in <code>[project.scripts]</code> ({{cite pyproject.toml:42-43}}). The installer puts it into the group <code>console_scripts</code> and writes a <code>vllm</code> executable.</p></x-a>
+  </x-q>
+  <x-q level="medium">Does <code>entry_points(group="vllm.general_plugins")</code> import the plugin modules?
+    <x-a><p>No. It reads metadata only. The import happens in <code>plugin.load()</code> ({{cite vllm/plugins/__init__.py:42}}, {{cite vllm/plugins/__init__.py:69}}). That is why vLLM can filter by name before any plugin code runs ({{cite vllm/plugins/__init__.py:64}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You set <code>VLLM_PLUGINS=vllm_add_dummy_model</code> and install the test package. The model is not registered, and there is no error. Why?
+    <x-a><p>The filter compares entry-point names ({{cite vllm/plugins/__init__.py:64}}). The name in the test package is <code>register_dummy_model</code>; <code>vllm_add_dummy_model</code> is the package name ({{cite tests/plugins/vllm_add_dummy_model/setup.py:7-11}}). So the loader skips the plugin. Set <code>VLLM_PLUGINS=register_dummy_model</code>.</p></x-a>
+  </x-q>
+  <x-q level="hard">Your plugin module has a syntax error. What happens when <code>vllm serve</code> starts, and where do you see it?
+    <x-a><p><code>plugin.load()</code> raises during the import. The loader catches it, logs "Failed to load plugin ..." with the traceback, and goes on ({{cite vllm/plugins/__init__.py:68-72}}). The server starts without the plugin, so you see the problem only in the log.</p></x-a>
+  </x-q>
+</x-quiz>
