@@ -1,0 +1,212 @@
+---
+title: v1/worker/gpu_worker.py: the GPU Worker
+nav_title: v1/worker/gpu_worker.py
+level: Advanced
+prerequisites: concepts/executors-and-workers
+related: concepts/executors-and-workers, concepts/model-runner, concepts/kv-cache-manager, concepts/compile-and-cuda-graphs, concepts/tuning, code/v1-executor-multiproc-executor, code/v1-worker-gpu-model-runner, tours/serve-startup
+summary: vllm/v1/worker/gpu_worker.py defines Worker, the object that owns one GPU. It sets up the device and NCCL, builds Model Runner V2, profiles memory to size the KV cache, warms up the model, and forwards each step to the model runner.
+---
+<h2>Purpose</h2>
+<p><code>vllm/v1/worker/gpu_worker.py</code> defines <code>Worker</code>, the CUDA {{term worker}}. One <code>Worker</code> object owns one GPU. The executor calls its methods by name, and most of them forward to the {{term model-runner}}.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/v1/worker/gpu_worker.py</code>, 1,720 lines of Python.</td></tr>
+    <tr><th>Main class</th><td><code>Worker(WorkerBase)</code> ({{cite vllm/v1/worker/gpu_worker.py:196}}). The CUDA platform sets <code>worker_cls</code> to it when <code>worker_cls</code> is <code>"auto"</code> ({{cite vllm/platforms/cuda.py:330-331}}).</td></tr>
+    <tr><th>Runs in</th><td>A worker process (<code>VllmWorker-&lt;rank&gt;</code>), or the engine core process with the {{term uni-executor}}. Always in the main thread of that process.</td></tr>
+    <tr><th>Called by</th><td><code>WorkerWrapperBase</code>, which the executor drives: directly ({{cite vllm/v1/executor/uniproc_executor.py:68-74}}) or through <code>worker_busy_loop</code> ({{cite vllm/v1/executor/multiproc_executor.py:1041-1047}}), which looks up the method by name ({{cite vllm/v1/executor/multiproc_executor.py:1057-1059}}).</td></tr>
+    <tr><th>Calls</th><td>Model Runner V2 (<code>vllm/v1/worker/gpu/model_runner.py</code>), <code>init_distributed_environment</code>, the memory profiler (<code>vllm/utils/mem_utils.py</code>), the sleep-mode backend, KV and EC connectors.</td></tr>
+    <tr><th>Not in this file</th><td>Inputs, attention metadata, the forward pass and sampling (the model runner); the KV cache planning (<code>v1/core/kv_cache_planning.py</code>); the process loop (<code>multiproc_executor.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>This page reads the methods that <code>vllm serve</code> uses. The page {{link concepts/executors-and-workers}} explains where the worker sits.</p>
+
+<h2>Where it sits</h2>
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Construction.</strong> <code>WorkerWrapperBase.init_worker</code> resolves <code>parallel_config.worker_cls</code> and makes the object ({{cite vllm/v1/worker/worker_base.py:292-347}}).</li>
+  <li><strong>Start-up.</strong> The executor calls <code>init_device</code> and <code>load_model</code>. Then <code>EngineCore._initialize_kv_caches</code> calls <code>get_kv_cache_spec</code>, <code>determine_available_memory</code>, <code>initialize_from_config</code> and <code>compile_or_warm_up_model</code> through <code>collective_rpc</code> ({{cite vllm/v1/engine/core.py:253-379}}).</li>
+  <li><strong>Every step.</strong> <code>execute_model</code>, then <code>sample_tokens</code> ({{cite vllm/v1/executor/abstract.py:261-287}}). With MoE data parallelism, idle ranks call <code>execute_dummy_batch</code> ({{cite vllm/v1/engine/core.py:2493-2495}}).</li>
+  <li><strong>Control.</strong> <code>sleep</code>, <code>wake_up</code>, LoRA and profiling calls come as utility calls from the front end.</li>
+</ul>
+<h3>What it calls</h3>
+<ul>
+  <li><code>init_worker_distributed_environment</code>: process groups and NCCL ({{cite vllm/v1/worker/gpu_worker.py:1678-1716}}).</li>
+  <li><code>_make_model_runner</code>: Model Runner V2 by default ({{cite vllm/v1/worker/gpu_worker.py:567-583}}).</li>
+  <li><code>memory_profiling</code> and <code>model_runner.profile_run</code> ({{cite vllm/v1/worker/gpu_worker.py:682-697}}).</li>
+  <li><code>model_runner.execute_model</code>, <code>model_runner.sample_tokens</code> ({{cite vllm/v1/worker/gpu_worker.py:1318-1353}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>AsyncIntermediateTensors</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:164-193}}</td><td>PP only: received activations that wait for their communication on first use.</td></tr>
+    <tr><td><code>Worker.__init__</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:197-247}}</td><td>Store config, matmul precision, sleep and profiler state.</td></tr>
+    <tr><td><code>sleep</code> / <code>wake_up</code> / <code>discard</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:298-369}}</td><td>Free and restore GPU memory through the sleep-mode backend.</td></tr>
+    <tr><td><code>init_device</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:446-549}}</td><td>Device, NCCL, cuBLAS handles, memory snapshot, model runner.</td></tr>
+    <tr><td><code>_make_model_runner</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:567-583}}</td><td>Choose Model Runner V2, the encoder-only runner, or the V1 fallback.</td></tr>
+    <tr><td><code>load_model</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:591-614}}</td><td>Load weights (in the "weights" memory pool when sleep mode is on).</td></tr>
+    <tr><td><code>determine_available_memory</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:637-811}}</td><td>Profile run; return the bytes for the KV cache.</td></tr>
+    <tr><td><code>initialize_from_config</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:856-909}}</td><td>Allocate the KV cache tensors.</td></tr>
+    <tr><td><code>compile_or_warm_up_model</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:923-1115}}</td><td>Compile sizes, kernel warm-up, CUDA graph capture, GC freeze.</td></tr>
+    <tr><td><code>sample_tokens</code> / <code>execute_model</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:1316-1383}}</td><td>The two calls of each step.</td></tr>
+    <tr><td><code>execute_dummy_batch</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:1454-1460}}</td><td>A one-token decode for idle DP ranks.</td></tr>
+    <tr><td><code>init_worker_distributed_environment</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:1678-1720}}</td><td>World group, then TP/PP/PCP/DCP groups.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>init_device</code>: the GPU, NCCL and the memory baseline</h3>
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="489-549" highlight="492-493,501-507,523-526,529-530,538-541,549" />
+<ol>
+  <li><strong>Lines 492-493.</strong> The worker binds its thread to its GPU.</li>
+  <li><strong>Lines 501-507.</strong> NCCL and the process groups start <em>before</em> the snapshot, as the comment says, so their buffers count as baseline.</li>
+  <li><strong>Lines 523-526.</strong> A tiny <code>mm</code> and <code>linear</code> make the cuBLAS handles now. The comment (lines 516-522) explains the reason: cuBLAS memory is invisible to torch's cache, so it must exist before the snapshot.</li>
+  <li><strong>Lines 538-541.</strong> The snapshot records free and total memory. <code>request_memory</code> computes the budget and fails at once if the GPU has less free memory than that ({{cite vllm/v1/worker/utils.py:724-726}}, {{cite vllm/v1/worker/utils.py:761-772}}).</li>
+  <li><strong>Line 549.</strong> The model runner is built here, before the weights load.</li>
+</ol>
+
+<h3><code>_make_model_runner</code>: Model Runner V2</h3>
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="567-583" />
+<p><code>use_v2_model_runner</code> is the default when Triton is present and no unsupported feature is set ({{cite vllm/config/vllm.py:713-748}}). Lines 581-583 are the Model Runner V1 fallback; the page {{link concepts/model-runner}} names its cases.</p>
+
+<h3><code>determine_available_memory</code>: size the KV cache</h3>
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="680-715" highlight="683-686,697,704-708,711-715" />
+<ol>
+  <li><strong>Lines 683-686.</strong> <code>memory_profiling</code> clears the cache, resets the peak counter and measures before and after the block.</li>
+  <li><strong>Line 697.</strong> The {{term profile-run}}: one forward pass with <code>max_num_batched_tokens</code> dummy tokens, then a dummy sampler run ({{cite vllm/v1/worker/gpu/model_runner.py:1010-1040}}). Attention is skipped in this pass (<code>skip_attn=True</code>, line 1024 there).</li>
+  <li><strong>Lines 704-708.</strong> When CUDA graphs will be captured, the runner estimates their memory.</li>
+  <li><strong>Lines 711-715.</strong> The estimate counts only with <code>VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1</code>, the default ({{cite vllm/envs.py:2217-2219}}).</li>
+</ol>
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="738-748" highlight="744-748" />
+<p>The two numbers in line 746 come from the profiler:</p>
+<x-code file="vllm/utils/mem_utils.py" lines="309-321" highlight="312-314,318-321" />
+<p>So the formula is:</p>
+<pre><code class="language-none">requested_memory  = ceil(total_memory × gpu_memory_utilization)
+total_consumed    = free(snapshot in init_device) − free(after profile run)
+peak_headroom     = torch_peak − torch_allocated            (after profile run)
+available_kv      = requested_memory − (total_consumed + peak_headroom) − cudagraph_estimate</code></pre>
+<x-simplified><p>This formula is for the normal case. When some weights are held outside the process, the budget becomes <code>requested_memory</code> minus those weights, with its own <code>ValueError</code> ({{cite vllm/v1/worker/utils.py:728-759}}).</p></x-simplified>
+<p>The default <code>gpu_memory_utilization</code> is 0.92 ({{cite vllm/config/cache.py:212}}). The result goes back to the engine core, which divides it by the bytes per block ({{cite vllm/v1/core/kv_cache_planning.py:678-681}}). See the worked example in the deep dive.</p>
+<x-warning title="--kv-cache-memory-bytes skips the budget">
+<p>With <code>kv_cache_memory_bytes</code> set, the worker still runs the profile run, but it returns that value. Only a multimodal reservation can take some bytes off it ({{cite vllm/v1/worker/gpu_worker.py:674-678}}). The log says that this "does not respect the gpu_memory_utilization config" ({{cite vllm/v1/worker/gpu_worker.py:653-678}}).</p>
+</x-warning>
+
+<h3><code>initialize_from_config</code>: allocate the KV cache</h3>
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="857-901" highlight="861,878,883-889,898-901" />
+<ol>
+  <li><strong>Line 861.</strong> The worker learns the final number of blocks.</li>
+  <li><strong>Line 878.</strong> A KV connector starts here, because it needs the KV cache config.</li>
+  <li><strong>Lines 883-889.</strong> The KV cache goes into the "kv_cache" memory pool, so sleep mode can free it on its own.</li>
+  <li><strong>Lines 898-901.</strong> The model runner allocates and binds the tensors. The page {{link concepts/kv-cache-manager}} explains the layout.</li>
+</ol>
+
+<h3><code>compile_or_warm_up_model</code>: the last start-up step</h3>
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="960-985" highlight="961-968,973,975-980,983-985" />
+<ol>
+  <li><strong>Lines 961-968.</strong> One dummy run per extra compile size, largest first.</li>
+  <li><strong>Line 973.</strong> Kernel warm-up and tuning before capture.</li>
+  <li><strong>Lines 983-985.</strong> CUDA graph capture, unless <code>--enforce-eager</code>. See {{link concepts/compile-and-cuda-graphs}}.</li>
+</ol>
+<p>After capture, when <code>--kv-cache-memory-bytes</code> is not set, the worker logs a suggested KV cache size that includes the real CUDA graph memory and a 150 MiB buffer ({{cite vllm/v1/worker/gpu_worker.py:1003-1057}}). The log line writes the flag as <code>--kv-cache-memory=</code>; the flag that the parser defines is <code>--kv-cache-memory-bytes</code> ({{cite vllm/engine/arg_utils.py:1385}}). Then it resets the random seed, freezes the GC heap and turns on the GPU sync check ({{cite vllm/v1/worker/gpu_worker.py:1085-1110}}).</p>
+
+<h3><code>execute_model</code> and <code>sample_tokens</code>: every step</h3>
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="1316-1363" highlight="1317,1321,1330-1333,1336-1348,1351-1353,1360-1363" />
+<ol>
+  <li><strong>Lines 1317 and 1324.</strong> <code>with_gpu_sync_check</code> can report any GPU-to-CPU wait in these calls (only with <code>VLLM_GPU_SYNC_CHECK</code>; see {{link concepts/async-scheduling}}).</li>
+  <li><strong>Line 1321.</strong> <code>sample_tokens</code> is a plain forward to the model runner. On the last PP rank it returns an <code>AsyncOutput</code>.</li>
+  <li><strong>Lines 1330-1348.</strong> PP only: wait for the previous send, and start receiving the activations of the stage before.</li>
+  <li><strong>Lines 1351-1353.</strong> The model runner does the step. With Model Runner V2 on the last rank, it returns <code>None</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2103-2110}}).</li>
+  <li><strong>Lines 1360-1363.</strong> <code>None</code> or an output goes straight back. Only a non-last PP rank continues: it sends its <code>IntermediateTensors</code> to the next stage without a wait (lines 1375-1379).</li>
+</ol>
+
+<h3><code>sleep</code> and <code>wake_up</code> in brief</h3>
+<p>Sleep mode frees GPU memory while the engine is not in use. It needs <code>enable_sleep_mode</code>. On CUDA this turns on the CuMem allocator; on a platform without sleep mode it raises <code>ValueError</code> ({{cite vllm/config/model.py:666-673}}). The engine core docstring gives the levels: level 0 only pauses scheduling; level 1 offloads the weights to the CPU and discards the KV cache; level 2 discards all GPU memory ({{cite vllm/v1/engine/core.py:984-992}}, {{cite vllm/v1/engine/core.py:997-998}}).</p>
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="298-320" highlight="303-313,317" />
+<p>For level 2, the worker first copies the model buffers (and the parameters named in <code>sleep_preserve_parameter_names</code>, and the buffers of a draft model) to the CPU (lines 303-313). <code>wake_up</code> restores them ({{cite vllm/v1/worker/gpu_worker.py:345-362}}). The backend decides what to offload: runtime state and graph pools at every level, and the weights only at level 1. Everything else, for example the KV cache, is discarded ({{cite vllm/device_allocator/sleep_mode_backend.py:127-137}}, {{cite vllm/device_allocator/cumem.py:233-241}}). So the code does not discard all GPU memory at level 2, as the docstring says: it keeps the runtime and CUDA graph pools.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: memory profiling on an 80 GiB GPU">
+<x-diagram name="b2b_memory_profile" alt="Panel 1: a bar for 80 GiB of total memory: 73.6 GiB requested (0.92 × 80) and 6.4 GiB not used. A second bar splits the 73.6 GiB: 16.0 GiB total consumed (15.0 weights plus 1.0 buffers and non-torch memory), 2.5 GiB transient peak headroom from the activations of the profile run, 0.5 GiB CUDA graph estimate, and 54.6 GiB KV cache. Panel 2: the formula rows: requested 73.6, total consumed 16.0, peak headroom 2.5, non-KV memory 18.5, available KV 73.6 − 18.5 − 0.5 = 54.6 GiB, bytes per block 2 MiB, 27,955 blocks, 447,280 tokens." caption="Figure: how determine_available_memory splits an 80 GiB GPU for an 8B BF16 model. The GiB values are illustrative; the formula is from the code." />
+<p>Assumptions (illustrative, not measured): an 8B model with 32 layers, 8 KV heads, head size 128, BF16 weights of about 15 GiB; one GPU with 80 GiB; default settings.</p>
+<ol>
+  <li><code>requested_memory = ceil(80 × 0.92) = 73.6 GiB</code> ({{cite vllm/v1/worker/utils.py:724-726}}).</li>
+  <li>The snapshot in <code>init_device</code> saw 79.0 GiB free. The weights loaded after it. After the profile run, 63.0 GiB are free. So <code>total_consumed = 16.0 GiB</code>: 15.0 GiB of weights and 1.0 GiB of runner buffers and non-torch memory ({{cite vllm/utils/mem_utils.py:312-314}}).</li>
+  <li>During the run, torch's peak was 2.5 GiB above what stays allocated: <code>peak_headroom = 2.5 GiB</code>.</li>
+  <li>CUDA graph estimate: 0.5 GiB.</li>
+  <li><code>available = 73.6 − 16.0 − 2.5 − 0.5 = 54.6 GiB</code> ({{cite vllm/v1/worker/gpu_worker.py:744-748}}).</li>
+  <li>One block holds 16 tokens in all 32 layers: <code>32 × 2 × 16 × 8 × 128 × 2 bytes = 2 MiB</code>. The planner adds up the page sizes of all layers in a group ({{cite vllm/v1/core/kv_cache_planning.py:574-593}}).</li>
+  <li><code>num_blocks = 54.6 GiB // 2 MiB = 27,955</code> ({{cite vllm/v1/core/kv_cache_planning.py:681}}), so the KV cache holds 447,280 tokens. (Derived.)</li>
+</ol>
+<p>The real values are in the log: "Available KV cache memory: ... GiB" ({{cite vllm/v1/worker/gpu_worker.py:763-766}}). The KV size math in general is in {{deepinfer learn/kv-cache | The KV cache}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Data flow: what each method takes and returns">
+<table>
+  <thead><tr><th>Method</th><th>Input</th><th>Output</th></tr></thead>
+  <tbody>
+    <tr><td><code>determine_available_memory</code></td><td>none</td><td><code>int</code> bytes</td></tr>
+    <tr><td><code>get_kv_cache_spec</code></td><td>none</td><td><code>dict[str, KVCacheSpec]</code>, one spec per attention layer ({{cite vllm/v1/worker/gpu_worker.py:841-842}})</td></tr>
+    <tr><td><code>initialize_from_config</code></td><td><code>KVCacheConfig</code> of this rank (the wrapper picks it, {{cite vllm/v1/worker/worker_base.py:350-354}})</td><td>none</td></tr>
+    <tr><td><code>compile_or_warm_up_model</code></td><td>none</td><td><code>CompilationTimes(language_model, encoder)</code></td></tr>
+    <tr><td><code>execute_model</code></td><td><code>SchedulerOutput</code></td><td><code>None</code> (MRV2, last PP rank), <code>ModelRunnerOutput</code>, or <code>AsyncModelRunnerOutput</code></td></tr>
+    <tr><td><code>sample_tokens</code></td><td><code>GrammarOutput | None</code></td><td><code>AsyncOutput</code> on the last PP rank; <code>None</code> if <code>execute_model</code> failed ({{cite vllm/v1/worker/gpu/model_runner.py:2117-2119}})</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>free memory at start-up below the budget</td><td><code>ValueError</code>: "Free memory on device ... is less than desired GPU memory utilization"</td><td>{{cite vllm/v1/worker/utils.py:761-770}}</td></tr>
+    <tr><td>free memory grew during profiling (another process released memory), and there is no ROCm fallback</td><td><code>AssertionError</code> "Error in memory profiling."</td><td>{{cite vllm/v1/worker/gpu_worker.py:719-731}}</td></tr>
+    <tr><td>device type is not CUDA</td><td><code>RuntimeError</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:546-547}}</td></tr>
+    <tr><td>model dtype not supported by the GPU</td><td>raised by <code>check_if_supports_dtype</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:495}}</td></tr>
+    <tr><td>memory grew after sleep</td><td><code>AssertionError</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:331}}</td></tr>
+    <tr><td><code>check_health</code></td><td>always passes while the process runs</td><td>{{cite vllm/v1/worker/gpu_worker.py:1474-1476}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables and config fields">
+<table>
+  <thead><tr><th>Name</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--gpu-memory-utilization</code></td><td>0.92 ({{cite vllm/config/cache.py:212}})</td><td>{{cite vllm/v1/worker/utils.py:724-726}}</td><td>Share of the total GPU memory that this instance may use.</td></tr>
+    <tr><td><code>--kv-cache-memory-bytes</code></td><td>unset ({{cite vllm/config/cache.py:371}})</td><td>{{cite vllm/v1/worker/gpu_worker.py:653}}</td><td>Fixed KV cache size (minus a multimodal reservation, if any); ignores the utilization budget.</td></tr>
+    <tr><td><code>VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS</code></td><td>1 ({{cite vllm/envs.py:2217-2219}})</td><td>{{cite vllm/v1/worker/gpu_worker.py:711-715}}</td><td>Subtract the CUDA graph estimate from the KV cache.</td></tr>
+    <tr><td><code>VLLM_FLOAT32_MATMUL_PRECISION</code></td><td>see {{link reference/env-vars}}</td><td>{{cite vllm/v1/worker/gpu_worker.py:214-215}}</td><td><code>torch.set_float32_matmul_precision</code>.</td></tr>
+    <tr><td><code>VLLM_RANDOMIZE_DP_DUMMY_INPUTS</code></td><td>see {{link reference/env-vars}}</td><td>{{cite vllm/v1/worker/gpu_worker.py:1447-1452}}</td><td>DP only: random inputs in dummy runs.</td></tr>
+    <tr><td><code>--enforce-eager</code></td><td>off</td><td>{{cite vllm/v1/worker/gpu_worker.py:983}}</td><td>No CUDA graph capture.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/executors-and-workers}}: who calls the worker, and in which process.</li>
+  <li>{{link concepts/model-runner}}: what <code>execute_model</code> and <code>sample_tokens</code> do inside.</li>
+  <li>{{link concepts/kv-cache-manager}}: how the bytes from this page become blocks.</li>
+  <li>{{link concepts/compile-and-cuda-graphs}}: warm-up and capture.</li>
+  <li>{{link concepts/tuning}}: <code>gpu_memory_utilization</code> in practice.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which class does the GPU worker build as its model runner by default?
+    <x-a><p>Model Runner V2, <code>vllm.v1.worker.gpu.model_runner.GPUModelRunner</code>, when <code>use_v2_model_runner</code> is true and the instance is not encoder-only ({{cite vllm/v1/worker/gpu_worker.py:569-580}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>init_device</code> start NCCL and make the cuBLAS handles before it takes the memory snapshot?
+    <x-a><p>So their memory counts as the baseline and not as memory that the model consumed. The comments say this for NCCL ({{cite vllm/v1/worker/gpu_worker.py:497-500}}) and for cuBLAS, whose memory torch cannot free on demand ({{cite vllm/v1/worker/gpu_worker.py:516-522}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">On an 80 GiB GPU with <code>--gpu-memory-utilization 0.92</code>, the profile run consumes 16 GiB, the peak headroom is 2.5 GiB and the CUDA graph estimate is 0.5 GiB. How much memory goes to the KV cache, and what changes with <code>VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0</code>?
+    <x-a><p><code>73.6 − 16 − 2.5 − 0.5 = 54.6 GiB</code> ({{cite vllm/v1/worker/gpu_worker.py:744-748}}, {{cite vllm/v1/worker/utils.py:724-726}}). With the variable at 0, the estimate is not subtracted, so the KV cache gets 55.1 GiB, and the worker warns that you may need a lower utilization to avoid OOM ({{cite vllm/v1/worker/gpu_worker.py:711-715}}, {{cite vllm/v1/worker/gpu_worker.py:790-805}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">What does <code>Worker.execute_model</code> return for a normal step with Model Runner V2 and no PP, and where does the sampled token come from then?
+    <x-a><p><code>None</code>: the model runner stores the hidden states and returns nothing ({{cite vllm/v1/worker/gpu/model_runner.py:2089-2110}}). The engine core then calls <code>sample_tokens</code>, which returns an <code>AsyncOutput</code> ({{cite vllm/v1/worker/gpu_worker.py:1318-1321}}, {{cite vllm/v1/worker/gpu/model_runner.py:2210-2218}}).</p></x-a>
+  </x-q>
+</x-quiz>

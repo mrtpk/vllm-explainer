@@ -50,9 +50,11 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
 
+- FINAL-PASS TODO (B2b FC): 'slow load hits VLLM_ENGINE_READY_TIMEOUT_S' without the >1-API-server condition on concepts/architecture-overview ~161, learn/processes-and-ipc ~140, reference/env-vars ~86; architecture-overview 'uni only when TP=PP=DP=1' → add 'by default' and PCP; async-off lists missing the CPU case (reference pages, t1 glossary async-scheduling); 'engine core calls get_output()' without the mp worker-thread case (Tour 1); any 'sleep level 2 discards all GPU memory'.
+
 - FINAL-PASS TODO: reference/serve-flags must describe --quantization fp8 as deprecated (warn → fp8_per_tensor), not as an error. Later pages lora-serving, quantization-plugins, weight-loading: no FP8 raise, no unload open question, 92.4 MB/slot.
 
-- 2026-10-22 22:23 (hourly check): 3 unknown 'fork' subagents found running (not started by the supervisor). Asked each for its task and files; flagged to the user. Not stopped yet (may be user-started). Watch for file conflicts with the B1b/B2b fact checkers.
+- 2026-10-22 22:23 (hourly check): 3 unknown 'fork' subagents found running (not started by the supervisor). Asked each for its task and files; flagged to the user. Not stopped (may be user-started). By 22:31 all 3 had ended; git status showed no stray changes. CAUSE (22:45): the B2b fact checker forked them itself. Fix: both briefs now forbid sub-agents.
 
 - LESSON: fact checkers can also be wrong (B2a 'last-slice abort bug' was an indentation misread). Supervisor verifies any 'bug in vLLM' claim before it reaches a page or the FAQ.
 
@@ -107,7 +109,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-22 20:36 | B2a writer (architecture-overview, engine-client, data-contracts + 4 engine module pages) | done ~21:00; 4 diagrams, b2a.json 7 terms |
 | 2026-10-22 21:01 | B2a fact check | done ~21:35: ~270 claims, 37 defects. Supervisor REJECTED its 'last-slice abort bug' (abort is inside the loop) and removed the note from 3 pages; supervisor fixed the msgspec claim on processes-and-ipc. |
 | 2026-10-22 21:37 | B2b writer | done ~22:10; 5 diagrams, b2b.json 9 terms |
-| 2026-10-22 22:11 | B2b fact check | running |
+| 2026-10-22 22:11 | B2b fact check | done ~22:45: ~380 claims, ~73 defects. NOTE: it started 3 forks itself (the 'unknown agents'); briefs now forbid sub-agents. |
+| 2026-10-22 22:32 | B3a writer (scheduler, kv-cache-manager + 3 modules + scheduler simulator) | running |
 | 2026-10-22 19:18 | 1b Tour 1 (t1) | done 19:45: 16 stops, 3 diagrams, request_stepper.js, t1.json (12 terms); not browser-checked by writer |
 | 2026-10-22 19:46 | Fact check t1 (+ browser check of stepper) | done ~20:00: ~230 claims, 38 defects (11 citation, 6 value, 9 logic, 3 default source, 9 other). Stepper OK at 1280/390, no overflow. |
 | 2026-10-22 19:49 | Fact check concepts/plugin-loading (+ folder descriptions) | done ~19:58: ~80 claims, 30 defects fixed (8 citation, 11 value/condition, 4 logic, 3 missing source, 5 glossary/folder). Open question answered (platform before general plugins in every process). |

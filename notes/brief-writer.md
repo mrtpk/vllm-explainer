@@ -44,6 +44,9 @@ glossary terms you own. This file gives everything else. It is binding.
 - Performance: both repos are on a slow Windows mount. Use `git -C ../vllm grep -n`, `sed -n 'a,bp'`; never cat or wc the whole tree.
 - Browser check (optional but welcome): /tmp/claude-1000/vllm-foundation/shot.js works with the LD_LIBRARY_PATH set up in that folder (see its scripts). Use your own output folder /tmp/claude-1000/vllm-<batch>/.
 
+## No sub-agents
+Do NOT start subagents or forks (no Agent/Task/fork tool use). The user limits the whole build to 2 running agents; you are one of them. Do all the work yourself.
+
 ## Claims that vLLM has a bug
 Do NOT put a "this looks like a vLLM bug" claim on a page. Re-read the control flow twice (indentation: is the line inside or after the loop/if? the caller and the callee) and report it to the supervisor with exact lines. A B2a fact checker misread an indentation level and wrote a false bug note on 3 pages.
 

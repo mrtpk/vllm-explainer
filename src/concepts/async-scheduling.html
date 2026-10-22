@@ -1,0 +1,158 @@
+---
+title: Async scheduling: overlap the CPU and the GPU
+nav_title: Async scheduling
+level: Advanced
+prerequisites: concepts/engine-core-loop, concepts/data-contracts
+related: concepts/engine-core-loop, concepts/scheduler, concepts/model-runner, concepts/structured-outputs, concepts/speculative-decoding, concepts/executors-and-workers, tours/engine-step, code/v1-engine-core
+summary: With async scheduling, the engine core schedules and starts step N+1 before it waits for the token of step N. Placeholders in the scheduler and a GPU-side token buffer in Model Runner V2 make this possible.
+---
+<x-sentence>With async scheduling, the engine core plans and starts step N+1 while the GPU still runs step N. So the GPU does not wait for the CPU.</x-sentence>
+
+<h2>The idea</h2>
+<p>Each {{term engine-step}} has CPU work and GPU work. The CPU schedules the batch, prepares the inputs, launches the kernels, and later turns the sampled tokens into outputs. The GPU runs the forward pass and the sampler. If the CPU waits for each step before it plans the next one, the GPU is idle during the CPU work. For small decode batches, that CPU work can take a large part of the step time.</p>
+<p>The fix is to plan one step ahead. DeepInfer uses the same idea: the CPU prepares batch N+1 while the GPU runs batch N ({{deepinfer concepts/zero-overhead-scheduling | Zero-overhead scheduling}}). vLLM does it with three parts:</p>
+<ol>
+  <li>The engine core keeps a {{term batch-queue}} of started steps, and it waits only for the oldest one ({{link concepts/engine-core-loop}}).</li>
+  <li><code>AsyncScheduler</code> counts an {{term output-placeholder}} for each token that a started step will sample. So it can schedule the next decode step before it knows the token.</li>
+  <li>Model Runner V2 keeps the last sampled token of each request in a GPU tensor. The next step reads its input token from there, without a copy to the CPU and back.</li>
+</ol>
+<p><strong>An everyday comparison.</strong> Think of a relay race where the next runner starts to run before the baton arrives, and takes it at full speed. The next step starts before the token arrives. The comparison stops in one place: in a relay race the baton must arrive. Here the token never has to reach the CPU before the next step: the GPU passes it to itself.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b2b_async_timeline" alt="Panel 1: without async scheduling, the engine core main thread does S1 (schedule and start), then waits while the GPU runs F1, then U1 (update), then S2. The GPU is idle during U and S, so three tokens take the time of three full cycles. Panel 2: with async scheduling, the engine core does S1 and S2 back to back, waits, U1, S3, waits, U2, S4 and so on. The GPU runs F1, F2, F3, F4, F5 with no gap, and the tokens reach the CPU sooner. Panel 3: the input token of step N+1: sample_tokens of step N writes last_sampled_tokens on the GPU with the post_update kernel; prepare_inputs of step N+1 reads it with combine_sampled_and_draft_tokens; a dashed path shows the copy to the CPU, which only updates the scheduler." caption="Figure: the same decode with and without async scheduling (panels 1 and 2), and the GPU-side path of the sampled token (panel 3). Durations are illustrative." />
+<p>Compare the GPU lanes of panels 1 and 2. Without async scheduling, the GPU has a gap in every step. With it, the GPU lane is full, and the CPU waits instead (dashed blocks). Panel 3 shows why the GPU can start step N+1 at once: it takes its input token from its own memory.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: when async scheduling is on</h3>
+<p>The flag <code>async_scheduling</code> has the default <code>None</code> ({{cite vllm/config/scheduler.py:211-214}}). <code>VllmConfig.__post_init__</code> turns <code>None</code> into <code>True</code> unless an incompatible option is set:</p>
+<x-code file="vllm/config/vllm.py" lines="1664-1698" highlight="1664,1668,1676,1683,1690,1698" />
+<p>So async scheduling is <strong>off</strong> in these cases:</p>
+<ul>
+  <li>You pass <code>--no-async-scheduling</code> (the flag is <code>--async-scheduling</code>, {{cite vllm/engine/arg_utils.py:1800-1802}}).</li>
+  <li>The model is a pooling model, for example an embedding model ({{cite vllm/config/vllm.py:1666-1675}}).</li>
+  <li>The executor class does not support it ({{cite vllm/config/vllm.py:1676-1682}}). The base class says no ({{cite vllm/v1/executor/abstract.py:452-455}}). The uni and mp executors say yes ({{cite vllm/v1/executor/uniproc_executor.py:156-158}}, {{cite vllm/v1/executor/multiproc_executor.py:565-567}}). The Ray executor inherits the mp answer ({{cite vllm/v1/executor/ray_executor_v2.py:239-247}}). An out-of-tree executor class gets <code>False</code> unless it overrides the method.</li>
+  <li>ROCm with dual-batch overlap and the <code>deepep_high_throughput</code> all-to-all backend ({{cite vllm/config/vllm.py:1624-1628}}, {{cite vllm/config/vllm.py:1683-1689}}).</li>
+  <li>The fallback Model Runner V1 is in use, with one of three options: pipeline parallelism, <code>disable_padded_drafter_batch</code>, or an unsupported speculative method ({{cite vllm/config/vllm.py:1630-1645}}, {{cite vllm/config/vllm.py:1690-1696}}). The supported methods are the EAGLE types, GPU n-gram, <code>draft_model</code>, <code>dspark</code> and <code>dflash</code>. With the default Model Runner V2, none of these options turn it off.</li>
+  <li>The CPU platform. Its platform hook always sets <code>async_scheduling = False</code> ({{cite vllm/platforms/cpu.py:342-343}}). The hook runs later in <code>__post_init__</code>, so it wins over your flag and raises no error ({{cite vllm/config/vllm.py:2046-2048}}).</li>
+</ul>
+<p>If you set <code>--async-scheduling</code> yourself and the executor, ROCm or Model Runner V1 case applies, the config raises <code>ValueError</code> instead ({{cite vllm/config/vllm.py:1647-1663}}). A pooling model does not raise: async scheduling stays on. With async scheduling on and no scheduler class set, the scheduler class is <code>AsyncScheduler</code> ({{cite vllm/config/scheduler.py:231-236}}). The batch queue has <code>pp_size + 1</code> slots with Model Runner V2:</p>
+<x-code file="vllm/config/vllm.py" lines="586-597" highlight="591-593" />
+
+<h3>Step 2: AsyncScheduler and the placeholders</h3>
+<p><code>AsyncScheduler</code> is a small subclass of <code>Scheduler</code>. It changes two hooks. After each <code>schedule()</code>, it adds placeholders:</p>
+<x-code file="vllm/v1/core/sched/async_scheduler.py" lines="25-50" highlight="34-35,37-39,45-47,50" />
+<ol>
+  <li>Lines 34-35: a request in the middle of a chunked prefill samples no token, so it gets no placeholder.</li>
+  <li>Lines 37-39: a structured output request with a token still in flight sets <code>pending_structured_output_tokens</code> (Step 5).</li>
+  <li>Lines 45-47: each sampling step adds one placeholder per sampled token, plus one per draft token with speculative decoding.</li>
+  <li>Line 50: the draft tokens of the next step are not known yet either. The scheduler uses a list of <code>-1</code> values as their placeholders ({{cite vllm/v1/core/sched/async_scheduler.py:17-18}}, {{cite vllm/v1/core/sched/async_scheduler.py:28-31}}). The worker fills in the real draft tokens on the GPU.</li>
+</ol>
+<p>The running pass of <code>schedule()</code> counts the placeholders as tokens that the request already has:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="759-763" />
+<p>Take a decode with one token in flight and no speculative decoding. The request has <code>T</code> known tokens, one placeholder, and <code>num_computed_tokens = T</code>. The result is <code>T + 1 - T = 1</code>: the scheduler plans exactly one more token. When the real token arrives, the second hook removes the placeholder:</p>
+<x-code file="vllm/v1/core/sched/async_scheduler.py" lines="59-80" highlight="65-67,71-73,76-79" />
+<p>The tour {{link tours/life-of-a-chat-request#the-loop | Tour 1, the loop}} shows the counters over three steps.</p>
+
+<h3>Step 3: the batch queue gives the overlap</h3>
+<p>The engine core uses <code>step_with_batch_queue</code> when <code>max_concurrent_batches &gt; 1</code> ({{cite vllm/v1/engine/core.py:205-211}}, {{cite vllm/v1/engine/core.py:227-229}}). On each call it schedules and starts step N+1, and only then waits for step N:</p>
+<x-code file="vllm/v1/engine/core.py" lines="753-759" highlight="753,754-759" />
+<x-code file="vllm/v1/engine/core.py" lines="767-773" highlight="768,773" />
+<p>Timeline of one call, for steps N and N+1:</p>
+<ol>
+  <li>The GPU runs step N (it was queued in the previous call).</li>
+  <li>The CPU schedules step N+1. The decode requests of step N+1 count their step-N token as a placeholder.</li>
+  <li>The CPU runs the CPU part of the model runner for step N+1. The kernels of step N+1 go into the same CUDA stream, behind step N.</li>
+  <li>The CPU waits for the result of step N. Often the GPU is already done, so the wait is short.</li>
+  <li>The CPU runs <code>update_from_output</code> for step N and sends its tokens. The GPU already runs step N+1.</li>
+</ol>
+<p>The page {{link concepts/engine-core-loop}} reads the whole function line by line.</p>
+
+<h3>Step 4: the next input token comes from the GPU</h3>
+<p>The CPU does not know the token of step N when it prepares step N+1. Model Runner V2 does not need it. The sampler output stays on the GPU, and <code>postprocess_sampled</code> writes it into <code>req_states.last_sampled_tokens</code> with the <code>post_update</code> kernel:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1702-1726" highlight="1715,1718,1720" />
+<p>In the next step, <code>prepare_inputs</code> copies that token into the input ids on the GPU:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1491-1504" highlight="1493,1496,1500" />
+<p>The copy to the CPU runs at the same time on a separate CUDA stream. <code>AsyncOutput</code> starts it in <code>sample_tokens</code> and records an event ({{cite vllm/v1/worker/gpu/async_utils.py:171}}); nobody waits for it there:</p>
+<x-code file="vllm/v1/worker/gpu/async_utils.py" lines="137-140" highlight="138,140" />
+<x-code file="vllm/v1/worker/gpu/async_utils.py" lines="173-184" highlight="174,180,183" />
+<p>The only wait is <code>copy_event.synchronize()</code> in <code>get_output()</code> (line 174). With the uni executor, the engine core calls it when it pops step N from the batch queue ({{cite vllm/v1/executor/uniproc_executor.py:38-48}}). With the mp executor, a worker thread calls it (Step 6). The design doc of Model Runner V2 states the rule: the core execution loop is "a CUDA stream with no CPU synchronization points" ({{cite docs/design/model_runner_v2.md:47}}). <code>get_output</code> also trims each row to the number of sampled tokens (line 183). So a prefill chunk that sampled nothing gets an empty list.</p>
+
+<h3>Step 5: execute_model and sample_tokens are two calls</h3>
+<p>The engine core calls the workers twice per step: <code>execute_model</code> runs the forward pass, and <code>sample_tokens</code> computes logits and samples. The worker interface links this design to structured outputs:</p>
+<x-code file="vllm/v1/worker/worker_base.py" lines="174-189" highlight="177-182,188" />
+<p>Between the two calls the engine core computes the grammar bitmask for structured output on the CPU, while the GPU runs the forward pass:</p>
+<x-code file="vllm/v1/engine/core.py" lines="737-749" highlight="737,740-742,743-745,749" />
+<p>The bitmask of step N+1 needs the token of step N, because the grammar must first advance by that token. When a structured output request still has a token in flight, the token is not on the CPU yet. Then the engine defers sampling: it processes step N first, computes the bitmask, and only then queues <code>sample_tokens</code> for step N+1 ({{cite vllm/v1/engine/core.py:789-810}}). In this case the GPU can wait for the CPU for a short time. Structured outputs as token masks are explained in {{deepinfer concepts/structured-outputs | Structured outputs}}.</p>
+
+<h3>Step 6: the same overlap with worker processes</h3>
+<p>With the uni executor, <code>execute_model</code> and <code>sample_tokens</code> run in the engine core's main thread. They return without a GPU wait; <code>non_block</code> only moves the wait into a future ({{cite vllm/v1/executor/uniproc_executor.py:108-117}}). With the mp executor, each worker process has an extra thread, <code>WorkerAsyncOutputCopy</code>, only when async scheduling is on ({{cite vllm/v1/executor/multiproc_executor.py:690-699}}). On the output rank, the worker's main thread hands each output to it and reads the next call at once ({{cite vllm/v1/executor/multiproc_executor.py:1019-1020}}, {{cite vllm/v1/executor/multiproc_executor.py:1070-1071}}). The extra thread calls <code>get_output()</code> and writes the result into the reply queue ({{cite vllm/v1/executor/multiproc_executor.py:1000-1002}}, {{cite vllm/v1/executor/multiproc_executor.py:1037-1039}}). See {{link concepts/executors-and-workers}}.</p>
+
+<h3>Step 7: what it costs</h3>
+<ul>
+  <li><strong>One step of extra work after a stop.</strong> When step N samples EOS or a stop token id, step N+1 for that request is already on the GPU. <code>update_from_output</code> skips results of finished requests ({{cite vllm/v1/core/sched/scheduler.py:2184-2192}}). The GPU time of that row is lost, but the client never sees the token.</li>
+  <li><strong>No extra step for <code>max_tokens</code>.</strong> The running pass skips a request when the step in flight surely reaches <code>max_tokens</code> ({{cite vllm/v1/core/sched/scheduler.py:720-734}}).</li>
+  <li><strong>Stop strings cost more.</strong> The engine core has no text. The front end finds a stop string after detokenization and sends an ABORT ({{cite vllm/v1/engine/output_processor.py:825-830}}, {{cite vllm/v1/engine/output_processor.py:878-882}}, {{cite vllm/v1/engine/async_llm.py:918-921}}). By then the engine may have started more than one further step for the request.</li>
+  <li><strong>Prefix caching lags by one step.</strong> After an update, the scheduler caches only blocks up to <code>num_computed_tokens - num_output_placeholders</code>, the tokens whose values are known ({{cite vllm/v1/core/sched/async_scheduler.py:75-79}}).</li>
+</ul>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: EOS versus max_tokens">
+<p>A request has a 10-token prompt and <code>max_tokens = 3</code>. It runs alone. "S k" = schedule step k; "U k" = update with the result of step k. In each call of <code>step_with_batch_queue</code>, S k+1 comes before U k. The skip test is <code>placeholders &gt; 0 and computed + 2 - placeholders &gt;= prompt + max_tokens</code> ({{cite vllm/v1/core/sched/scheduler.py:720-729}}).</p>
+<table>
+  <thead><tr><th>Event</th><th>computed</th><th>placeholders</th><th>num_tokens</th><th>Note</th></tr></thead>
+  <tbody>
+    <tr><td>S 1 (prefill)</td><td>0 → 10</td><td>0 → 1</td><td>10</td><td>last prefill chunk samples a token</td></tr>
+    <tr><td>S 2</td><td>10 → 11</td><td>1 → 2</td><td>10</td><td>test: 10 + 2 − 1 = 11 &lt; 13, schedule 1 token</td></tr>
+    <tr><td>U 1 (token 1)</td><td>11</td><td>2 → 1</td><td>11</td><td></td></tr>
+    <tr><td>S 3</td><td>11 → 12</td><td>1 → 2</td><td>11</td><td>test: 11 + 2 − 1 = 12 &lt; 13, schedule</td></tr>
+    <tr><td>U 2 (token 2)</td><td>12</td><td>2 → 1</td><td>12</td><td></td></tr>
+    <tr><td>S 4</td><td>12</td><td>1</td><td>12</td><td>test: 12 + 2 − 1 = 13 ≥ 13, <strong>skip</strong></td></tr>
+    <tr><td>U 3 (token 3)</td><td>12</td><td>1 → 0</td><td>13</td><td><code>check_stop</code>: length reached</td></tr>
+  </tbody>
+</table>
+<p>No wasted step. Now let token 2 be EOS. At U 2 the request finishes, but S 3 has already started step 3 for it. At U 3 the request is finished, so the result is skipped. One GPU row is wasted. (Derived from the code above and {{cite vllm/v1/core/sched/async_scheduler.py:45-47}}, {{cite vllm/v1/core/sched/async_scheduler.py:71-73}}.)</p>
+</x-deepdive>
+
+<x-deepdive title="Speculative decoding with async scheduling">
+<p>With <code>k</code> speculative tokens, each scheduled decode adds <code>1 + k</code> placeholders (lines 45-47 above). The scheduled draft tokens are the list <code>[-1] * k</code> from the previous schedule call (line 29-31). The real drafts exist only on the GPU. <code>sample_tokens</code> writes them into <code>req_states.draft_tokens</code> after the speculator runs ({{cite vllm/v1/worker/gpu/model_runner.py:2257-2289}}). The next <code>prepare_inputs</code> reads them in <code>combine_sampled_and_draft_tokens</code> (the <code>draft_tokens</code> argument at line 1500).</p>
+<p>When the result arrives, rejected drafts roll back both counters: <code>num_computed_tokens</code> and <code>num_output_placeholders</code> go down by the number of rejected drafts ({{cite vllm/v1/core/sched/scheduler.py:2213-2221}}). Then <code>_update_request_with_output</code> removes one placeholder per accepted token. For this reason <code>EngineCore.post_step</code> does not take draft tokens from the workers when async scheduling is on ({{cite vllm/v1/engine/core.py:689-696}}). The page {{link concepts/speculative-decoding}} explains the methods.</p>
+</x-deepdive>
+
+<x-deepdive title="How vLLM checks that the loop never waits for the GPU">
+<p>The worker methods <code>execute_model</code> and <code>sample_tokens</code> have the decorator <code>with_gpu_sync_check</code> ({{cite vllm/v1/worker/gpu_worker.py:1316-1327}}). It reports any GPU-to-CPU synchronization inside these calls ({{cite vllm/utils/gpu_sync_debug.py:386-392}}). The check is off unless <code>VLLM_GPU_SYNC_CHECK</code> is <code>warn</code> or <code>error</code> ({{cite vllm/envs.py:657-658}}). It starts only after warm-up, when the worker calls <code>enable_gpu_sync_check()</code> ({{cite vllm/v1/worker/gpu_worker.py:1108-1110}}). This is the tool to use when you add code to the model runner and want to keep the overlap.</p>
+</x-deepdive>
+
+<x-deepdive title="The overlap with pipeline parallelism">
+<p>With Model Runner V2 and PP = 2, the batch queue has 3 slots ({{cite vllm/config/vllm.py:591-593}}). The comment gives the reason: PP needs <code>pp_size</code> batches in flight "to fill the pipeline", and async scheduling one more to overlap ({{cite vllm/config/vllm.py:588-589}}). The scheduler then enforces <code>pp_size</code> steps between two decodes of the same request, through <code>next_decode_eligible_step</code> ({{cite vllm/v1/core/sched/async_scheduler.py:52-57}}, {{cite vllm/v1/core/sched/scheduler.py:736-740}}). On XPU with <code>VLLM_XPU_PP_MICROBATCH</code> off, the gap is 1 step ({{cite vllm/v1/core/sched/async_scheduler.py:20-23}}). The page {{link concepts/distributed-groups}} explains PP in vLLM.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Async scheduling is off and you do not know it.</strong> For a pooling model it is off by default and the log says so only at DEBUG level ({{cite vllm/config/vllm.py:1672-1675}}). For an unsupported executor it logs a warning ({{cite vllm/config/vllm.py:1677-1681}}).</li>
+  <li><strong>A custom executor loses the overlap.</strong> An out-of-tree executor class gets <code>supports_async_scheduling() = False</code> from the base class ({{cite vllm/v1/executor/abstract.py:452-455}}). Override it if your executor returns futures correctly.</li>
+  <li><strong>Structured output slows decode.</strong> Each step with a pending structured output token defers sampling until the previous step is processed ({{cite vllm/v1/engine/core.py:746-749}}). The GPU can then wait for the CPU grammar work.</li>
+  <li><strong>New code adds a GPU sync.</strong> A <code>.item()</code> or a <code>.cpu()</code> in the model runner path breaks the overlap without an error. Run with <code>VLLM_GPU_SYNC_CHECK=warn</code> to find it.</li>
+  <li><strong>Wasted tokens after a stop.</strong> With many short answers that end on EOS, about one row per finished request is wasted. This is normally much smaller than the gain.</li>
+</ul>
+<p><strong>Why it matters.</strong> At small batch sizes, the CPU work per step is a large part of the step time. Async scheduling hides it, and that improves both the inter-token latency and the throughput. When you change scheduling or model runner code, keep the two rules of this page. Plan with placeholders. Do not wait for the GPU before the next step is queued.</p>
+
+<x-quiz>
+  <x-q level="easy">What is the default of <code>async_scheduling</code> for a chat model on one GPU, and which scheduler class does the engine core use?
+    <x-a><p>The flag is <code>None</code>, and <code>VllmConfig.__post_init__</code> sets it to <code>True</code> because nothing is incompatible ({{cite vllm/config/vllm.py:1664-1698}}). The scheduler class is then <code>AsyncScheduler</code> ({{cite vllm/config/scheduler.py:231-236}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">How does the scheduler compute the number of new tokens for a decoding request whose last token is still in flight?
+    <x-a><p><code>num_new_tokens = num_tokens_with_spec + num_output_placeholders - num_computed_tokens</code> ({{cite vllm/v1/core/sched/scheduler.py:759-763}}). The placeholder stands for the token in flight, so the result is 1, and the scheduler can plan the step before the token is known.</p></x-a>
+  </x-q>
+  <x-q level="medium">Where does Model Runner V2 get the input token of a decode step when the CPU has not received the previous token yet?
+    <x-a><p>From <code>req_states.last_sampled_tokens</code>, a GPU tensor. <code>post_update</code> writes the sampled token there in <code>sample_tokens</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1715-1726}}), and <code>combine_sampled_and_draft_tokens</code> reads it in the next <code>prepare_inputs</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1493-1500}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A request with <code>max_tokens = 3</code> finishes by length. Another request ends with EOS at its second token. Which of the two wastes a GPU step, and which line prevents the waste for the other?
+    <x-a><p>The EOS request wastes one step. Step 3 was scheduled before the EOS token reached the scheduler. Its result is skipped because the request is finished ({{cite vllm/v1/core/sched/scheduler.py:2184-2192}}). The length case wastes nothing: the running pass skips the request when <code>computed + 2 - placeholders &gt;= prompt + max_tokens</code> ({{cite vllm/v1/core/sched/scheduler.py:720-734}}). See the worked example in the deep dive.</p></x-a>
+  </x-q>
+  <x-q level="hard">Why are <code>execute_model</code> and <code>sample_tokens</code> two separate worker calls?
+    <x-a><p>So the engine core can compute the grammar bitmask on the CPU between them, while the GPU runs the forward pass. <code>sample_tokens</code> takes the bitmask as its argument ({{cite vllm/v1/engine/core.py:740-745}}). The worker interface ties this design to structured outputs ({{cite vllm/v1/worker/worker_base.py:177-182}}).</p></x-a>
+  </x-q>
+</x-quiz>

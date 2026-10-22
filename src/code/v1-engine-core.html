@@ -1,0 +1,253 @@
+---
+title: v1/engine/core.py: EngineCore and the engine core process
+nav_title: v1/engine/core.py
+level: Advanced
+prerequisites: concepts/engine-core-loop, concepts/async-scheduling
+related: concepts/engine-core-loop, concepts/async-scheduling, concepts/executors-and-workers, concepts/data-parallel-serving, code/v1-engine-core-client, code/v1-executor-multiproc-executor, tours/engine-step, tours/life-of-a-chat-request
+summary: vllm/v1/engine/core.py defines EngineCore (scheduler + executor + step functions), EngineCoreProc (the process with its ZMQ threads and busy loop) and DPEngineCoreProc (the lock-step variant for MoE data parallelism).
+---
+<h2>Purpose</h2>
+<p><code>vllm/v1/engine/core.py</code> is the inner loop of vLLM. It owns the scheduler and the {{term executor}}, runs the engine steps, and, in <code>vllm serve</code>, wraps all of this in a process that talks {{term zmq | ZMQ}} with the front end.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/v1/engine/core.py</code>, 2,847 lines of Python. Seven classes: three engine classes, one enum, three Ray actor classes.</td></tr>
+    <tr><th>Main classes</th><td><code>EngineCore</code> ({{cite vllm/v1/engine/core.py:118}}), <code>EngineCoreProc</code> ({{cite vllm/v1/engine/core.py:1153}}), <code>DPEngineCoreProc</code> ({{cite vllm/v1/engine/core.py:2269}}).</td></tr>
+    <tr><th>Runs in</th><td>The {{term engine-core}} process, one per data parallel rank: the main thread (busy loop), the {{term input-thread}} and the {{term output-thread}}. With the {{term uni-executor}}, the worker and the model runner also run in the main thread.</td></tr>
+    <tr><th>Called by</th><td>The engine core client, which starts the process with <code>run_engine_core</code>; with multiprocessing off, <code>InprocClient</code> makes an <code>EngineCore</code> in the caller's process ({{cite vllm/v1/engine/core_client.py:384-389}}).</td></tr>
+    <tr><th>Calls</th><td>The scheduler (<code>schedule</code>, <code>update_from_output</code>, <code>get_grammar_bitmask</code>), the executor (<code>execute_model</code>, <code>sample_tokens</code>, start-up RPCs), the KV cache planner, <code>StructuredOutputManager</code>, msgpack and ZMQ.</td></tr>
+    <tr><th>Not in this file</th><td>The scheduling algorithm (<code>v1/core/sched/scheduler.py</code>), the client side of the sockets (<code>core_client.py</code>), the process launcher and the handshake on the front-end side (<code>v1/engine/utils.py</code>), the workers (<code>v1/executor/</code>, <code>v1/worker/</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/engine-core-loop}} explains the ideas. This page reads the file method by method.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b2b_core_threads" alt="Panel 1: the input thread (process_input_sockets) decodes requests and puts them into input_queue; the main thread (run_busy_loop) processes the input queue and runs step_with_batch_queue, then puts outputs into output_queue; the output thread (process_output_sockets) encodes and sends them. Panel 2: three calls of step_with_batch_queue with a batch queue of size 2. Panel 3: the other messages in the two queues and where each thread blocks." caption="Figure: the three threads of EngineCoreProc, the batch queue, and the other queue messages." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Process launch.</strong> The engine core client starts one process per local DP rank with the target <code>EngineCoreProc.run_engine_core</code> ({{cite vllm/v1/engine/utils.py:279-288}}).</li>
+  <li><strong>Ray data parallel backend.</strong> <code>EngineCoreActor</code> or <code>DPMoEEngineCoreActor</code> run the same classes inside Ray actors ({{cite vllm/v1/engine/utils.py:516-522}}).</li>
+  <li><strong>In-process engine.</strong> <code>InprocClient</code> calls <code>EngineCore.step_fn</code> directly, with no threads and no sockets ({{cite vllm/v1/engine/core_client.py:396-399}}). <code>vllm serve</code> never uses it: <code>AsyncLLM</code> always makes a multiprocess client ({{cite vllm/v1/engine/async_llm.py:193}}).</li>
+  <li><strong>The front end at run time.</strong> ADD, ABORT and UTILITY messages over ZMQ; the utility methods are the public methods of <code>EngineCore</code> and <code>EngineCoreProc</code>, looked up by name ({{cite vllm/v1/engine/core.py:1756-1761}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>load_general_plugins</code>, then <code>executor_class(vllm_config)</code> ({{cite vllm/v1/engine/core.py:130-147}}).</li>
+  <li>Executor start-up RPCs and <code>get_kv_cache_configs</code> in <code>_initialize_kv_caches</code> ({{cite vllm/v1/engine/core.py:253-379}}).</li>
+  <li><code>get_scheduler_cls()</code> and the scheduler constructor ({{cite vllm/v1/engine/core.py:164-185}}).</li>
+  <li>Per step: <code>schedule</code>, <code>execute_model</code>, <code>get_grammar_bitmask</code>, <code>sample_tokens</code>, <code>update_from_output</code> ({{cite vllm/v1/engine/core.py:724-785}}).</li>
+  <li><code>Request.from_engine_core_request</code> in the input thread ({{cite vllm/v1/engine/core.py:1128}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>EngineCore.__init__</code></td><td>{{cite vllm/v1/engine/core.py:121-243}}</td><td>Plugins, executor, KV caches, scheduler, batch queue, block hasher, <code>step_fn</code>.</td></tr>
+    <tr><td><code>_initialize_kv_caches</code></td><td>{{cite vllm/v1/engine/core.py:245-406}}</td><td>Profile memory, plan the KV cache, allocate it on the workers, warm up.</td></tr>
+    <tr><td><code>add_request</code> / <code>abort_requests</code></td><td>{{cite vllm/v1/engine/core.py:508-559}}</td><td>Check a request and give it to the scheduler; finish requests as aborted.</td></tr>
+    <tr><td><code>step</code></td><td>{{cite vllm/v1/engine/core.py:657-687}}</td><td>One synchronous step (no batch queue).</td></tr>
+    <tr><td><code>step_with_batch_queue</code></td><td>{{cite vllm/v1/engine/core.py:698-812}}</td><td>The default step: start N+1, then wait for N.</td></tr>
+    <tr><td><code>_process_aborts_queue</code></td><td>{{cite vllm/v1/engine/core.py:814-822}}</td><td>Apply early aborts before an update.</td></tr>
+    <tr><td><code>sleep</code> / <code>wake_up</code> / <code>pause_scheduler</code></td><td>{{cite vllm/v1/engine/core.py:943-1044}}</td><td>Pause scheduling and free or restore GPU memory.</td></tr>
+    <tr><td><code>collective_rpc</code></td><td>{{cite vllm/v1/engine/core.py:1098-1105}}</td><td>Forward an RPC to all workers.</td></tr>
+    <tr><td><code>preprocess_add_request</code></td><td>{{cite vllm/v1/engine/core.py:1114-1136}}</td><td>Build the <code>Request</code> (runs in the input thread).</td></tr>
+    <tr><td><code>EngineShutdownState</code></td><td>{{cite vllm/v1/engine/core.py:1147-1150}}</td><td><code>RUNNING</code>, <code>REQUESTED</code>, <code>SHUTTING_DOWN</code>.</td></tr>
+    <tr><td><code>EngineCoreProc.__init__</code></td><td>{{cite vllm/v1/engine/core.py:1160-1273}}</td><td>Queues, handshake, <code>EngineCore.__init__</code>, I/O threads.</td></tr>
+    <tr><td><code>_perform_handshakes</code> / <code>startup_handshake</code></td><td>{{cite vllm/v1/engine/core.py:1275-1447}}</td><td>HELLO, init message with addresses, READY.</td></tr>
+    <tr><td><code>run_engine_core</code></td><td>{{cite vllm/v1/engine/core.py:1449-1591}}</td><td>Process entry: title, signals, class choice, busy loop, fatal errors.</td></tr>
+    <tr><td><code>run_busy_loop</code></td><td>{{cite vllm/v1/engine/core.py:1608-1620}}</td><td>The main loop.</td></tr>
+    <tr><td><code>_process_input_queue</code> / <code>_process_engine_step</code></td><td>{{cite vllm/v1/engine/core.py:1635-1684}}</td><td>Drain the input queue (block when idle); run one step.</td></tr>
+    <tr><td><code>_handle_client_request</code></td><td>{{cite vllm/v1/engine/core.py:1739-1771}}</td><td>Dispatch ADD, ABORT, UTILITY, EXECUTOR_FAILED, WAKEUP.</td></tr>
+    <tr><td><code>_invoke_utility_method</code></td><td>{{cite vllm/v1/engine/core.py:1822-1839}}</td><td>Run a utility call; defer the reply for a <code>Future</code>.</td></tr>
+    <tr><td><code>_send_engine_dead</code></td><td>{{cite vllm/v1/engine/core.py:1858-1869}}</td><td>Send <code>ENGINE_CORE_DEAD</code> and wait 5 s for the output thread.</td></tr>
+    <tr><td><code>_make_ready_response</code></td><td>{{cite vllm/v1/engine/core.py:1871-1919}}</td><td>The values that the front end copies into its config.</td></tr>
+    <tr><td><code>process_input_sockets</code></td><td>{{cite vllm/v1/engine/core.py:1921-2028}}</td><td>The input thread.</td></tr>
+    <tr><td><code>process_output_sockets</code></td><td>{{cite vllm/v1/engine/core.py:2030-2096}}</td><td>The output thread.</td></tr>
+    <tr><td><code>DPEngineCoreProc</code></td><td>{{cite vllm/v1/engine/core.py:2269-2670}}</td><td>MoE DP: waves, dummy batches, all-reduce of "has work".</td></tr>
+    <tr><td><code>EngineCoreActorMixin</code> and two actor classes</td><td>{{cite vllm/v1/engine/core.py:2673-2847}}</td><td>The same engines as Ray actors.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>EngineCore.__init__</code>: build the engine</h3>
+<x-code file="vllm/v1/engine/core.py" lines="146-185" highlight="147,150,157,160,161,164,166-171,177-185" />
+<ol>
+  <li><strong>Line 147.</strong> The executor constructor starts the workers and loads the model. This is the slowest line of start-up.</li>
+  <li><strong>Line 150.</strong> The failure callback (from <code>EngineCoreProc</code>) lets a dead worker stop the busy loop.</li>
+  <li><strong>Line 160.</strong> The KV cache set-up needs the loaded model (next method).</li>
+  <li><strong>Line 164.</strong> <code>get_scheduler_cls()</code> returns the class in <code>scheduler_cls</code> when it is set. Otherwise it returns <code>AsyncScheduler</code> when async scheduling is on, or <code>Scheduler</code> ({{cite vllm/config/scheduler.py:231-239}}).</li>
+  <li><strong>Lines 166-171.</strong> A model with no KV cache groups (an encoder-only model) gets chunked prefill turned off.</li>
+  <li><strong>Lines 177-185.</strong> The scheduler gets the final KV cache config, so its block pool has the real number of blocks.</li>
+</ol>
+<x-code file="vllm/v1/engine/core.py" lines="201-243" highlight="205,209-211,217-225,227-229,232,238,243" />
+<ol>
+  <li><strong>Lines 205-211.</strong> The batch queue is a <code>deque</code> with <code>maxlen = max_concurrent_batches</code>, only when that value is more than 1.</li>
+  <li><strong>Lines 217-225.</strong> The block hasher exists when prefix caching is on or a KV connector is set. The input thread uses it.</li>
+  <li><strong>Lines 227-229.</strong> The step function: <code>step</code> without a batch queue, <code>step_with_batch_queue</code> with one.</li>
+  <li><strong>Line 232.</strong> The abort queue for early aborts.</li>
+  <li><strong>Line 238.</strong> <code>freeze_gc_heap()</code> marks all start-up objects as static, so the garbage collector does not scan them again (comment at lines 236-237).</li>
+  <li><strong>Line 243.</strong> From here on, environment variables are cached.</li>
+</ol>
+
+<h3><code>_initialize_kv_caches</code>: memory and KV cache</h3>
+<x-code file="vllm/v1/engine/core.py" lines="288-325" highlight="300,311-313,321-322,324-325" />
+<ol>
+  <li><strong>Line 300.</strong> When the model has a KV cache (line 289), each worker runs a {{term profile-run}} and returns the bytes left for the KV cache. The page {{link code/v1-worker-gpu-worker}} has the formula and a worked example.</li>
+  <li><strong>Lines 311-313.</strong> <code>get_kv_cache_configs</code> turns bytes into blocks, one config per worker. The page {{link concepts/kv-cache-manager}} explains it.</li>
+  <li><strong>Lines 321-322.</strong> If the planner changed <code>max_model_len</code> (for example, auto-fit lowered it to fit the memory), the workers learn the new value by RPC.</li>
+  <li><strong>Lines 324-325.</strong> The scheduler's view of the cache, and the final <code>num_gpu_blocks</code>. The ready message sends this number to the front end ({{cite vllm/v1/engine/core.py:1876}}).</li>
+</ol>
+<x-code file="vllm/v1/engine/core.py" lines="358-380" highlight="362,378-379" />
+<ol>
+  <li><strong>Line 362.</strong> The workers allocate the KV cache tensors.</li>
+  <li><strong>Line 379.</strong> Compile, warm up and capture CUDA graphs. Only after this line can the engine serve requests.</li>
+</ol>
+
+<h3><code>step</code>: the synchronous step</h3>
+<x-code file="vllm/v1/engine/core.py" lines="657-687" highlight="665-666,667,668,669,674-676,680,681-683,687" />
+<ol>
+  <li><strong>Lines 665-666.</strong> No requests: no step.</li>
+  <li><strong>Lines 668-669.</strong> The forward pass starts (non-blocking), and the grammar bitmask runs on the CPU meanwhile.</li>
+  <li><strong>Lines 674-676.</strong> Wait for <code>execute_model</code>. A <code>None</code> result means "now call <code>sample_tokens</code>", which here is blocking.</li>
+  <li><strong>Line 687.</strong> The second return value tells <code>post_step</code> whether the model ran.</li>
+</ol>
+
+<h3><code>step_with_batch_queue</code>: the default step</h3>
+<x-code file="vllm/v1/engine/core.py" lines="722-759" highlight="725,727-729,733-735,737-745,749,753,754-759" />
+<x-code file="vllm/v1/engine/core.py" lines="767-787" highlight="768,773-778,782,783-785" />
+<p>The page {{link concepts/engine-core-loop}} reads this method line by line in a deep dive, and {{link concepts/async-scheduling}} explains the deferred-sampling branch (line 749). The short version: start step N+1 (lines 725-753); if the queue is full, wait for step N (lines 768-778) and update the scheduler (line 783).</p>
+
+<h3><code>run_busy_loop</code></h3>
+<x-code file="vllm/v1/engine/core.py" lines="1608-1620" highlight="1608,1611,1613,1617,1620" />
+<ol>
+  <li><strong>Line 1608.</strong> <code>fault_tolerant_wrapper</code> re-raises at once unless fault tolerance is on ({{cite vllm/v1/fault_tolerance/engine_core_sentinel.py:175-183}}).</li>
+  <li><strong>Line 1611.</strong> <code>_handle_shutdown()</code> is true while running, and also while a requested shutdown drains work.</li>
+  <li><strong>Line 1613.</strong> Blocks when there is no work ({{cite vllm/v1/engine/core.py:1638-1656}}).</li>
+  <li><strong>Line 1620.</strong> The loop ends only with <code>SystemExit</code>. <code>run_engine_core</code> catches it and cleans up ({{cite vllm/v1/engine/core.py:1560-1583}}).</li>
+</ol>
+
+<h3><code>process_input_sockets</code>: the input thread</h3>
+<x-code file="vllm/v1/engine/core.py" lines="1929-1975" highlight="1930-1933,1936-1943,1961-1968,1972,1975" />
+<ol>
+  <li><strong>Lines 1930-1933.</strong> One typed decoder for ADD messages, one generic decoder for the rest. Both can receive tensors through the tensor IPC queue of multimodal inputs.</li>
+  <li><strong>Lines 1936-1943.</strong> One DEALER socket per front end (per API server), with this engine's identity. The front end owns the ROUTER side.</li>
+  <li><strong>Lines 1961-1968.</strong> The first message on each socket is the ready response.</li>
+  <li><strong>Line 1972.</strong> With a DP coordinator, the thread first waits for its <code>READY</code>.</li>
+  <li><strong>Line 1975.</strong> Only now can <code>EngineCoreProc.__init__</code> finish ({{cite vllm/v1/engine/core.py:1267-1273}}).</li>
+</ol>
+<p>The receive loop that follows (lines 1977-2028) is read on {{link concepts/engine-core-loop}}, Step 3.</p>
+
+<h3><code>process_output_sockets</code>: the output thread</h3>
+<x-code file="vllm/v1/engine/core.py" lines="2033-2062" highlight="2035,2037,2042,2049,2053-2061,2062" />
+<ol>
+  <li><strong>Line 2035.</strong> One encoder for the life of the thread.</li>
+  <li><strong>Lines 2037 and 2042.</strong> Send buffers are reused. A buffer that ZMQ still sends waits in <code>pending</code> with its tracker.</li>
+  <li><strong>Line 2049.</strong> One PUSH socket per front end. <code>linger=4000</code> gives the <code>ENGINE_CORE_DEAD</code> message 4 seconds to leave (comment at lines 2044-2045).</li>
+  <li><strong>Line 2062.</strong> At most one spare buffer per socket, plus one, is kept.</li>
+</ol>
+<p>The send loop (lines 2064-2096) is read on {{link concepts/engine-core-loop}}, Step 7.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types in and out">
+<table>
+  <thead><tr><th>Value</th><th>Type</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>ADD message</td><td>frames <code>[b"\x00", msgpack(EngineCoreRequest), tensor frames...]</code></td><td>{{cite vllm/v1/engine/core.py:1980-1991}}</td></tr>
+    <tr><td>after preprocessing</td><td><code>(Request, wave: int)</code></td><td>{{cite vllm/v1/engine/core.py:1114-1136}}</td></tr>
+    <tr><td>UTILITY message</td><td><code>(client_idx: int, call_id: int, method: str, args: tuple)</code></td><td>{{cite vllm/v1/engine/core.py:2010-2011}}</td></tr>
+    <tr><td>batch queue entry</td><td><code>(Future[ModelRunnerOutput], SchedulerOutput, Future[Any])</code></td><td>{{cite vllm/v1/engine/core.py:206-208}}</td></tr>
+    <tr><td>step result</td><td><code>dict[int, EngineCoreOutputs]</code> (client index → outputs), or <code>None</code></td><td>{{cite vllm/v1/engine/core.py:698-700}}</td></tr>
+    <tr><td>output queue item</td><td><code>(client_index, EngineCoreOutputs)</code> or <code>b"ENGINE_CORE_DEAD"</code></td><td>{{cite vllm/v1/engine/core.py:1173}}</td></tr>
+    <tr><td>ready response</td><td><code>EngineCoreReadyResponse</code> (msgpack)</td><td>{{cite vllm/v1/engine/core.py:1871-1919}}</td></tr>
+  </tbody>
+</table>
+<p>The fields of these types are on {{link concepts/data-contracts}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Processes and threads">
+<table>
+  <thead><tr><th>Thread</th><th>Methods of this file</th><th>Blocks in</th></tr></thead>
+  <tbody>
+    <tr><td>main</td><td><code>run_engine_core</code>, <code>run_busy_loop</code>, every <code>EngineCore</code> method, every utility method</td><td><code>input_queue.get()</code> when idle; <code>future.result()</code> when the batch queue is full</td></tr>
+    <tr><td>input</td><td><code>process_input_sockets</code>, <code>preprocess_add_request</code>, the error-output helpers</td><td><code>poller.poll()</code></td></tr>
+    <tr><td>output</td><td><code>process_output_sockets</code></td><td><code>output_queue.get()</code></td></tr>
+  </tbody>
+</table>
+<p>The input thread calls <code>preprocess_add_request</code>, which touches <code>mm_receiver_cache</code> and <code>structured_output_manager</code>. Its comments explain why there is no race: only the input thread uses the cache after start-up, and grammar compilation is asynchronous and per request ({{cite vllm/v1/engine/core.py:1120-1135}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: what one engine core sends in four steps">
+<p>One request, async scheduling, queue size 2, a 3-token answer that ends with EOS. Each line is one call of <code>_process_engine_step</code> ({{cite vllm/v1/engine/core.py:1666-1684}}).</p>
+<ol>
+  <li>Call 1: schedule step 1 (the prompt) and return <code>None</code>. Nothing goes into <code>output_queue</code>.</li>
+  <li>Call 2: schedule step 2, wait for step 1, update. <code>output_queue</code> gets <code>(0, EngineCoreOutputs(outputs=[token 1]))</code>.</li>
+  <li>Call 3: schedule step 3, wait for step 2. Output: token 2.</li>
+  <li>Call 4: schedule step 4, wait for step 3. Output: token 3 = EOS, <code>finish_reason=STOP</code>.</li>
+  <li>Call 5: <code>has_requests()</code> is still true for one call, because the finished request id must reach the workers in the next <code>SchedulerOutput</code> ({{cite vllm/v1/core/sched/scheduler.py:2913-2914}}, {{cite vllm/v1/core/sched/scheduler.py:1597-1601}}). It schedules an empty step 5, then waits for step 4, whose result is skipped. <code>schedule()</code> clears the finished ids ({{cite vllm/v1/core/sched/scheduler.py:1731-1734}}), so a sixth call only pops the empty step 5.</li>
+</ol>
+<p>So 4 GPU steps produce 3 tokens. (Derived from {{cite vllm/v1/engine/core.py:724-785}} and {{cite vllm/v1/core/sched/scheduler.py:2184-2192}}.)</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>request_id</code> is not a string</td><td><code>TypeError</code> in <code>add_request</code></td><td>{{cite vllm/v1/engine/core.py:515-518}}</td></tr>
+    <tr><td>pooling task not supported</td><td><code>ValueError</code></td><td>{{cite vllm/v1/engine/core.py:520-529}}</td></tr>
+    <tr><td><code>kv_transfer_params</code> without a KV connector</td><td>warning; transfer off for the request</td><td>{{cite vllm/v1/engine/core.py:531-537}}</td></tr>
+    <tr><td>preprocessing fails in the input thread</td><td>logged; error output for that request only</td><td>{{cite vllm/v1/engine/core.py:1999-2008}}, {{cite vllm/v1/engine/core.py:2149-2167}}</td></tr>
+    <tr><td>a utility method raises</td><td>logged; <code>failure_message</code> in the reply</td><td>{{cite vllm/v1/engine/core.py:1836-1839}}</td></tr>
+    <tr><td>unknown message type</td><td>logged at ERROR; ignored</td><td>{{cite vllm/v1/engine/core.py:1768-1771}}</td></tr>
+    <tr><td>a worker died</td><td><code>RuntimeError("Executor failed.")</code></td><td>{{cite vllm/v1/engine/core.py:1766-1767}}</td></tr>
+    <tr><td>exception in a step</td><td>engine state dumped, exception re-raised</td><td>{{cite vllm/v1/engine/core.py:561-575}}</td></tr>
+    <tr><td>exception before the busy loop</td><td>"EngineCore failed to start."</td><td>{{cite vllm/v1/engine/core.py:1571-1572}}</td></tr>
+    <tr><td>exception in the busy loop</td><td>"EngineCore encountered a fatal error."; <code>ENGINE_CORE_DEAD</code></td><td>{{cite vllm/v1/engine/core.py:1573-1576}}</td></tr>
+    <tr><td>no init message in 5 minutes</td><td><code>RuntimeError</code></td><td>{{cite vllm/v1/engine/core.py:1408-1413}}</td></tr>
+    <tr><td>input thread dies at start-up</td><td><code>RuntimeError("Input socket thread died during startup")</code></td><td>{{cite vllm/v1/engine/core.py:1269-1271}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables and config fields">
+<table>
+  <thead><tr><th>Name</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_ELASTIC_EP_SCALE_UP_LAUNCH</code></td><td>off</td><td>{{cite vllm/v1/engine/core.py:154}}, {{cite vllm/v1/engine/core.py:290}}, {{cite vllm/v1/engine/core.py:378}}</td><td>Elastic EP only: skip profiling and warm-up for a new rank.</td></tr>
+    <tr><td><code>max_concurrent_batches</code> (derived)</td><td>2 on one GPU</td><td>{{cite vllm/v1/engine/core.py:205}}</td><td>Batch queue size.</td></tr>
+    <tr><td><code>prefix_caching_hash_algo</code></td><td><code>sha256</code></td><td>{{cite vllm/v1/engine/core.py:218-220}}</td><td>Hash of the block hasher.</td></tr>
+    <tr><td><code>shutdown_timeout</code></td><td>0</td><td>{{cite vllm/v1/engine/core.py:1697}}</td><td>Abort or drain at shutdown.</td></tr>
+    <tr><td><code>enable_logging_iteration_details</code></td><td>off</td><td>{{cite vllm/v1/engine/core.py:581-586}}</td><td>Per-step details in the scheduler stats (needs <code>log_stats</code>).</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/engine-core-loop}}: the threads, the busy loop, utility calls, aborts and errors.</li>
+  <li>{{link concepts/async-scheduling}}: why <code>step_with_batch_queue</code> is the default.</li>
+  <li>{{link concepts/executors-and-workers}}: what <code>model_executor</code> does with each call.</li>
+  <li>{{link concepts/data-parallel-serving}}: <code>DPEngineCoreProc</code>, waves and the coordinator.</li>
+  <li>{{link code/v1-engine-core-client}}: the other end of the sockets.</li>
+  <li>{{link tours/engine-step}}: one call of <code>step_with_batch_queue</code> with real numbers.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which method does the engine core use as <code>step_fn</code> with the default settings on one GPU?
+    <x-a><p><code>step_with_batch_queue</code>, because the batch queue exists when <code>max_concurrent_batches</code> is more than 1 ({{cite vllm/v1/engine/core.py:209-211}}, {{cite vllm/v1/engine/core.py:227-229}}). With async scheduling and Model Runner V2 it is <code>pp_size + 1 = 2</code> ({{cite vllm/config/vllm.py:591-593}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">In which order does <code>EngineCore.__init__</code> build the executor, the KV cache and the scheduler, and why this order?
+    <x-a><p>Executor (line 147), KV caches (line 160), scheduler (lines 177-185) ({{cite vllm/v1/engine/core.py:146-185}}). The KV cache size depends on a profile run of the loaded model, and the scheduler needs the final KV cache config.</p></x-a>
+  </x-q>
+  <x-q level="medium">Which thread runs <code>preprocess_add_request</code>, and what does that buy?
+    <x-a><p>The input thread ({{cite vllm/v1/engine/core.py:1993}}). The <code>Request</code> object and its block hashes are built while the main thread runs the model, as the docstring says ({{cite vllm/v1/engine/core.py:1115-1119}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">The front end sends a utility call to <code>sleep</code> while requests still run, with the pause mode <code>"wait"</code>. When does the reply go out?
+    <x-a><p><code>sleep()</code> pauses the scheduler and gets a <code>Future</code> back, because the engine is not idle yet. It returns a second <code>Future</code> that puts the executor to sleep when the pause completes ({{cite vllm/v1/engine/core.py:994-1017}}). <code>_invoke_utility_method</code> sees a <code>Future</code> and adds a callback, so the reply is sent only when that future is done ({{cite vllm/v1/engine/core.py:1828-1834}}). The busy loop meanwhile keeps stepping the in-flight requests.</p></x-a>
+  </x-q>
+</x-quiz>

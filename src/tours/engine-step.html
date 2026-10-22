@@ -1,0 +1,252 @@
+---
+title: Tour: One engine step
+nav_title: One engine step
+level: Advanced
+prerequisites: tours/life-of-a-chat-request, concepts/engine-core-loop, concepts/async-scheduling
+related: concepts/engine-core-loop, concepts/async-scheduling, concepts/executors-and-workers, concepts/scheduler, concepts/model-runner, concepts/data-contracts, code/v1-engine-core, code/v1-worker-gpu-worker, tours/forward-pass, tours/multi-gpu-step
+summary: Follow one call of step_with_batch_queue in 12 stops, with two requests in the batch (a 1-token decode and an 8191-token prefill chunk): schedule, launch, sample, pop the previous step, update and send.
+---
+<x-sentence>We follow one call of step_with_batch_queue: it plans and starts step k for two requests, then finishes step k-1 and sends its token.</x-sentence>
+
+<h2>The idea</h2>
+<p>Tour 1 ({{link tours/life-of-a-chat-request}}) follows one request through the whole server. This tour stays in one place, the engine core process, and looks at one {{term engine-step}} in detail. A real server has many requests in each step, so we take two that need different work:</p>
+<ul>
+  <li><strong>Request B</strong> is a chat answer in progress. It decodes: it needs 1 new token per step.</li>
+  <li><strong>Request A</strong> has a long prompt of 20,000 tokens. The prompt does not fit into one step, so the scheduler runs it in chunks ({{deepinfer learn/batching | chunked prefill}}).</li>
+</ul>
+<p>With {{term async-scheduling}}, one call of <code>step_with_batch_queue</code> does two things. It plans and starts step k, and then it finishes step k-1, which is already on the GPU. So the token that this call sends belongs to the step before. The page {{link concepts/async-scheduling}} explains why.</p>
+<p><strong>An everyday comparison.</strong> Think of a bakery with one oven. The baker puts the next tray into the queue of the oven before the current tray is done. Then the baker takes out the finished tray and packs it. One tray holds rolls (one each, the decodes) and a big part of a cake (the prefill chunk). The comparison stops in one place. The cake leaves the oven unfinished and goes back in the next round. Only a finished cake is packed. A prefill chunk gives no token.</p>
+
+<h3>The example</h3>
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-8B-Instruct     # one H100 80 GiB GPU, default settings</code></pre>
+<ul>
+  <li>One GPU, TP = 1, DP = 1: the {{term uni-executor}} runs the worker in the engine core process ({{cite vllm/config/parallel.py:1099-1100}}).</li>
+  <li>{{term token-budget | Token budget}}: <code>max_num_batched_tokens = 8192</code> and <code>max_num_seqs = 1024</code>, because the GPU has 70 GiB or more and is not an A100 ({{cite vllm/engine/arg_utils.py:2960-2993}}). An A100 would get 2048 and 256.</li>
+  <li>Async scheduling is on, and the {{term batch-queue}} has 2 slots ({{cite vllm/config/vllm.py:1664-1698}}, {{cite vllm/config/vllm.py:586-597}}).</li>
+  <li>Step k-1 is already on the GPU. In it, B decoded its 41st output token, and A ran its first chunk: prompt positions 0 to 8190.</li>
+</ul>
+<x-simplified><p>The model, the prompt lengths and the positions are illustrative. The scheduler and model runner rules are from the code. We assume a block size of 16 tokens, no prefix cache hit for A, no structured output, no speculative decoding, and no LoRA.</p></x-simplified>
+
+<h2>The picture</h2>
+<x-diagram name="b2b_step_map" alt="Panel 1: the batch of step k is 8192 tokens: request B first with 1 token, then request A with 8191 prompt tokens at positions 8191 to 16381. Rows of values: num_scheduled_tokens B 1, A 8191, total 8192; query_start_loc [0, 1, 8192]; seq_lens [541, 16382]; logits_indices [0, 8191]; num_sampled [1, 0]. Panel 2: where the stops run: stops 1, 2, 3, 8, 10 and 11 in the engine core and scheduler; stops 4 to 7 and 9 in the executor, the worker and Model Runner V2; stop 12 in the output thread. Panel 3: a time line: the main thread schedules step k, launches it, launches sampling, waits for step k-1, updates step k-1 and queues the output, while the GPU first finishes step k-1 and then runs step k." caption="Figure: the batch of our step (panel 1), where each stop runs (panel 2), and what one call does over time (panel 3)." />
+
+<table>
+  <thead><tr><th>Stop</th><th>What happens</th><th>File and function</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>The busy loop calls the step function</td><td><code>v1/engine/core.py</code>: <code>_process_engine_step</code></td></tr>
+    <tr><td>2</td><td>The scheduler shares the token budget</td><td><code>v1/core/sched/scheduler.py</code>: <code>schedule</code></td></tr>
+    <tr><td>3</td><td>The SchedulerOutput and the placeholders</td><td><code>scheduler.py</code>; <code>async_scheduler.py</code>: <code>_update_after_schedule</code></td></tr>
+    <tr><td>4</td><td>The executor starts <code>execute_model</code></td><td><code>v1/executor/uniproc_executor.py</code>; <code>v1/worker/gpu_worker.py</code></td></tr>
+    <tr><td>5</td><td>Model Runner V2 updates its states and picks a CUDA graph mode</td><td><code>v1/worker/gpu/model_runner.py</code>: <code>execute_model</code></td></tr>
+    <tr><td>6</td><td>Inputs and attention metadata</td><td><code>model_runner.py</code>: <code>prepare_inputs</code>, <code>prepare_attn</code></td></tr>
+    <tr><td>7</td><td>The forward pass is queued; <code>execute_model</code> returns <code>None</code></td><td><code>model_runner.py</code>: <code>execute_model</code></td></tr>
+    <tr><td>8</td><td>The grammar bitmask (none here)</td><td><code>core.py</code>; <code>scheduler.py</code>: <code>get_grammar_bitmask</code></td></tr>
+    <tr><td>9</td><td><code>sample_tokens</code>: logits, sampler, <code>AsyncOutput</code></td><td><code>model_runner.py</code>: <code>sample_tokens</code></td></tr>
+    <tr><td>10</td><td>The batch queue is full: pop step k-1 and wait</td><td><code>core.py</code>: <code>step_with_batch_queue</code>; <code>gpu/async_utils.py</code></td></tr>
+    <tr><td>11</td><td><code>update_from_output</code> for step k-1</td><td><code>scheduler.py</code>: <code>update_from_output</code></td></tr>
+    <tr><td>12</td><td><code>EngineCoreOutputs</code> go to the output thread</td><td><code>core.py</code>: <code>process_output_sockets</code></td></tr>
+  </tbody>
+</table>
+<p>All paths are under <code>vllm/</code>. All stops run in the engine core process.</p>
+
+<x-stop n="1" title="The busy loop calls step_with_batch_queue">
+<p>We are in the main thread of the engine core process, in <code>EngineCoreProc._process_engine_step</code>. The input queue is empty, and the scheduler has two running requests, so the {{term busy-loop}} does not block ({{cite vllm/v1/engine/core.py:1596-1602}}). It calls the step function:</p>
+<x-code file="vllm/v1/engine/core.py" lines="1666-1676" highlight="1671,1673-1674" />
+<p><code>step_fn</code> is <code>step_with_batch_queue</code>, because the batch queue exists ({{cite vllm/v1/engine/core.py:227-229}}). Right now the queue holds one entry: step k-1.</p>
+<x-code file="vllm/v1/engine/core.py" lines="714-725" highlight="720,724-725" />
+<p><strong>What the data looks like now:</strong></p>
+<pre><code class="language-python">batch_queue = deque([(future_sample[k-1], scheduler_output[k-1], future_exec[k-1])], maxlen=2)
+scheduler.running = [B, A]       # B first: it was running before A arrived</code></pre>
+</x-stop>
+
+<x-stop n="2" title="Scheduler.schedule(): sharing 8192 tokens">
+<p>We are in <code>vllm/v1/core/sched/scheduler.py</code>. The scheduler has no prefill phase and no decode phase. It gives every running request the tokens it still needs, until the budget is used (see {{link concepts/scheduler}}). The running pass computes the need of each request:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="759-768" highlight="759-763,766-768" />
+<ol>
+  <li><strong>B.</strong> B knows 540 tokens (500 prompt + 40 output). Token 41 is in flight, so B has 1 {{term output-placeholder}}, and <code>num_computed_tokens = 540</code>. So <code>540 + 1 - 540 = 1</code>. The budget drops from 8192 to 8191.</li>
+  <li><strong>A.</strong> A has 20,000 prompt tokens, no placeholder, and 8191 computed tokens. Its need is <code>20000 - 8191 = 11809</code>, but line 766 caps it at the budget: 8191. The budget is now 0.</li>
+</ol>
+<p>The order matters: the running pass goes through <code>self.running</code> from the front ({{cite vllm/v1/core/sched/scheduler.py:713-716}}). B was first, so the decode gets its token before the prefill takes the rest. <code>long_prefill_token_threshold</code> could cap A further, but its default is 0, which means no cap ({{cite vllm/config/scheduler.py:79-84}}). The waiting pass has no budget left, so no new request starts in this step.</p>
+<p>Then <code>allocate_slots</code> reserves KV cache slots for the new tokens ({{cite vllm/v1/core/sched/scheduler.py:831-838}}). With blocks of 16 tokens, A needs <code>ceil(16382 / 16) = 1024</code> blocks; it had 512, so it gets 512 new blocks. B needs <code>ceil(541 / 16) = 34</code> blocks, the same as before. (Derived.) The KV cache and its blocks are explained in {{deepinfer learn/kv-cache | The KV cache}}.</p>
+</x-stop>
+
+<x-stop n="3" title="The SchedulerOutput, and the placeholder for B">
+<p>Both requests ran before, so they travel as <code>CachedRequestData</code>, which carries only the changes ({{cite vllm/v1/core/sched/output.py:137-152}}). The scheduler builds it before it advances the counters ({{cite vllm/v1/core/sched/scheduler.py:1527-1534}}), then builds the {{term scheduler-output}} ({{cite vllm/v1/core/sched/scheduler.py:1588-1609}}), and only then calls <code>_update_after_schedule</code> ({{cite vllm/v1/core/sched/scheduler.py:1641-1643}}). That method advances <code>num_computed_tokens</code> and decides whether each request is still in a prefill chunk:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1713-1723" highlight="1716,1721-1723" />
+<p>For A: <code>8191 + 8191 = 16382 &lt; 20000</code>, so A is still a prefill chunk. For B: <code>541 &lt; 540 + 1</code> is false, so B is not. <code>AsyncScheduler</code> then adds placeholders only for B:</p>
+<x-code file="vllm/v1/core/sched/async_scheduler.py" lines="32-47" highlight="34-35,45-47" />
+<p><strong>What the data looks like now</strong> (illustrative ids):</p>
+<pre><code class="language-python">SchedulerOutput(
+    scheduled_new_reqs=[],
+    scheduled_cached_reqs=CachedRequestData(
+        req_ids=["B", "A"],
+        new_block_ids=[None, ([b512, ..., b1023],)],   # 512 new block ids for A
+        num_computed_tokens=[540, 8191],               # values before this step
+        num_output_tokens=[41, 0], ...),               # 40 known + 1 placeholder for B
+    num_scheduled_tokens={"B": 1, "A": 8191},
+    total_num_scheduled_tokens=8192,
+    scheduled_spec_decode_tokens={}, finished_req_ids=set(), ...)
+B.num_computed_tokens = 541;   B.num_output_placeholders = 2    # tokens 41 and 42 in flight
+A.num_computed_tokens = 16382; A.is_prefill_chunk = True</code></pre>
+<p><code>num_output_tokens</code> includes the placeholders ({{cite vllm/v1/core/sched/scheduler.py:1825-1827}}). The page {{link concepts/data-contracts}} lists all fields.</p>
+</x-stop>
+
+<x-stop n="4" title="The executor starts execute_model, without a wait">
+<p>Back in <code>step_with_batch_queue</code>, the engine core passes the plan to the {{term executor}}:</p>
+<x-code file="vllm/v1/engine/core.py" lines="726-731" highlight="727-729,731" />
+<p><code>model_executed</code> is true, because 8192 tokens are scheduled. The uni executor runs the worker method at once, in this thread:</p>
+<x-code file="vllm/v1/executor/uniproc_executor.py" lines="119-132" highlight="122-127,129-131" />
+<p>The call goes through <code>WorkerWrapperBase.execute_model</code> ({{cite vllm/v1/worker/worker_base.py:378-383}}) to <code>Worker.execute_model</code>, which calls the {{term model-runner}}:</p>
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="1350-1353" />
+<p>With one GPU there is no message queue. With TP = 2, this stop would put the call into a shared-memory queue for two worker processes instead ({{link concepts/executors-and-workers}}).</p>
+</x-stop>
+
+<x-stop n="5" title="Model Runner V2: update states, sort the batch, pick a CUDA graph mode">
+<p>We are in <code>vllm/v1/worker/gpu/model_runner.py</code>. Model Runner V2 keeps its own copy of each request's state. First it applies the changes from the plan:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1753-1760" highlight="1758,1759,1760" />
+<p><code>update_requests</code> stores the computed-token counts and appends A's 512 new block ids to its block table ({{cite vllm/v1/worker/gpu/model_runner.py:1257-1269}}). Then the runner sorts the batch: decodes first, then prefills ({{cite vllm/v1/worker/gpu/model_runner.py:1312-1314}}, {{cite vllm/v1/worker/gpu/model_runner.py:2471-2483}}). B has 1 token, which equals the decode query length, so B is row 0 and A is row 1.</p>
+<p>Next it picks a {{term cuda-graph}} mode for the batch shape ({{cite vllm/v1/worker/gpu/model_runner.py:1806-1821}}). Our batch has 8192 tokens and contains a prefill. On an H100 the largest captured size is 512 tokens: <code>min(max_num_seqs × 1 × 2, 512)</code> with <code>max_num_seqs = 1024</code> ({{cite vllm/config/vllm.py:2439-2449}}). No captured graph matches 8192 tokens, so <code>dispatch</code> returns mode <code>NONE</code>: eager ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:535-553}}). With DP = 1, no padding across ranks changes this result ({{cite vllm/v1/worker/gpu/dp_utils.py:270-279}}).</p>
+<x-note title="A pure decode step looks different">
+<p>When A has finished its prefill, a step with B and A both decoding has 2 tokens. That batch is a uniform decode batch below 512 tokens, so it can replay a FULL CUDA graph. The page {{link concepts/compile-and-cuda-graphs}} explains the modes.</p>
+</x-note>
+</x-stop>
+
+<x-stop n="6" title="prepare_inputs and prepare_attn: the flat batch">
+<p>The runner packs both requests into one flat batch of 8192 tokens, as in {{deepinfer concepts/input-metadata | Input metadata}}. <code>query_start_loc</code> marks where each request starts:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1446-1456" highlight="1451,1456" />
+<p>A is in a prefill, so its prompt tokens are copied on the GPU from the request state ({{cite vllm/v1/worker/gpu/model_runner.py:1469-1479}}). B's input token is token 41, which the CPU does not know yet. It comes from <code>last_sampled_tokens</code> on the GPU, which step k-1 will write before step k runs on the same stream:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1491-1504" highlight="1493,1496" />
+<p>Without speculative decoding, each request gets one logits row ({{cite vllm/v1/worker/gpu/model_runner.py:1401-1408}}): the last token of its query. Then <code>prepare_attn</code> builds the block tables and the slot of each new token, and the model state builds the attention metadata ({{cite vllm/v1/worker/gpu/model_runner.py:1838}}, {{cite vllm/v1/worker/gpu/model_runner.py:1940-1951}}).</p>
+<p><strong>What the data looks like now</strong> (step k, derived from our numbers):</p>
+<pre><code class="language-python">num_scheduled_tokens = [1, 8191]              # row 0 = B, row 1 = A
+query_start_loc  int32 [3]    = [0, 1, 8192]
+positions        int64 [8192] = [540, 8191, 8192, ..., 16381]
+seq_lens         int32 [2]    = [541, 16382]
+input_ids        int32 [8192] = [token 41 of B (from GPU), A's prompt tokens 8191..16381]
+logits_indices   [2]          = [0, 8191]
+slot_mappings    one slot per token: B -> its block index 33, offset 12 (540 = 33 x 16 + 12)
+                 A -> its block indexes 511 .. 1023 (positions 8191 .. 16381)</code></pre>
+<p>The block indexes are positions in each request's own block table. The table maps them to physical block ids in the {{term block-pool}}, and the slot of a token is <code>block_id × 16 + offset</code> ({{cite vllm/v1/worker/gpu/block_table.py:409}}).</p>
+</x-stop>
+
+<x-stop n="7" title="The forward pass is queued, and execute_model returns None">
+<p>In mode <code>NONE</code>, the runner calls the model eagerly, inside the {{term forward-context}} that gives each attention layer its metadata:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="2041-2070" highlight="2041,2068-2070" />
+<p>The Python code returns as soon as all kernels are queued; the GPU runs them later, after step k-1. The runner keeps the hidden states for the sampler and returns <code>None</code>:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="2089-2110" highlight="2090,2110" />
+<p>Back in the uni executor, the future is already done with the value <code>None</code> ({{cite vllm/v1/executor/uniproc_executor.py:112-113}}). The tour {{link tours/forward-pass}} goes inside the model call.</p>
+<x-simplified><p>"Queued" ignores small CPU work that PyTorch does per kernel. The point is that this stop does not wait for the GPU: Model Runner V2 has no GPU-to-CPU synchronization in <code>execute_model</code> ({{cite docs/design/model_runner_v2.md:47}}).</p></x-simplified>
+</x-stop>
+
+<x-stop n="8" title="The grammar bitmask: not needed this time">
+<p>Back in <code>step_with_batch_queue</code>. Before sampling, the engine core may compute a grammar bitmask for structured output requests, on the CPU, while the GPU works:</p>
+<x-code file="vllm/v1/engine/core.py" lines="733-749" highlight="737,740-742,743-745,749" />
+<p>Our requests do not use structured output, so <code>has_structured_output_requests</code> is false and <code>get_grammar_bitmask</code> returns <code>None</code> at once ({{cite vllm/v1/core/sched/scheduler.py:2091-2092}}). If B used a JSON schema, its token 41 would still be in flight. Then <code>pending_structured_output_tokens</code> would be true, and sampling would wait until stop 11 ({{cite vllm/v1/core/sched/async_scheduler.py:37-39}}, {{cite vllm/v1/engine/core.py:792-810}}).</p>
+</x-stop>
+
+<x-stop n="9" title="sample_tokens: logits for two rows, one token, an AsyncOutput">
+<p><code>sample_tokens(None, non_block=True)</code> takes the same path as stop 4 and reaches the runner. It computes logits only for the two rows in <code>logits_indices</code>, and samples:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1637-1638" />
+<x-code file="vllm/v1/worker/gpu/sample/sampler.py" lines="190-199" highlight="190-192" />
+<p>The comment gives the rule: a request in a chunked prefill "produce[s] no output token". So <code>num_sampled = [1, 0]</code>: B gets token 42, A gets nothing. The runner starts the copy of the result to the CPU on a separate stream. Then it writes token 42 into <code>last_sampled_tokens</code> for step k+1:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="2209-2218" highlight="2210" />
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="2244-2255" highlight="2249" />
+<p>The uni executor wraps the <code>AsyncOutput</code> in an <code>AsyncOutputFuture</code>; nothing waits yet ({{cite vllm/v1/executor/uniproc_executor.py:109-111}}). The sampling methods are in {{deepinfer learn/sampling | Sampling}}.</p>
+<p><strong>What the data looks like now</strong> (on the GPU, step k):</p>
+<pre><code class="language-python">logits             [2, vocab_size]       # rows of B and A
+sampled_token_ids  [2, 1] = [[t42], [x]] # x is ignored
+num_sampled        [2]    = [1, 0]
+last_sampled_tokens[B] = t42             # input of B in step k+1</code></pre>
+</x-stop>
+
+<x-stop n="10" title="The batch queue is full: pop step k-1 and wait">
+<p>Step k goes into the queue. Now the queue has 2 entries, which is full, so the function does not return early:</p>
+<x-code file="vllm/v1/engine/core.py" lines="751-759" highlight="753,754-756" />
+<x-code file="vllm/v1/engine/core.py" lines="767-778" highlight="768,773" />
+<p><code>pop()</code> takes step k-1 from the right end. <code>future.result()</code> calls <code>AsyncOutput.get_output()</code> ({{cite vllm/v1/executor/uniproc_executor.py:38-48}}). This is the one place where the engine core waits for the GPU:</p>
+<x-code file="vllm/v1/worker/gpu/async_utils.py" lines="173-184" highlight="174,180,183-184" />
+<p>If the GPU has already finished step k-1, the wait returns at once. Meanwhile, step k is already queued behind it on the GPU. Line 183 trims each row to its sampled count, so A's row becomes an empty list.</p>
+<p><strong>What the data looks like now</strong> (step k-1):</p>
+<pre><code class="language-python">ModelRunnerOutput(req_ids=["B", "A"],
+                  sampled_token_ids=[[t41], []],   # A ran its first chunk in step k-1
+                  logprobs=None, ...)</code></pre>
+</x-stop>
+
+<x-stop n="11" title="update_from_output for step k-1">
+<p>Before the update, the engine core applies any aborts that arrived during the step ({{cite vllm/v1/engine/core.py:780-785}}). Then the scheduler walks over the requests of step k-1:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="2258-2262" highlight="2259-2261" />
+<ol>
+  <li><strong>B.</strong> It has a new token, so <code>_update_request_with_output</code> appends t41 and runs <code>check_stop</code> ({{cite vllm/v1/core/sched/scheduler.py:2598-2603}}). t41 is not EOS, so B keeps running. <code>AsyncScheduler</code> removes one placeholder: 2 becomes 1 ({{cite vllm/v1/core/sched/async_scheduler.py:71-73}}). It caches full blocks up to <code>541 - 1 = 540</code> tokens for the prefix cache (lines 76-79 there).</li>
+  <li><strong>A.</strong> No new tokens, no pooler output, no stop: the scheduler makes no output for A ({{cite vllm/v1/core/sched/scheduler.py:2293-2295}}).</li>
+</ol>
+<p>The outputs are grouped by front end ({{cite vllm/v1/core/sched/scheduler.py:2486-2491}}). With stats on, the scheduler stats go into the same object ({{cite vllm/v1/core/sched/scheduler.py:2507-2521}}).</p>
+<p><strong>What the data looks like now:</strong></p>
+<pre><code class="language-python">{0: EngineCoreOutputs(
+        outputs=[EngineCoreOutput(request_id="B", new_token_ids=[t41], finish_reason=None, ...)],
+        scheduler_stats=SchedulerStats(num_running_reqs=2, num_waiting_reqs=0, ...))}
+B: num_tokens = 541, num_computed_tokens = 541, num_output_placeholders = 1   # t42 still in flight</code></pre>
+</x-stop>
+
+<x-stop n="12" title="The outputs go to the output thread">
+<p><code>step_with_batch_queue</code> returns the dict and <code>model_executed = True</code>. <code>_process_engine_step</code> puts each pair into <code>output_queue</code> (stop 1, lines 1673-1674) and calls <code>post_step</code>, which does nothing with async scheduling ({{cite vllm/v1/engine/core.py:689-696}}). The {{term output-thread}} takes the pair, encodes it with msgpack, and sends it on the PUSH socket of front end 0:</p>
+<x-code file="vllm/v1/engine/core.py" lines="2087-2091" highlight="2088-2090" />
+<p>From here, Tour 1 continues: the front end detokenizes t41 and writes one SSE chunk ({{link tours/life-of-a-chat-request#stop-15 | Tour 1, stop 15}}). The busy loop goes back to stop 1. The next call schedules step k+1: B again 1 token, and A its last chunk of <code>20000 - 16382 = 3618</code> tokens. That chunk ends the prompt, so A samples its first token there.</p>
+</x-stop>
+
+<h2>Deep dive</h2>
+<x-deepdive title="The counters of B and A across three calls">
+<p>Values right after each event. "S k" = schedule step k; "U k" = update with the result of step k. (Derived from the rules in stops 2, 3 and 11.)</p>
+<table>
+  <thead><tr><th>Event</th><th>B: num_tokens / computed / placeholders</th><th>A: computed / prefill chunk?</th><th>Scheduled (B, A)</th></tr></thead>
+  <tbody>
+    <tr><td>before S k</td><td>540 / 540 / 1</td><td>8191 / yes</td><td>-</td></tr>
+    <tr><td>S k (this tour)</td><td>540 / 541 / 2</td><td>16382 / yes</td><td>(1, 8191)</td></tr>
+    <tr><td>U k-1 (this tour)</td><td>541 / 541 / 1</td><td>16382 / yes</td><td>-</td></tr>
+    <tr><td>S k+1</td><td>541 / 542 / 2</td><td>20000 / no; A gets 1 placeholder</td><td>(1, 3618)</td></tr>
+    <tr><td>U k</td><td>542 / 542 / 1</td><td>20000 / no</td><td>-</td></tr>
+    <tr><td>S k+2</td><td>542 / 543 / 2</td><td>20001 / no; 2 placeholders</td><td>(1, 1)</td></tr>
+    <tr><td>U k+1</td><td>543 / 543 / 1</td><td>A gets its first token</td><td>-</td></tr>
+  </tbody>
+</table>
+<p>In S k+1, A's need is <code>20000 + 0 - 16382 = 3618</code>, so the budget is not full: 8192 − 1 − 3618 = 4573 tokens remain for waiting requests. In S k+2, A decodes for the first time, with its first token still in flight.</p>
+</x-deepdive>
+
+<x-deepdive title="Where the time goes in this call">
+<ul>
+  <li><strong>Stops 2-3</strong> run in Python in the scheduler. Their cost grows with the number of running requests, not with the number of tokens. The comment in <code>update_from_output</code> warns that its loop "can be a performance bottleneck" with 1K or more requests ({{cite vllm/v1/core/sched/scheduler.py:2163-2165}}).</li>
+  <li><strong>Stops 5-7 and 9</strong> run on the CPU but only queue GPU work. Their cost is the Python code of the model runner and the kernel launches. A CUDA graph replaces many launches with one; our eager step does not have this help.</li>
+  <li><strong>Stop 10</strong> is the only wait for the GPU. When the GPU step takes longer than all the CPU work of a call, the main thread waits here, and the GPU never waits. That is the goal of async scheduling.</li>
+  <li><strong>Stop 12</strong> encoding and sending run in the output thread, in parallel with the next call.</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="What changes with TP = 2">
+<p>Stops 1-3, 8 and 10-12 do not change. In stops 4 and 9, the {{term multiproc-executor}} writes the call once into the shared-memory queue. Both worker processes run stops 5-7 and 9 on their own GPU, and they meet in NCCL all-reduces. Only worker 0 replies ({{cite vllm/v1/executor/multiproc_executor.py:549-563}}). The wait of stop 10 then happens in worker 0's <code>WorkerAsyncOutputCopy</code> thread, which calls <code>get_output()</code>, and the engine core waits for the reply message ({{cite vllm/v1/executor/multiproc_executor.py:1000-1002}}, {{cite vllm/v1/executor/multiproc_executor.py:1019-1039}}). See {{link concepts/executors-and-workers}} and {{link tours/multi-gpu-step}}.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A long prompt slows every stream.</strong> In our step, B shares a step of 8192 tokens with A's chunk. B's next token comes only when that large step ends. <code>long_prefill_token_threshold</code> limits one prompt's share of a step ({{cite vllm/v1/core/sched/scheduler.py:764-765}}).</li>
+  <li><strong>No KV blocks for the chunk.</strong> If <code>allocate_slots</code> fails, the scheduler preempts a running request to free blocks. With the default first-come-first-served policy, the victim is the last request in <code>self.running</code> ({{cite vllm/v1/core/sched/scheduler.py:850-858}}, {{cite vllm/v1/core/sched/scheduler.py:889-900}}). In our batch this is A itself: A loses its KV cache and must compute it again later, and B keeps running.</li>
+  <li><strong>An exception in the model.</strong> <code>log_error_detail</code> dumps the <code>SchedulerOutput</code> of the failed step, and the engine core dies with <code>ENGINE_CORE_DEAD</code> ({{cite vllm/v1/engine/core.py:561-575}}, {{link concepts/engine-core-loop}}).</li>
+  <li><strong>A request aborted during the step.</strong> Its row still runs on the GPU. <code>_process_aborts_queue</code> finishes it before the update, and the update skips it ({{cite vllm/v1/engine/core.py:780-782}}, {{cite vllm/v1/core/sched/scheduler.py:2184-2192}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Every performance number of vLLM comes from this loop. The size of each step comes from stop 2, the CPU cost from stops 2-9, and the GPU cost from stop 7. When you tune <code>max_num_batched_tokens</code> or read a profile, you can now map each part to a stop.</p>
+
+<x-quiz>
+  <x-q level="easy">In this tour, which step's token does the call send to the front end?
+    <x-a><p>The token of step k-1 (B's token 41). The call schedules and starts step k first, then pops step k-1 from the batch queue and updates the scheduler with it ({{cite vllm/v1/engine/core.py:753-785}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does A get 8191 tokens and not 11809?
+    <x-a><p>The running pass caps each request at the remaining token budget ({{cite vllm/v1/core/sched/scheduler.py:766-768}}). B came first and took 1 token of the 8192, so 8191 remained. <code>long_prefill_token_threshold</code> is 0 by default, so it does not cap A further ({{cite vllm/config/scheduler.py:79-84}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Where does B's input token for step k come from, given that the CPU has not received it yet?
+    <x-a><p>From <code>req_states.last_sampled_tokens</code> on the GPU. <code>combine_sampled_and_draft_tokens</code> copies it into <code>input_ids</code> in <code>prepare_inputs</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1493-1500}}). Step k-1 writes it in <code>postprocess_sampled</code>, earlier on the same CUDA stream ({{cite vllm/v1/worker/gpu/model_runner.py:1715-1726}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A has a logits row in step k. Why does it have no token in the <code>ModelRunnerOutput</code>, and why does the scheduler send nothing for A?
+    <x-a><p>Without spec decoding, every request gets one logits row ({{cite vllm/v1/worker/gpu/model_runner.py:1401-1408}}). The sampler sets <code>num_sampled = 0</code> for a chunked-prefill request ({{cite vllm/v1/worker/gpu/sample/sampler.py:190-199}}), and <code>get_output()</code> trims the row to an empty list ({{cite vllm/v1/worker/gpu/async_utils.py:182-183}}). With no new tokens, no pooler output and no stop, the scheduler makes no <code>EngineCoreOutput</code> ({{cite vllm/v1/core/sched/scheduler.py:2293-2295}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Which CUDA graph mode does step k use, and what would a step with only B and A decoding use?
+    <x-a><p>Step k has 8192 tokens and a prefill. The largest captured size on this GPU is 512 ({{cite vllm/config/vllm.py:2439-2449}}), so no captured graph matches, and <code>dispatch</code> returns <code>NONE</code> (eager) ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:535-553}}). A step with two 1-token decodes is a uniform decode batch of 2 tokens. So it can replay a FULL graph under the default mode FULL_AND_PIECEWISE ({{cite vllm/config/vllm.py:310}}).</p></x-a>
+  </x-q>
+</x-quiz>

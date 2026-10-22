@@ -1,0 +1,230 @@
+---
+title: v1/executor/multiproc_executor.py: MultiprocExecutor and WorkerProc
+nav_title: v1/executor/multiproc_executor.py
+level: Advanced
+prerequisites: concepts/executors-and-workers
+related: concepts/executors-and-workers, concepts/async-scheduling, concepts/engine-core-loop, code/v1-engine-core, code/v1-worker-gpu-worker, code/distributed-device-communicators-shm-broadcast, tours/multi-gpu-step
+summary: vllm/v1/executor/multiproc_executor.py starts one worker process per local GPU, broadcasts every call to them through a shared-memory MessageQueue, reads the reply of one output rank, and watches the processes for failures.
+---
+<h2>Purpose</h2>
+<p><code>vllm/v1/executor/multiproc_executor.py</code> implements the {{term multiproc-executor}}: the default executor when an engine core needs more than one worker on a node, or when DP &gt; 1. It also defines {{term worker-proc}}, the code that runs inside each worker process.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/v1/executor/multiproc_executor.py</code>, 1,147 lines of Python.</td></tr>
+    <tr><th>Main classes</th><td><code>MultiprocExecutor(Executor)</code> ({{cite vllm/v1/executor/multiproc_executor.py:112}}), <code>WorkerProc</code> ({{cite vllm/v1/executor/multiproc_executor.py:608}}), <code>FutureWrapper(Future)</code> ({{cite vllm/v1/executor/multiproc_executor.py:79}}).</td></tr>
+    <tr><th>Runs in</th><td><code>MultiprocExecutor</code>: the engine core process (main thread, plus the thread <code>MultiprocWorkerMonitor</code>). <code>WorkerProc</code>: each worker process (main thread, <code>WorkerAsyncOutputCopy</code>, <code>DeathPipeMonitor</code>).</td></tr>
+    <tr><th>Called by</th><td><code>EngineCore.__init__</code> makes it ({{cite vllm/v1/engine/core.py:147}}); the busy loop calls <code>execute_model</code> and <code>sample_tokens</code>; utility calls reach <code>collective_rpc</code>.</td></tr>
+    <tr><th>Calls</th><td><code>MessageQueue</code> (shared memory), <code>multiprocessing</code> processes and pipes, <code>WorkerWrapperBase</code> and through it the GPU <code>Worker</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The ring buffer itself (<code>distributed/device_communicators/shm_broadcast.py</code>), the worker methods (<code>v1/worker/gpu_worker.py</code>), the uni executor (<code>uniproc_executor.py</code>), the base interface (<code>abstract.py</code>), Ray (<code>ray_executor_v2.py</code>, which subclasses this file's classes).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/executors-and-workers}} explains the ideas. This page reads the file method by method.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b2b_executor_workers" alt="Panel 1: the uni, mp and ray executor backends. Panel 2: with TP = 2, the engine core's MultiprocExecutor enqueues the call into the shared-memory rpc_broadcast_mq; both worker processes dequeue it; worker 0, the output rank, writes its result into its response queue, which the executor reads. Panel 3: the main thread, WorkerAsyncOutputCopy and DeathPipeMonitor threads of a worker process." caption="Figure: where MultiprocExecutor and WorkerProc sit, and the path of one call." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><code>Executor.get_class</code> returns <code>MultiprocExecutor</code> for the backend <code>"mp"</code> ({{cite vllm/v1/executor/abstract.py:80-83}}). When you do not set a backend, the config picks <code>"mp"</code> when <code>world_size_across_dp &gt; 1</code>, unless a Ray case applies ({{cite vllm/config/parallel.py:1055-1096}}).</li>
+  <li><code>EngineCore</code> builds it and registers the failure callback ({{cite vllm/v1/engine/core.py:147-150}}).</li>
+  <li><code>RayExecutorV2</code> and <code>RayWorkerProc</code> subclass the two main classes ({{cite vllm/v1/executor/ray_executor_v2.py:79}}, {{cite vllm/v1/executor/ray_executor_v2.py:239}}).</li>
+  <li>The spawned child process runs <code>WorkerProc.worker_main</code> ({{cite vllm/v1/executor/multiproc_executor.py:745-750}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>MessageQueue(...)</code>, <code>export_handle</code>, <code>create_from_handle</code>, <code>enqueue</code>, <code>dequeue</code> ({{cite vllm/v1/executor/multiproc_executor.py:165-172}}, {{cite vllm/v1/executor/multiproc_executor.py:615-625}}).</li>
+  <li><code>get_mp_context()</code> for processes, locks and pipes ({{cite vllm/v1/executor/multiproc_executor.py:174-175}}, {{cite vllm/v1/executor/multiproc_executor.py:723-727}}).</li>
+  <li><code>WorkerWrapperBase.init_worker</code>, then <code>init_device</code> and <code>load_model</code> in the worker ({{cite vllm/v1/executor/multiproc_executor.py:659-688}}).</li>
+  <li><code>set_multiprocessing_worker_envs</code>, which forces spawn when needed and sets <code>OMP_NUM_THREADS</code> ({{cite vllm/v1/executor/multiproc_executor.py:1119-1147}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>FutureWrapper</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:79-110}}</td><td>A future that reads replies in call order from a shared deque.</td></tr>
+    <tr><td><code>MultiprocExecutor._init_executor</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:119-268}}</td><td>Broadcast queue, worker processes, ready wait, monitor, reply queues, output rank.</td></tr>
+    <tr><td><code>start_worker_monitor</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:300-334}}</td><td>Thread that waits for any worker to exit.</td></tr>
+    <tr><td><code>execute_model</code> / <code>sample_tokens</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:342-366}}</td><td>One-reply RPCs with the step timeout and the KV/EC aggregators.</td></tr>
+    <tr><td><code>collective_rpc</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:383-456}}</td><td>Enqueue once, build the reply reader, return a future or the result.</td></tr>
+    <tr><td><code>_ensure_worker_termination</code> / <code>shutdown</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:458-543}}</td><td>Close the death pipes, wait, SIGTERM, SIGKILL; close the queues.</td></tr>
+    <tr><td><code>_get_output_rank</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:549-563}}</td><td><code>world_size - TP × PCP</code>: first TP rank of the last PP stage.</td></tr>
+    <tr><td><code>UnreadyWorkerProcHandle</code> / <code>WorkerProcHandle</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:570-605}}</td><td>The parent's view of a worker before and after <code>READY</code>.</td></tr>
+    <tr><td><code>WorkerProc.__init__</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:647-710}}</td><td>Build the worker, device, model, async copy thread, queues.</td></tr>
+    <tr><td><code>make_worker_process</code> / <code>wait_for_ready</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:712-822}}</td><td>Start the child with a ready pipe and a death pipe; collect <code>READY</code>.</td></tr>
+    <tr><td><code>worker_main</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:861-989}}</td><td>Process entry point of a worker.</td></tr>
+    <tr><td><code>enqueue_output</code> / <code>handle_output</code> / <code>async_output_busy_loop</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:995-1039}}</td><td>Turn a result into <code>(status, value)</code>; wait for async outputs in a thread.</td></tr>
+    <tr><td><code>worker_busy_loop</code> / <code>_execute_worker_rpc</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:1041-1080}}</td><td>Dequeue a call, run it, reply if this rank must.</td></tr>
+    <tr><td><code>setup_proc_title_and_log_prefix</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:1082-1116}}</td><td>Process titles such as <code>Worker_TP0</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>_init_executor</code>: start the workers</h3>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="174-216" highlight="174-175,191-193,197-206,216" />
+<ol>
+  <li><strong>Lines 174-175.</strong> One lock is shared by all workers of this executor; the worker uses it for the multimodal receiver cache ({{cite vllm/v1/worker/worker_base.py:339-343}}).</li>
+  <li><strong>Lines 191-193.</strong> One process per <em>local</em> rank. <code>is_driver_worker</code> is true when <code>rank % TP == 0</code> ({{cite vllm/v1/executor/multiproc_executor.py:297-298}}).</li>
+  <li><strong>Lines 197-206.</strong> Each child gets the handle of the broadcast queue, not the queue object.</li>
+  <li><strong>Line 216.</strong> The executor blocks until every worker has loaded its model. The comment at lines 212-213 explains the order: all workers must exist first, because <code>init_device</code> synchronizes the devices.</li>
+</ol>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="222-268" highlight="222,225-226,229-241,247-251,253,268" />
+<ol>
+  <li><strong>Line 222.</strong> The engine core process sets its torch thread count for run time. The comment gives the reason: this process only schedules, and more threads only compete with the workers for the CPU.</li>
+  <li><strong>Lines 229-241.</strong> One reply queue per rank. Local workers write to their own <code>MessageQueue(1, 1)</code>; remote ranks reach the leader node through worker 0.</li>
+  <li><strong>Lines 247-251.</strong> Both sides must call <code>wait_until_ready()</code> in the same order. The comment warns that another order deadlocks.</li>
+  <li><strong>Lines 258-266.</strong> On any failure, the executor closes the death pipes and terminates the processes it started.</li>
+</ol>
+
+<h3><code>collective_rpc</code>: one call to all workers</h3>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="383-423" highlight="396-398,399-400,402,405-422" />
+<ol>
+  <li><strong>Lines 396-398.</strong> Only the leader node of a DP rank owns the broadcast queue.</li>
+  <li><strong>Lines 399-400.</strong> After a worker death, every call fails at once.</li>
+  <li><strong>Line 402.</strong> One deadline for the whole call; each reply read gets the time that is left.</li>
+  <li><strong>Lines 405-422.</strong> With a KV or EC connector aggregator, <code>output_rank</code> becomes <code>None</code>: all workers reply, and the aggregator merges their outputs onto the reply of <code>unique_reply_rank</code>.</li>
+</ol>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="424-456" highlight="425-427,428,431-432,437-443,444-448,452-456" />
+<ol>
+  <li><strong>Lines 425-427.</strong> A callable is sent as cloudpickle bytes; the worker calls it with the worker object as the first argument ({{cite vllm/v1/executor/multiproc_executor.py:1059-1060}}).</li>
+  <li><strong>Line 428.</strong> The single write into shared memory.</li>
+  <li><strong>Lines 437-443.</strong> A reply that does not come in time becomes <code>TimeoutError</code>.</li>
+  <li><strong>Lines 452-456.</strong> <code>non_block</code> returns the <code>FutureWrapper</code>; else the method waits at once.</li>
+</ol>
+
+<h3><code>FutureWrapper</code>: replies in order</h3>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="79-110" highlight="90,97-99,104-106" />
+<ol>
+  <li><strong>Line 90.</strong> Each new future goes to the left end of the shared deque.</li>
+  <li><strong>Lines 97-99.</strong> <code>result()</code> pops from the right end, the oldest future, and reads its reply, until its own future is done. The reply queues are FIFO, so the reply of the oldest call always comes first.</li>
+  <li><strong>Lines 104-109.</strong> An error goes into the future that owns it, not into the caller's future.</li>
+</ol>
+
+<h3><code>WorkerProc.__init__</code>: inside the worker process</h3>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="658-710" highlight="659,672,680,688,691-699,702,706,710" />
+<ol>
+  <li><strong>Lines 659-672.</strong> <code>WorkerWrapperBase.init_worker</code> loads the general plugins and makes the worker class. Only this rank's kwargs are filled in.</li>
+  <li><strong>Line 680.</strong> <code>init_device</code>: CUDA device, NCCL groups, memory snapshot, model runner.</li>
+  <li><strong>Line 688.</strong> The weights load here, before the worker reports <code>READY</code>.</li>
+  <li><strong>Lines 691-699.</strong> With async scheduling, a second thread will wait for the GPU results.</li>
+  <li><strong>Line 702.</strong> The platform may change the block size for the chosen attention backend.</li>
+  <li><strong>Line 706.</strong> The queues come last, because a multi-node setup needs the process groups.</li>
+</ol>
+
+<h3><code>worker_busy_loop</code> and <code>_execute_worker_rpc</code></h3>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="1041-1080" highlight="1045-1046,1057-1060,1063-1068,1070-1071,1076,1079-1080" />
+<ol>
+  <li><strong>Lines 1045-1046.</strong> Wait for the next call without a timeout. The stack-dump watchdog is off during this wait, so an idle worker does not look stuck.</li>
+  <li><strong>Lines 1057-1060.</strong> A name is looked up on the worker wrapper; bytes are a pickled function.</li>
+  <li><strong>Lines 1070-1071.</strong> Only the reply rank (or every rank when <code>output_rank</code> is <code>None</code>) sends the result.</li>
+  <li><strong>Lines 1076-1080.</strong> An exception is logged with its traceback and sent as a <code>FAILURE</code> reply. The loop goes on.</li>
+</ol>
+
+<h3><code>handle_output</code>: the async copy thread</h3>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="995-1039" highlight="1000-1005,1007-1010,1019-1022,1034-1035,1037-1039" />
+<ol>
+  <li><strong>Lines 1000-1005.</strong> An <code>AsyncModelRunnerOutput</code> is resolved with <code>get_output()</code>, which waits for the copy to the CPU.</li>
+  <li><strong>Lines 1019-1022.</strong> With async scheduling, this wait happens in the extra thread, not in the main thread.</li>
+  <li><strong>Lines 1034-1035.</strong> The thread sets its CUDA device first. A new thread does not inherit it, and a CUDA call on device 0 would make a second CUDA context.</li>
+</ol>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types in and out">
+<table>
+  <thead><tr><th>Value</th><th>Type</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>broadcast message</td><td><code>(method: str | bytes, args: tuple, kwargs: dict, output_rank: int | None)</code>, pickled</td><td>{{cite vllm/v1/executor/multiproc_executor.py:428}}, {{cite vllm/v1/executor/multiproc_executor.py:1050-1055}}</td></tr>
+    <tr><td><code>execute_model</code> args</td><td><code>(SchedulerOutput,)</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:345-347}}</td></tr>
+    <tr><td><code>sample_tokens</code> args</td><td><code>(GrammarOutput | None,)</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:358-360}}</td></tr>
+    <tr><td>reply message</td><td><code>(ResponseStatus.SUCCESS, result)</code> or <code>(ResponseStatus.FAILURE, str(exception))</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:1007-1012}}</td></tr>
+    <tr><td><code>execute_model</code> reply (MRV2, last PP rank)</td><td><code>None</code>: sampling follows in <code>sample_tokens</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:2103-2110}}</td></tr>
+    <tr><td><code>sample_tokens</code> reply</td><td><code>ModelRunnerOutput</code> (after <code>get_output()</code> in the worker)</td><td>{{cite vllm/v1/executor/multiproc_executor.py:1000-1002}}</td></tr>
+    <tr><td>ready pipe message</td><td><code>{"status": "READY", "handle": Handle, "peer_response_handles": [...]}</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:931-937}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Processes and threads">
+<table>
+  <thead><tr><th>Process</th><th>Thread</th><th>Code</th><th>Blocks in</th></tr></thead>
+  <tbody>
+    <tr><td>engine core</td><td>main</td><td><code>collective_rpc</code>, <code>FutureWrapper.result</code></td><td><code>mq.dequeue</code> of a reply queue</td></tr>
+    <tr><td>engine core</td><td><code>MultiprocWorkerMonitor</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:307-331}}</td><td><code>multiprocessing.connection.wait(sentinels)</code></td></tr>
+    <tr><td>worker</td><td>main</td><td><code>worker_busy_loop</code></td><td><code>rpc_broadcast_mq.dequeue(indefinite=True)</code></td></tr>
+    <tr><td>worker</td><td><code>WorkerAsyncOutputCopy</code> (async scheduling only)</td><td><code>async_output_busy_loop</code></td><td><code>async_output_queue.get()</code>, then <code>copy_event.synchronize()</code></td></tr>
+    <tr><td>worker</td><td><code>DeathPipeMonitor</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:835-859}}</td><td><code>death_pipe.recv()</code></td></tr>
+  </tbody>
+</table>
+<p>The process name is <code>VllmWorker-&lt;rank&gt;</code> ({{cite vllm/v1/executor/multiproc_executor.py:748}}). After <code>init_device</code>, the worker renames itself by its parallel ranks, for example <code>Worker_TP1</code> or, for an MoE model with DP = 2 and TP = 2, <code>Worker_DP1_TP0</code> ({{cite vllm/v1/executor/multiproc_executor.py:1101-1116}}). A dense model's DP rank runs as DP = 1 ({{cite vllm/config/parallel.py:1192-1199}}), so its name has no DP part.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: TP = 2, one step">
+<ol>
+  <li>The busy loop calls <code>execute_model(so, non_block=True)</code>. <code>collective_rpc</code> enqueues <code>("execute_model", (so,), {}, 0)</code> and returns future F1 ({{cite vllm/v1/executor/multiproc_executor.py:342-353}}).</li>
+  <li>Both workers dequeue the same message. Both run <code>Worker.execute_model</code>; their forward passes meet in the NCCL all-reduces of the TP layers.</li>
+  <li>Worker 0 is the output rank (<code>2 - 2 × 1 = 0</code>). It replies <code>(SUCCESS, None)</code> through its copy thread. Worker 1 replies nothing.</li>
+  <li>The busy loop computes the grammar bitmask, then calls <code>sample_tokens(grammar, non_block=True)</code>: message <code>("sample_tokens", (grammar,), {}, 0)</code>, future F2.</li>
+  <li>Both workers sample. Worker 0 gives its <code>AsyncOutput</code> to the copy thread, which waits for the copy and replies <code>(SUCCESS, ModelRunnerOutput)</code>.</li>
+  <li>One call later, the busy loop pops this step and calls <code>F2.result()</code>. <code>FutureWrapper</code> first reads the reply of F1 (<code>None</code>), then the reply of F2.</li>
+</ol>
+<p>(Derived from the methods above and {{cite vllm/v1/engine/core.py:724-773}}.)</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>world size is not TP × PP × PCP</td><td><code>AssertionError</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:126-132}}</td></tr>
+    <tr><td>a worker sends a status other than <code>READY</code>, or its pipe closes</td><td><code>Exception("WorkerProc initialization failed ...")</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:790-816}}</td></tr>
+    <tr><td>a worker process exits</td><td>ERROR log, <code>is_failed = True</code>, shutdown, failure callback</td><td>{{cite vllm/v1/executor/multiproc_executor.py:314-326}}</td></tr>
+    <tr><td>call after a failure</td><td><code>RuntimeError("Executor failed.")</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:399-400}}</td></tr>
+    <tr><td>worker method raises</td><td>worker logs it. Only a replying rank sends <code>FAILURE</code>, and then the executor raises <code>RuntimeError("Worker failed with error ...")</code>. A failure on another rank is only logged</td><td>{{cite vllm/v1/executor/multiproc_executor.py:1072-1080}}, {{cite vllm/v1/executor/multiproc_executor.py:444-448}}</td></tr>
+    <tr><td>reply timeout</td><td><code>TimeoutError("RPC call to ... timed out.")</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:440-443}}</td></tr>
+    <tr><td><code>get_output()</code> fails in the copy thread</td><td>logged; sent as a <code>FAILURE</code> reply</td><td>{{cite vllm/v1/executor/multiproc_executor.py:1000-1005}}</td></tr>
+    <tr><td>parent process exits</td><td>worker logs "Parent process exited, terminating worker queues"</td><td>{{cite vllm/v1/executor/multiproc_executor.py:841-849}}</td></tr>
+    <tr><td>SIGTERM / SIGINT in a worker</td><td><code>SystemExit</code>, raised once</td><td>{{cite vllm/v1/executor/multiproc_executor.py:873-884}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_MQ_MAX_CHUNK_BYTES_MB</code></td><td>16 ({{cite vllm/envs.py:1856-1858}})</td><td>{{cite vllm/v1/executor/multiproc_executor.py:152}}</td><td>Chunk size of the broadcast queue; larger messages go over ZMQ.</td></tr>
+    <tr><td><code>VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS</code></td><td>300 ({{cite vllm/envs.py:1861-1863}})</td><td>{{cite vllm/v1/executor/multiproc_executor.py:350}}, {{cite vllm/v1/executor/multiproc_executor.py:363}}</td><td>Timeout of <code>execute_model</code>, <code>sample_tokens</code>, dummy batches and draft tokens.</td></tr>
+    <tr><td><code>VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS</code></td><td>5 ({{cite vllm/envs.py:1865-1867}})</td><td>{{cite vllm/v1/executor/multiproc_executor.py:484-486}}</td><td>Grace period before SIGTERM; SIGKILL follows after 4 s more.</td></tr>
+    <tr><td><code>VLLM_WORKER_MULTIPROC_METHOD</code></td><td><code>fork</code>; <code>vllm serve</code> sets <code>spawn</code></td><td>through <code>get_mp_context()</code> ({{cite vllm/v1/executor/multiproc_executor.py:723}})</td><td>Start method of the worker processes.</td></tr>
+    <tr><td><code>OMP_NUM_THREADS</code></td><td>set by vLLM if unset</td><td>{{cite vllm/v1/executor/multiproc_executor.py:1125-1135}}</td><td>CPU threads per worker.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/executors-and-workers}}: the backends, the call path and the worker start-up.</li>
+  <li>{{link concepts/async-scheduling}}: why the worker has a copy thread.</li>
+  <li>{{link concepts/engine-core-loop}}: what happens after <code>EXECUTOR_FAILED</code>.</li>
+  <li>{{link code/v1-worker-gpu-worker}}: the methods that the RPCs run.</li>
+  <li>{{link code/distributed-device-communicators-shm-broadcast}}: the <code>MessageQueue</code> ring buffer.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">What is the name of a worker process before it renames itself, and which method is its target?
+    <x-a><p><code>VllmWorker-&lt;rank&gt;</code>, with the target <code>WorkerProc.worker_main</code> ({{cite vllm/v1/executor/multiproc_executor.py:745-750}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With TP = 8 and PP = 4, which rank replies to <code>execute_model</code>?
+    <x-a><p>Rank <code>world_size - TP × PCP = 32 - 8 = 24</code>, the first TP rank of the last PP stage. The comment in <code>_get_output_rank</code> uses this example ({{cite vllm/v1/executor/multiproc_executor.py:549-563}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A worker method raises <code>ValueError("bad")</code>. What does the engine core see, and where is the traceback?
+    <x-a><p>The worker logs "WorkerProc hit an exception." with the traceback. If it is the reply rank (or the call has no <code>output_rank</code>), it replies <code>(FAILURE, "bad")</code> ({{cite vllm/v1/executor/multiproc_executor.py:1072-1080}}). The executor raises <code>RuntimeError("Worker failed with error 'bad', ...")</code> ({{cite vllm/v1/executor/multiproc_executor.py:444-448}}). The traceback is only in the worker's log.</p></x-a>
+  </x-q>
+  <x-q level="hard">Why does <code>async_output_busy_loop</code> call <code>current_platform.set_device</code> before its loop, and what goes wrong without it?
+    <x-a><p>A new thread does not inherit the current CUDA device of the main thread. The first CUDA call in the thread, here the event synchronize in <code>get_output()</code>, would then make a new CUDA context on device 0, which costs extra memory. The comment says this ({{cite vllm/v1/executor/multiproc_executor.py:1026-1035}}).</p></x-a>
+  </x-q>
+</x-quiz>

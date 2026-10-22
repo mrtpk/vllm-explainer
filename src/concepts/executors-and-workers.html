@@ -1,0 +1,184 @@
+---
+title: Executors and workers: from the engine core to the GPUs
+nav_title: Executors and workers
+level: Intermediate
+prerequisites: concepts/architecture-overview, concepts/engine-core-loop
+related: concepts/async-scheduling, concepts/model-runner, concepts/distributed-groups, concepts/kv-cache-manager, concepts/engine-hooks, code/v1-executor-multiproc-executor, code/v1-worker-gpu-worker, tours/engine-step, tours/multi-gpu-step
+summary: The executor starts the workers and runs each call on all of them. The uni executor calls one worker in the engine core process; the multiproc executor sends calls to one worker process per GPU through a shared-memory queue.
+---
+<x-sentence>The executor starts the workers and runs every engine call on all of them. Each worker owns one GPU and holds the model runner.</x-sentence>
+
+<h2>The idea</h2>
+<p>The {{term engine-core}} does not touch a GPU itself. It talks to an {{term executor}}, and the executor talks to the {{term worker | workers}}. A worker owns one GPU: it sets up the device and the process groups, loads its part of the model, and holds the {{term model-runner}}. With tensor parallelism, one model runs on several GPUs, so there are several workers ({{deepinfer learn/parallelism | Parallelism basics}}).</p>
+<p>The engine core asks the executor for things like "run this step" or "how much memory is free?". The executor turns each request into a {{term collective-rpc}}: it calls the same worker method on every worker, and collects the results. How it reaches the workers depends on the backend:</p>
+<ul>
+  <li>The {{term uni-executor}} keeps the one worker as an object in the engine core process. A call is a plain Python call. By default, vLLM uses it only when TP = PP = DP = 1.</li>
+  <li>The {{term multiproc-executor}} starts one worker process per GPU on the node. It writes each call once into a shared-memory {{term message-queue}}, and all workers read it.</li>
+  <li>The Ray executor uses the same message queues, but its workers are Ray actors ({{cite vllm/v1/executor/ray_executor_v2.py:239-247}}).</li>
+</ul>
+<p><strong>An everyday comparison.</strong> Think of a conductor and an orchestra. The conductor (the engine core) gives one sign, and every musician (worker) plays the same bar on their own instrument (GPU). One musician, the first violin, reports when the bar is done. The comparison stops here: the musicians in vLLM also talk to each other during the bar (NCCL collectives), and the conductor never hears that.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b2b_executor_workers" alt="Panel 1: three executor backends. uni (UniProcExecutor): by default only when TP = PP = DP = 1, the worker is an object in the engine core process and collective_rpc is a direct call. mp (MultiprocExecutor): the default when world_size_across_dp is greater than 1 on one node, one VllmWorker process per local rank, a shared-memory MessageQueue. ray (RayExecutorV2): a subclass of MultiprocExecutor whose workers are Ray actors. Panel 2: with TP = 2, the engine core's MultiprocExecutor enqueues (method, args, kwargs, output_rank) into rpc_broadcast_mq, a shared-memory ring buffer with two readers. Both worker processes dequeue the call. Worker 0, the output rank, writes the result into its own response MessageQueue(1, 1); the executor reads it. Worker 1 does not reply. The workers talk with NCCL inside the forward pass. Panel 3: three threads in a worker process: the main thread with worker_busy_loop, the WorkerAsyncOutputCopy thread for async outputs, and the DeathPipeMonitor thread that detects the end of the parent process." caption="Figure: the three executor backends (panel 1), the path of one execute_model call with TP = 2 (panel 2), and the threads inside a worker process (panel 3)." />
+<p>Read panel 2 from left to right and back. The call goes out once and reaches every worker. Only one result comes back. Panel 3 explains how a worker keeps the overlap of {{link concepts/async-scheduling}}: its main thread never waits for the GPU result.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: which backend</h3>
+<p><code>distributed_executor_backend</code> has the default <code>None</code> ({{cite vllm/config/parallel.py:290-292}}). <code>ParallelConfig.__post_init__</code> fills it in:</p>
+<x-code file="vllm/config/parallel.py" lines="1055-1061" />
+<x-code file="vllm/config/parallel.py" lines="1096-1100" />
+<p><code>world_size_across_dp</code> is <code>world_size × data_parallel_size</code> ({{cite vllm/config/parallel.py:626-629}}), and <code>world_size</code> is <code>PP × TP × PCP</code> ({{cite vllm/config/parallel.py:965-969}}). So, when you do not set a backend, <code>"uni"</code> applies only when TP, PP, DP (and the prefill context parallel size) are all 1. With DP = 2 and TP = 1, each engine core gets one worker <em>process</em> (see {{link concepts/architecture-overview}}). Ray replaces <code>"mp"</code> only after three earlier tests ({{cite vllm/config/parallel.py:1063-1078}}). TPU with SPMD picks <code>"uni"</code>. CUDA with more than one node (<code>--nnodes</code>) keeps <code>"mp"</code>. Too few GPUs on the node raise <code>ValueError</code>. Then Ray is used when the data parallel backend is Ray, or when Ray is installed and a Ray placement group is set or active ({{cite vllm/config/parallel.py:1079-1095}}). <code>Executor.get_class</code> then maps the name to a class:</p>
+<x-code file="vllm/v1/executor/abstract.py" lines="63-103" highlight="69-75,76-79,80-83,84-87,88-91,92-98" />
+<p>You can also pass your own <code>Executor</code> subclass, as a class or as a qualified name (lines 69-75 and 92-98). The {{link concepts/engine-hooks}} page lists this extension point.</p>
+
+<h3>Step 2: the executor interface</h3>
+<p>Every executor implements <code>collective_rpc</code>. The docstring defines it: run a method "on all workers", by name or as a callable that gets the worker as <code>self</code> ({{cite vllm/v1/executor/abstract.py:209-242}}). The base class builds the step calls on top of it:</p>
+<x-code file="vllm/v1/executor/abstract.py" lines="261-287" highlight="264-266,284-286" />
+<p>With <code>non_block=True</code>, the call returns a <code>Future</code> instead of the result. The default loop, <code>step_with_batch_queue</code>, uses this for both calls of a step ({{cite vllm/v1/engine/core.py:727-729}}, {{cite vllm/v1/engine/core.py:743-745}}). In <code>step()</code>, only <code>execute_model</code> uses it ({{cite vllm/v1/engine/core.py:668}}, {{cite vllm/v1/engine/core.py:676}}). Start-up and control calls go the same way. For example, <code>determine_available_memory</code> is <code>collective_rpc("determine_available_memory")</code> ({{cite vllm/v1/executor/abstract.py:156-157}}), and <code>sleep</code> is <code>collective_rpc("sleep", ...)</code> ({{cite vllm/v1/executor/abstract.py:393-403}}).</p>
+
+<h3>Step 3: UniProcExecutor, one worker in the same process</h3>
+<x-code file="vllm/v1/executor/uniproc_executor.py" lines="51-75" highlight="54,68,69,74" />
+<p>The executor wraps the worker in a <code>WorkerWrapperBase</code>, then runs the three start-up steps directly: <code>init_worker</code>, <code>init_device</code> and <code>load_model</code>. A call is <code>run_method</code> on the wrapper, which calls <code>getattr(wrapper, method)</code> ({{cite vllm/v1/serial_utils.py:485-508}}). The wrapper's own methods, such as <code>execute_model</code>, run first; other names go to the worker through <code>__getattr__</code> ({{cite vllm/v1/worker/worker_base.py:365-366}}):</p>
+<x-code file="vllm/v1/executor/uniproc_executor.py" lines="102-117" highlight="104-106,109-111,112-113" />
+<p>With <code>non_block=True</code>, the method still runs at once, in the engine core's main thread. Only an <code>AsyncModelRunnerOutput</code> result becomes a future that waits later, in <code>get_output()</code> ({{cite vllm/v1/executor/uniproc_executor.py:32-48}}). So <code>non_block</code> does not make the call faster. It moves the wait for the GPU result to the moment when the engine core pops the step from its batch queue.</p>
+
+<h3>Step 4: MultiprocExecutor starts the worker processes</h3>
+<p><code>_init_executor</code> does four things in order ({{cite vllm/v1/executor/multiproc_executor.py:119-268}}):</p>
+<ol>
+  <li>It makes the broadcast queue, with one reader per worker and a chunk size from <code>VLLM_MQ_MAX_CHUNK_BYTES_MB</code> (16 MiB by default):
+    <x-code file="vllm/v1/executor/multiproc_executor.py" lines="152-172" highlight="152,165-171,172" />
+  </li>
+  <li>It starts one process per local rank with <code>WorkerProc.make_worker_process</code> ({{cite vllm/v1/executor/multiproc_executor.py:191-207}}). The process name is <code>VllmWorker-&lt;rank&gt;</code>, and it uses the context of <code>get_mp_context()</code>, normally spawn ({{cite vllm/v1/executor/multiproc_executor.py:723-750}}).</li>
+  <li>It waits until every worker sends <code>READY</code> through a pipe, with the handle of its reply queue ({{cite vllm/v1/executor/multiproc_executor.py:786-822}}).</li>
+  <li>It starts the worker monitor (Step 6), connects the reply queues, and computes <code>output_rank</code> ({{cite vllm/v1/executor/multiproc_executor.py:224-268}}).</li>
+</ol>
+
+<h3>Step 5: collective_rpc over shared memory</h3>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="424-456" highlight="428,430-432,441,444-448,452-456" />
+<ol>
+  <li>Line 428: the call goes into the broadcast queue <em>once</em>, as <code>(method, args, kwargs, output_rank)</code>. The queue pickles it ({{cite vllm/distributed/device_communicators/shm_broadcast.py:925-941}}).</li>
+  <li>Lines 430-432: with an <code>output_rank</code>, the executor reads only that worker's reply queue.</li>
+  <li>Lines 444-448: when the worker that replies failed, it sends a <code>FAILURE</code> status, and the executor raises <code>RuntimeError</code> with the error text.</li>
+  <li>Lines 452-456: the reply is read later, in <code>FutureWrapper.result()</code>.</li>
+</ol>
+<p>For <code>execute_model</code> and <code>sample_tokens</code>, the <code>output_rank</code> is the first TP worker of the last PP stage ({{cite vllm/v1/executor/multiproc_executor.py:342-366}}, {{cite vllm/v1/executor/multiproc_executor.py:549-563}}). The other workers run the same method but send nothing back. With a KV or EC connector, all workers reply, and an aggregator merges their outputs ({{cite vllm/v1/executor/multiproc_executor.py:405-419}}, {{cite vllm/v1/engine/core.py:191-194}}).</p>
+<p>The replies come back in call order, and <code>FutureWrapper</code> uses that. Each future joins a shared deque. When you ask a future for its result, it first reads the replies of all older futures ({{cite vllm/v1/executor/multiproc_executor.py:79-110}}). So the engine core can wait for the <code>sample_tokens</code> future of step N, and the <code>execute_model</code> reply of step N is read on the way.</p>
+
+<h3>Step 6: detecting a dead worker</h3>
+<p>Two threads watch the processes. In the engine core, <code>MultiprocWorkerMonitor</code> waits on the sentinels of all worker processes:</p>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="307-326" highlight="309,314,322,326" />
+<p>The callback puts <code>EXECUTOR_FAILED</code> into the engine core's input queue, and the busy loop raises ({{link concepts/engine-core-loop}}, Step 10). In each worker, <code>DeathPipeMonitor</code> blocks on a pipe from the parent. When the parent process ends, the pipe returns <code>EOFError</code>, and the worker shuts down its queues ({{cite vllm/v1/executor/multiproc_executor.py:835-859}}). The wait for a call that hangs also ends: <code>execute_model</code> and <code>sample_tokens</code> use the timeout <code>VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS</code>, 300 s by default ({{cite vllm/v1/executor/multiproc_executor.py:350}}, {{cite vllm/envs.py:1861-1863}}). The engine core then gets <code>TimeoutError</code> ({{cite vllm/v1/executor/multiproc_executor.py:440-443}}); the hung worker keeps running.</p>
+
+<h3>Step 7: WorkerProc, the worker process</h3>
+<p>The process target is <code>WorkerProc.worker_main</code>. It installs signal handlers, builds the <code>WorkerProc</code>, sends <code>READY</code> and enters the busy loop ({{cite vllm/v1/executor/multiproc_executor.py:861-948}}). The constructor is the same start-up as in the uni executor:</p>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="672-699" highlight="672,680,688,691-699" />
+<p><code>init_worker</code> loads the general plugins and makes the worker class from <code>parallel_config.worker_cls</code> ({{cite vllm/v1/worker/worker_base.py:268-347}}). On CUDA that is <code>vllm.v1.worker.gpu_worker.Worker</code>, when <code>worker_cls</code> is <code>"auto"</code> ({{cite vllm/platforms/cuda.py:330-331}}). The busy loop reads calls forever:</p>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="1041-1080" highlight="1046,1058,1064,1070-1071,1079-1080" />
+<p>Line 1070: only the output rank (or every worker when <code>output_rank</code> is <code>None</code>) sends a reply. With async scheduling, <code>handle_output</code> passes the result to the <code>WorkerAsyncOutputCopy</code> thread, which waits for the GPU copy and then writes the reply ({{cite vllm/v1/executor/multiproc_executor.py:1000-1002}}, {{cite vllm/v1/executor/multiproc_executor.py:1019-1039}}).</p>
+
+<h3>Step 8: the GPU worker</h3>
+<p>The class <code>Worker</code> in <code>vllm/v1/worker/gpu_worker.py</code> does the per-GPU work. The engine core calls its methods in this order at start-up and during serving:</p>
+<table>
+  <thead><tr><th>Method</th><th>Called from</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>init_device</code></td><td>executor start-up</td><td>sets the CUDA device, starts the process groups (NCCL), takes a memory snapshot, builds the model runner ({{cite vllm/v1/worker/gpu_worker.py:446-549}})</td></tr>
+    <tr><td><code>load_model</code></td><td>executor start-up</td><td>loads the weights through the model runner ({{cite vllm/v1/worker/gpu_worker.py:591-598}})</td></tr>
+    <tr><td><code>get_kv_cache_spec</code></td><td><code>EngineCore._initialize_kv_caches</code> ({{cite vllm/v1/engine/core.py:253}})</td><td>the KV cache layout that each layer needs</td></tr>
+    <tr><td><code>determine_available_memory</code></td><td>same ({{cite vllm/v1/engine/core.py:300}})</td><td>runs the {{term profile-run}} and returns the bytes left for the KV cache ({{cite vllm/v1/worker/gpu_worker.py:638-811}})</td></tr>
+    <tr><td><code>initialize_from_config</code></td><td>same ({{cite vllm/v1/engine/core.py:362}})</td><td>allocates the KV cache tensors ({{cite vllm/v1/worker/gpu_worker.py:857-909}})</td></tr>
+    <tr><td><code>compile_or_warm_up_model</code></td><td>same ({{cite vllm/v1/engine/core.py:379}})</td><td>compiles, warms up and captures CUDA graphs ({{cite vllm/v1/worker/gpu_worker.py:924-1115}})</td></tr>
+    <tr><td><code>execute_model</code>, <code>sample_tokens</code></td><td>every engine step</td><td>forward to the model runner ({{cite vllm/v1/worker/gpu_worker.py:1316-1383}})</td></tr>
+    <tr><td><code>sleep</code>, <code>wake_up</code></td><td>utility calls, for example from the dev-mode <code>/sleep</code> route</td><td>free and restore GPU memory ({{cite vllm/v1/worker/gpu_worker.py:298-364}})</td></tr>
+  </tbody>
+</table>
+<p>The page {{link code/v1-worker-gpu-worker}} reads these methods line by line, with a memory example.</p>
+
+<h3>Step 9: the worker builds Model Runner V2</h3>
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="567-583" highlight="569,575-580" />
+<p><code>use_v2_model_runner</code> is true by default when Triton is present and no unsupported feature is set ({{cite vllm/config/vllm.py:713-748}}). A multimodal encoder-only instance gets <code>MMEncoderModelRunner</code> (lines 570-573). Otherwise the worker falls back to Model Runner V1 (lines 581-583); the page {{link concepts/model-runner}} names the cases.</p>
+
+<h3>Step 10: Ray in one paragraph</h3>
+<p><code>RayExecutorV2</code> subclasses <code>MultiprocExecutor</code>. Its docstring says it reuses "the MQ-based control plane and NCCL data plane", with Ray actors as workers ({{cite vllm/v1/executor/ray_executor_v2.py:239-247}}). Each actor runs a <code>RayWorkerProc</code>, a <code>WorkerProc</code> that learns its GPU after Ray places it ({{cite vllm/v1/executor/ray_executor_v2.py:79-100}}). So steps 5, 8 and 9 of this page also hold for Ray, and so does the worker busy loop. Process creation, placement and the monitoring differ: Ray has its own <code>RayWorkerMonitor</code> thread ({{cite vllm/v1/executor/ray_executor_v2.py:487-537}}), and <code>RayWorkerProc.run()</code> calls <code>worker_busy_loop</code> without <code>worker_main</code> ({{cite vllm/v1/executor/ray_executor_v2.py:223-231}}). The inherited <code>supports_async_scheduling()</code> is true, so async scheduling stays on.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Start-up: every executor call, in order">
+<p>For <code>vllm serve</code> with TP = 2 on one node. (Derived from the call sites below.)</p>
+<ol>
+  <li><code>MultiprocExecutor(vllm_config)</code> in <code>EngineCore.__init__</code> ({{cite vllm/v1/engine/core.py:147}}): starts <code>VllmWorker-0</code> and <code>VllmWorker-1</code>. Each runs <code>init_worker</code>, <code>init_device</code> (NCCL starts here) and <code>load_model</code>, then sends <code>READY</code>.</li>
+  <li><code>measure_encoder_output_widths</code> may call <code>collective_rpc</code> ({{cite vllm/v1/engine/core.py:157}}).</li>
+  <li><code>get_kv_cache_specs()</code>, <code>get_supported_kv_cache_layouts()</code>, <code>set_kv_cache_layout()</code> ({{cite vllm/v1/engine/core.py:253}}, {{cite vllm/v1/engine/core.py:281-286}}).</li>
+  <li><code>determine_available_memory()</code> returns one value per worker, only when the model has a KV cache ({{cite vllm/v1/engine/core.py:288-300}}).</li>
+  <li><code>update_max_model_len</code>, only when the KV cache planning changed <code>max_model_len</code> ({{cite vllm/v1/engine/core.py:320-322}}).</li>
+  <li><code>initialize_from_config(kv_cache_configs)</code>: the wrapper picks the config of its own rank ({{cite vllm/v1/worker/worker_base.py:350-354}}).</li>
+  <li><code>compile_or_warm_up_model()</code>: the executor keeps the largest compile time of the workers ({{cite vllm/v1/executor/abstract.py:133-148}}).</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="The broadcast queue in numbers">
+<table>
+  <thead><tr><th>Property</th><th>Value</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>Writers / readers</td><td>1 writer (the executor), <code>world_size</code> readers, <code>local_world_size</code> of them through shared memory</td><td>{{cite vllm/v1/executor/multiproc_executor.py:165-171}}</td></tr>
+    <tr><td>Chunks</td><td>10 (default of <code>max_chunks</code>)</td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:491-492}}</td></tr>
+    <tr><td>Chunk size</td><td>16 MiB (<code>VLLM_MQ_MAX_CHUNK_BYTES_MB</code>); the class default is 24 MiB</td><td>{{cite vllm/envs.py:1856-1858}}, {{cite vllm/v1/executor/multiproc_executor.py:152}}</td></tr>
+    <tr><td>Format</td><td>pickle; buffers of 1 MiB or more go out-of-band</td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:906-914}}</td></tr>
+    <tr><td>Overflow</td><td>a message of a chunk size or more goes over a ZMQ XPUB socket; the chunk only carries a flag</td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:942-946}}</td></tr>
+    <tr><td>Reply queue</td><td><code>MessageQueue(1, 1)</code> per worker, on a single node</td><td>{{cite vllm/v1/executor/multiproc_executor.py:618-626}}</td></tr>
+  </tbody>
+</table>
+<p>A <code>SchedulerOutput</code> of a normal decode step is small. A grammar bitmask for a large batch can be large. The comment on the class default says that 24 MiB is "large enough to accommodate grammar bitmask tensors for large batches (1024 requests)" ({{cite vllm/distributed/device_communicators/shm_broadcast.py:489-491}}). The page {{link code/distributed-device-communicators-shm-broadcast}} explains the ring buffer.</p>
+</x-deepdive>
+
+<x-deepdive title="Errors: what raises and where">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>a worker method raises</td><td>the worker logs "WorkerProc hit an exception.". Only the replying worker (the output rank, or every worker when <code>output_rank</code> is <code>None</code>) sends <code>FAILURE</code>; then the executor raises <code>RuntimeError("Worker failed with error ...")</code>. A failure on another rank is only logged, and the executor waits for the output rank or the timeout</td><td>{{cite vllm/v1/executor/multiproc_executor.py:1072-1080}}, {{cite vllm/v1/executor/multiproc_executor.py:444-448}}</td></tr>
+    <tr><td>a worker fails during start-up</td><td>"WorkerProc failed to start."; the executor sees <code>EOFError</code> on the ready pipe and raises</td><td>{{cite vllm/v1/executor/multiproc_executor.py:956-957}}, {{cite vllm/v1/executor/multiproc_executor.py:814-816}}</td></tr>
+    <tr><td>a worker process dies</td><td>"Worker proc ... died unexpectedly"; executor shut down; failure callback</td><td>{{cite vllm/v1/executor/multiproc_executor.py:314-326}}</td></tr>
+    <tr><td>any call after a failure</td><td><code>RuntimeError("Executor failed.")</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:399-400}}</td></tr>
+    <tr><td>no reply in time</td><td><code>TimeoutError("RPC call to ... timed out.")</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:440-443}}</td></tr>
+    <tr><td><code>check_health</code></td><td>a <code>collective_rpc</code> with a 10 s timeout; the uni executor is always healthy</td><td>{{cite vllm/v1/executor/multiproc_executor.py:545-547}}, {{cite vllm/v1/executor/uniproc_executor.py:147-150}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_MQ_MAX_CHUNK_BYTES_MB</code></td><td>16 ({{cite vllm/envs.py:1856-1858}})</td><td>{{cite vllm/v1/executor/multiproc_executor.py:152}}</td><td>Chunk size of the broadcast queue.</td></tr>
+    <tr><td><code>VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS</code></td><td>300 ({{cite vllm/envs.py:1861-1863}})</td><td>{{cite vllm/v1/executor/multiproc_executor.py:350}}</td><td>Timeout of one step call in the mp executor.</td></tr>
+    <tr><td><code>VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS</code></td><td>5 ({{cite vllm/envs.py:1865-1867}})</td><td>{{cite vllm/v1/executor/multiproc_executor.py:484-486}}</td><td>Grace period before SIGTERM, then SIGKILL after 4 more seconds.</td></tr>
+    <tr><td><code>VLLM_WORKER_MULTIPROC_METHOD</code></td><td><code>fork</code>; the CLI sets <code>spawn</code></td><td>{{cite vllm/envs.py:938-940}}</td><td>Start method of the worker processes.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>"World size (...) is larger than the number of available GPUs".</strong> With the mp backend, all workers of one engine must fit on the node ({{cite vllm/config/parallel.py:1067-1078}}).</li>
+  <li><strong>"RPC call to execute_model timed out."</strong> A step took more than 300 s, or a worker hangs in a collective. Check the logs of every worker; the hung rank is often not the one that reports ({{cite vllm/v1/executor/multiproc_executor.py:440-443}}).</li>
+  <li><strong>"Worker proc VllmWorker-1 died unexpectedly".</strong> Often the kernel OOM killer or a CUDA crash. The engine then fails all requests ({{link concepts/engine-core-loop}}, Step 10).</li>
+  <li><strong>The error message has no stack trace.</strong> The reply carries only <code>str(exception)</code> ({{cite vllm/v1/executor/multiproc_executor.py:1007-1008}}). The traceback is in the worker's own log line "WorkerProc hit an exception.".</li>
+  <li><strong>An out-of-tree executor turns off async scheduling.</strong> See {{link concepts/async-scheduling}}.</li>
+</ul>
+<p><strong>Why it matters.</strong> The executor is the boundary between "what to run" and "where it runs". To debug a multi-GPU server, you must know that every worker runs every call, that only one replies, and which thread waits where. To size a server, you must know that TP = 1 and DP = 1 give no worker process at all.</p>
+
+<x-quiz>
+  <x-q level="easy">Which executor backend does <code>vllm serve</code> use with one GPU and default flags, and why is there no worker process?
+    <x-a><p><code>"uni"</code>, because <code>world_size</code> is 1 and DP is 1 ({{cite vllm/config/parallel.py:1099-1100}}). <code>UniProcExecutor</code> makes the worker as an object in the engine core process and calls it directly ({{cite vllm/v1/executor/uniproc_executor.py:51-75}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With TP = 4, how many times does the executor write one <code>execute_model</code> call into shared memory, and how many replies does it read?
+    <x-a><p>Once, into <code>rpc_broadcast_mq</code>, which all four workers read ({{cite vllm/v1/executor/multiproc_executor.py:428}}). It reads one reply, from <code>output_rank = world_size - TP × PCP = 0</code> ({{cite vllm/v1/executor/multiproc_executor.py:549-563}}). With a KV connector, it reads all four and aggregates them ({{cite vllm/v1/executor/multiproc_executor.py:405-419}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">The engine core waits only for the <code>sample_tokens</code> future of a step. How does the <code>execute_model</code> reply of the same step get read from the reply queue?
+    <x-a><p><code>FutureWrapper.result()</code> first drains all older futures in the shared <code>futures_queue</code>, in order ({{cite vllm/v1/executor/multiproc_executor.py:92-100}}). The <code>execute_model</code> future is older, so its reply is read first.</p></x-a>
+  </x-q>
+  <x-q level="hard">Async scheduling is on and the executor is mp. Which thread of the worker process waits for the copy of the sampled tokens to the CPU? Why not the main thread?
+    <x-a><p>The <code>WorkerAsyncOutputCopy</code> thread. <code>handle_output</code> puts the result into <code>async_output_queue</code> ({{cite vllm/v1/executor/multiproc_executor.py:1014-1022}}), and that thread calls <code>enqueue_output</code>, which calls <code>get_output()</code> ({{cite vllm/v1/executor/multiproc_executor.py:995-1002}}, {{cite vllm/v1/executor/multiproc_executor.py:1037-1039}}). So the main thread can dequeue and start the next call at once, which keeps the GPU stream full.</p></x-a>
+  </x-q>
+</x-quiz>
