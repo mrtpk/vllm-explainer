@@ -28,6 +28,9 @@ If the batch has a visual or complex layout, check it at 1280 and 390 px with /t
 (outputs to /tmp/claude-1000/vllm-fc-<batch>/): no page overflow, no console errors, the visual reacts to click and keyboard.
 Performance: slow mount; use git -C ../vllm grep -n and sed -n.
 
+## Claims that vLLM has a bug
+Do NOT put a "this looks like a vLLM bug" claim on a page. Re-read the control flow twice (indentation: is the line inside or after the loop/if? the caller and the callee) and report it to the supervisor with exact lines. A B2a fact checker misread an indentation level and wrote a false bug note on 3 pages.
+
 ## Report (final message only)
 - Number of claims checked and defects fixed, by type (citation, value, logic, missing source, other).
 - The most important corrections (one line each).
