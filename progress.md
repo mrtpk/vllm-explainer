@@ -17,7 +17,7 @@ This file is the memory of the project. A new session must be able to continue f
 
 ## RESUME NOTES
 
-(none — work is running normally. If a usage limit cuts agents off: list here the batch, the agent role, the partial files, and the resume order.)
+- 2026-10-23 ~00:05: usage limit (spend limit, reset 1am Dubai) cut off BOTH running writers: B3b (prefix-caching, hybrid-kv-cache, code/v1-core-kv-cache-utils, prefix_cache_explorer.js) and B4b (oot-models, model-interfaces, custom-ops, code/model-executor-custom-op, code/model-executor-models-registry). Their partial files are on disk (see git status). Resume order: continue both writers with SendMessage (not restart); then B3b FC, B4b FC; then B5 ...
 
 ## Done
 
