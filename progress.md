@@ -50,6 +50,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
 
+- FINAL-PASS TODO (B5 FC): any page saying sleep mode is CUDA/HIP only; front end imports the KV factory lazily; Llama prefix model.layers.N.qkv_proj (missing self_attn); platform-interface 'pre_register_and_update only before parsing'.
+
 - FINAL-PASS TODO (B4b FC): 'O2 gives VLLM_COMPILE' needs the exceptions (breakable-CUDA-graph default archs vllm.py:75-108, 825-851; --enforce-eager; TORCH_COMPILE_DISABLE=1) on learn/what-is-vllm ~96, learn/pytorch-for-serving ~118, ~146, reference/serve-flags ~65.
 
 - FINAL-PASS TODO (B3b FC): code/v1-core-kv-cache-manager ~132 'AsyncScheduler hashes it later when output of step 3 arrives' → the next step's allocate_slots hashes it; concepts/async-scheduling ~96 mechanism → num_tokens cap at allocation (kv_cache_manager.py:612-615).
@@ -120,8 +122,11 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-22 23:11 | B3a fact check | done ~23:40: ~260 claims, 25 defects; simulator verified |
 | 2026-10-22 23:41 | B3b writer | cut off by usage limit ~00:05, resumed 01:01, done ~01:30 |
 | 2026-10-23 01:31 | B3b fact check | done ~01:45: ~190 claims, 21 defects; explorer verified in 12 scenarios |
-| 2026-10-23 01:46 | B5 writer | running (sent CustomOp corrections) |
-| 2026-10-23 02:11 | B6a writer | running |
+| 2026-10-23 01:46 | B5 writer | done ~02:35; 6 diagrams, chooser visual, b5.json 16 terms. Decision: DeepSeek-V3 MLA example kept (page notes ignored +quant_fp8). |
+| 2026-10-23 02:36 | B5 fact check (+ 3 plugin-map row fixes) | done ~03:00: ~270 claims, 34 defects; chooser all 640 combos OK |
+| 2026-10-23 03:01 | B5t writer (life-of-a-plugin, build-a-toy-plugin) | running |
+| 2026-10-23 02:11 | B6a writer | done ~02:50; 3 diagrams, b6a.json 13 terms |
+| 2026-10-23 02:51 | B6a fact check | running |
 | 2026-10-22 22:47 | B4a writer (plugin-map, platform-plugins, platform-interface + 2 modules + plugin timeline) | done ~23:25; 3 diagrams, b4a.json 5 terms |
 | 2026-10-22 23:26 | B4a fact check | done ~23:55: ~270 claims, 24 defects; OOT quant open question answered |
 | 2026-10-22 23:56 | B4b writer | cut off ~00:05, resumed 01:01, done ~01:45; 3 diagrams, b4b.json 11 terms |

@@ -1,0 +1,176 @@
+---
+title: distributed/kv_transfer/kv_connector/factory.py: the KV connector registry
+nav_title: kv_connector/factory.py
+level: Advanced
+prerequisites: concepts/kv-connectors, concepts/plugin-map
+related: concepts/kv-connectors, concepts/plugin-map, concepts/disaggregated-prefill, concepts/hybrid-kv-cache, code/v1-core-sched-scheduler, code/plugins-init
+summary: factory.py holds KVConnectorFactory - a class-level dict from connector name to a lazy loader - the lookup that prefers kv_connector_module_path over the registry, the creation of a connector in one role, the HMA check, and the registration of the 17 built-in connectors.
+---
+<h2>Purpose</h2>
+<p><code>vllm/distributed/kv_transfer/kv_connector/factory.py</code> turns the connector name in <code>--kv-transfer-config</code> into a {{term kv-connector}} class, and makes one object of it in a given {{term connector-role}}.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/distributed/kv_transfer/kv_connector/factory.py</code>, 249 lines of Python. One class with five class methods, and 17 module-level <code>register_connector</code> calls.</td></tr>
+    <tr><th>Main class</th><td><code>KVConnectorFactory</code> ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:27}})</td></tr>
+    <tr><th>Runs in</th><td>Every process that imports it, on the CPU: the {{term front-end}} (class lookups for config checks and metrics), the {{term engine-core}} process (the scheduler-side object) and each {{term worker}} (the worker-side object).</td></tr>
+    <tr><th>Called by</th><td>The scheduler constructor, <code>ensure_kv_transfer_initialized</code> in the worker, <code>VllmConfig</code> checks, the KV connector metrics classes, <code>MultiConnector</code> and a layout helper (see "Who calls it").</td></tr>
+    <tr><th>Calls</th><td><code>importlib.import_module</code>, <code>supports_hma</code> ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:13-16}}), <code>supports_kw</code> ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:18}}) and the connector constructor.</td></tr>
+    <tr><th>Not in this file</th><td>The base class <code>KVConnectorBase_V1</code> and the role enum (<code>kv_connector/v1/base.py</code>), the connectors themselves (<code>kv_connector/v1/</code>), the config (<code>vllm/config/kv_transfer.py</code>), the EC connector factory (<code>vllm/distributed/ec_transfer/ec_connector/factory.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/kv-connectors}} explains connectors from the reader's side. This page reads the factory from top to bottom.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b5_kv_factory" alt="Panel 1, get_connector_class, lines 96-129: step 1, if kv_connector_module_path is set, import the module and take the attribute named kv_connector; the class must accept kv_cache_config, else ValueError (lines 106-124). Step 2, else if the name is in _registry, call the stored loader, which imports the module only now (lines 125-126). Step 3, else ValueError Unsupported connector type (lines 127-128). Panel 2, which process asks: the front end gets the class only, for the HMA check at config/vllm.py 2243, the sleep mode check at 1242 and the CUDA graph mode at 1966; the engine core calls create_connector with role SCHEDULER (scheduler.py 177), which raises ValueError if HMA is on and unsupported; each worker calls create_connector with role WORKER and keeps the object in the global _KV_CONNECTOR_AGENT (kv_transfer_state.py 88). A callout says that register_connector stores a loader and that a taken name raises ValueError (lines 30-40)." caption="Figure: the lookup order of <code>get_connector_class</code> (panel 1) and the three kinds of callers (panel 2). Line numbers without a file are in <code>factory.py</code>." />
+<p>The file has three parts. The class body has the registry and the lookups (lines 27-146). After it, 17 calls register the built-in connectors (lines 149-249). A comment says why they live here and not in each connector file: "we want to only load the files corresponding to the current connector" (lines 149-151).</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>The scheduler</strong> makes the <code>SCHEDULER</code> object in its constructor ({{cite vllm/v1/core/sched/scheduler.py:177-181}}).</li>
+  <li><strong>Each worker</strong> makes the <code>WORKER</code> object once, in <code>ensure_kv_transfer_initialized</code> ({{cite vllm/distributed/kv_transfer/kv_transfer_state.py:73-92}}), called from <code>Worker</code> after the KV cache config is known ({{cite vllm/v1/worker/gpu_worker.py:873-878}}).</li>
+  <li><strong><code>VllmConfig</code></strong> in the front end reads the class for three checks: HMA support ({{cite vllm/config/vllm.py:2243}}), sleep mode ({{cite vllm/config/vllm.py:1242-1249}}) and PIECEWISE CUDA graphs ({{cite vllm/config/vllm.py:1966-1980}}).</li>
+  <li><strong>Metrics.</strong> <code>KVConnectorLogging</code> and the Prometheus metrics class read the class ({{cite vllm/distributed/kv_transfer/kv_connector/v1/metrics.py:57}}, {{cite vllm/distributed/kv_transfer/kv_connector/v1/metrics.py:161}}); the stat logger makes the first one in the front end ({{cite vllm/v1/metrics/loggers.py:132}}).</li>
+  <li><strong>Other code.</strong> A layout helper asks for the required KV cache layout ({{cite vllm/distributed/kv_transfer/kv_connector/utils.py:56-57}}). <code>MultiConnector</code> resolves its children ({{cite vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:150}}, {{cite vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:168}}, {{cite vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:694}}).</li>
+  <li><strong>Tests and plugins</strong> call <code>register_connector</code>, for example {{cite tests/v1/kv_connector/unit/test_multi_connector.py:146}}.</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>importlib.import_module</code> in the loader and for the module path ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:37}}, {{cite vllm/distributed/kv_transfer/kv_connector/factory.py:108}}).</li>
+  <li><code>supports_kw(connector_cls, "kv_cache_config")</code> to reject old constructors ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:116}}).</li>
+  <li><code>supports_hma</code>, an <code>issubclass</code> check against <code>SupportsHMA</code> ({{cite vllm/distributed/kv_transfer/kv_connector/v1/base.py:132-136}}), and <code>MultiConnector.all_children_support_hma</code> ({{cite vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:156-170}}).</li>
+  <li>The connector constructor <code>connector_cls(config, role, kv_cache_config)</code> (line 75).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>KVConnectorFactory._registry</code></td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:28}}</td><td><code>dict[str, Callable[[], type]]</code>: name to a function that imports the class.</td></tr>
+    <tr><td><code>register_connector(name, module_path, class_name)</code></td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:30-40}}</td><td>Stores a lazy loader; a taken name raises <code>ValueError</code>.</td></tr>
+    <tr><td><code>create_connector(config, role, kv_cache_config)</code></td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:42-75}}</td><td>Finds the class, checks HMA, logs, makes the object.</td></tr>
+    <tr><td><code>get_connector_class_by_name(name)</code></td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:77-94}}</td><td>Registry only; an unknown name raises <code>ValueError</code>.</td></tr>
+    <tr><td><code>get_connector_class(kv_transfer_config)</code></td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:96-129}}</td><td>Module path first, then registry, else <code>ValueError</code>.</td></tr>
+    <tr><td><code>supports_hma_config(kv_transfer_config)</code></td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:131-146}}</td><td>True if the class supports the hybrid KV cache manager; for <code>MultiConnector</code>, all children must.</td></tr>
+    <tr><td>17 <code>register_connector</code> calls</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:153-249}}</td><td>The built-in names, from <code>ExampleConnector</code> to <code>HF3FSKVConnector</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>register_connector</code>: a lazy entry</h3>
+<x-code file="vllm/distributed/kv_transfer/kv_connector/factory.py" lines="27-40" highlight="28,33-34,36-38,40" />
+<ol>
+  <li><strong>Line 28.</strong> The registry is a class attribute, so there is one per process.</li>
+  <li><strong>Lines 33-34.</strong> A second registration of any name raises. There is no override form.</li>
+  <li><strong>Lines 36-38.</strong> The loader is a closure. It imports the module only when it is called, so the front end can register NIXL or Mooncake without importing their libraries.</li>
+</ol>
+
+<h3><code>get_connector_class</code>: module path wins</h3>
+<x-code file="vllm/distributed/kv_transfer/kv_connector/factory.py" lines="96-129" highlight="100-102,103-105,106-108,109-114,116-124,125-128" />
+<ol>
+  <li><strong>Lines 100-102.</strong> No <code>kv_connector</code>: <code>ValueError</code>.</li>
+  <li><strong>Lines 103-105.</strong> An empty string as module path is an error; <code>None</code> means "not set".</li>
+  <li><strong>Lines 106-114.</strong> With a module path, <code>kv_connector</code> is the <em>class name</em> inside that module. A missing class raises <code>AttributeError</code> with the module path.</li>
+  <li><strong>Lines 116-124.</strong> The constructor must accept <code>kv_cache_config</code>. The message says that the "2-argument constructor signature" is deprecated; vLLM logs it at ERROR level and raises.</li>
+  <li><strong>Lines 125-128.</strong> Without a module path, the registry; else "Unsupported connector type".</li>
+</ol>
+<p>The EC connector factory uses the opposite order: registry first, module path as the fallback ({{cite vllm/distributed/ec_transfer/ec_connector/factory.py:66-73}}).</p>
+
+<h3><code>create_connector</code>: one role, one object</h3>
+<x-code file="vllm/distributed/kv_transfer/kv_connector/factory.py" lines="42-75" highlight="49-52,55-60,62-66,67-75" />
+<ol>
+  <li><strong>Lines 49-52.</strong> The config must have a KV transfer config; the class comes from <code>get_connector_class</code>.</li>
+  <li><strong>Lines 55-60.</strong> If the hybrid KV cache manager is on and the connector does not support it, <code>ValueError</code> asks for <code>--disable-hybrid-kv-cache-manager</code>. <code>VllmConfig</code> normally turns the manager off first ({{cite vllm/config/vllm.py:2236-2259}}), so this raises only when the user forced the manager on.</li>
+  <li><strong>Lines 62-66.</strong> An INFO log names the class and the engine id.</li>
+  <li><strong>Lines 67-75.</strong> The comment explains the two roles: the scheduler connector "should only be used inside the Scheduler class", the worker connector "inside the forward context &amp; attention layer". The same class is built with the role as an argument.</li>
+</ol>
+
+<h3><code>supports_hma_config</code>: the MultiConnector case</h3>
+<x-code file="vllm/distributed/kv_transfer/kv_connector/factory.py" lines="131-146" highlight="138-140,142-146" />
+<p>A normal connector supports HMA when its class subclasses <code>SupportsHMA</code>. <code>MultiConnector</code> subclasses it too, but the docstring says that "effective support depends on every configured child". So the factory asks <code>all_children_support_hma</code>, which returns <code>False</code> for an empty child list.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types in and out">
+<table>
+  <thead><tr><th>Value</th><th>Type</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>_registry</code></td><td><code>dict[str, Callable[[], type[KVConnectorBase]]]</code>, 17 entries after import</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:28}}</td></tr>
+    <tr><td><code>kv_transfer_config.kv_connector</code></td><td><code>str | None</code>: a registry name, or a class name inside the module path</td><td>{{cite vllm/config/kv_transfer.py:60}}</td></tr>
+    <tr><td><code>kv_transfer_config.kv_connector_module_path</code></td><td><code>str | None</code>: an importable module name (dots, not a file path)</td><td>{{cite vllm/config/kv_transfer.py:81}}</td></tr>
+    <tr><td><code>role</code></td><td><code>KVConnectorRole.SCHEDULER</code> (0) or <code>WORKER</code> (1)</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/v1/base.py:139-144}}</td></tr>
+    <tr><td><code>kv_cache_config</code></td><td><code>KVCacheConfig</code>: the planned KV cache groups and blocks</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:47}}</td></tr>
+    <tr><td>return of <code>create_connector</code></td><td>a <code>KVConnectorBase</code> object</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:48}}</td></tr>
+  </tbody>
+</table>
+<p><code>KVConnectorBase</code> and <code>KVConnectorBaseType</code> come from <code>kv_connector/base.py</code> ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:9-12}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Processes and import time">
+<p>The 17 built-in names enter the registry when Python imports the module, in each process that imports it. For <code>vllm serve</code>, the front end imports it at start-up: the CLI module imports the multiprocess executor, which imports the connector utilities, which import the factory ({{cite vllm/entrypoints/cli/serve.py:29}}, {{cite vllm/v1/executor/multiproc_executor.py:33}}, {{cite vllm/distributed/kv_transfer/kv_connector/utils.py:17}}). The imports inside <code>VllmConfig</code> are lazy ({{cite vllm/config/vllm.py:2239-2241}}). The scheduler, the worker-side state module and the metrics module import it at module level ({{cite vllm/v1/core/sched/scheduler.py:21}}, {{cite vllm/distributed/kv_transfer/kv_transfer_state.py:6}}, {{cite vllm/distributed/kv_transfer/kv_connector/v1/metrics.py:9}}).</p>
+<p>A plugin's <code>register_connector</code> must therefore run after the factory module is imported and before the lookup. A {{term general-plugin}} that imports <code>KVConnectorFactory</code> and calls <code>register_connector</code> satisfies both: its own import loads the built-ins first. It runs in the front end, the engine core and each worker ({{link concepts/plugin-loading}}).</p>
+<p>With TP = 2 one <code>vllm serve</code> makes 3 connector objects: 1 <code>SCHEDULER</code> in the engine core and 1 <code>WORKER</code> in each of the 2 workers. The front end makes none; it only gets the class. (Derived from "Who calls it".)</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: a connector from a module path">
+<p>You write <code>acme_kv/connector.py</code> with <code>class AcmeConnector(KVConnectorBase_V1)</code> and start:</p>
+<pre><code class="language-bash">vllm serve Qwen/Qwen3-8B --kv-transfer-config \
+  '{"kv_connector":"AcmeConnector","kv_role":"kv_both","kv_connector_module_path":"acme_kv.connector"}'</code></pre>
+<ol>
+  <li>The front end checks HMA: <code>get_connector_class</code> imports <code>acme_kv.connector</code> and takes <code>AcmeConnector</code> (lines 106-110). It does not subclass <code>SupportsHMA</code>, so <code>VllmConfig</code> turns the hybrid manager off with a WARNING ({{cite vllm/config/vllm.py:2243-2256}}).</li>
+  <li><code>supports_kw</code> finds <code>kv_cache_config</code> in the constructor (line 116); the base class has it ({{cite vllm/distributed/kv_transfer/kv_connector/v1/base.py:214-219}}).</li>
+  <li>The engine core imports the module again and makes <code>AcmeConnector(config, KVConnectorRole.SCHEDULER, kv_cache_config)</code>.</li>
+  <li>Each worker does the same with <code>WORKER</code>.</li>
+</ol>
+<p>No registration is needed, because every lookup imports the module itself. An offline example in the repository uses the same field ({{cite examples/disaggregated/kv_load_failure_recovery_offline/decode_example.py:44}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Name registered twice</td><td><code>ValueError</code> "Connector '...' is already registered."</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:33-34}}</td></tr>
+    <tr><td>No KV transfer config in <code>create_connector</code></td><td><code>ValueError</code></td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:50-51}}</td></tr>
+    <tr><td><code>kv_connector</code> is <code>None</code></td><td><code>ValueError</code></td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:101-102}}</td></tr>
+    <tr><td>Module path is <code>""</code></td><td><code>ValueError</code></td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:104-105}}</td></tr>
+    <tr><td>Module path does not import</td><td>the import error, not caught</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:108}}</td></tr>
+    <tr><td>Class missing in the module</td><td><code>AttributeError</code></td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:111-114}}</td></tr>
+    <tr><td>Old 2-argument constructor</td><td>ERROR log, then <code>ValueError</code></td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:116-124}}</td></tr>
+    <tr><td>Unknown name, no module path</td><td><code>ValueError</code> "Unsupported connector type"</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:127-128}}</td></tr>
+    <tr><td>HMA on, connector without HMA</td><td><code>ValueError</code></td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:55-60}}</td></tr>
+    <tr><td>A registered module fails to import</td><td>the import error, at the first lookup</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/factory.py:36-38}}</td></tr>
+  </tbody>
+</table>
+<p><code>get_connector_class_by_name</code> reads only the registry ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:92-94}}). Its one caller in <code>vllm/</code> rebuilds the stats of <code>MultiConnector</code> children by name, when the stats arrive as a dict and not as a stats object ({{cite vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:686-696}}). The name is the child's class name ({{cite vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:716}}). A module-path child is not in the registry. Whether its stats reach line 694 as a dict is not traced here (open question).</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables and flags">
+<p>The factory reads no environment variable. Its inputs come from <code>--kv-transfer-config</code> ({{cite vllm/engine/arg_utils.py:1871}}), and indirectly from <code>--kv-offloading-size</code>, which fills <code>kv_connector</code> with <code>OffloadingConnector</code> or <code>SimpleCPUOffloadConnector</code> ({{cite vllm/config/vllm.py:1149-1157}}). <code>VLLM_USE_SIMPLE_KV_OFFLOAD</code> (default 0) picks between the two ({{cite vllm/envs.py:2239-2241}}).</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/kv-connectors}}: the connector interface, the two roles and the scheduler integration.</li>
+  <li>{{link concepts/plugin-map}}: all registries, and what a second registration does in each.</li>
+  <li>{{link concepts/disaggregated-prefill}}: the main use of connectors between instances.</li>
+  <li>{{link concepts/hybrid-kv-cache}}: the hybrid KV cache manager that <code>supports_hma_config</code> protects.</li>
+  <li>{{link code/v1-core-sched-scheduler}}: the scheduler that owns the <code>SCHEDULER</code> object.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">What does the registry store for each name: a class, an object or something else?
+    <x-a><p>A function with no arguments that imports the module and returns the class ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:36-40}}). The module is imported only at the first lookup.</p></x-a>
+  </x-q>
+  <x-q level="medium">With a module path set, what must <code>kv_connector</code> contain?
+    <x-a><p>The class name inside that module: <code>getattr(connector_module, connector_name)</code> ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:108-114}}). The registry is not used.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why can <code>create_connector</code> raise for a hybrid model even though <code>VllmConfig</code> checks HMA first?
+    <x-a><p><code>VllmConfig</code> turns the manager off only when <code>disable_hybrid_kv_cache_manager</code> is <code>None</code> ({{cite vllm/config/vllm.py:2236-2259}}). If the user forced the manager on, <code>create_connector</code> still finds HMA on and raises ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:55-60}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You serve with TP = 4 and a connector registered by a general plugin. How many times does <code>register_connector</code> run, and how many connector objects exist?
+    <x-a><p>The general plugin runs once in each process: front end, engine core and 4 workers, so 6 registrations, one per process registry ({{cite vllm/plugins/__init__.py:82-90}}). Objects: 1 <code>SCHEDULER</code> in the engine core ({{cite vllm/v1/core/sched/scheduler.py:177-181}}) and 1 <code>WORKER</code> per worker ({{cite vllm/distributed/kv_transfer/kv_transfer_state.py:88-92}}), so 5. The front end only reads the class. (A model registry subprocess, if one runs, adds one more registration.)</p></x-a>
+  </x-q>
+</x-quiz>

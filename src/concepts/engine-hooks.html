@@ -1,0 +1,152 @@
+---
+title: Hooks in the engine core and the workers
+nav_title: Engine hooks
+level: Advanced
+prerequisites: concepts/plugin-map, concepts/executors-and-workers
+related: concepts/plugin-map, concepts/executors-and-workers, concepts/scheduler, concepts/sampling-and-logits-processors, concepts/weight-loading, concepts/platform-interface, concepts/quantization-plugins
+summary: Several extension points of the engine core and the workers are config fields or registries, not entry-point groups - scheduler_cls, worker_cls and worker_extension_cls, logits processors, model loaders, sleep-mode backends and KV cache dtypes. This page shows where each one is read and what your class must do.
+---
+<x-sentence>The engine core and the workers read class names from config fields and registries. That is how you replace the scheduler, the worker or the loader.</x-sentence>
+
+<h2>The idea</h2>
+<p>The {{term engine-core}} process runs the scheduler. Each {{term worker}} owns one GPU, builds the model and runs it ({{link concepts/executors-and-workers}}). These parts have extension points of two kinds:</p>
+<ul>
+  <li><strong>Config hooks.</strong> A field of <code>VllmConfig</code> holds a class name, for example <code>--scheduler-cls my_pkg.sched.MyScheduler</code>. The front end parses it, the other processes get it inside the pickled config, and each process imports the class itself. No registration is needed.</li>
+  <li><strong>Registries.</strong> A module-level table maps a name to a class, for example <code>--load-format</code> values to model loaders. A {{term general-plugin}} fills it in every process.</li>
+</ul>
+<p>One more extension point is an entry-point group: <code>vllm.logits_processors</code>. vLLM loads it in the workers, and in the front end for a request check.</p>
+<p><strong>An everyday comparison.</strong> Think of a theatre production. The director's script names the actors for the main roles: the scheduler, the worker, an extra helper. Every theatre that plays the script hires these actors itself. The prop room has labelled shelves (registries) that a stage manager fills before the show. The comparison stops here: in vLLM each process is its own theatre, and a shelf filled in one process is empty in the next.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b5_engine_hooks" alt="Panel 1, engine core process, EngineCore.__init__: 1 general plugins run, so registries are filled before anything reads them (core.py 132); 2 the executor starts the workers and the KV cache is planned (core.py 147 and 160); 3 scheduler_cls: unset gives AsyncScheduler or Scheduler, a string goes through resolve_obj_by_qualname, and a class outside vllm. gives a WARNING (core.py 164). Panel 2, worker: 4 general plugins and register_triton_kernel_overrides (worker_base.py 284); 5 worker_cls must be a dotted string, set by the platform when it is auto (worker_base.py 292); 6 worker_extension_cls is added to the worker class bases, an assert stops shared names, and init_worker_extension runs (worker_base.py 304); 7 the model loader is chosen by load_config.load_format, filled by register_model_loader (model_runner.py 398); 8 logits processors from the vllm.logits_processors group plus the logits_processors list, which must be V2 LogitsProcessor subclasses (model_runner.py 463); 9 register_kv_cache_dtype, a registry with no caller in vllm/ (cache.py 111). Panel 3, run time: 10 collective_rpc with a method name from LLM, AsyncLLM or the dev route POST /collective_rpc; 11 run_method in each worker uses getattr on the worker and raises NotImplementedError when the method is missing; 12 the sleep-mode backend, keyed by model_config.sleep_mode_backend, default cumem, made by SleepModeBackendFactory on first use (gpu_worker.py 250)." caption="Figure: the hooks of the engine core (panel 1), of the worker start-up (panel 2) and at run time (panel 3)." />
+<p>Read the numbers in order. Violet items are config fields, blue items are registries, green items load plugins. With one GPU, the uni executor runs panel 2 inside the engine core process.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: scheduler_cls</h3>
+<p>The field takes a class or a dotted name ({{cite vllm/config/scheduler.py:175-180}}). The engine core resolves it after the KV cache plan ({{cite vllm/v1/engine/core.py:160-164}}):</p>
+<x-code file="vllm/config/scheduler.py" lines="231-256" highlight="232-239,243-253,254-256" />
+<ol>
+  <li><strong>Lines 232-239.</strong> Not set: <code>AsyncScheduler</code> when async scheduling is on, else <code>Scheduler</code>. <code>VllmConfig</code> turns async scheduling on when no option conflicts with it ({{cite vllm/config/vllm.py:1664-1698}}).</li>
+  <li><strong>Lines 243-253.</strong> A class object, or a string that does not start with <code>vllm.</code>, logs a WARNING once. It says that the interface "is not public", and that a subclass of <code>Scheduler</code> instead of <code>AsyncScheduler</code> turns async scheduling off.</li>
+  <li><strong>Lines 254-256.</strong> A class object is used as it is; a string is split at the last dot ({{cite vllm/utils/import_utils.py:119-123}}). From the CLI the value is always a string, so write <code>pkg.module.Class</code>, not <code>pkg.module:Class</code>.</li>
+</ol>
+<p>The test passes a class object, because it builds the engine in the same process:</p>
+<x-code file="tests/plugins_tests/test_scheduler_plugins.py" lines="12-36" highlight="12-14,21,27" />
+<p>With <code>vllm serve</code>, the engine core is a separate process, so pass a dotted name that the engine core can import.</p>
+
+<h3>Step 2: worker_cls and worker_extension_cls</h3>
+<p>Both are strings in <code>ParallelConfig</code>; <code>worker_cls</code> defaults to <code>"auto"</code>, which the platform replaces ({{cite vllm/config/parallel.py:306-312}}, {{cite vllm/platforms/cuda.py:330-331}}). The worker wrapper resolves both in <code>init_worker</code>:</p>
+<x-code file="vllm/v1/worker/worker_base.py" lines="292-331" highlight="293-302,305-308,310-321,323-325" />
+<ol>
+  <li><strong>Lines 293-302.</strong> <code>worker_cls</code> must be a string. A class object raises <code>ValueError</code> "passing worker_cls is no longer supported".</li>
+  <li><strong>Lines 310-321.</strong> Each attribute of the extension must be new, except names that start with <code>__</code>. An <code>assert</code> stops start-up when the worker class has it already. Callable attributes are listed as "extended collective_rpc calls".</li>
+  <li><strong>Lines 323-325.</strong> The extension becomes an extra base class of the worker class. The worker object made at line 347 has its methods.</li>
+</ol>
+<p>The wrapper also calls an optional hook <code>init_worker_extension(worker)</code> after <code>init_device</code> ({{cite vllm/v1/worker/worker_base.py:356-363}}).</p>
+<p>The extension's methods are reached with {{term collective-rpc}} by name. In each worker, <code>run_method</code> looks the name up on the wrapper, which forwards unknown names to the worker ({{cite vllm/v1/serial_utils.py:485-508}}, {{cite vllm/v1/worker/worker_base.py:365-366}}). <code>AsyncLLM</code> has <code>collective_rpc</code> ({{cite vllm/v1/engine/async_llm.py:1247}}). Over HTTP, the route <code>POST /collective_rpc</code> exists only with <code>VLLM_SERVER_DEV_MODE</code>, and its comment says that it passes only serialized string arguments ({{cite vllm/entrypoints/launchers/api_server/routers.py:46-49}}, {{cite vllm/entrypoints/serve/dev/rpc/api_router.py:43-50}}). An endpoint plugin is the normal way to expose such a method ({{link concepts/frontend-plugins}}).</p>
+<pre><code class="language-bash">vllm serve Qwen/Qwen3-0.6B --worker-extension-cls my_pkg.ext.WeightSync
+# an endpoint plugin, or code with the engine client, then calls:
+#   await engine_client.collective_rpc("update_weights_from", args=("s3://...",))</code></pre>
+
+<h3>Step 3: logits processors</h3>
+<p>A logits processor changes the logits of the batch before sampling. Two sources feed Model Runner V2, and the loader combines them:</p>
+<x-code file="vllm/v1/worker/gpu/sample/logits_processor/loader.py" lines="136-146" />
+<ul>
+  <li><strong>The group <code>vllm.logits_processors</code>.</strong> The loader calls <code>entry_points()</code> directly, so <code>VLLM_PLUGINS</code> does not filter it. A failed import raises <code>RuntimeError</code>; a class that is not a V2 <code>LogitsProcessor</code> raises <code>ValueError</code> ({{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:37-74}}).</li>
+  <li><strong>The field <code>logits_processors</code></strong> (<code>--logits-processors</code>): classes or <code>"module:Class"</code> strings, with exactly one colon ({{cite vllm/config/model.py:407-409}}, {{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:99-104}}).</li>
+</ul>
+<p>The model runner builds them in <code>load_model</code> ({{cite vllm/v1/worker/gpu/model_runner.py:463-466}}). A pooling model with custom processors raises ({{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:172-179}}). The front end loads the same classes once, to call <code>validate_params</code> for each request ({{cite vllm/v1/engine/input_processor.py:93-107}}, {{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:186-211}}).</p>
+<p>The V2 interface has five methods:</p>
+<x-code file="vllm/v1/worker/gpu/sample/logits_processor/interface.py" lines="109-158" highlight="109-110,118-119,126,136,144-145" />
+<x-note title="BatchUpdate belongs to the V1 interface">
+<p><code>BatchUpdate</code> is part of the older interface in <code>vllm/v1/sample/logits_processor/</code> ({{cite vllm/v1/sample/logits_processor/interface.py:37}}). Model Runner V2 does not use it. A processor sees each new request in <code>add_request</code>, keyed by a recycled slot index. It sees the batch layout in <code>apply</code> ({{cite vllm/v1/worker/gpu/sample/logits_processor/interface.py:92-107}}). A plugin written for the V1 interface is rejected at load (loader lines 67-72). The page {{link concepts/sampling-and-logits-processors}} explains where <code>apply</code> runs in the sampler.</p>
+</x-note>
+
+<h3>Step 4: model loaders</h3>
+<p>A {{term model-loader}} builds the model and loads its weights for one <code>--load-format</code>. The table and the register function:</p>
+<x-code file="vllm/model_executor/model_loader/__init__.py" lines="100-128" highlight="101-107,108-111,112,125-128" />
+<p>A taken name logs a WARNING and is overwritten; a class that is not a <code>BaseModelLoader</code> raises <code>ValueError</code>. <code>load_format</code> accepts any string and is lower-cased ({{cite vllm/config/load.py:30}}, {{cite vllm/config/load.py:136-138}}). The worker calls <code>get_model_loader</code> in <code>load_model</code> ({{cite vllm/v1/worker/gpu/model_runner.py:398-406}}). A loader implements <code>download_model</code> and <code>load_weights</code> ({{cite vllm/model_executor/model_loader/base_loader.py:38-47}}); the test is a minimal one ({{cite tests/model_executor/model_loader/test_registry.py:19-33}}). The page {{link concepts/weight-loading}} explains the default loader.</p>
+
+<h3>Step 5: sleep-mode backends</h3>
+<p>{{term sleep-mode | Sleep mode}} frees GPU memory of an idle engine. <code>--enable-sleep-mode</code> turns it on ({{cite vllm/config/model.py:370-372}}). The field docstring says "only cuda and hip", but the platform check also accepts XPU ({{cite vllm/config/model.py:666-668}}, {{cite vllm/platforms/interface.py:231-236}}). The mechanism is a backend class with <code>suspend(level)</code> and <code>resume(tags)</code> ({{cite vllm/device_allocator/sleep_mode_backend.py:37-69}}). The factory mirrors the KV connector factory:</p>
+<x-code file="vllm/device_allocator/sleep_mode_backend.py" lines="160-214" highlight="171-180,194-203,210-214" />
+<p>The worker makes the backend on first use, from <code>model_config.sleep_mode_backend</code> ({{cite vllm/v1/worker/gpu_worker.py:249-259}}), and calls <code>suspend</code> and <code>resume</code> ({{cite vllm/v1/worker/gpu_worker.py:317}}, {{cite vllm/v1/worker/gpu_worker.py:339}}). The field defaults to <code>"cumem"</code> ({{cite vllm/config/model.py:379-383}}).</p>
+<x-warning title="No CLI flag selects the sleep-mode backend">
+<p><code>EngineArgs</code> passes <code>enable_sleep_mode</code> and the other sleep fields to <code>ModelConfig</code>, but not <code>sleep_mode_backend</code> ({{cite vllm/engine/arg_utils.py:2039-2043}}). At this commit no other line in <code>vllm/</code> sets the field. So <code>vllm serve</code> always uses <code>cumem</code>, unless your code changes <code>model_config.sleep_mode_backend</code>, for example a platform in <code>check_and_update_config</code>. A plugin also cannot replace <code>"cumem"</code>: the factory raises <code>ValueError</code> for a taken name ({{cite vllm/device_allocator/sleep_mode_backend.py:173-174}}). (Derived from a search of the repository.)</p>
+</x-warning>
+
+<h3>Step 6: register_kv_cache_dtype</h3>
+<p>A new <code>--kv-cache-dtype</code> value needs a handler with a name, a <code>torch_dtype()</code> and a <code>quant_mode()</code> ({{cite vllm/config/cache.py:73-103}}). The decorator adds the name to the mutable list <code>KV_CACHE_DTYPES</code> and writes the torch dtype into the shared dtype table:</p>
+<x-code file="vllm/config/cache.py" lines="138-155" highlight="139-147,148-152" />
+<p>The docstring says that it "Runs at platform activation time (first <code>current_platform</code> access)" ({{cite vllm/config/cache.py:112-116}}). No code in <code>vllm/</code> calls it at this commit; only a test does ({{cite tests/config/test_kv_cache_dtype.py:35}}). The KV cache code reads the handlers through <code>get_kv_cache_dtype_handler</code> ({{cite vllm/v1/kv_cache_interface.py:110-112}}). A platform plugin or a general plugin would have to call it in every process that parses or uses the dtype. (Derived.)</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="All engine hooks in one table">
+<table>
+  <thead><tr><th>Hook</th><th>Kind</th><th>Flag or API</th><th>Read at</th><th>Process</th><th>Duplicate</th></tr></thead>
+  <tbody>
+    <tr><td>scheduler</td><td>config field</td><td><code>--scheduler-cls</code> ({{cite vllm/engine/arg_utils.py:1785}})</td><td>{{cite vllm/v1/engine/core.py:164}}</td><td>engine core</td><td>-</td></tr>
+    <tr><td>worker class</td><td>config field</td><td><code>--worker-cls</code> ({{cite vllm/engine/arg_utils.py:1360}})</td><td>{{cite vllm/v1/worker/worker_base.py:293-296}}</td><td>workers</td><td>-</td></tr>
+    <tr><td>worker extension</td><td>config field</td><td><code>--worker-extension-cls</code> ({{cite vllm/engine/arg_utils.py:1361-1363}})</td><td>{{cite vllm/v1/worker/worker_base.py:304-331}}</td><td>workers</td><td>assert on shared names</td></tr>
+    <tr><td>logits processors</td><td>group + field</td><td><code>vllm.logits_processors</code>, <code>--logits-processors</code> ({{cite vllm/engine/arg_utils.py:1058-1060}})</td><td>{{cite vllm/v1/worker/gpu/model_runner.py:463-466}}</td><td>workers, front end (check)</td><td>-</td></tr>
+    <tr><td>model loader</td><td>registry</td><td><code>@register_model_loader</code>, <code>--load-format</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:398}}</td><td>workers</td><td>WARNING, overwrite</td></tr>
+    <tr><td>sleep backend</td><td>registry</td><td><code>SleepModeBackendFactory.register_backend</code></td><td>{{cite vllm/v1/worker/gpu_worker.py:256-258}}</td><td>workers</td><td><code>ValueError</code></td></tr>
+    <tr><td>KV cache dtype</td><td>registry</td><td><code>@register_kv_cache_dtype</code></td><td>{{cite vllm/v1/kv_cache_interface.py:110-112}}</td><td>every process that reads the dtype</td><td>WARNING, overwrite</td></tr>
+  </tbody>
+</table>
+<p>The table on {{link concepts/plugin-map}} puts these hooks next to the other extension points.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: a worker extension for weight sync, with TP = 2">
+<p>You start <code>vllm serve ... --tensor-parallel-size 2 --worker-extension-cls my_pkg.ext.WeightSync</code>. <code>WeightSync</code> defines <code>update_weights_from(path)</code> and <code>init_worker_extension(worker)</code>.</p>
+<ol>
+  <li>The front end stores the string in <code>parallel_config.worker_extension_cls</code>. The workers get it in the pickled <code>VllmConfig</code>.</li>
+  <li>Each of the 2 worker processes runs <code>init_worker</code>: it imports <code>my_pkg.ext</code>, checks that <code>Worker</code> has no attribute <code>update_weights_from</code>, and adds <code>WeightSync</code> to <code>Worker.__bases__</code> ({{cite vllm/v1/worker/worker_base.py:304-331}}). It logs "Injected ... for extended collective_rpc calls ['init_worker_extension', 'update_weights_from']". (The list holds every callable name that does not start with <code>__</code>.)</li>
+  <li>After <code>init_device</code>, the wrapper calls <code>WeightSync.init_worker_extension(worker)</code> ({{cite vllm/v1/worker/worker_base.py:361-363}}).</li>
+  <li>Later, <code>collective_rpc("update_weights_from", args=(path,))</code> runs the method in both workers and returns a list of 2 results. With TP = 1 the uni executor calls <code>run_method</code> on its one in-process worker ({{cite vllm/v1/executor/uniproc_executor.py:103}}).</li>
+</ol>
+<p>Note that line 323 changes the class <code>Worker</code> itself, not one object. Every worker object of that process gets the methods. (Derived.)</p>
+</x-deepdive>
+
+<x-deepdive title="Edge cases">
+<ul>
+  <li><strong>Extension already a base.</strong> If the extension class is already in <code>worker_class.__bases__</code>, the injection and the clash check are skipped (line 310).</li>
+  <li><strong>Unknown RPC method.</strong> <code>run_method</code> raises <code>NotImplementedError("Method ... is not implemented.")</code> ({{cite vllm/v1/serial_utils.py:499-505}}).</li>
+  <li><strong>Mixed-case load format.</strong> <code>load_format</code> is lower-cased ({{cite vllm/config/load.py:136-138}}), but <code>register_model_loader</code> stores the name as given. A loader registered as <code>"My_Format"</code> is never found. (Derived.)</li>
+  <li><strong>Logits processors and <code>VLLM_PLUGINS</code>.</strong> An allowlist does not stop a logits processor plugin. To keep one out, uninstall its package.</li>
+  <li><strong>Unsupported sleep backend.</strong> A backend whose <code>is_supported()</code> is false raises "Sleep-mode backend ... is not supported on this platform." on first use ({{cite vllm/device_allocator/sleep_mode_backend.py:198-201}}).</li>
+</ul>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="A custom scheduler can switch async scheduling off">
+<p>vLLM's default is <code>AsyncScheduler</code>. For a class that subclasses <code>Scheduler</code>, vLLM only warns of "degraded performance due to async scheduling being disabled" ({{cite vllm/config/scheduler.py:247-253}}). Subclass <code>AsyncScheduler</code> unless you need the synchronous behaviour.</p>
+</x-warning>
+<ul>
+  <li><strong>The class does not import in the child process.</strong> Config hooks are imported in the engine core or the workers. A class that exists only in your launch script fails there. Put it in an installed package.</li>
+  <li><strong>Colon instead of dot.</strong> <code>scheduler_cls</code>, <code>worker_cls</code> and <code>worker_extension_cls</code> need <code>pkg.module.Class</code>; <code>logits_processors</code> strings need <code>pkg.module:Class</code> ({{cite vllm/utils/import_utils.py:119-123}}, {{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:99-104}}).</li>
+  <li><strong>A name clash in the extension.</strong> An attribute that the worker class has already stops start-up with an <code>AssertionError</code> ({{cite vllm/v1/worker/worker_base.py:315-319}}).</li>
+  <li><strong>A V1 logits processor.</strong> Model Runner V2 rejects it with <code>ValueError</code> at model load ({{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:67-72}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> These hooks change the engine itself: the scheduling policy, the worker code, the sampler input and the weight source. They are powerful, and most of them are not public, stable interfaces. Read the code of the version that you run before you rely on one.</p>
+
+<x-quiz>
+  <x-q level="easy">Which class does the engine core use when <code>--scheduler-cls</code> is not set and async scheduling is on?
+    <x-a><p><code>AsyncScheduler</code> ({{cite vllm/config/scheduler.py:232-236}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">How do the methods of a worker extension class become callable with <code>collective_rpc</code>?
+    <x-a><p><code>init_worker</code> adds the extension class to the bases of the worker class ({{cite vllm/v1/worker/worker_base.py:323-325}}). <code>run_method</code> then finds the method by name with <code>getattr</code> ({{cite vllm/v1/serial_utils.py:499-501}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You set <code>VLLM_PLUGINS=acme_admin</code>. Does an installed <code>vllm.logits_processors</code> plugin still load in the workers?
+    <x-a><p>Yes. The Model Runner V2 loader calls <code>entry_points(group=...)</code> directly and does not read <code>VLLM_PLUGINS</code> ({{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:46}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A general plugin calls <code>SleepModeBackendFactory.register_backend("cumem", ...)</code> to replace the built-in backend. What happens?
+    <x-a><p>The factory raises <code>ValueError</code> "Sleep-mode backend 'cumem' is already registered." because vLLM registered <code>cumem</code> at import ({{cite vllm/device_allocator/sleep_mode_backend.py:173-174}}, {{cite vllm/device_allocator/sleep_mode_backend.py:210-214}}). The general plugin does not catch it, so start-up stops ({{cite vllm/plugins/__init__.py:89-90}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You register a model loader with <code>@register_model_loader("Fast_Load")</code> and start with <code>--load-format Fast_Load</code>. What happens, and why?
+    <x-a><p>Start-up fails with "Load format `fast_load` is not supported". The config lower-cases <code>load_format</code> ({{cite vllm/config/load.py:136-138}}), but the table stores <code>"Fast_Load"</code> as given ({{cite vllm/model_executor/model_loader/__init__.py:112}}), so <code>get_model_loader</code> does not find it ({{cite vllm/model_executor/model_loader/__init__.py:126-127}}). Register lower-case names. (Derived from these lines.)</p></x-a>
+  </x-q>
+</x-quiz>

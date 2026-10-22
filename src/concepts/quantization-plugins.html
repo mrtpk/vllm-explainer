@@ -1,0 +1,194 @@
+---
+title: Quantization methods as plugins
+nav_title: Quantization plugins
+level: Advanced
+prerequisites: learn/quantized-checkpoints, concepts/plugin-map
+related: learn/quantized-checkpoints, concepts/plugin-map, concepts/weight-loading, concepts/engine-hooks, concepts/platform-interface, concepts/attention-backend-selection, concepts/plugin-loading
+summary: A quantization method is a QuantizationConfig subclass registered under a name. The front end picks the name from the checkpoint or --quantization and makes one config object; each layer in the worker asks it for a quantize method that makes the weights and runs the forward.
+---
+<x-sentence>A quantization method is a named QuantizationConfig class; each layer asks the config object for a quantize method that owns its weights.</x-sentence>
+
+<h2>The idea</h2>
+<p>A quantized checkpoint stores weights in fewer bits, with scales ({{deepinfer learn/number-formats | Number formats}}). The page {{link learn/quantized-checkpoints}} explains the formats and the memory that they save. This page explains the code path: how vLLM knows the format, and how a layer gets the right weights and kernel.</p>
+<p>Each format is a {{term quantization-method}}. In code it is a class pair. The {{term quantization-config}} holds the settings of one checkpoint, for example the group size of AWQ. The {{term quantize-method}} works on one layer: it makes the layer's weight tensors, and it runs the layer's matrix multiply. The config chooses a quantize method for each layer, so one model can mix methods, for example a quantized MLP and an unquantized <code>lm_head</code>.</p>
+<p>vLLM keeps a table from a name, such as <code>"fp8"</code> or <code>"awq"</code>, to a config class. A {{term plugin}} adds a name with the decorator <code>@register_quantization_config</code>. Then <code>--quantization my_quant</code>, or a checkpoint whose config says <code>"quant_method": "my_quant"</code>, uses the new class. No file of vLLM changes.</p>
+<p><strong>An everyday comparison.</strong> Think of a print shop that receives files in many formats. At the front desk, a clerk reads the file header and picks the matching instruction sheet. The sheet says, for each page, which machine and which paper to use. The machine operators only follow the sheet. A new format needs a new sheet, not new machines. The comparison stops here: in vLLM, the front desk (the API server) passes a copy of the filled-in sheet to every worker.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b5_quant_flow" alt="Panel 1, front end: step 1 reads the checkpoint quantization_config, for example quant_method awq, and the optional --quantization flag (model.py 1389). Step 2, _verify_quantization, runs the override_quantization_method loop with custom methods first, finds the name auto_awq and checks the platform (model.py 1383). Step 3, _get_quantization_config, makes the object with from_config and checks get_min_capability and get_supported_act_dtypes (vllm.py 898). Panel 2, worker model build: step 4, the model constructor reads vllm_config.quant_config and passes it with a prefix to every linear layer (llama.py 370). Step 5, LinearBase.__init__ calls get_quant_method with the layer and a name such as model.layers.0.self_attn.qkv_proj; None is a ValueError for a linear layer (linear.py 293). Step 6, the quantize method runs create_weights, the loader fills the tensors, and process_weights_after_loading runs (linear.py 379). Panel 3, each step: layer.forward calls quant_method.apply, which calls the kernel of the method. A callout says that register_quantization_config must run in the front end and that a worker only needs the module to be importable." caption="Figure: the front end chooses the method and makes one config object (panel 1); each layer gets a quantize method when the worker builds the model (panel 2); apply() runs in every step (panel 3)." />
+<p>Read the panels from top to bottom. Panel 1 runs once, in the API server, while it builds <code>VllmConfig</code>. Panel 2 runs in each worker. Panel 3 is the hot path. The callout is the main rule for plugins.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the names</h3>
+<p>The built-in names are a <code>Literal</code> type, copied into a list that plugins can extend:</p>
+<x-code file="vllm/model_executor/layers/quantization/__init__.py" lines="15-58" highlight="40-48,50,52-55,58" />
+<p>The list has 30 names: 24 methods and 6 "online quant shorthand names" (lines 40-48). Two names are deprecated (lines 52-55). The dict <code>_CUSTOMIZED_METHOD_TO_QUANT_CONFIG</code> holds the plugin classes (line 58). The CLI flag accepts any string, because the field type is <code>QuantizationMethods | str | None</code> ({{cite vllm/config/model.py:264}}).</p>
+
+<h3>Step 2: register_quantization_config</h3>
+<x-code file="vllm/model_executor/layers/quantization/__init__.py" lines="88-109" highlight="89-95,97-100,102-105,106" />
+<ol>
+  <li><strong>Lines 89-95.</strong> A name that exists already is not an error. vLLM logs at DEBUG level and overwrites it. A plugin can replace a built-in method this way.</li>
+  <li><strong>Lines 97-100.</strong> A new name goes into <code>QUANTIZATION_METHODS</code>. If the platform has a non-empty <code>supported_quantization</code> list, the name goes there too. ROCm has such a list ({{cite vllm/platforms/rocm.py:625-649}}); CUDA has none, and an empty list means "no limit" ({{cite vllm/platforms/interface.py:1153-1158}}).</li>
+  <li><strong>Lines 102-105.</strong> A class that is not a <code>QuantizationConfig</code> subclass raises <code>ValueError</code>. The check comes after line 97, so the new name is in the list already.</li>
+  <li><strong>Line 106.</strong> The class goes into the plugin dict.</li>
+</ol>
+<p>Lookups go through <code>get_quantization_config(name)</code>. It builds the built-in table, then applies the plugin dict last, so a plugin class wins over a built-in class of the same name:</p>
+<x-code file="vllm/model_executor/layers/quantization/__init__.py" lines="187-197" highlight="191-192,195" />
+
+<h3>Step 3: the interface of a QuantizationConfig</h3>
+<p>Six methods are abstract ({{cite vllm/model_executor/layers/quantization/base_config.py:130-217}}):</p>
+<table>
+  <thead><tr><th>Method</th><th>Kind</th><th>Called by</th><th>Purpose</th></tr></thead>
+  <tbody>
+    <tr><td><code>get_name()</code></td><td>instance</td><td>logs, checks</td><td>the method name</td></tr>
+    <tr><td><code>get_supported_act_dtypes()</code></td><td>instance</td><td>{{cite vllm/config/vllm.py:919-925}}</td><td>the model dtype must be in this list, else <code>ValueError</code></td></tr>
+    <tr><td><code>get_min_capability()</code></td><td>class</td><td>{{cite vllm/config/vllm.py:908-918}}</td><td>for example 80 for Ampere; a GPU below it raises <code>ValueError</code></td></tr>
+    <tr><td><code>get_config_filenames()</code></td><td>static</td><td>{{cite vllm/model_executor/model_loader/weight_utils.py:352}}</td><td>extra JSON files to read when <code>config.json</code> has no quantization config</td></tr>
+    <tr><td><code>from_config(dict)</code></td><td>class</td><td>{{cite vllm/model_executor/model_loader/weight_utils.py:237}}</td><td>makes the object from the checkpoint dict</td></tr>
+    <tr><td><code>get_quant_method(layer, prefix)</code></td><td>instance</td><td>{{cite vllm/model_executor/layers/quantization/base_config.py:312}}</td><td>returns a quantize method for one layer, or <code>None</code></td></tr>
+  </tbody>
+</table>
+<p>One class method is optional: <code>override_quantization_method</code>. It returns <code>None</code> by default ({{cite vllm/model_executor/layers/quantization/base_config.py:163-182}}). The docstring says that a subclass should override it "only ... in exceptional circumstances". Step 4 shows what it does. <code>maybe_update_config</code> is a hook that runs after the object is made ({{cite vllm/model_executor/layers/quantization/base_config.py:275-292}}).</p>
+
+<h3>Step 4: how vLLM picks the method name</h3>
+<p><code>ModelConfig._verify_quantization</code> runs in <code>ModelConfig.__post_init__</code> ({{cite vllm/config/model.py:922}}), in the front end. It reads the checkpoint's <code>quant_method</code> and asks every method whether it wants to take over:</p>
+<x-code file="vllm/config/model.py" lines="1389-1450" highlight="1392,1396-1416,1420-1426,1429-1433,1438-1447,1448-1450" />
+<ol>
+  <li><strong>Line 1392.</strong> The checkpoint names a method in <code>quant_method</code>, for example <code>"awq"</code>.</li>
+  <li><strong>Lines 1396-1416.</strong> Seventeen built-in names are "overrides": their class has its own <code>override_quantization_method</code>. The order matters, "particularly ... for GPTQ".</li>
+  <li><strong>Lines 1420-1426.</strong> All other names come first, then the overrides. Plugin names are in the first part, so "custom overrides have preference over the built-in ones".</li>
+  <li><strong>Lines 1429-1433.</strong> The first method whose <code>override_quantization_method</code> returns a name wins. For an AWQ checkpoint on a GPU, <code>AutoAWQConfig</code> answers <code>"auto_awq"</code> ({{cite vllm/model_executor/layers/quantization/auto_awq.py:263-286}}).</li>
+  <li><strong>Lines 1438-1447.</strong> A built-in method that overrides but is missing from the list raises <code>ValueError</code>. This guards vLLM's own code, not plugins.</li>
+</ol>
+<p>The rest of the method checks the result ({{cite vllm/config/model.py:1452-1485}}). <code>--quantization</code> must match the checkpoint, unless an override changed it. An unknown name raises "Unknown quantization method". The platform can refuse the name in <code>verify_quantization</code>. A deprecated name raises unless <code>--allow-deprecated-quantization</code> is set.</p>
+
+<h3>Step 5: one config object, made in the front end</h3>
+<p><code>VllmConfig.__post_init__</code> makes the object once:</p>
+<x-code file="vllm/config/vllm.py" lines="1586-1589" />
+<x-code file="vllm/config/vllm.py" lines="904-931" highlight="907,912-918,919-925,926-930" />
+<p><code>get_quant_config</code> finds the settings. It reads <code>quantization_config</code> from the HF config, or from its <code>text_config</code>, or <code>compression_config</code>, and calls <code>from_config</code> with that dict ({{cite vllm/model_executor/model_loader/weight_utils.py:239-279}}). Without one, it looks for the files that <code>get_config_filenames()</code> names. If that list is empty, it calls the class with no arguments ({{cite vllm/model_executor/model_loader/weight_utils.py:352-368}}). So a plugin that quantizes a BF16 checkpoint at load time needs a constructor without required arguments.</p>
+<x-note title="The fp8 deprecation path">
+<p><code>--quantization fp8</code> on a BF16 checkpoint does not fail. <code>Fp8Config</code> names no config file, so <code>get_quant_config</code> logs "--quantization fp8 is deprecated for online quantization; use --quantization fp8_per_tensor instead." and returns an <code>OnlineQuantizationConfig</code> ({{cite vllm/model_executor/model_loader/weight_utils.py:354-363}}). With an FP8 checkpoint, the same flag uses <code>Fp8Config.from_config</code>.</p>
+</x-note>
+
+<h3>Step 6: how the workers get the config</h3>
+<p>The worker does not look up the name again. <code>quant_config</code> is a field of <code>VllmConfig</code>, and the engine core and the workers get the whole <code>VllmConfig</code> pickled, as an argument of the new process ({{cite vllm/v1/engine/utils.py:256-287}}). Python imports the module of the config class while it unpickles the object. So a worker needs your module importable, but not your registration. (Derived from the pickling.)</p>
+<p>Two worker paths do look up a name, so register in every process to be safe. A draft model for speculative decoding makes its own config ({{cite vllm/model_executor/models/utils.py:1003-1007}}). The torchao loader calls <code>get_quant_config</code> again ({{cite vllm/model_executor/model_loader/default_loader.py:491-492}}). A {{term general-plugin}} runs the decorator in every process.</p>
+
+<h3>Step 7: each layer asks for its quantize method</h3>
+<p>The model reads the object from the config, for example in Llama ({{cite vllm/model_executor/models/llama.py:370}}), and passes it to each layer with a prefix. A linear layer asks it in its constructor:</p>
+<x-code file="vllm/model_executor/layers/linear.py" lines="290-296" highlight="291-292,293-294,295-296" />
+<p><code>resolve_quant_method</code> calls <code>get_quant_method(layer, prefix)</code>, and adds online quantization on top when it is configured ({{cite vllm/model_executor/layers/quantization/base_config.py:295-356}}). The prefix is the module name, so the config can skip layers by name. A linear layer must get a method; <code>None</code> raises "All linear layers should support quant method." Other layer types, such as attention, accept <code>None</code>.</p>
+<p>The quantize method has two required methods and one important optional one ({{cite vllm/model_executor/layers/quantization/base_config.py:43-85}}):</p>
+<ul>
+  <li><code>create_weights(layer, ...)</code> makes the parameters and sets them on the layer. A replicated linear layer calls it with the sizes and its <code>weight_loader</code> ({{cite vllm/model_executor/layers/linear.py:379-387}}).</li>
+  <li><code>apply(layer, x, bias)</code> runs in every forward ({{cite vllm/model_executor/layers/linear.py:420}}).</li>
+  <li><code>process_weights_after_loading(layer)</code> runs once after the weights are loaded, for example to repack them for a kernel. The loader calls it for every module that has a <code>quant_method</code> ({{cite vllm/model_executor/model_loader/utils.py:157-186}}).</li>
+</ul>
+
+<h3>Step 8: a minimal out-of-tree method</h3>
+<p>The test suite has a complete plugin. It fakes 8-bit quantization of the activations and keeps BF16 weights:</p>
+<x-code file="tests/quantization/test_register_quantization_config.py" lines="36-105" highlight="44-49,67,87,90-92,94-97,99-105" />
+<p>Note the choices. <code>FakeQuantLinearMethod</code> subclasses <code>UnquantizedLinearMethod</code>, so it reuses its <code>create_weights</code> and only changes <code>apply</code>. <code>get_config_filenames()</code> returns <code>[]</code> and the constructor has a default, so <code>--quantization custom_quant</code> works on a normal BF16 checkpoint. The test loads Llama-3.2-1B with it and checks that <code>qkv_proj</code> uses the method ({{cite tests/quantization/test_register_quantization_config.py:130-140}}).</p>
+<p>To use such a class with <code>vllm serve</code>, publish a general plugin that imports the module, so that the decorator runs:</p>
+<pre><code class="language-python"># my_quant_pkg/__init__.py  (illustrative, not in the vLLM repository)
+def register():
+    from my_quant_pkg import config  # noqa: F401  (runs @register_quantization_config("custom_quant"))
+
+# pyproject.toml
+# [project.entry-points."vllm.general_plugins"]
+# my_quant = "my_quant_pkg:register"</code></pre>
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.2-1B-Instruct --quantization custom_quant</code></pre>
+<p>The guide in the docs shows the same pattern, and a MoE method too ({{cite docs/features/quantization/README.md:93-148}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The override loop, line by line, for three checkpoints">
+<p>The loop of {{cite vllm/config/model.py:1420-1450}} with the default settings, on a CUDA GPU:</p>
+<table>
+  <thead><tr><th>Checkpoint <code>quant_method</code></th><th>--quantization</th><th>Result</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td><code>"awq"</code></td><td>not set</td><td><code>auto_awq</code></td><td><code>AutoAWQConfig</code> takes <code>"awq"</code> when the user value is unset or an AWQ name, and the platform is not CPU ({{cite vllm/model_executor/layers/quantization/auto_awq.py:267-284}}).</td></tr>
+    <tr><td><code>"fp8"</code></td><td>not set</td><td><code>fp8</code></td><td>No override answers, so line 1455 copies the checkpoint name.</td></tr>
+    <tr><td>none (BF16)</td><td><code>fp8</code></td><td><code>fp8</code>, then an online config</td><td>The checkpoint branch does not run (line 1391). Step 5 turns the name into <code>OnlineQuantizationConfig</code>.</td></tr>
+    <tr><td><code>"fp8"</code></td><td><code>awq</code></td><td><code>ValueError</code></td><td>"Quantization method specified in the model config (fp8) does not match ..." ({{cite vllm/config/model.py:1456-1462}}).</td></tr>
+  </tbody>
+</table>
+<p>A plugin can take over a checkpoint format. Its class overrides <code>override_quantization_method</code> and returns its own name for, say, <code>quant_method == "awq"</code>. Its name is in the first part of the loop, so it answers before <code>auto_awq</code>. (Derived from lines 1420-1433.)</p>
+</x-deepdive>
+
+<x-deepdive title="Which process does what">
+<table>
+  <thead><tr><th>Work</th><th>Process</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>register the name (decorator)</td><td>every process that runs the general plugin</td><td>{{cite vllm/model_executor/layers/quantization/__init__.py:88-107}}</td></tr>
+    <tr><td>choose the name, check the platform</td><td>front end, <code>ModelConfig.__post_init__</code></td><td>{{cite vllm/config/model.py:1383-1470}}</td></tr>
+    <tr><td>make the config object, check capability and dtype</td><td>front end, <code>VllmConfig.__post_init__</code></td><td>{{cite vllm/config/vllm.py:1586-1589}}</td></tr>
+    <tr><td>receive the object</td><td>engine core and workers (pickled <code>VllmConfig</code>)</td><td>{{cite vllm/v1/engine/utils.py:256-287}}</td></tr>
+    <tr><td><code>get_quant_method</code>, <code>create_weights</code></td><td>worker, model build</td><td>{{cite vllm/model_executor/layers/linear.py:293}}, {{cite vllm/model_executor/layers/linear.py:379}}</td></tr>
+    <tr><td><code>process_weights_after_loading</code></td><td>worker, after weight load</td><td>{{cite vllm/model_executor/model_loader/utils.py:186}}</td></tr>
+    <tr><td><code>apply</code></td><td>worker, every step</td><td>{{cite vllm/model_executor/layers/linear.py:420}}</td></tr>
+  </tbody>
+</table>
+<p>With TP = 2, the front end makes one object, and each of the 2 workers unpickles its own copy. The quantize methods are new objects per layer and per worker. (Derived.)</p>
+<p>A platform has its own hook for this: the docstring of <code>pre_register_and_update</code> says it can import and register "the out-of-tree quantization config" ({{cite vllm/platforms/interface.py:639-651}}). It runs in the front end twice: when the CLI builds the parser ({{cite vllm/engine/arg_utils.py:3257}}), and again when <code>create_engine_config</code> starts ({{cite vllm/engine/arg_utils.py:2246}}).</p>
+</x-deepdive>
+
+<x-deepdive title="KV cache quantization at a high level">
+<p>The KV cache data type is a separate setting, <code>--kv-cache-dtype</code>. Its default <code>auto</code> is resolved in two places, and the result depends on the checkpoint format:</p>
+<ol>
+  <li><strong>ModelOpt checkpoints.</strong> <code>EngineArgs</code> resolves <code>auto</code> before it makes <code>CacheConfig</code> ({{cite vllm/engine/arg_utils.py:2285-2288}}). <code>resolve_kv_cache_dtype_string</code> reads the KV scheme only when <code>quant_method</code> starts with <code>"modelopt"</code> ({{cite vllm/utils/torch_utils.py:457-466}}, {{cite vllm/utils/torch_utils.py:509-521}}).</li>
+  <li><strong>compressed-tensors (llm-compressor) checkpoints.</strong> The <code>Attention</code> layer sees <code>kv_cache_scheme</code> on the quant config and turns <code>auto</code> into <code>fp8</code> while the model is built ({{cite vllm/model_executor/layers/attention/attention.py:287-291}}).</li>
+  <li><strong>Other checkpoints.</strong> <code>auto</code> stays the model dtype ({{cite vllm/utils/torch_utils.py:527-529}}).</li>
+</ol>
+<p>The scales come through the same quant config. Each attention layer asks <code>resolve_quant_method</code> for a KV cache method. A quantized one must be a <code>BaseKVCacheMethod</code>, and its <code>create_weights</code> makes <code>k_scale</code> and <code>v_scale</code> parameters that the checkpoint fills ({{cite vllm/model_executor/layers/attention/attention.py:194-226}}). The KV dtype also limits the attention backends ({{link concepts/attention-backend-selection}}).</p>
+<p>A new <code>--kv-cache-dtype</code> value has its own registry, <code>register_kv_cache_dtype</code> ({{cite vllm/config/cache.py:111-155}}). No code in <code>vllm/</code> calls it at this commit; the page {{link concepts/engine-hooks}} explains it.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Unknown name in <code>get_quantization_config</code></td><td><code>ValueError</code> "Invalid quantization method"</td><td>{{cite vllm/model_executor/layers/quantization/__init__.py:113-114}}</td></tr>
+    <tr><td>Name not in <code>QUANTIZATION_METHODS</code> after the checks</td><td><code>ValueError</code> "Unknown quantization method"</td><td>{{cite vllm/config/model.py:1464-1469}}</td></tr>
+    <tr><td>Platform list does not contain the name</td><td><code>ValueError</code> "... quantization is currently not supported in ..."</td><td>{{cite vllm/platforms/interface.py:1153-1158}}</td></tr>
+    <tr><td>GPU capability below <code>get_min_capability()</code></td><td><code>ValueError</code></td><td>{{cite vllm/config/vllm.py:912-918}}</td></tr>
+    <tr><td>Model dtype not in <code>get_supported_act_dtypes()</code></td><td><code>ValueError</code></td><td>{{cite vllm/config/vllm.py:919-925}}</td></tr>
+    <tr><td>Config files expected but missing, or more than one</td><td><code>ValueError</code></td><td>{{cite vllm/model_executor/model_loader/weight_utils.py:375-385}}</td></tr>
+    <tr><td>Linear layer gets <code>None</code></td><td><code>ValueError</code> "All linear layers should support quant method."</td><td>{{cite vllm/model_executor/layers/linear.py:295-296}}</td></tr>
+    <tr><td>Re-registering a name</td><td>DEBUG log, overwrite</td><td>{{cite vllm/model_executor/layers/quantization/__init__.py:89-95}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="Register before the front end parses the config">
+<p>The front end checks the name and makes the config object while it builds <code>VllmConfig</code>. If the decorator has not run in the API server process by then, start-up stops with "Unknown quantization method" ({{cite vllm/config/model.py:1464-1469}}). A general plugin runs early enough: the CLI loads it while it builds the parser ({{link concepts/plugin-loading}}).</p>
+</x-warning>
+<ul>
+  <li><strong>A plugin hides a built-in method.</strong> A name collision only logs at DEBUG level, and the plugin class wins ({{cite vllm/model_executor/layers/quantization/__init__.py:89-95}}, {{cite vllm/model_executor/layers/quantization/__init__.py:195}}).</li>
+  <li><strong>The method is refused on ROCm.</strong> A platform with a list accepts only listed names. The decorator appends a <em>new</em> name to the list (lines 97-100). It does not append a name that exists already. So ROCm still refuses a plugin that replaces a built-in method missing from its list, such as <code>experts_int8</code>. (Derived from {{cite vllm/model_executor/layers/quantization/__init__.py:89-100}} and {{cite vllm/platforms/rocm.py:625-649}}.)</li>
+  <li><strong>The config class needs arguments.</strong> On a checkpoint without quantization settings, vLLM calls your class with no arguments ({{cite vllm/model_executor/model_loader/weight_utils.py:368}}).</li>
+  <li><strong>A deprecated method.</strong> <code>fbgemm_fp8</code> and <code>fp_quant</code> need <code>--allow-deprecated-quantization</code> ({{cite vllm/config/model.py:1472-1485}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Most production models are quantized. When a checkpoint loads with the wrong method, or with no method, the model gives wrong answers or uses too much memory. The startup log and the error messages above show which method vLLM picked and why.</p>
+
+<x-quiz>
+  <x-q level="easy">Which decorator adds a new quantization method, and what must the class subclass?
+    <x-a><p><code>@register_quantization_config("name")</code>; the class must subclass <code>QuantizationConfig</code>, else <code>ValueError</code> ({{cite vllm/model_executor/layers/quantization/__init__.py:61}}, {{cite vllm/model_executor/layers/quantization/__init__.py:102-105}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Which method of the quantize method runs in every forward of a linear layer?
+    <x-a><p><code>apply(layer, x, bias)</code> ({{cite vllm/model_executor/layers/linear.py:420}}). <code>create_weights</code> runs once when the layer is built.</p></x-a>
+  </x-q>
+  <x-q level="medium">A checkpoint says <code>"quant_method": "awq"</code> and you pass no flag. Which method name does vLLM use on a GPU, and which code decides?
+    <x-a><p><code>auto_awq</code>. <code>_verify_quantization</code> asks each method's <code>override_quantization_method</code> ({{cite vllm/config/model.py:1429-1450}}), and <code>AutoAWQConfig</code> answers for <code>"awq"</code> when the platform is not CPU ({{cite vllm/model_executor/layers/quantization/auto_awq.py:263-284}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Your plugin registers <code>"my_quant"</code> only in a script that runs in the API server process. With TP = 2, do the workers fail?
+    <x-a><p>Not for the main model: the workers get the config object inside the pickled <code>VllmConfig</code> ({{cite vllm/v1/engine/utils.py:256-287}}), and need only your module importable. But a draft model or the torchao loader looks the name up again in the worker ({{cite vllm/model_executor/models/utils.py:1003-1007}}, {{cite vllm/model_executor/model_loader/default_loader.py:491-492}}). A general plugin avoids the difference.</p></x-a>
+  </x-q>
+  <x-q level="hard">You run <code>--quantization custom_quant</code> on a BF16 checkpoint, and <code>get_config_filenames()</code> returns <code>[]</code>. How is the config object made, and what follows for the constructor?
+    <x-a><p><code>config.json</code> has no quantization config, so <code>get_quant_config</code> goes past line 279. The class names no files, and <code>custom_quant</code> is neither <code>fp8</code> nor an online shorthand, so vLLM calls <code>quant_cls()</code> with no arguments ({{cite vllm/model_executor/model_loader/weight_utils.py:352-368}}). The constructor must work without arguments; the test class has <code>num_bits: int = 8</code> ({{cite tests/quantization/test_register_quantization_config.py:71-74}}).</p></x-a>
+  </x-q>
+</x-quiz>

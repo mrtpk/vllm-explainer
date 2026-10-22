@@ -1,0 +1,248 @@
+---
+title: How vLLM chooses an attention backend
+nav_title: Attention backend selection
+level: Advanced
+prerequisites: concepts/platform-interface, concepts/custom-ops
+related: concepts/attention-backends, concepts/platform-interface, concepts/custom-ops, concepts/plugin-map, concepts/hybrid-kv-cache, concepts/kv-connectors, code/v1-attention-backend
+summary: Each attention layer asks the selector for a backend class when the worker builds the model. The selector asks current_platform. CUDA validates a priority list for the GPU generation and takes the first valid backend; an explicit --attention-backend is validated alone.
+scripts: viz/op_backend_chooser.js
+---
+<x-sentence>When the worker builds the model, each attention layer asks the platform for a backend; CUDA takes the first valid entry of a priority list.</x-sentence>
+
+<h2>The idea</h2>
+<p>Attention computes softmax(QK<sup>T</sup>)V for every head; MHA, GQA and MLA differ in how many key and value heads they store ({{deepinfer learn/attention | Attention basics}}). vLLM has many implementations of this step. Each one is an {{term attention-backend}}: FlashAttention, FlashInfer, Triton, FlashMLA and more. A backend is fast only for some GPUs, head sizes and KV cache formats, so vLLM must choose one for each kind of layer.</p>
+<p>The choice happens in the {{term worker}}, while it builds the model. Each attention layer calls one function, the selector, with its own facts. Examples are the head size, the data type, the KV cache data type and MLA or not. The selector adds facts from the config and asks the {{term platform}}. The platform method <code>get_attn_backend_cls</code> is a {{term component-picker}}: it returns the dotted name of a backend class.</p>
+<p>On NVIDIA GPUs, <code>CudaPlatform</code> has a {{term backend-priority}} list for each case: MLA or not, and the GPU generation. It asks each backend in the list whether it can serve this layer. The first backend that says yes wins. If the user names a backend with <code>--attention-backend</code>, vLLM checks only that one, and an invalid choice stops start-up.</p>
+<p>All backend names are members of one enum, the {{term attention-backend-enum}}. A {{term plugin}} can replace the class behind a member, or add a new member, with <code>register_backend</code>. An {{term out-of-tree}} platform can return any class name.</p>
+<p><strong>An everyday comparison.</strong> Think of a hospital that needs a surgeon for one operation. The head nurse has a ranked list of surgeons for each kind of operation. She asks each surgeon in order whether they can do this one. Each surgeon checks a fixed list of conditions and answers yes or no, with reasons. The first yes gets the job. If a patient asks for one surgeon by name, the nurse asks only that surgeon. The comparison stops here: vLLM asks every surgeon on the list, even after a yes, and it remembers the answer for the same question.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b5_attn_selection" alt="Panel 1: six steps. Step 1: the Attention layer constructor calls get_attn_backend with head_size, dtype, kv_cache_dtype, use_mla, has_sink, attention type and sliding window (attention.py line 350); the MLA layer passes use_sparse and num_heads instead. Step 2: get_attn_backend adds the block size only if the user set --block-size, plus the KV connector, PCP and DCP and batch-invariance flags, and picks --attention-backend or a per-kind override (selector.py 109). Step 3: a cached function calls current_platform.get_attn_backend_cls once per input set and imports the class (selector.py 206 and 227). Step 4: on CUDA, an explicit backend is validated alone; an invalid one raises ValueError with no fallback (cuda.py 430-449). Step 5: otherwise CUDA takes a priority list keyed by MLA, compute capability major, head count, KV dtype and multimodal prefix, and validates each entry (cuda.py 84-181). Step 6: no valid entry raises ValueError with every reason; otherwise the valid entry with the smallest index wins and is logged (cuda.py 471-518). Panel 2: four worked examples with the default auto KV dtype and BF16. Llama-3-8B on H100: list FLASH_ATTN, FLASHINFER, TRITON_ATTN, FLEX_ATTENTION, TURBOQUANT; chosen FLASH_ATTN. Llama-3-8B on B200: list FLASHINFER, FLASH_ATTN, TRITON_ATTN, FLEX_ATTENTION, TURBOQUANT; chosen FLASHINFER. DeepSeek-V3 MLA on H100, head size 576: list FLASH_ATTN_MLA, FLASHMLA, FLASHINFER_MLA, TRITON_MLA and three sparse entries; chosen FLASH_ATTN_MLA. DeepSeek-V3 on B200: list FLASHINFER_MLA, TOKENSPEED_MLA, CUTLASS_MLA, FLASH_ATTN_MLA, FLASHMLA, TRITON_MLA and sparse entries; chosen FLASHINFER_MLA. A callout says that with an fp8 KV cache the H100 MLA example moves to FLASHMLA, because FLASH_ATTN_MLA accepts only auto, float16 and bfloat16." caption="Figure: the selection path of one attention layer on CUDA (panel 1), and the winner for four common cases (panel 2)." />
+<p>Read panel 1 in two rows. The blue steps run on every platform. The violet steps are the CUDA implementation of the platform hook; ROCm, CPU and XPU have their own. Panel 2 shows that the same model gets a different backend on a different GPU generation, because the lists differ.</p>
+<p>The interactive visual below combines this choice with the CustomOp choice of {{link concepts/custom-ops}}. Pick a platform and the flags, and read which <code>forward_*</code> method RMSNorm runs and which attention backend a layer gets.</p>
+<x-viz id="op-backend-chooser" title="Which kernel path? RMSNorm method and attention backend" caption="Press a button to change a setting (Tab, then Enter or Space). The rule tags (C1 ... C6, A1 ... A12) refer to the list below. acme_hw is a made-up out-of-tree platform." />
+<x-simplified>
+<p>The visual is a simplified model. It assumes that the CUDA wheels have <code>vllm_flash_attn</code> with FA3 on SM90 and FA4 on SM100, and that FlashInfer and FlashMLA import. On ROCm, <code>VLLM_ROCM_USE_AITER</code> is not set. The CPU is x86 with AVX-512 and no AMX. There is no <code>VLLM_BATCH_INVARIANT</code>, no <code>--block-size</code>, no KV connector, no sliding window and no attention sinks. It uses these rules from the code:</p>
+<ol>
+  <li><strong>C1.</strong> <code>--enforce-eager</code> sets the compilation mode to <code>NONE</code> ({{cite vllm/config/vllm.py:1745-1746}}). Otherwise level O2 sets <code>VLLM_COMPILE</code> ({{cite vllm/config/vllm.py:1806-1810}}).</li>
+  <li><strong>C2.</strong> An empty compile backend becomes the platform default, <code>"inductor"</code> ({{cite vllm/config/compilation.py:1080-1081}}, {{cite vllm/platforms/interface.py:172}}).</li>
+  <li><strong>C3.</strong> If the list has neither <code>"all"</code> nor <code>"none"</code>, vLLM appends <code>"none"</code> for Inductor with a compile mode, else <code>"all"</code> ({{cite vllm/config/vllm.py:1819-1826}}). The CPU platform changes the mode later, in <code>check_and_update_config</code> ({{cite vllm/platforms/cpu.py:368-379}}, called at {{cite vllm/config/vllm.py:2046}}).</li>
+  <li><strong>C4.</strong> An op is enabled when the base mode is <code>"all"</code> or <code>+name</code> is set, and <code>-name</code> is not set ({{cite vllm/model_executor/custom_op.py:282-290}}).</li>
+  <li><strong>C5.</strong> A disabled op uses <code>forward_native</code>; an enabled op uses the method of the platform ({{cite vllm/model_executor/custom_op.py:189-205}}). RMSNorm's <code>forward_cuda</code> calls <code>forward_native</code> when batch invariance is off ({{cite vllm/model_executor/layers/layernorm.py:120}}). The default <code>forward_hip</code> calls <code>forward_cuda</code>; the default <code>forward_cpu</code> and <code>forward_oot</code> call <code>forward_native</code> ({{cite vllm/model_executor/custom_op.py:147-149}}, {{cite vllm/model_executor/custom_op.py:156-159}}, {{cite vllm/model_executor/custom_op.py:167-170}}).</li>
+  <li><strong>C6.</strong> RMSNorm's <code>forward_native</code> calls the IR op <code>rms_norm</code>, or <code>fused_add_rms_norm</code> with a residual ({{cite vllm/model_executor/layers/layernorm.py:79-99}}). Both ops get the same provider list. On CUDA its provider list is <code>["native"]</code> with Inductor and a compile mode, else <code>["vllm_c", "native"]</code> ({{cite vllm/platforms/cuda.py:716-734}}).</li>
+  <li><strong>A1.</strong> CUDA validates an explicit backend alone and raises <code>ValueError</code> if it is invalid ({{cite vllm/platforms/cuda.py:430-449}}).</li>
+  <li><strong>A2.</strong> Without one, CUDA validates its priority list and takes the valid entry with the smallest index ({{cite vllm/platforms/cuda.py:84-181}}, {{cite vllm/platforms/cuda.py:479-485}}).</li>
+  <li><strong>A3.</strong> A backend rejects a layer when it does not accept the head size or the KV dtype, or when <code>use_mla</code> does not match <code>is_mla()</code> ({{cite vllm/v1/attention/backend.py:302-307}}, {{cite vllm/v1/attention/backend.py:314-318}}). An MLA layer has head size 576. <code>FLASH_ATTN</code> and <code>FLASHINFER</code> reject it; <code>TRITON_ATTN</code> takes any head size from 32 ({{cite vllm/v1/attention/backends/flash_attn.py:423-433}}, {{cite vllm/v1/attention/backends/flashinfer.py:662-664}}, {{cite vllm/v1/attention/backends/triton_attn.py:378-379}}).</li>
+  <li><strong>A4.</strong> <code>FLASH_ATTN</code> needs capability 8.0 or higher. Its fp8 KV cache needs FA3 on SM90 or FA4 on SM100 ({{cite vllm/v1/attention/backends/flash_attn.py:456-457}}, {{cite vllm/v1/attention/backends/fa_utils.py:306-312}}).</li>
+  <li><strong>A5.</strong> <code>FLASHINFER</code> takes head sizes 64, 128, 256 and 512 on capability 8.0 to 12.1, with fp8 KV ({{cite vllm/v1/attention/backends/flashinfer.py:544-553}}, {{cite vllm/v1/attention/backends/flashinfer.py:662-675}}). <code>TRITON_ATTN</code> runs on any capability, with fp8 KV ({{cite vllm/v1/attention/backends/triton_attn.py:325-334}}, {{cite vllm/v1/attention/backends/triton_attn.py:404-405}}).</li>
+  <li><strong>A6-A9.</strong> <code>FLASH_ATTN_MLA</code>: KV auto, float16 or bfloat16 only, capability major 9 ({{cite vllm/v1/attention/backends/mla/flashattn_mla.py:42-46}}, {{cite vllm/v1/attention/backends/mla/flashattn_mla.py:69-70}}). <code>FLASHMLA</code>: fp8 KV, dense only on Hopper ({{cite vllm/v1/attention/backends/mla/flashmla.py:48-54}}, {{cite vllm/v1/attention/ops/flashmla.py:56-57}}). <code>FLASHINFER_MLA</code>: capability major 10, fp8 KV ({{cite vllm/v1/attention/backends/mla/flashinfer_mla.py:195-201}}, {{cite vllm/v1/attention/backends/mla/flashinfer_mla.py:220-221}}).</li>
+  <li><strong>A10.</strong> ROCm starts its MHA list with <code>ROCM_ATTN</code>; without AITER MLA its MLA list is only <code>TRITON_MLA</code> ({{cite vllm/platforms/rocm.py:499-526}}). An invalid explicit backend raises ({{cite vllm/platforms/rocm.py:781-785}}).</li>
+  <li><strong>A11.</strong> CPU ignores an explicit backend with an INFO log ({{cite vllm/platforms/cpu.py:183-184}}). MLA with fp8 KV raises; without AMX, MLA uses <code>CPU_MLA</code> ({{cite vllm/platforms/cpu.py:152-182}}). fp8 KV needs AMX or AVX-512 ({{cite vllm/v1/attention/backends/cpu_attn.py:69-75}}).</li>
+  <li><strong>A12.</strong> An out-of-tree platform decides alone. The test platform returns its own class for every layer ({{cite tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_platform.py:25-32}}).</li>
+</ol>
+<p>The CustomOp half models RMSNorm in a Llama-like model only. It ignores these exceptions from {{link concepts/custom-ops}}:</p>
+<ul>
+  <li><code>+name</code> entries that vLLM adds itself, for example <code>+quant_fp8</code> for block-quantized weights ({{cite vllm/config/vllm.py:1799-1802}}), and the additions of ROCm and of ARM CPUs;</li>
+  <li>layers built with <code>enforce_enable=True</code>, and classes that override <code>enabled()</code>;</li>
+  <li>two more ways to get compile mode <code>NONE</code>: <code>TORCH_COMPILE_DISABLE=1</code> ({{cite vllm/config/vllm.py:1765-1770}}) and breakable CUDA graphs, which vLLM turns on by default for some architectures ({{cite vllm/config/vllm.py:849-851}}).</li>
+</ul>
+<p>The visual does not show the block size choice, the ROCm results for an explicit <code>FLASH_ATTN</code> or <code>FLASHINFER</code>, or a library that fails to import. The deep dives explain them.</p>
+</x-simplified>
+
+<h2>In the code</h2>
+
+<h3>Step 1: AttentionBackendEnum names every backend</h3>
+<p>The enum value is the default dotted class path. The docstring says that <code>register_backend()</code> can override it:</p>
+<x-code file="vllm/v1/attention/backends/registry.py" lines="34-48" highlight="37-38,44,48" />
+<p>At this commit the enum has 49 members ({{cite vllm/v1/attention/backends/registry.py:44-166}}, counted with <code>git grep</code>). Two members are placeholders. <code>TORCH_SDPA</code> has an empty value and is "only used for ViT". <code>CUSTOM</code> has the value <code>None</code> and "must be registered before use" ({{cite vllm/v1/attention/backends/registry.py:70}}, {{cite vllm/v1/attention/backends/registry.py:164-166}}). Mamba-style layers use a second enum, <code>MambaAttentionBackendEnum</code>, with 6 members ({{cite vllm/v1/attention/backends/registry.py:288-295}}). The first deep dive groups all members.</p>
+<p><code>get_path()</code> reads an override first, then the enum value. <code>get_class()</code> imports the class:</p>
+<x-code file="vllm/v1/attention/backends/registry.py" lines="200-231" highlight="210-215,231" />
+
+<h3>Step 2: register_backend changes the table</h3>
+<x-code file="vllm/v1/attention/backends/registry.py" lines="399-420" highlight="400-404,406-411,413-418" caption="A string makes a new enum member first. Then the decorator or the explicit <code>class_path</code> writes the override." />
+<ol>
+  <li><strong>Lines 400-404.</strong> A string name such as <code>"CUSTOM_MLA"</code> calls <code>AttentionBackendEnum.register</code>. That method raises <code>ValueError</code> if the name exists already, or if it is not a valid identifier ({{cite vllm/v1/attention/backends/registry.py:180-187}}). It logs "Registered new attention backend" at INFO level ({{cite vllm/v1/attention/backends/registry.py:197}}).</li>
+  <li><strong>Lines 406-411.</strong> As a decorator, the override is the module and qualified name of the decorated class.</li>
+  <li><strong>Lines 413-418.</strong> With <code>class_path</code>, the override is that string. An enum member that has an override already gets the new one with no log and no error.</li>
+</ol>
+<p>The overrides live in the module dict <code>_ATTN_OVERRIDES</code> ({{cite vllm/v1/attention/backends/registry.py:344}}). So <code>register_backend</code> must run in each process that selects backends: a {{term general-plugin}} is the normal place. A test shows the <code>CUSTOM</code> form:</p>
+<x-code file="tests/test_attention_backend_registry.py" lines="160-180" highlight="162-166,178-179" />
+
+<h3>Step 3: the layer calls the selector</h3>
+<p>The <code>Attention</code> layer asks in its constructor, with <code>use_mla=False</code>:</p>
+<x-code file="vllm/model_executor/layers/attention/attention.py" lines="346-362" highlight="348,350-360" />
+<p>The MLA layer does the same with <code>use_mla=True</code> and <code>num_heads</code> ({{cite vllm/model_executor/layers/attention/mla_attention.py:514-521}}). Its head size is <code>kv_lora_rank + qk_rope_head_dim</code> ({{cite vllm/model_executor/layers/attention/mla_attention.py:480}}). A layer can also bring its own backend in <code>attn_backend</code>; then the selector does not run (lines 361-362). The model is built in the worker, so the selection runs there, or in the engine core process with the uni executor.</p>
+<p>The selector adds facts from <code>VllmConfig</code>. Two details matter. First, it passes the block size only when the user set <code>--block-size</code>:</p>
+<x-code file="vllm/v1/attention/selector.py" lines="131-143" highlight="135-138,141-143" />
+<p>Second, it chooses the requested backend. A per-kind override wins over the global value:</p>
+<x-code file="vllm/v1/attention/selector.py" lines="182-203" highlight="185-192,196-203" />
+<p>The kinds are the values of <code>KVCacheSpecKind</code>, for example <code>full_attention</code>, <code>mla_attention</code> and <code>sliding_window</code> ({{cite vllm/v1/kv_cache_interface.py:168-178}}). <code>get_attn_spec_kind</code> derives the kind from the layer ({{cite vllm/v1/attention/selector.py:68-106}}).</p>
+
+<h3>Step 4: one cached call to the platform</h3>
+<x-code file="vllm/v1/attention/selector.py" lines="206-228" highlight="206,218-222,223-226,227" />
+<ol>
+  <li><strong>Line 206.</strong> <code>@cache</code> keys on all arguments. The 32 decoder layers of a Llama model ask the same question, so the platform runs once. The run-wide KV dtype is in the key too (lines 214-215).</li>
+  <li><strong>Lines 218-222.</strong> The platform gets the requested backend (an enum member or <code>None</code>), the <code>AttentionSelectorConfig</code> and the head count.</li>
+  <li><strong>Lines 223-226.</strong> An empty answer raises "Invalid attention backend for ...". The base <code>Platform</code> returns <code>""</code> ({{cite vllm/platforms/interface.py:388-396}}).</li>
+  <li><strong>Line 227.</strong> The dotted name is imported. The layer keeps the class.</li>
+</ol>
+
+<h3>Step 5: CUDA checks an explicit backend alone</h3>
+<x-code file="vllm/platforms/cuda.py" lines="426-449" highlight="430,432-436,437-446,448-449" />
+<p>The flag <code>--attention-backend</code> fills <code>attention_config.backend</code> ({{cite vllm/engine/arg_utils.py:1103-1105}}, {{cite vllm/engine/arg_utils.py:2716-2726}}). The validator turns <code>"auto"</code> into <code>None</code> and any other string into an enum member, case-insensitive ({{cite vllm/config/attention.py:208-220}}). An unknown name raises "Unknown attention backend: ... Valid options are: ..." ({{cite vllm/v1/attention/backends/registry.py:21-31}}). The comment at line 451 says "or the selected backend is invalid", but the code above raises in that case and does not fall back.</p>
+
+<h3>Step 6: the priority lists</h3>
+<p><code>_get_backend_priorities</code> builds the list. The non-MLA branch:</p>
+<x-code file="vllm/platforms/cuda.py" lines="156-181" highlight="160-168,170-181" />
+<p>Blackwell (capability major 10) puts FlashInfer first, unless the model uses non-causal attention. Other GPUs put FlashAttention first. A multimodal prefix model gets a Triton variant in front. The major 10 causal list adds <code>TRITON_FLASHINFER</code>; the other list adds <code>TRITON_FLASH_ATTN</code> only on major 9 (lines 162, 171-175). The MLA branch has three cases: major 10, major 12 and all others ({{cite vllm/platforms/cuda.py:96-155}}). The third deep dive lists every case.</p>
+
+<h3>Step 7: each candidate validates itself</h3>
+<p><code>get_valid_backends</code> asks every entry, not only until the first success:</p>
+<x-code file="vllm/platforms/cuda.py" lines="389-417" highlight="398-404,405-409,410-415" />
+<p>An entry whose module fails to import gets the reason <code>"ImportError: ..."</code> or <code>"OSError: ..."</code> and a DEBUG log. So a missing optional library only removes that backend. Each backend class answers with <code>validate_configuration</code>, which collects reasons:</p>
+<x-code file="vllm/v1/attention/backend.py" lines="301-331" highlight="302-309,314-318,321-325,328-331" />
+<p>The rest of the method checks sliding window, R-SWA, non-causal attention, batch invariance and the KV connector. It also checks PCP, DCP and adaptive verification, then calls <code>supports_combination</code> for backend-specific rules ({{cite vllm/v1/attention/backend.py:332-369}}). A backend class changes the answer by overriding the small <code>supports_*</code> methods. For example, FlashAttention accepts capability 8.0 and higher ({{cite vllm/v1/attention/backends/flash_attn.py:456-457}}). <code>ROCM_ATTN</code> returns <code>False</code> from <code>supports_kv_connector</code> ({{cite vllm/v1/attention/backends/rocm_attn.py:184-188}}).</p>
+
+<h3>Step 8: pick the winner, or fail with every reason</h3>
+<x-code file="vllm/platforms/cuda.py" lines="453-485" highlight="458-465,467-470,471-475,479-482" />
+<p>All reasons go into one string, so the error message tells why each backend said no. The winner is the valid entry with the smallest index. vLLM logs it once at INFO level: "Using FLASH_ATTN attention backend out of potential backends: ['FLASH_ATTN', 'FLASHINFER', ...]" ({{cite vllm/platforms/cuda.py:508-516}}). If the user set <code>--block-size</code> and that excluded a better backend, vLLM warns ({{cite vllm/platforms/cuda.py:487-506}}).</p>
+
+<h3>Step 9: other platforms, and how to add a backend</h3>
+<p>Each platform implements the hook in its own way:</p>
+<ul>
+  <li><strong>ROCm</strong> has the same shape: an explicit backend first, then a list ({{cite vllm/platforms/rocm.py:731-836}}). Its list depends on AITER and on the KV connector ({{cite vllm/platforms/rocm.py:489-526}}). It tolerates an invalid explicit backend only in TurboQuant and UltraQuant runs. Even there, the one reason must be the KV dtype or the packed layout. Then it uses the list ({{cite vllm/platforms/rocm.py:765-795}}).</li>
+  <li><strong>CPU</strong> has no list. It returns <code>CPU_ATTN</code>, or <code>AMX_MLA</code> / <code>CPU_MLA</code> for MLA. It logs an explicit backend that it cannot use and goes on ({{cite vllm/platforms/cpu.py:143-192}}).</li>
+  <li><strong>An out-of-tree platform</strong> overrides <code>get_attn_backend_cls</code> and returns any dotted class path. The test platform does exactly this ({{cite tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_platform.py:25-32}}).</li>
+</ul>
+<p>So there are three ways to bring your own backend:</p>
+<ol>
+  <li><strong>Replace a built-in member.</strong> <code>register_backend(AttentionBackendEnum.FLASH_ATTN, "my_pkg.attn.MyFlash")</code>. CUDA reads members through <code>get_class()</code> ({{cite vllm/platforms/cuda.py:189-190}}), so the priority list uses your class in that slot. Your class then validates itself.</li>
+  <li><strong>Fill <code>CUSTOM</code>.</strong> <code>CUSTOM</code> is in no priority list, so the user must select it: <code>--attention-backend CUSTOM</code>.</li>
+  <li><strong>Own the platform.</strong> A platform plugin returns its class from <code>get_attn_backend_cls</code>, as the test platform does. The page {{link concepts/platform-interface}} explains the hook.</li>
+</ol>
+<p>Choices 1 and 2 need the register call in every process that builds the model, so put it in a general plugin.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The 49 enum members, grouped">
+<p>Counted from {{cite vllm/v1/attention/backends/registry.py:44-166}}. The groups are this site's; the code has one flat list.</p>
+<table>
+  <thead><tr><th>Group</th><th>Members</th><th>Count</th></tr></thead>
+  <tbody>
+    <tr><td>Standard attention (MHA/GQA) on GPUs</td><td><code>FLASH_ATTN</code>, <code>FLASH_ATTN_DIFFKV</code>, <code>TRITON_ATTN</code>, <code>TRITON_ATTN_DIFFKV</code>, <code>TRITON_FLASH_ATTN</code>, <code>FLASHINFER</code>, <code>TRITON_FLASHINFER</code>, <code>FLEX_ATTENTION</code>, <code>B12X</code>, <code>HPC_ATTN</code>, <code>TURBOQUANT</code>, <code>ULTRAQUANT</code></td><td>12</td></tr>
+    <tr><td>Dense MLA</td><td><code>FLASHINFER_MLA</code>, <code>TOKENSPEED_MLA</code>, <code>TRITON_MLA</code>, <code>CUTLASS_MLA</code>, <code>FLASHMLA</code>, <code>FLASH_ATTN_MLA</code></td><td>6</td></tr>
+    <tr><td>Sparse MLA</td><td><code>FLASHINFER_MLA_SPARSE</code>, <code>FLASHINFER_MLA_SPARSE_SM120</code>, <code>FLASHINFER_MLA_SPARSE_SM90</code>, <code>FLASHMLA_SPARSE</code>, <code>FLASH_ATTN_MLA_SPARSE</code>, <code>FLASH_ATTN_MLA_SPARSE_FA4</code></td><td>6</td></tr>
+    <tr><td>Model-specific (value in <code>vllm.models.*</code>)</td><td>3 for DeepSeek V4, 4 for DeepSeek V4.1, <code>MINIMAX_M3_SPARSE</code>, <code>CUTLASS_MSA</code>, <code>TRITON_MSA</code>, <code>STEP5_DSA</code></td><td>11</td></tr>
+    <tr><td>ROCm</td><td><code>ROCM_ATTN</code>, <code>ROCM_SEGMENTED_ATTN</code>, <code>ROCM_AITER_FA</code>, <code>ROCM_AITER_UNIFIED_ATTN</code>, <code>ROCM_AITER_MLA</code>, <code>ROCM_AITER_TRITON_MLA</code>, <code>ROCM_AITER_MLA_SPARSE</code></td><td>7</td></tr>
+    <tr><td>XPU</td><td><code>XPU_MLA_SPARSE</code></td><td>1</td></tr>
+    <tr><td>CPU</td><td><code>CPU_ATTN</code>, <code>CPU_MLA</code>, <code>AMX_MLA</code></td><td>3</td></tr>
+    <tr><td>Special</td><td><code>TORCH_SDPA</code> (ViT tag, empty value), <code>NO_ATTENTION</code>, <code>CUSTOM</code> (placeholder)</td><td>3</td></tr>
+  </tbody>
+</table>
+<p>A comment says that the DeepSeek V4 and V4.1 members are "model-driven; selected via the V4 layer" ({{cite vllm/v1/attention/backends/registry.py:99}}). Another says that <code>HPC_ATTN</code> runs only on Hopper with the Hy3 model and block size 64 ({{cite vllm/v1/attention/backends/registry.py:149-154}}). The model-specific layers bring their own backend through <code>get_attn_backend()</code> methods, for example in {{cite vllm/models/deepseek_v4/attention.py:852}}. This site does not describe the per-model code.</p>
+</x-deepdive>
+
+<x-deepdive title="AttentionSelectorConfig: every input of the decision">
+<p>The selector packs the facts into a <code>NamedTuple</code> ({{cite vllm/v1/attention/selector.py:25-43}}). The platform passes all fields to <code>validate_configuration</code> as keyword arguments ({{cite vllm/platforms/cuda.py:401-404}}).</p>
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Set from</th></tr></thead>
+  <tbody>
+    <tr><td><code>head_size</code></td><td><code>int</code></td><td>the layer; 128 for Llama-3-8B, 576 for a DeepSeek MLA layer (512 + 64, {{cite vllm/v1/attention/backends/fa_utils.py:338-339}})</td></tr>
+    <tr><td><code>dtype</code></td><td><code>torch.dtype</code></td><td><code>torch.get_default_dtype()</code> during model build ({{cite vllm/model_executor/layers/attention/attention.py:348}})</td></tr>
+    <tr><td><code>kv_cache_dtype</code></td><td><code>str | None</code></td><td><code>cache_config.cache_dtype</code>, after per-layer skips ({{cite vllm/model_executor/layers/attention/attention.py:276-326}})</td></tr>
+    <tr><td><code>block_size</code></td><td><code>int | None</code></td><td>only with <code>--block-size</code> ({{cite vllm/v1/attention/selector.py:135-138}})</td></tr>
+    <tr><td><code>use_mla</code>, <code>use_sparse</code></td><td><code>bool</code></td><td>the layer class</td></tr>
+    <tr><td><code>has_sink</code>, <code>use_mm_prefix</code>, <code>use_per_head_quant_scales</code>, <code>has_sliding_window</code></td><td><code>bool</code></td><td>the layer and the model config ({{cite vllm/model_executor/layers/attention/attention.py:294-297}}, {{cite vllm/model_executor/layers/attention/attention.py:340-344}})</td></tr>
+    <tr><td><code>attn_type</code></td><td><code>str</code></td><td>default <code>AttentionType.DECODER</code> ({{cite vllm/v1/attention/selector.py:157}})</td></tr>
+    <tr><td><code>use_non_causal</code></td><td><code>bool</code></td><td><code>attention_config.use_non_causal</code> ({{cite vllm/v1/attention/selector.py:170}})</td></tr>
+    <tr><td><code>use_batch_invariant</code></td><td><code>bool</code></td><td><code>VLLM_BATCH_INVARIANT</code>, default 0 ({{cite vllm/envs.py:637}})</td></tr>
+    <tr><td><code>use_kv_connector</code></td><td><code>bool</code></td><td>a KV transfer config with a connector and a role ({{cite vllm/v1/attention/selector.py:140-143}})</td></tr>
+    <tr><td><code>use_pcp</code>, <code>use_dcp</code></td><td><code>bool</code></td><td>prefill or decode context parallel size above 1 ({{cite vllm/v1/attention/selector.py:173-175}})</td></tr>
+    <tr><td><code>use_adaptive_verification</code>, <code>use_rswa</code></td><td><code>bool</code></td><td>speculative config and model config ({{cite vllm/v1/attention/selector.py:145-155}}, {{cite vllm/v1/attention/selector.py:176-179}})</td></tr>
+  </tbody>
+</table>
+<p>The KV dtype string must be known, else an <code>assert</code> fails ({{cite vllm/v1/attention/selector.py:123-127}}). <code>num_heads</code> is not a field; only the MLA layer passes it, and only the sparse MLA lists use it ({{cite vllm/platforms/cuda.py:110}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Every CUDA priority list">
+<p>From {{cite vllm/platforms/cuda.py:84-181}}. "Major" is the major compute capability: 9 for H100, 10 for B200, 12 for consumer Blackwell.</p>
+<table>
+  <thead><tr><th>Case</th><th>List, best first</th></tr></thead>
+  <tbody>
+    <tr><td>non-MLA, major 10, causal</td><td>(<code>TRITON_FLASHINFER</code> if multimodal prefix), <code>FLASHINFER</code>, <code>FLASH_ATTN</code>, <code>TRITON_ATTN</code>, <code>FLEX_ATTENTION</code>, <code>TURBOQUANT</code></td></tr>
+    <tr><td>non-MLA, all other cases</td><td>(<code>TRITON_FLASH_ATTN</code> if major 9 and multimodal prefix), <code>FLASH_ATTN</code>, <code>FLASHINFER</code>, <code>TRITON_ATTN</code>, <code>FLEX_ATTENTION</code>, <code>TURBOQUANT</code></td></tr>
+    <tr><td>MLA, major 10</td><td><code>FLASHINFER_MLA</code>, <code>TOKENSPEED_MLA</code>, <code>CUTLASS_MLA</code>, <code>FLASH_ATTN_MLA</code>, <code>FLASHMLA</code>, <code>TRITON_MLA</code>, then sparse: fp8 KV → <code>FLASHINFER_MLA_SPARSE</code>, <code>FLASHMLA_SPARSE</code>; BF16 and ≤ 16 heads → <code>FLASH_ATTN_MLA_SPARSE_FA4</code>, <code>FLASHINFER_MLA_SPARSE</code>, <code>FLASHMLA_SPARSE</code>; else <code>FLASHMLA_SPARSE</code>, <code>FLASHINFER_MLA_SPARSE</code></td></tr>
+    <tr><td>MLA, major 12</td><td><code>TRITON_MLA</code>, <code>FLASHINFER_MLA_SPARSE_SM120</code></td></tr>
+    <tr><td>MLA, other majors (9, 8 ...)</td><td><code>FLASH_ATTN_MLA</code>, <code>FLASHMLA</code>, <code>FLASHINFER_MLA</code>, <code>TRITON_MLA</code>, then <code>FLASH_ATTN_MLA_SPARSE</code>, <code>FLASHMLA_SPARSE</code>, with <code>FLASHINFER_MLA_SPARSE_SM90</code> first if head size is 512, else last</td></tr>
+  </tbody>
+</table>
+<p>Dense and sparse entries share one list. <code>validate_configuration</code> removes the wrong half, because <code>use_sparse</code> must equal <code>is_sparse()</code> ({{cite vllm/v1/attention/backend.py:321-325}}). The comment at {{cite vllm/platforms/cuda.py:157-159}} gives the reason for the non-causal rule on SM100: FlashInfer's non-causal path "is known to have problems". The comment at {{cite vllm/platforms/cuda.py:98-100}} links the benchmark issue for the sparse order.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: Llama-3-8B and DeepSeek-V3 on H100 and B200">
+<p>All four cases use <code>vllm serve</code> defaults: <code>--kv-cache-dtype auto</code>, BF16 weights, no <code>--block-size</code>. They assume three things. <code>vllm_flash_attn</code> has FA3 for SM90 (case 3). FlashInfer imports (cases 2 and 4). The FlashMLA extension is built (the fp8 variant of case 3). An <code>ImportError</code> or a missing build only makes that backend invalid, and the next entry wins. (Model sizes come from the model configs, not from this repository.)</p>
+<ol>
+  <li><strong>Llama-3-8B, H100 (capability 9.0).</strong> 32 query heads of size 128, 8 KV heads. The list is <code>FLASH_ATTN, FLASHINFER, TRITON_ATTN, FLEX_ATTENTION, TURBOQUANT</code>. <code>FLASH_ATTN</code> accepts head size 128 (a multiple of 8, at most 256), BF16, KV <code>auto</code>, capability 9.0 ({{cite vllm/v1/attention/backends/flash_attn.py:423-427}}, {{cite vllm/v1/attention/backends/flash_attn.py:456-457}}). It has index 0, so it wins.</li>
+  <li><strong>Llama-3-8B, B200 (capability 10.0).</strong> The list starts with <code>FLASHINFER</code>. It accepts head size 128 and capability 10.0 ({{cite vllm/v1/attention/backends/flashinfer.py:662-675}}), so it wins.</li>
+  <li><strong>DeepSeek-V3, H100.</strong> MLA layers, head size 512 + 64 = 576. The list starts with <code>FLASH_ATTN_MLA</code>. It needs FA3 on SM90 ({{cite vllm/v1/attention/backends/fa_utils.py:334-336}}) and accepts KV <code>auto</code>. It wins. With <code>--kv-cache-dtype fp8</code> it says "kv_cache_dtype not supported", and <code>FLASHMLA</code> (index 1) wins.</li>
+  <li><strong>DeepSeek-V3, B200.</strong> The list starts with <code>FLASHINFER_MLA</code>. It needs capability major 10 and <code>qk_nope_head_dim</code> in 64, 128 or 192 ({{cite vllm/v1/attention/backends/mla/flashinfer_mla.py:240-249}}). DeepSeek-V3 has 128, so it wins.</li>
+</ol>
+<p><strong>The block size follows.</strong> After <code>load_model</code>, <code>update_block_size_for_backend</code> picks a block size for the chosen backends, when the user did not set one ({{cite vllm/platforms/interface.py:771-781}}). With one backend, it is that backend's preferred size ({{cite vllm/platforms/interface.py:721-722}}). <code>FLASHMLA</code> supports only 64 ({{cite vllm/v1/attention/backends/mla/flashmla.py:57-58}}), so case 3 with fp8 runs with block size 64 instead of 16. <code>FLASHINFER_MLA</code> supports 32 and 64 ({{cite vllm/v1/attention/backends/mla/flashinfer_mla.py:204-205}}), so case 4 gets 32, the smallest one ({{cite vllm/v1/attention/backend.py:155-163}}). (Derived from these lines.)</p>
+</x-deepdive>
+
+<x-deepdive title="Flags, config fields and environment variables">
+<table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--attention-backend</code></td><td>not set (auto)</td><td>{{cite vllm/engine/arg_utils.py:2716-2726}}</td><td>Fills <code>attention_config.backend</code>; raises if <code>--attention-config</code> also sets <code>backend</code>.</td></tr>
+    <tr><td><code>--attention-config '{"backend_per_kind": {...}}'</code></td><td><code>{}</code></td><td>{{cite vllm/v1/attention/selector.py:186-192}}</td><td>A backend per KV cache kind; unknown kinds raise ({{cite vllm/config/attention.py:230-254}}).</td></tr>
+    <tr><td><code>attention_config.flash_attn_version</code></td><td><code>None</code></td><td>{{cite vllm/v1/attention/backends/fa_utils.py:113-117}}</td><td>Forces FA 2, 3 or 4; SM90 prefers 3, SM100 prefers 4 ({{cite vllm/v1/attention/backends/fa_utils.py:99-107}}).</td></tr>
+    <tr><td><code>--kv-cache-dtype</code></td><td><code>auto</code></td><td>{{cite vllm/model_executor/layers/attention/attention.py:276-279}}</td><td>An fp8 value removes backends that do not accept it.</td></tr>
+    <tr><td><code>--block-size</code></td><td>not set</td><td>{{cite vllm/v1/attention/selector.py:135-138}}</td><td>Only a user value reaches the selector; it can exclude backends, with a warning.</td></tr>
+    <tr><td><code>VLLM_BATCH_INVARIANT</code></td><td>0</td><td>{{cite vllm/v1/attention/selector.py:171}}</td><td>Backends without batch invariance say no.</td></tr>
+    <tr><td><code>VLLM_LOGGING_LEVEL=DEBUG</code></td><td><code>INFO</code></td><td>{{cite vllm/platforms/cuda.py:467-470}}</td><td>Shows every rejected backend and its reasons, also when one is valid.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Edge cases of register_backend and the cache">
+<ul>
+  <li><strong>Re-registration.</strong> An enum member gets the new override silently. A string name that exists raises <code>ValueError</code> and suggests the enum form ({{cite vllm/v1/attention/backends/registry.py:180-185}}). So two general plugins that override <code>FLASH_ATTN</code> do not fail; the last one wins.</li>
+  <li><strong>Timing.</strong> <code>_cached_get_attn_backend</code> keeps its first answer for the process ({{cite vllm/v1/attention/selector.py:206}}). A registration after the model build has no effect on that model. (Derived.)</li>
+  <li><strong>The front end parses the name.</strong> <code>--attention-backend MY_NAME</code> becomes an enum member while the front end parses the config ({{cite vllm/config/attention.py:216-219}}). A string-registered name must therefore exist in the front end too. Whether such a dynamic member survives the pickled <code>VllmConfig</code> in the engine core and the workers is not traced here (open question). The <code>CUSTOM</code> member exists in every process.</li>
+  <li><strong><code>CUSTOM</code> without registration.</strong> <code>get_path()</code> raises "Backend CUSTOM must be registered before use" ({{cite vllm/v1/attention/backends/registry.py:211-215}}).</li>
+  <li><strong>Mamba.</strong> <code>register_backend(..., is_mamba=True)</code> writes <code>_MAMBA_ATTN_OVERRIDES</code> ({{cite vllm/v1/attention/backends/registry.py:407-417}}). Mamba layers do not use the priority lists; they ask <code>get_mamba_attn_backend</code> ({{cite vllm/v1/attention/selector.py:231-250}}).</li>
+</ul>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="An explicit backend does not fall back">
+<p>With <code>--attention-backend</code>, CUDA validates only that backend. If it does not fit one layer type, start-up stops with "Selected backend ... is not valid for this configuration. Reason: [...]" ({{cite vllm/platforms/cuda.py:442-446}}). For a model with mixed layers, use <code>backend_per_kind</code> instead.</p>
+</x-warning>
+<ul>
+  <li><strong>No backend fits.</strong> The message lists every backend and its reasons: "No valid attention backend found for cuda with AttentionSelectorConfig(...). Reasons: {...}" ({{cite vllm/platforms/cuda.py:471-475}}). Read the reasons: a wrong KV dtype, an unsupported head size or a missing library is the usual cause.</li>
+  <li><strong>A library is missing.</strong> An import error makes only that backend invalid, with a DEBUG log ({{cite vllm/platforms/cuda.py:405-409}}). The server starts with a slower backend and says so only in the INFO line "Using X attention backend".</li>
+  <li><strong>A block size excludes the best backend.</strong> vLLM warns "--block-size ... precluded higher-priority backend(s)" ({{cite vllm/platforms/cuda.py:498-506}}). Remove <code>--block-size</code>.</li>
+  <li><strong>Your custom backend is never chosen.</strong> <code>CUSTOM</code> and new string names are in no priority list. Select them with <code>--attention-backend</code>, or override an existing member.</li>
+  <li><strong>CPU ignores your choice.</strong> The CPU platform logs "Cannot use ... backend on CPU." and uses its own backend ({{cite vllm/platforms/cpu.py:183-184}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> The attention backend sets the speed of every step and also the block size and the KV cache layout. The startup log line "Using X attention backend" is the first thing to check when a deployment is slower than expected.</p>
+
+<x-quiz>
+  <x-q level="easy">In which process, and when, does vLLM choose the attention backend?
+    <x-a><p>In the worker (or in the engine core process with the uni executor), while the model is built. Each attention layer calls <code>get_attn_backend</code> in its constructor ({{cite vllm/model_executor/layers/attention/attention.py:349-360}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">You start Llama-3-8B on an H100 with no flags. Which backend runs, and why not FlashInfer?
+    <x-a><p><code>FLASH_ATTN</code>. On capability major 9 the non-MLA list puts <code>FLASH_ATTN</code> before <code>FLASHINFER</code> ({{cite vllm/platforms/cuda.py:170-181}}), and the valid entry with the smallest index wins ({{cite vllm/platforms/cuda.py:479-482}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You run a DeepSeek-V3-style MLA model on H100 with <code>--kv-cache-dtype fp8</code>. Which backend wins, and what block size follows?
+    <x-a><p><code>FLASHMLA</code>. <code>FLASH_ATTN_MLA</code> is first but accepts only auto, float16 and bfloat16 KV ({{cite vllm/v1/attention/backends/mla/flashattn_mla.py:42-46}}). FlashMLA supports only block size 64 ({{cite vllm/v1/attention/backends/mla/flashmla.py:57-58}}), so <code>update_block_size_for_backend</code> sets 64 when you did not set <code>--block-size</code> ({{cite vllm/platforms/interface.py:721-722}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A general plugin calls <code>register_backend(AttentionBackendEnum.CUSTOM, "acme.attn.Fast")</code>. Will vLLM use it on CUDA with no other flag?
+    <x-a><p>No. <code>CUSTOM</code> is in no CUDA priority list ({{cite vllm/platforms/cuda.py:84-181}}). Start with <code>--attention-backend CUSTOM</code>, which CUDA then validates alone ({{cite vllm/platforms/cuda.py:430-449}}). Or override a member that is in the list, such as <code>FLASH_ATTN</code>.</p></x-a>
+  </x-q>
+  <x-q level="hard">You set <code>--attention-backend FLASH_ATTN</code> for a model whose layers are MLA. What is the error, and why is there no fallback?
+    <x-a><p><code>ValueError</code>: "Selected backend AttentionBackendEnum.FLASH_ATTN is not valid for this configuration. Reason: [...]". The list has "MLA not supported", because <code>FlashAttentionBackend.is_mla()</code> is <code>False</code> while <code>use_mla</code> is <code>True</code> ({{cite vllm/v1/attention/backend.py:314-316}}). For a DeepSeek layer (head size 576) it starts with "head_size not supported", because FlashAttention accepts at most 512 ({{cite vllm/v1/attention/backends/flash_attn.py:423-433}}, {{cite vllm/v1/attention/backend.py:302-303}}). The explicit branch raises and returns before the priority list ({{cite vllm/platforms/cuda.py:442-449}}), although the comment at line 451 suggests a fallback.</p></x-a>
+  </x-q>
+</x-quiz>

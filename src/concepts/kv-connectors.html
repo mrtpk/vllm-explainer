@@ -1,0 +1,181 @@
+---
+title: KV connectors
+nav_title: KV connectors
+level: Advanced
+prerequisites: concepts/scheduler, concepts/prefix-caching, concepts/plugin-map
+related: concepts/disaggregated-prefill, code/distributed-kv-transfer-kv-connector-factory, concepts/kv-cache-manager, concepts/prefix-caching, concepts/hybrid-kv-cache, concepts/plugin-map, concepts/attention-backend-selection
+summary: A KV connector moves KV cache blocks between vLLM and something outside it. One connector class runs as two objects - a scheduler-side object in the engine core that plans loads and saves, and a worker-side object in each worker that moves the bytes. KVConnectorFactory finds the class by name.
+---
+<x-sentence>A KV connector moves KV blocks in and out of vLLM; its scheduler half plans each step and its worker half moves the bytes.</x-sentence>
+
+<h2>The idea</h2>
+<p>The KV cache keeps the keys and values of earlier tokens, so decode does not compute them again ({{deepinfer learn/kv-cache | The KV cache}}). Prefix caching reuses these blocks inside one vLLM instance ({{link concepts/prefix-caching}}). A {{term kv-connector}} goes further: it moves blocks to or from something outside the instance. Examples are a second vLLM instance (disaggregated prefill), CPU memory, a local disk or a distributed store.</p>
+<p>The work has two parts that run in different processes. The scheduler must know, before it allocates blocks, how many prompt tokens it can load instead of compute. The workers must copy the bytes into or out of the GPU. So one connector class is made twice, with a different {{term connector-role}}. The <code>SCHEDULER</code> object lives in the {{term engine-core}} process. The <code>WORKER</code> object lives in each {{term worker}}. Each step, the scheduler side writes a metadata object; the worker side reads it.</p>
+<p>You turn a connector on with <code>--kv-transfer-config</code>, a {{term kv-transfer-config}}. Its field <code>kv_connector</code> names the class. <code>KVConnectorFactory</code> maps names to classes. vLLM registers 17 built-in connectors, and a plugin can register more, or name a module path.</p>
+<p><strong>An everyday comparison.</strong> Think of a restaurant kitchen with an external store room. Before each round of orders, the head chef checks the store list for the sauces of each order. If they are in the store, she reserves a shelf and writes a pick list. The kitchen porters read the list, bring the items to the shelf, and take finished items back to the store. The comparison stops here. In vLLM the porters (workers) can also carry items layer by layer during cooking, and the chef can postpone an order until its items arrive.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b5_kv_connector_step" alt="Panel 1, scheduler role in schedule(): step 1 get_num_new_matched_tokens takes the request and the local hit and returns the number of external tokens and whether the load is asynchronous; None means ask again next step. Step 2 allocates blocks with delay_cache_blocks set for async loads and calls update_state_after_alloc with the blocks and the external token count; async loads move the request to WAITING_FOR_REMOTE_KVS. Step 3 build_connector_meta turns the scheduler output of the step into KVConnectorMetadata, stored in scheduler_output. Panel 2, worker role in execute_model: step 4 pre_forward calls handle_preemptions and bind_connector_metadata, and starts synchronous loads. Step 5 in each attention layer calls wait_for_layer_load, runs attention, then save_kv_layer. Step 6 post_forward starts asynchronous loads, calls wait_for_save and get_transfer_results. Panel 3, scheduler role in update_from_output: step 7 update_connector_output; finished receives let a request run, finished sends free blocks, failures follow kv_load_failure_policy. Step 8 request_finished returns whether to delay the block free and the KV transfer parameters. Step 9 the next schedule caches the loaded blocks and schedules the rest of the prompt. A callout says that create_connector makes one object with role SCHEDULER in the engine core and one with role WORKER in each worker." caption="Figure: the connector calls of one step. Blue runs in the scheduler's schedule(), violet in each worker, green in the scheduler's update_from_output()." />
+<p>Follow the numbers. Steps 1-3 run on the CPU in the engine core, before the step goes to the workers. Steps 4-6 run in every worker around the forward pass. Steps 7-9 run in the engine core when the outputs come back, and in the next schedule.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the configuration</h3>
+<x-code file="vllm/config/kv_transfer.py" lines="56-91" highlight="60,71-73,78,81,88" />
+<ul>
+  <li><code>kv_connector</code> is the registered name or the class name. <code>kv_role</code> is <code>kv_producer</code>, <code>kv_consumer</code> or <code>kv_both</code>; a connector without a role raises ({{cite vllm/config/kv_transfer.py:120-124}}).</li>
+  <li><code>kv_connector_extra_config</code> is a free dict for the connector, for example <code>cpu_bytes_to_use</code>.</li>
+  <li><code>kv_load_failure_policy</code> defaults to <code>"fail"</code>: a failed load fails the request.</li>
+  <li><code>engine_id</code> becomes a random UUID when unset ({{cite vllm/config/kv_transfer.py:111-112}}).</li>
+</ul>
+<p>The producer and consumer properties decide some scheduler behaviour ({{cite vllm/config/kv_transfer.py:126-136}}). A typical disaggregated setup runs one instance with <code>kv_producer</code> and one with <code>kv_consumer</code>; the page {{link concepts/disaggregated-prefill}} explains it. This command is adapted from the docs ({{cite docs/features/disagg_prefill.md:41}}):</p>
+<pre><code class="language-bash">vllm serve Qwen/Qwen3-8B --kv-transfer-config \
+  '{"kv_connector":"OffloadingConnector","kv_role":"kv_both","kv_connector_extra_config":{"cpu_bytes_to_use":1000000000}}'</code></pre>
+
+<h3>Step 2: the factory finds the class</h3>
+<x-code file="vllm/distributed/kv_transfer/kv_connector/factory.py" lines="96-129" highlight="103-105,106-124,125-126,127-128" />
+<ol>
+  <li><strong>Lines 106-124.</strong> When <code>kv_connector_module_path</code> is set, it wins over the registry. vLLM imports the module and takes the class named <code>kv_connector</code>. A class without the <code>kv_cache_config</code> constructor argument raises.</li>
+  <li><strong>Lines 125-126.</strong> Else the registry: it calls the stored loader, which imports the module only now.</li>
+  <li><strong>Lines 127-128.</strong> An unknown name raises "Unsupported connector type".</li>
+</ol>
+<p>A plugin registers a name with <code>register_connector(name, module_path, class_name)</code>. A name that exists raises <code>ValueError</code> ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:30-40}}). The built-in names are registered when the factory module is imported (lines 149-249). The page {{link code/distributed-kv-transfer-kv-connector-factory}} reads the file line by line.</p>
+
+<h3>Step 3: one class, two objects</h3>
+<p>The scheduler makes the <code>SCHEDULER</code> object in its constructor:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="172-195" highlight="174-176,177-181,184-185,191-193" />
+<p>Each worker makes the <code>WORKER</code> object after it knows the KV cache config ({{cite vllm/v1/worker/gpu_worker.py:873-878}}, {{cite vllm/distributed/kv_transfer/kv_transfer_state.py:73-92}}). The roles are an enum with two values ({{cite vllm/distributed/kv_transfer/kv_connector/v1/base.py:139-144}}). The factory checks the hybrid KV cache manager: a connector that does not support it raises when the manager is on ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:54-60}}). <code>VllmConfig</code> turns the manager off for such a connector when the user did not choose, with a warning ({{cite vllm/config/vllm.py:2236-2259}}).</p>
+<p>The base class constructor stores the config and logs a warning that the API "is experimental and subject to change" ({{cite vllm/distributed/kv_transfer/kv_connector/v1/base.py:214-232}}).</p>
+
+<h3>Step 4: the scheduler-side methods</h3>
+<p>Three methods are abstract on the scheduler side ({{cite vllm/distributed/kv_transfer/kv_connector/v1/base.py:515-611}}):</p>
+<table>
+  <thead><tr><th>Method</th><th>Called</th><th>Returns, and what the scheduler does</th></tr></thead>
+  <tbody>
+    <tr><td><code>get_num_new_matched_tokens(request, num_computed_tokens)</code></td><td>once for a waiting request with no computed tokens, after the local prefix lookup ({{cite vllm/v1/core/sched/scheduler.py:1027-1039}})</td><td><code>(n, async)</code>: <code>n</code> more tokens can be loaded. <code>None</code> means "ask again": the request is skipped this step ({{cite vllm/v1/core/sched/scheduler.py:1043-1048}}).</td></tr>
+    <tr><td><code>update_state_after_alloc(request, blocks, num_external_tokens)</code></td><td>after <code>allocate_slots</code> succeeds ({{cite vllm/v1/core/sched/scheduler.py:1352-1357}})</td><td>nothing; the connector notes which blocks to fill</td></tr>
+    <tr><td><code>build_connector_meta(scheduler_output)</code></td><td>at the end of <code>schedule()</code> ({{cite vllm/v1/core/sched/scheduler.py:1615-1617}})</td><td>the metadata object that goes to the workers inside <code>SchedulerOutput</code>; the call also resets the connector state</td></tr>
+  </tbody>
+</table>
+<p>Other scheduler-side methods have defaults: <code>request_finished</code> (no delay), <code>update_connector_output</code>, <code>on_new_request</code>, <code>take_events</code> and more ({{cite vllm/distributed/kv_transfer/kv_connector/v1/base.py:613-680}}).</p>
+
+<h3>Step 5: the worker-side methods</h3>
+<p>Four methods are abstract on the worker side ({{cite vllm/distributed/kv_transfer/kv_connector/v1/base.py:332-396}}): <code>start_load_kv</code>, <code>wait_for_layer_load</code>, <code>save_kv_layer</code> and <code>wait_for_save</code>. Model Runner V2 wraps them in a small class:</p>
+<x-code file="vllm/v1/worker/gpu/kv_connector.py" lines="75-96" highlight="86-87,92-94" />
+<p>A synchronous load must finish before the forward reads the blocks, so it starts in <code>pre_forward</code>. An asynchronous load starts after the forward, "to keep submission off the critical path". The layer-by-layer calls wrap the attention custom op:</p>
+<x-code file="vllm/model_executor/layers/attention/kv_transfer_utils.py" lines="37-61" highlight="39-40,47-48,51,57" />
+<p>After the forward, <code>post_forward</code> calls <code>wait_for_save</code> and collects the finished transfers into a <code>KVConnectorOutput</code> ({{cite vllm/v1/worker/gpu/kv_connector.py:136-160}}). With speculative decoding, the save finishes later, after the drafter runs ({{cite vllm/v1/worker/gpu/model_runner.py:2220-2224}}). The model runner calls it on every pipeline rank ({{cite vllm/v1/worker/gpu/model_runner.py:2150}}, {{cite vllm/v1/worker/gpu/model_runner.py:2222-2224}}).</p>
+
+<h3>Step 6: async loads, delayed caching and deferred frees</h3>
+<p>The scheduler integrates the connector in four places:</p>
+<ol>
+  <li><strong>External prefix hits.</strong> The connector sees a block-aligned local hit and returns more tokens. The scheduler counts them as computed ({{cite vllm/v1/core/sched/scheduler.py:1027-1039}}).</li>
+  <li><strong>Async loads.</strong> For an async load, <code>allocate_slots</code> gets <code>delay_cache_blocks=True</code> ({{cite vllm/v1/core/sched/scheduler.py:1327}}). The block hashes are not committed yet, because the bytes are not there ({{cite vllm/v1/core/kv_cache_manager.py:602-605}}). The request goes to <code>WAITING_FOR_REMOTE_KVS</code> and is skipped for this step ({{cite vllm/v1/core/sched/scheduler.py:1384-1411}}).</li>
+  <li><strong>Completion.</strong> When a worker reports <code>finished_recving</code>, the request is marked ready ({{cite vllm/v1/core/sched/scheduler.py:3325-3334}}). The next schedule caches the loaded blocks and moves it back to <code>WAITING</code> ({{cite vllm/v1/core/sched/scheduler.py:3275-3289}}, {{cite vllm/v1/core/sched/scheduler.py:3254-3257}}).</li>
+  <li><strong>Frees.</strong> <code>request_finished</code> can return <code>True</code> (a connector with <code>SupportsHMA</code> gets <code>request_finished_all_groups</code>, {{cite vllm/v1/core/sched/scheduler.py:3145-3157}}): the blocks stay until the worker reports <code>finished_sending</code> ({{cite vllm/v1/core/sched/scheduler.py:2840-2842}}, {{cite vllm/v1/core/sched/scheduler.py:3335-3338}}). Separately, <code>defer_block_free</code> holds freed blocks while an in-flight step may still write them. It is on only with more than one batch in flight and a consumer role ({{cite vllm/v1/core/sched/scheduler.py:187-193}}).</li>
+</ol>
+
+<h3>Step 7: which processes read the registry</h3>
+<p>The registry is a class attribute in each process. Three processes read it, for different reasons:</p>
+<table>
+  <thead><tr><th>Process</th><th>Reads</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>front end</td><td>the class only, for config checks: the hybrid manager, sleep mode, the CUDA graph mode, and the metrics loggers</td><td>{{cite vllm/config/vllm.py:2243}}, {{cite vllm/config/vllm.py:1242}}, {{cite vllm/config/vllm.py:1966}}, {{cite vllm/v1/metrics/loggers.py:132}} → {{cite vllm/distributed/kv_transfer/kv_connector/v1/metrics.py:57}}, {{cite vllm/distributed/kv_transfer/kv_connector/v1/metrics.py:161}}</td></tr>
+    <tr><td>engine core</td><td>makes the <code>SCHEDULER</code> object</td><td>{{cite vllm/v1/core/sched/scheduler.py:177-181}}</td></tr>
+    <tr><td>each worker</td><td>makes the <code>WORKER</code> object</td><td>{{cite vllm/distributed/kv_transfer/kv_transfer_state.py:88-92}}</td></tr>
+  </tbody>
+</table>
+<p>So a connector registered by a plugin must be registered in all three processes. A {{term general-plugin}} does that. <code>kv_connector_module_path</code> needs no registration, because each process imports the module itself.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The 17 built-in connectors">
+<p>Registered at {{cite vllm/distributed/kv_transfer/kv_connector/factory.py:149-249}}. The descriptions come from the docstrings and comments of each module.</p>
+<table>
+  <thead><tr><th>Name</th><th>What it does</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>ExampleConnector</code></td><td>"Simple debug implementation"; saves and loads KV to and from disk (<code>shared_storage_path</code>)</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py:85-88}}</td></tr>
+    <tr><td><code>ExampleHiddenStatesConnector</code></td><td>debug connector that stores hidden states to disk, for the <code>extract_hidden_states</code> method</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/v1/example_hidden_states_connector.py:99-104}}</td></tr>
+    <tr><td><code>LMCacheConnectorV1</code>, <code>LMCacheMPConnector</code></td><td>the external LMCache library; the MP form talks to a separate <code>lmcache server</code></td><td>{{cite docs/features/disagg_prefill.md:23}}</td></tr>
+    <tr><td><code>NixlConnector</code>, <code>NixlPullConnector</code>, <code>NixlPushConnector</code></td><td>NIXL transfer for disaggregated prefill; pull (READ) or push (WRITE); <code>NixlConnector</code> is an alias of the pull form</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:350-351}}, {{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:391-392}}, {{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:432}}</td></tr>
+    <tr><td><code>MultiConnector</code></td><td>wraps several connectors: loads from the first that reports tokens, saves to all</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:133-140}}</td></tr>
+    <tr><td><code>HiSparseConnector</code></td><td>connector boundary for HiSparse sparse-MLA host offloading</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/v1/hisparse/connector.py:3}}, {{cite vllm/config/attention.py:122-126}}</td></tr>
+    <tr><td><code>MoRIIOConnector</code></td><td>MoRI-IO transfer, ROCm only</td><td>{{cite docs/features/disagg_prefill.md:31}}</td></tr>
+    <tr><td><code>OffloadingConnector</code></td><td>vLLM's native offloading to CPU (and more tiers) through <code>vllm/v1/kv_offload</code></td><td>{{cite vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py:79-100}}</td></tr>
+    <tr><td><code>DecodeBenchConnector</code></td><td>fills the KV cache with dummy values to test a decode instance</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/v1/decode_bench_connector.py:3-7}}</td></tr>
+    <tr><td><code>MooncakeConnector</code></td><td>direct peer-to-peer transfer with Mooncake</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py:6-10}}</td></tr>
+    <tr><td><code>MooncakeStoreConnector</code></td><td>a shared KV pool in <code>MooncakeDistributedStore</code></td><td>{{cite vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/connector.py:6-10}}</td></tr>
+    <tr><td><code>FlexKVConnectorV1</code></td><td>offload to FlexKV: CPU memory, SSD and remote storage</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/v1/flexkv_connector.py:36-40}}</td></tr>
+    <tr><td><code>SimpleCPUOffloadConnector</code></td><td>"minimal CPU KV cache offloading"</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py:3}}</td></tr>
+    <tr><td><code>HF3FSKVConnector</code></td><td>stores KV in the 3FS file system</td><td>{{cite vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:3-6}}</td></tr>
+  </tbody>
+</table>
+<p>There is no <code>P2pNcclConnector</code> at this commit (<code>git grep</code> finds no such name in <code>vllm/</code>). The docs say "Now supports 9 types of connectors" and name nine in eight bullets ({{cite docs/features/disagg_prefill.md:20-49}}). <code>LMCacheMPConnector</code> is inside the LMCache bullet. The registry has 17 names.</p>
+</x-deepdive>
+
+<x-deepdive title="The metadata contract between the two roles">
+<ul>
+  <li><strong>Scheduler → worker.</strong> <code>KVConnectorMetadata</code> is an empty abstract class; each connector defines its own ({{cite vllm/distributed/kv_transfer/kv_connector/v1/base.py:155-160}}). It travels inside <code>SchedulerOutput</code> to every worker. The worker binds it before the forward and clears it after ({{cite vllm/distributed/kv_transfer/kv_connector/v1/base.py:249-268}}).</li>
+  <li><strong>Worker → scheduler.</strong> Each worker returns a <code>KVConnectorOutput</code> with <code>finished_sending</code>, <code>finished_recving</code>, failed loads, invalid block ids, stats, events and optional worker metadata ({{cite vllm/v1/worker/gpu/kv_connector.py:145-157}}). Worker metadata objects must implement <code>aggregate</code>, because vLLM merges the objects of all workers ({{cite vllm/distributed/kv_transfer/kv_connector/v1/base.py:163-178}}).</li>
+  <li><strong>All workers answer.</strong> With a KV connector, the engine core sets up an output aggregator ({{cite vllm/v1/engine/core.py:191-192}}). The multiprocess executor then collects the outputs of all workers, not only of the output rank, and merges them ({{cite vllm/v1/executor/multiproc_executor.py:405-419}}).</li>
+  <li><strong>Request outputs.</strong> <code>request_finished</code> may return <code>kv_transfer_params</code>; vLLM puts them into the request output, so a router can pass them to the next instance ({{cite vllm/distributed/kv_transfer/kv_connector/v1/base.py:631-650}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Worked example: an async load of a 3,000-token prompt">
+<p>A consumer instance with <code>block_size</code> 16 gets a request with a 3,000-token prompt. The local prefix cache has the first 62 full blocks, 992 tokens; only full blocks can hit ({{cite vllm/v1/core/kv_cache_manager.py:264-266}}). The connector can load 1,984 more tokens asynchronously. (The numbers are an example; the steps follow the cited lines.)</p>
+<ol>
+  <li>The local hit is 992 tokens. 992 mod 16 = 0, so the connector sees all 992 tokens ({{cite vllm/v1/core/sched/scheduler.py:1031-1034}}).</li>
+  <li><code>get_num_new_matched_tokens(request, 992)</code> returns <code>(1984, True)</code>. There is no partial tail, so all 1,984 tokens are external ({{cite vllm/v1/core/sched/scheduler.py:1083-1084}}). (A local hit that ends inside a block loses its partial block when the remote hit is longer, lines 1064-1075.)</li>
+  <li><code>allocate_slots</code> gets 992 local and 1,984 external computed tokens, and <code>delay_cache_blocks=True</code> ({{cite vllm/v1/core/sched/scheduler.py:1320-1337}}). 2,976 tokens fill 186 blocks of 16. <code>update_state_after_alloc</code> tells the connector the block ids.</li>
+  <li>The request goes to <code>WAITING_FOR_REMOTE_KVS</code>, with <code>num_computed_tokens</code> set already ({{cite vllm/v1/core/sched/scheduler.py:1393-1407}}). It runs no prefill this step.</li>
+  <li>The workers start the load after their forward. Some steps later a worker reports <code>finished_recving</code>.</li>
+  <li>The next <code>schedule()</code> caches the loaded blocks and puts the request back to <code>WAITING</code>. The remaining 24 prompt tokens are prefilled as usual.</li>
+</ol>
+<p>If the whole prompt was loaded, vLLM sets <code>num_computed_tokens</code> to the prompt length minus one. So one token runs, and the model samples the first output token ({{cite vllm/v1/core/sched/scheduler.py:3271-3272}}).</p>
+</x-deepdive>
+
+<x-deepdive title="EC connectors: the same pattern for encoder outputs">
+<p>A multimodal model runs an encoder (for example a vision tower) before the language model. An {{term ec-connector}} moves the encoder outputs between instances, so one instance can run only the encoder. It has its own config, <code>--ec-transfer-config</code>, with <code>ec_connector</code>, <code>ec_role</code> (<code>ec_producer</code>, <code>ec_consumer</code> or <code>ec_both</code>) and <code>ec_connector_module_path</code> ({{cite vllm/config/ec_transfer.py:10-54}}).</p>
+<p>The factory is a copy of the KV factory, with one difference: the registry wins, and the module path is only the fallback ({{cite vllm/distributed/ec_transfer/ec_connector/factory.py:58-74}}). Three connectors are built in: <code>ECExampleConnector</code>, <code>ECCPUConnector</code> and <code>ECMooncakeConnector</code> ({{cite vllm/distributed/ec_transfer/ec_connector/factory.py:81-97}}). The scheduler makes the scheduler-side object ({{cite vllm/v1/core/sched/scheduler.py:201-205}}); each worker makes the worker-side object ({{cite vllm/distributed/ec_transfer/ec_transfer_state.py:26-39}}). The base class has <code>start_load_caches</code>, <code>save_caches</code>, <code>has_cache_item</code>, <code>update_state_after_alloc</code> and <code>build_connector_meta</code> as abstract methods ({{cite vllm/distributed/ec_transfer/ec_connector/base.py:164-312}}). The scheduler calls <code>request_finished</code> on it next to the KV connector ({{cite vllm/v1/core/sched/scheduler.py:2829-2832}}).</p>
+</x-deepdive>
+
+<x-deepdive title="KV offloading: vllm/v1/kv_offload">
+<p>{{term kv-offloading | KV offloading}} copies blocks to CPU memory or another tier, so a later request with the same prefix can load them. The easy switch is <code>--kv-offloading-size</code> in GiB. <code>VllmConfig</code> then makes or changes the KV transfer config:</p>
+<x-code file="vllm/config/vllm.py" lines="1139-1167" highlight="1140,1149-1157,1158-1164,1167" />
+<p>The default backend <code>native</code> selects <code>OffloadingConnector</code>, or <code>SimpleCPUOffloadConnector</code> with <code>VLLM_USE_SIMPLE_KV_OFFLOAD=1</code> (default 0, {{cite vllm/envs.py:2239-2241}}). The size becomes <code>cpu_bytes_to_use</code>. The docstring says that with TP &gt; 1 the size is "the total buffer size summed across all TP ranks" ({{cite vllm/config/cache.py:380-389}}). Note that lines 1154 and 1167 overwrite <code>kv_connector</code> and <code>kv_role</code> of a config that you also passed. (Derived.)</p>
+<p>The native code has its own small plugin point. <code>OffloadingConnector</code> builds an <code>OffloadingSpec</code> through <code>OffloadingSpecFactory</code> ({{cite vllm/distributed/kv_transfer/kv_connector/v1/offloading_connector.py:87-89}}). The spec gives a scheduler-side <code>OffloadingManager</code> and a worker-side <code>OffloadingWorker</code> ({{cite vllm/v1/kv_offload/base.py:724-743}}). Two specs are built in, <code>CPUOffloadingSpec</code> (the default) and <code>TieringOffloadingSpec</code>. An out-of-tree spec is named with <code>spec_name</code> and <code>spec_module_path</code> in <code>kv_connector_extra_config</code>, with an "experimental" warning ({{cite vllm/v1/kv_offload/factory.py:30-69}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="A registered name must be new">
+<p><code>register_connector</code> raises <code>ValueError</code> for a name that exists, and the built-in names exist from the import of the factory ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:33-34}}). A general plugin that raises stops the start-up of that process. Pick a name that vLLM does not use.</p>
+</x-warning>
+<ul>
+  <li><strong>The front end does not know your connector.</strong> The front end reads the class for config checks ({{cite vllm/config/vllm.py:2243}}). If only the engine core and the workers register it, <code>VllmConfig</code> or the metrics loggers fail with "Unsupported connector type". Use a general plugin or <code>kv_connector_module_path</code>.</li>
+  <li><strong>Old constructor.</strong> A module-path connector must accept <code>kv_cache_config</code> as the third argument, else <code>ValueError</code> ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:116-124}}).</li>
+  <li><strong>Hybrid models.</strong> A connector without <code>SupportsHMA</code> turns the hybrid KV cache manager off, and the warning says that hybrid SSM models "will fail at startup without it" ({{cite vllm/config/vllm.py:2245-2256}}).</li>
+  <li><strong>Encoder-decoder models.</strong> The scheduler asserts "Encoder-decoder models are not currently supported with KV connectors" ({{cite vllm/v1/core/sched/scheduler.py:174-176}}).</li>
+  <li><strong>Backends that refuse a connector.</strong> An attention backend can reject a KV connector in its validation; <code>ROCM_ATTN</code> does ({{cite vllm/v1/attention/backends/rocm_attn.py:184-188}}). See {{link concepts/attention-backend-selection}}.</li>
+  <li><strong>Load failures.</strong> With the default policy <code>"fail"</code>, a failed load fails the request; <code>"recompute"</code> computes the missing blocks instead ({{cite vllm/config/kv_transfer.py:88-91}}, {{cite vllm/v1/core/sched/scheduler.py:184-185}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> KV connectors are the base of disaggregated prefill and of KV offloading, two of the main ways to scale online serving. Most connector problems are process problems: which process registered the class, and which role runs where.</p>
+
+<x-quiz>
+  <x-q level="easy">Which object of a KV connector runs in the engine core, and which runs in the workers?
+    <x-a><p>The <code>SCHEDULER</code>-role object runs in the engine core, made by the scheduler ({{cite vllm/v1/core/sched/scheduler.py:177-181}}). Each worker makes a <code>WORKER</code>-role object ({{cite vllm/distributed/kv_transfer/kv_transfer_state.py:88-92}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">What does <code>get_num_new_matched_tokens</code> return, and what does <code>None</code> mean?
+    <x-a><p>A pair: the number of extra tokens that can be loaded, and whether the load is asynchronous. <code>None</code> as the count means that the connector needs more time; the scheduler skips the request this step and asks again ({{cite vllm/distributed/kv_transfer/kv_connector/v1/base.py:529-538}}, {{cite vllm/v1/core/sched/scheduler.py:1043-1048}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You set both <code>kv_connector_module_path</code> and a registry entry for the same name. Which class runs? And for an EC connector?
+    <x-a><p>For KV connectors the module path wins ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:106-108}}). For EC connectors the registry wins and the module path is the fallback ({{cite vllm/distributed/ec_transfer/ec_connector/factory.py:66-73}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does the scheduler pass <code>delay_cache_blocks=True</code> for an async load?
+    <x-a><p>The blocks are allocated, but the bytes arrive later. Committing their hashes now would let another request hit blocks that hold no data. <code>allocate_slots</code> returns before <code>cache_blocks</code> in that case ({{cite vllm/v1/core/kv_cache_manager.py:602-605}}), and the blocks are cached when the load finishes ({{cite vllm/v1/core/sched/scheduler.py:3254-3257}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You start with <code>--kv-offloading-size 8 --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer"}'</code>. Which connector and role run?
+    <x-a><p><code>OffloadingConnector</code> with <code>kv_both</code>. When <code>kv_offloading_size</code> is set and the backend is <code>native</code>, <code>_post_init_kv_transfer_config</code> overwrites <code>kv_connector</code> and sets <code>kv_role = "kv_both"</code> on the existing config ({{cite vllm/config/vllm.py:1149-1167}}). To combine both, use <code>MultiConnector</code>. (Derived from these lines.)</p></x-a>
+  </x-q>
+</x-quiz>

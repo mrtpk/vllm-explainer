@@ -1,0 +1,167 @@
+---
+title: Plugins in the API server
+nav_title: Front-end plugins
+level: Intermediate
+prerequisites: concepts/plugin-loading, concepts/plugin-map
+related: concepts/plugin-map, concepts/plugin-loading, concepts/tool-and-reasoning-parsers, concepts/lora-serving, concepts/metrics-and-observability, concepts/pooling-and-embeddings, concepts/openai-server, code/plugins-init
+summary: Five kinds of plugins act in the API server - endpoint plugins add or replace HTTP routes, IO processor plugins shape pooling input and output, tool and reasoning parser plugins parse model text, LoRA resolvers find unknown adapters, and stat logger plugins receive the metrics of each step.
+---
+<x-sentence>Five plugin kinds act in the API server: HTTP routes, pooling IO processors, text parsers, LoRA resolvers and stat loggers.</x-sentence>
+
+<h2>The idea</h2>
+<p>The {{term front-end}} of <code>vllm serve</code> is the API server process. It parses HTTP requests, renders prompts, talks to the engine core and turns the engine output into OpenAI responses ({{link concepts/openai-server}}). Several parts of this work are open to {{term plugin | plugins}}, because deployments differ in these places. Examples are extra routes, output formats, model-specific parsing, adapter storage and metrics systems.</p>
+<p>Each front-end extension point reaches vLLM in its own way:</p>
+<ul>
+  <li><strong>{{term endpoint-plugin | Endpoint plugins}}</strong> (group <code>vllm.endpoint_plugins</code>) add HTTP routes, and can replace an existing route. They load only when <code>VLLM_PLUGINS</code> names them.</li>
+  <li><strong>{{term io-processor-plugin | IO processor plugins}}</strong> (group <code>vllm.io_processor_plugins</code>) change the input and output of a pooling model.</li>
+  <li><strong>{{term tool-parser | Tool parsers}} and {{term reasoning-parser | reasoning parsers}}</strong> are registries. A flag imports your module: <code>--tool-parser-plugin</code> or <code>--reasoning-parser-plugin</code>.</li>
+  <li><strong>{{term lora-resolver | LoRA resolvers}}</strong> are a registry that a {{term general-plugin}} fills.</li>
+  <li><strong>{{term stat-logger | Stat loggers}}</strong> (group <code>vllm.stat_logger_plugins</code>) receive the statistics of each engine step.</li>
+</ul>
+<p><strong>An everyday comparison.</strong> Think of the reception of a hotel. A partner company can add a service desk (an endpoint) or bring a translator for some guests (a parser). It can give the porters a list of storage rooms for unknown luggage (a resolver), or put a counter on the door (a stat logger). The comparison stops here: in vLLM the receptionist does not ask the partner; each plugin must be installed and, for routes, named in an allowlist.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b5_frontend_hooks" alt="Panel 1, API server start-up, six steps: 1 general plugins run while the CLI builds the parser, for example the LoRA resolvers register in LoRAResolverRegistry (arg_utils.py 3243). 2 the parser plugin flags --tool-parser-plugin and --reasoning-parser-plugin are imported only if longer than 3 characters (launcher.py 369). 3 stat logger plugins load in AsyncLLM.__init__; a class that is not a StatLoggerBase subclass raises TypeError (async_llm.py 156). 4 endpoint plugins phase A: only when named in VLLM_PLUGINS and required_tasks match, attach_router(app) (app.py 51). 5 endpoint plugins phase B: init_state with the engine client, which is None on the render server (app_state.py 173). 6 IO processor plugins, only for pooling models, chosen by --io-processor-plugin or the io_processor_plugin key of the HF config (factories.py 73). Panel 2, one request: 1 the HTTP route; an endpoint plugin route with the same path and method replaces the core route. 2 an unknown model name asks each LoRA resolver in order, only with VLLM_ALLOW_RUNTIME_LORA_UPDATING=1. 3 pooling input goes through IOProcessor.pre_process when an IO processor plugin is set. 4 the engine core, another process, imports the reasoning parser plugin again for structured outputs. 5 output text goes through the parser classes named by --reasoning-parser and --tool-call-parser. 6 every engine step all stat loggers record; vLLM adds PrometheusStatLogger unless a plugin is one." caption="Figure: when each front-end plugin loads (panel 1) and what it touches during one request (panel 2)." />
+<p>Read panel 1 in number order: this is the start-up of the API server process. Panel 2 follows one request. Green items are entry-point groups that vLLM finds by itself. Blue items are registries. The violet item is a pair of CLI flags.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: endpoint plugins</h3>
+<p>The contract is a <code>Protocol</code>. An entry point gives a factory with no arguments that returns such an object:</p>
+<x-code file="vllm/plugins/endpoint_plugins/interface.py" lines="49-94" highlight="58-59,61-67,69-76,78-94" />
+<p>Loading has a stricter rule than the other groups. With <code>VLLM_PLUGINS</code> unset, vLLM loads none and warns:</p>
+<x-code file="vllm/plugins/__init__.py" lines="120-159" highlight="122-131,133,137-141,143-154" />
+<ol>
+  <li><strong>Lines 122-131.</strong> Not set: a WARNING names the discovered plugins, and nothing loads. <code>VLLM_PLUGINS=""</code> is an allowlist that matches nothing ({{cite vllm/plugins/__init__.py:107-109}}).</li>
+  <li><strong>Line 133.</strong> The shared loader filters by the <em>entry-point name</em> in <code>VLLM_PLUGINS</code> ({{cite vllm/plugins/__init__.py:63-64}}). The <code>name</code> attribute of the object is for logs; the docstring calls it the allowlist name too, so give both the same value.</li>
+  <li><strong>Lines 137-141.</strong> A factory that raises is logged and skipped.</li>
+  <li><strong>Lines 143-154.</strong> <code>required_tasks</code> must meet the server's tasks, or the plugin is skipped with an INFO log.</li>
+</ol>
+<p>Phase A attaches the routes in <code>build_app</code> ({{cite vllm/entrypoints/launchers/app.py:51}}). A plugin route with the same path and the same HTTP method replaces the core route; other methods of that path stay ({{cite vllm/plugins/endpoint_plugins/interface.py:109-143}}). vLLM logs "Endpoint plugin overrides ..." at INFO level. Phase B calls <code>init_state</code> in <code>init_app_state</code> ({{cite vllm/entrypoints/launchers/api_server/app_state.py:173}}). The CPU-only render server passes <code>engine_client=None</code> ({{cite vllm/entrypoints/launchers/render/app_state.py:124}}).</p>
+<p>The test plugin shows both phases:</p>
+<x-code file="tests/plugins/vllm_add_dummy_endpoint_plugin/vllm_add_dummy_endpoint_plugin/__init__.py" lines="19-37" highlight="20-21,23-24,33,37" />
+<p>Its route calls <code>engine_client.collective_rpc("get_scheduler_config")</code>. The module docstring says that a plugin that needs engine-side behaviour pairs the endpoint entry point with a general plugin ({{cite vllm/plugins/endpoint_plugins/interface.py:11-16}}). The end-to-end test uses a fake engine client for this call ({{cite tests/plugins_tests/test_endpoint_plugins.py:394}}).</p>
+
+<h3>Step 2: IO processor plugins (pooling only)</h3>
+<p>An IO processor converts a custom request into pooling inputs and the pooling output into a custom response. The abstract methods are <code>pre_process</code> and <code>post_process</code> ({{cite vllm/plugins/io_processors/interface.py:18-66}}). The plugin entry point is a function that returns the dotted class name, or <code>None</code>:</p>
+<x-code file="tests/plugins/prithvi_io_processor_plugin/setup.py" lines="6-15" highlight="11-13" />
+<p>vLLM selects one plugin by name. The name comes from <code>--io-processor-plugin</code>, or from the key <code>io_processor_plugin</code> in the model's HF config:</p>
+<x-code file="vllm/plugins/io_processors/__init__.py" lines="42-88" highlight="42-50,59-61,63-71,74-84,86-88" />
+<p>Only the pooling entry points ask for it ({{cite vllm/entrypoints/pooling/factories.py:73-84}}). A plugin function that raises gives a WARNING. No usable plugin, or the wrong name, raises <code>ValueError</code> (lines 74-84).</p>
+
+<h3>Step 3: tool parser and reasoning parser plugins</h3>
+<p><code>ToolParserManager</code> keeps two dicts: classes and lazy entries (module path, class name) ({{cite vllm/tool_parsers/abstract_tool_parser.py:243-244}}). vLLM registers its own parsers lazily at import ({{cite vllm/tool_parsers/__init__.py:264-270}}). A lookup tries the classes first, then imports a lazy entry and caches it:</p>
+<x-code file="vllm/tool_parsers/abstract_tool_parser.py" lines="246-282" highlight="254-255,257-258,260,267-273,275-282" />
+<p><code>register_module</code> has two forms ({{cite vllm/tool_parsers/abstract_tool_parser.py:327-370}}). With <code>module=...</code> it registers the class at once; <code>force=False</code> raises <code>KeyError</code> for a taken name. As a decorator it only stores a lazy entry with the class's module and name, and overwrites any entry with that name. <code>ReasoningParserManager</code> has the same shape ({{cite vllm/reasoning/abs_reasoning_parsers.py:225-373}}).</p>
+<p>Your module reaches the manager through a flag:</p>
+<x-code file="vllm/entrypoints/common/cli_args.py" lines="576-594" highlight="579-580,582-583,589-594" />
+<ol>
+  <li><strong>Lines 579-583.</strong> The value is imported only if it is longer than 3 characters. The code does not say why.</li>
+  <li><strong><code>import_plugin</code></strong> tries a module name first, then a file path. A file that fails to import is logged, not raised ({{cite vllm/utils/import_utils.py:81-98}}). The file is loaded under its file name as a module and put into <code>sys.modules</code> ({{cite vllm/utils/import_utils.py:101-116}}), so a decorator entry that points to it works.</li>
+  <li><strong>Lines 589-594.</strong> With <code>--enable-auto-tool-choice</code>, an unknown <code>--tool-call-parser</code> raises <code>KeyError</code> at start-up. So a plugin that failed to import shows up here.</li>
+</ol>
+<p>The API server calls <code>init_parser_plugin</code> in <code>setup_server</code> and again in <code>run_server_worker</code> ({{cite vllm/entrypoints/launchers/launcher.py:369-370}}, {{cite vllm/entrypoints/launchers/api_server/entry.py:183}}). The reasoning parser is also needed in the engine core, for structured outputs. So the engine core imports the reasoning parser plugin itself, with the same length rule:</p>
+<x-code file="vllm/v1/structured_output/__init__.py" lines="100-112" highlight="103-104,109-112" />
+<p>The page {{link concepts/tool-and-reasoning-parsers}} explains what the parsers do with the text.</p>
+<x-warning title="The docs example registers a module path that does not exist">
+<p>The tool calling guide ends its plugin example with <code>register_lazy_module(name="example", module_path="vllm.tool_parsers.example", ...)</code> ({{cite docs/features/tool_calling.md:676-681}}). There is no such module in <code>vllm/tool_parsers/</code>, so the lookup of <code>"example"</code> would fail to import. Use the decorator <code>@ToolParserManager.register_module("example")</code> on your class instead; it records your module. (Derived from {{cite vllm/tool_parsers/abstract_tool_parser.py:353-366}} and the folder listing.)</p>
+</x-warning>
+
+<h3>Step 4: LoRA resolvers</h3>
+<p>A resolver finds a LoRA adapter by name when a request asks for a model name that the server does not know. The registry holds instances by name; a second registration overwrites with a WARNING ({{cite vllm/lora/resolver.py:52-72}}). vLLM ships two resolvers, as general plugins:</p>
+<x-code file="pyproject.toml" lines="45-47" lang="toml" />
+<ul>
+  <li><strong>Filesystem resolver.</strong> It registers only when <code>VLLM_LORA_RESOLVER_CACHE_DIR</code> is set, and raises <code>ValueError</code> if that is not a directory ({{cite vllm/plugins/lora_resolvers/filesystem_resolver.py:49-61}}).</li>
+  <li><strong>HF Hub resolver.</strong> It needs <code>VLLM_LORA_RESOLVER_HF_REPO_LIST</code> and the name <code>lora_hf_hub_resolver</code> in <code>VLLM_PLUGINS</code>, "because it allows remote downloads" ({{cite vllm/plugins/lora_resolvers/hf_hub_resolver.py:129-147}}).</li>
+</ul>
+<p>The serving layer copies all resolvers when it starts ({{cite vllm/entrypoints/openai/models/serving.py:113-117}}). It asks them only when <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code> is on:</p>
+<x-code file="vllm/entrypoints/serve/engine/serving.py" lines="58-73" highlight="62-66" />
+<p>The resolvers run in registration order. The first one that finds the adapter and loads it wins. If a found adapter fails to load, vLLM logs a WARNING and asks the next resolver. When adapters were found but none loads, the answer is HTTP 400 ({{cite vllm/entrypoints/openai/models/serving.py:315-359}}). The page {{link concepts/lora-serving}} covers adapters in general.</p>
+
+<h3>Step 5: stat logger plugins</h3>
+<p>A stat logger implements <code>StatLoggerBase</code>: a constructor with <code>vllm_config</code> and <code>engine_index</code>, <code>record</code>, and <code>log_engine_initialized</code> ({{cite vllm/v1/metrics/loggers.py:54-81}}). The plugin group gives the class itself:</p>
+<x-code file="vllm/v1/metrics/loggers.py" lines="84-98" highlight="87,88-94" />
+<p><code>AsyncLLM.__init__</code> loads them, after any loggers that the caller passed ({{cite vllm/v1/engine/async_llm.py:155-165}}). A plugin turns on stats even with <code>--disable-log-stats</code>, but then without the default loggers (lines 158-165). <code>StatLoggerManager</code> wraps a per-engine class in an adapter, and always adds <code>PrometheusStatLogger</code> unless one of the loggers is a Prometheus logger ({{cite vllm/v1/metrics/loggers.py:1398-1419}}). The test plugin is a minimal example ({{cite tests/plugins/vllm_add_dummy_stat_logger/dummy_stat_logger/dummy_stat_logger.py:7-30}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The five extension points side by side">
+<table>
+  <thead><tr><th>Extension point</th><th>How it is found</th><th>VLLM_PLUGINS</th><th>Loaded at</th><th>Failure</th></tr></thead>
+  <tbody>
+    <tr><td>endpoint plugin</td><td>group <code>vllm.endpoint_plugins</code></td><td>must name it</td><td><code>build_app</code> ({{cite vllm/entrypoints/launchers/app.py:51}})</td><td>factory error: log and skip ({{cite vllm/plugins/__init__.py:137-141}})</td></tr>
+    <tr><td>IO processor plugin</td><td>group <code>vllm.io_processor_plugins</code> + a name</td><td>filters</td><td>pooling serving set-up ({{cite vllm/entrypoints/pooling/pooling/io_processor.py:51-55}})</td><td>function error: WARNING; none usable: <code>ValueError</code></td></tr>
+    <tr><td>tool / reasoning parser</td><td>flag imports a module or file</td><td>not used</td><td>{{cite vllm/entrypoints/common/cli_args.py:576-583}}</td><td>import error of a file: ERROR log only</td></tr>
+    <tr><td>LoRA resolver</td><td>registry, filled by a general plugin</td><td>filters the general plugin</td><td>{{cite vllm/entrypoints/openai/models/serving.py:113-117}}</td><td>filesystem resolver: <code>ValueError</code> at registration</td></tr>
+    <tr><td>stat logger</td><td>group <code>vllm.stat_logger_plugins</code></td><td>filters</td><td>{{cite vllm/v1/engine/async_llm.py:156}}</td><td>not a subclass: <code>TypeError</code></td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="How an endpoint plugin replaces a route">
+<p><code>attach_endpoint_plugins</code> rebuilds the route list after the plugins have attached their routes ({{cite vllm/plugins/endpoint_plugins/interface.py:108-146}}):</p>
+<ol>
+  <li>Remember the ids of all routes that exist before the plugins run (line 109).</li>
+  <li>Call <code>attach_router(app)</code> for each plugin, in discovery order (lines 110-111).</li>
+  <li>Walk all routes. A new <code>APIRoute</code> removes the methods it shares with an earlier route of the same path. An earlier route with no methods left is dropped; one with other methods stays, as a copy (lines 121-139).</li>
+  <li>Insert the new route at the place of the first route it replaced, so it stays ahead of mounts (lines 133, 140).</li>
+  <li>Reset the OpenAPI schema, and keep the plugin list in <code>app.state.endpoint_plugins</code> for phase B (lines 144-146).</li>
+</ol>
+<p>So a later plugin also replaces an earlier plugin's route for the same method. A test checks this ({{cite tests/plugins_tests/test_endpoint_plugins.py:280}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Lazy parser entries, step by step">
+<p>Example: your file <code>/opt/acme_parser.py</code> has <code>@ToolParserManager.register_module("acme")</code> on <code>class AcmeToolParser(ToolParser)</code>. You start <code>vllm serve ... --enable-auto-tool-choice --tool-call-parser acme --tool-parser-plugin /opt/acme_parser.py</code>.</p>
+<ol>
+  <li><code>init_parser_plugin</code> sees a value longer than 3 characters and calls <code>import_plugin</code> ({{cite vllm/entrypoints/common/cli_args.py:579-580}}).</li>
+  <li><code>importlib.import_module("/opt/acme_parser.py")</code> raises <code>ModuleNotFoundError</code>, so vLLM loads the file as module <code>acme_parser</code> ({{cite vllm/utils/import_utils.py:88-93}}).</li>
+  <li>The decorator stores <code>lazy_parsers["acme"] = ("acme_parser", "AcmeToolParser")</code> ({{cite vllm/tool_parsers/abstract_tool_parser.py:353-366}}).</li>
+  <li><code>validate_api_server_args</code> finds <code>"acme"</code> in <code>list_registered()</code> ({{cite vllm/tool_parsers/abstract_tool_parser.py:373-375}}).</li>
+  <li>The first lookup imports <code>acme_parser</code> from <code>sys.modules</code>, checks the subclass and caches the class ({{cite vllm/tool_parsers/abstract_tool_parser.py:263-274}}).</li>
+</ol>
+<p>A name like <code>"hermes"</code> exists as a lazy built-in entry. Your decorator with that name replaces the lazy entry, unless the built-in class was already loaded into <code>tool_parsers</code>, which the lookup checks first (lines 254-255). (Derived.)</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_PLUGINS</code></td><td>not set</td><td>{{cite vllm/plugins/__init__.py:122}}</td><td>Endpoint plugins load only when it is set and names them.</td></tr>
+    <tr><td><code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code></td><td><code>0</code> ({{cite vllm/envs.py:1197-1200}})</td><td>{{cite vllm/entrypoints/serve/engine/serving.py:63}}</td><td>Without it, LoRA resolvers are never asked.</td></tr>
+    <tr><td><code>VLLM_LORA_RESOLVER_CACHE_DIR</code></td><td>not set ({{cite vllm/envs.py:1171-1173}})</td><td>{{cite vllm/plugins/lora_resolvers/filesystem_resolver.py:51}}</td><td>Turns on the filesystem resolver.</td></tr>
+    <tr><td><code>VLLM_LORA_RESOLVER_HF_REPO_LIST</code></td><td>not set ({{cite vllm/envs.py:1178-1180}})</td><td>{{cite vllm/plugins/lora_resolvers/hf_hub_resolver.py:131}}</td><td>Comma-separated repos for the HF Hub resolver.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="An installed endpoint plugin does nothing by default">
+<p>Without <code>VLLM_PLUGINS</code>, vLLM only warns "Found endpoint plugin(s) ... but VLLM_PLUGINS is not set" ({{cite vllm/plugins/__init__.py:125-130}}). Set <code>VLLM_PLUGINS</code> to the entry-point name. Remember that this list then also filters the general, platform and stat logger plugins.</p>
+</x-warning>
+<ul>
+  <li><strong>A short parser plugin value is ignored.</strong> Three characters or fewer are not imported ({{cite vllm/entrypoints/common/cli_args.py:579}}).</li>
+  <li><strong>A broken parser file only logs.</strong> The ERROR log "Failed to load module ..." is easy to miss. Start-up then fails later with "invalid tool call parser" only when auto tool choice is on ({{cite vllm/utils/import_utils.py:94-98}}, {{cite vllm/entrypoints/common/cli_args.py:589-594}}).</li>
+  <li><strong>The resolver never runs.</strong> <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code> is off, or <code>VLLM_PLUGINS</code> filtered out the general plugin that registers it.</li>
+  <li><strong>A stat logger class is wrong.</strong> A non-<code>StatLoggerBase</code> entry raises <code>TypeError</code> in <code>AsyncLLM.__init__</code> and stops start-up ({{cite vllm/v1/metrics/loggers.py:88-94}}).</li>
+  <li><strong>An IO processor plugin is missing.</strong> A pooling model that names a plugin fails with "The model requires the ... IO Processor plugin but it is not installed" ({{cite vllm/plugins/io_processors/__init__.py:79-84}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> These plugins change what clients see: routes, response formats, parsed tool calls and metrics. They all live in the API server, so they cost no GPU time, but a mistake in them shows up directly in the HTTP responses.</p>
+
+<x-quiz>
+  <x-q level="easy">Which front-end plugin group loads only when <code>VLLM_PLUGINS</code> names it?
+    <x-a><p><code>vllm.endpoint_plugins</code>. With <code>VLLM_PLUGINS</code> unset, <code>load_endpoint_plugins</code> returns an empty list after a warning ({{cite vllm/plugins/__init__.py:122-131}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">What must the object behind a <code>vllm.stat_logger_plugins</code> entry point be?
+    <x-a><p>A class that subclasses <code>StatLoggerBase</code>, else <code>TypeError</code> ({{cite vllm/v1/metrics/loggers.py:87-94}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You pass <code>--reasoning-parser-plugin my.py --reasoning-parser mine</code>. In which processes does vLLM import <code>my.py</code>?
+    <x-a><p>In two processes. <code>"my.py"</code> has 5 characters, so it passes the length rule. The API server imports it ({{cite vllm/entrypoints/common/cli_args.py:582-583}}), and the engine core imports it again for structured outputs ({{cite vllm/v1/structured_output/__init__.py:103-104}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Your endpoint plugin registers <code>POST /v1/completions</code>. What happens to vLLM's own route, and to a <code>GET</code> on the same path?
+    <x-a><p>The plugin route replaces the core <code>POST</code> route; other methods of the path stay ({{cite vllm/plugins/endpoint_plugins/interface.py:121-141}}, docstring {{cite vllm/plugins/endpoint_plugins/interface.py:72-74}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A request asks for model <code>"sql-lora"</code>, which the server does not know. You set <code>VLLM_LORA_RESOLVER_CACHE_DIR=/loras</code> and <code>VLLM_PLUGINS=acme_admin</code>. Is the adapter found?
+    <x-a><p>No. The filesystem resolver registers from the general plugin <code>lora_filesystem_resolver</code> ({{cite pyproject.toml:45-46}}), and <code>VLLM_PLUGINS=acme_admin</code> filters it out ({{cite vllm/plugins/__init__.py:63-64}}). Also, resolvers run only with <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING=1</code> ({{cite vllm/entrypoints/serve/engine/serving.py:62-66}}). The request gets "The model `sql-lora` does not exist."</p></x-a>
+  </x-q>
+</x-quiz>
