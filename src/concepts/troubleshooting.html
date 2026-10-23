@@ -1,0 +1,207 @@
+---
+title: Troubleshooting vLLM: symptom, cause and fix
+nav_title: Troubleshooting
+level: Advanced
+prerequisites: concepts/architecture-overview, concepts/tuning, concepts/metrics-and-observability
+related: concepts/tuning, concepts/metrics-and-observability, concepts/deployment-recipes, concepts/kv-cache-manager, concepts/compile-and-cuda-graphs, concepts/plugin-loading, concepts/tool-and-reasoning-parsers, concepts/structured-outputs, concepts/prefix-caching, tours/serve-startup, reference/env-vars
+summary: A triage guide for vllm serve: find the phase (start-up, serving, output quality), read the right process log, then match the symptom to a cause in the code and a fix. Covers out-of-memory and max_model_len errors, slow start-up, engine death and timeouts, preemption and prefix-cache misses, HTTP 400 and 404, tool calls, structured outputs, plugins, custom ops and multi-node hangs.
+---
+<x-sentence>Find the phase and the process that failed. The first traceback in that process's log names the cause; this page maps it to a fix.</x-sentence>
+
+<h2>The idea</h2>
+<p>A <code>vllm serve</code> problem shows up in one of three phases:</p>
+<ol>
+  <li><strong>Start-up</strong>: the log never reaches "Application startup complete.". The cause is almost always in the configuration, the memory or the environment.</li>
+  <li><strong>Serving</strong>: the server runs, but requests fail (HTTP errors) or are slow. The cause is in the request, the load or a dead engine.</li>
+  <li><strong>Output</strong>: HTTP 200, but the content is wrong: tool calls as plain text, rejected JSON schemas, changed quality, a plugin without effect.</li>
+</ol>
+<p>The second rule: several processes write to one log ({{link concepts/architecture-overview}}). Each line has a prefix, for example <code>(APIServer pid=...)</code> or <code>(EngineCore pid=...)</code>. When the engine core fails, the API server only reports that it failed. The real cause is the first traceback in the engine core or worker lines above it.</p>
+<p><strong>An everyday comparison.</strong> Think of the triage desk of a hospital. The nurse first asks when the problem started and where it hurts, and only then calls the right specialist. The comparison stops at the patient. In vLLM, the "patient" writes its own detailed notes (the tracebacks and log lines). This page tells you which note to read first.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b9_triage_flow" alt="Three lanes. Lane 1, start-up fails or is slow, before Application startup complete: card 1 Engine core initialization failed, see the first traceback above it, log EngineCore failed to start, often a plugin error or a bad env value; card 2 ValueError about KV cache memory, No available memory or max seq len larger than, fix --max-model-len or utilization; card 3 CUDA out of memory at start-up, in the profile run or graph capture, fix max_num_batched_tokens, --enforce-eager or utilization; card 4 start-up takes minutes, log torch.compile took X s, warm start Directly load AOT compilation, keep VLLM_CACHE_ROOT on disk. Lane 2, requests fail or are slow: HTTP 400, read error.param, often context length, stream_options, max_tokens, tool_choice; HTTP 404, model is not a served name; HTTP 500 and /health 503, the engine core died, EngineDeadError, the server exits; slow TTFT or ITL, look at num_requests_waiting, kv_cache_usage_perc near 1 and the preemption rate. Lane 3, HTTP 200 with wrong output: tool calls arrive as text, need --enable-auto-tool-choice and --tool-call-parser; structured output rejected, the engine keeps its first backend; quality changed, defaults from generation_config.json, fix --generation-config vllm; plugin or op has no effect, VLLM_PLUGINS filter, DEBUG logging, op name +rms_norm." caption="Figure: the first question is the phase; each card names the first thing to check. The sections below give the cause in the code and the fix." />
+<p>Read the lane that matches the phase, from top to bottom. The cards are ordered by how often each problem shows up at start-up or in serving (a judgement, not a measurement). Each card has a step below with the code lines.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: read the right log line</h3>
+<p>When the engine core process fails during start-up, it logs the traceback with "EngineCore failed to start." and re-raises ({{cite vllm/v1/engine/core.py:1570-1572}}). A worker process logs "WorkerProc failed to start." ({{cite vllm/v1/executor/multiproc_executor.py:957}}). The API server then raises its own error, which points back to them:</p>
+<x-code file="vllm/v1/engine/utils.py" lines="1468-1477" />
+<p>So scroll up from "Engine core initialization failed. See root cause above." to the first traceback of an <code>EngineCore</code> or <code>Worker</code> line. For more detail, set <code>VLLM_LOGGING_LEVEL=DEBUG</code> (default INFO, {{cite vllm/envs.py:860}}). The vLLM docs also suggest <code>CUDA_LAUNCH_BLOCKING=1</code> for a failing kernel and <code>NCCL_DEBUG=TRACE</code> for NCCL ({{cite docs/usage/troubleshooting.md:33-41}}).</p>
+
+<h3>Step 2: start-up runs out of memory</h3>
+<p>Four errors look alike, but they happen at four different points ({{link concepts/kv-cache-manager}} and {{link concepts/tuning}} explain the memory profile):</p>
+<table>
+  <thead><tr><th>Message (start)</th><th>Cause</th><th>Fix</th></tr></thead>
+  <tbody>
+    <tr><td>"Free memory on device ... is less than desired GPU memory utilization"</td><td>another process uses the GPU; <code>total × gpu_memory_utilization</code> is not free ({{cite vllm/v1/worker/utils.py:761-770}})</td><td>lower <code>--gpu-memory-utilization</code>, or stop the other process</td></tr>
+    <tr><td><code>torch.OutOfMemoryError</code> during the profile run</td><td>the dummy forward pass with <code>max_num_batched_tokens</code> tokens does not fit ({{cite vllm/v1/worker/gpu/model_runner.py:1022-1027}})</td><td>lower <code>--max-num-batched-tokens</code>; TP or quantization for big weights</td></tr>
+    <tr><td>"No available memory for the cache blocks."</td><td>weights, activations and the graph estimate use all the requested memory ({{cite vllm/v1/core/kv_cache_planning.py:56-64}})</td><td>raise <code>--gpu-memory-utilization</code>; lower <code>--max-num-batched-tokens</code>; <code>--enforce-eager</code></td></tr>
+    <tr><td><code>torch.OutOfMemoryError</code> during graph capture</td><td>the real graph memory is larger than the estimate</td><td>lower <code>--gpu-memory-utilization</code> a little, or <code>--enforce-eager</code></td></tr>
+  </tbody>
+</table>
+<p><code>--enforce-eager</code> saves the graph memory: the estimate is 0 and no graph is captured ({{cite vllm/v1/worker/gpu_worker.py:704-708}}, {{cite vllm/v1/worker/gpu_worker.py:983-985}}). It costs speed in every step ({{link concepts/compile-and-cuda-graphs}}).</p>
+<p>After a successful start, the worker logs the measured parts and a suggested fixed KV size. The text names the flag <code>--kv-cache-memory=N</code>, but the flag is {{term kv-cache-memory-bytes | --kv-cache-memory-bytes}} ({{cite vllm/v1/worker/gpu_worker.py:1046-1053}}, {{cite vllm/engine/arg_utils.py:1384-1386}}). The vLLM docs use the short name too ({{cite docs/configuration/optimization.md:24}}). The short name also works on the command line (derived, not run with vLLM). Python's argparse accepts an unambiguous prefix of a long option, and no vLLM parser sets <code>allow_abbrev=False</code>. <code>FlexibleArgumentParser</code> does not change the prefix matching ({{cite vllm/utils/argparse_utils.py:313-502}}). <code>--kv-cache-memory-bytes</code> is the only flag that starts with <code>--kv-cache-memory</code>.</p>
+
+<h3>Step 3: max_model_len is too large</h3>
+<p>Two different errors stop the start-up:</p>
+<ol>
+  <li><strong>Larger than the model allows.</strong> "User-specified max_model_len (N) is greater than the derived max_model_len (...)" when <code>--max-model-len</code> exceeds the model config. <code>VLLM_ALLOW_LONG_MAX_MODEL_LEN=1</code> turns this into a warning, with a caution about NaN outputs for RoPE models ({{cite vllm/config/model.py:2656-2683}}).</li>
+  <li><strong>Larger than the KV cache can hold.</strong> The message starts "To serve at least one request with the model's max seq len (N), (X GiB KV cache is needed ...". It ends with "... the estimated maximum model length is M." ({{cite vllm/v1/core/kv_cache_planning.py:68-87}}).</li>
+</ol>
+<p>For the second error: set <code>--max-model-len M</code>, or <code>--max-model-len auto</code>, which fits the length to the memory and logs "Auto-fit max_model_len: reduced from ..." ({{cite vllm/v1/core/kv_cache_planning.py:1584-1587}}, {{cite vllm/v1/core/kv_cache_planning.py:1401-1410}}). The other fixes are more KV memory (Step 2) or <code>--kv-cache-dtype fp8</code> ({{link concepts/tuning}}). The playground on {{link concepts/tuning}} computes the same estimate.</p>
+
+<h3>Step 4: start-up is slow</h3>
+<p>After the model loads, the engine core profiles, compiles and captures graphs. Then it logs "init engine (profile, create kv cache, warmup model) took X s (compilation: Y s)" ({{cite vllm/v1/engine/core.py:394-400}}). A cold start compiles with <code>torch.compile</code>; a warm start loads the saved result and logs "Directly load AOT compilation from path ..." ({{cite vllm/compilation/decorators.py:326-330}}). The cache lives under <code>VLLM_CACHE_ROOT</code> ({{cite vllm/envs.py:713-718}}; {{link tours/serve-startup}}).</p>
+<ul>
+  <li>Keep the cache on a persistent disk (in a container, a volume). The docs have a section on this for Docker ({{cite docs/deployment/docker.md:32}}).</li>
+  <li>A change of <code>max_num_batched_tokens</code>, <code>max_num_seqs</code> or most environment variables gives a new cache key, so the next start compiles again ({{cite vllm/config/scheduler.py:271-284}}).</li>
+  <li>For fast restarts during development, use <code>-O0</code> or <code>--enforce-eager</code> (no compile, no graphs) ({{cite vllm/config/vllm.py:1745-1747}}).</li>
+</ul>
+
+<h3>Step 5: "EngineCore failed to start." and the start-up timeouts</h3>
+<p>Besides memory and length errors, three causes are common:</p>
+<ul>
+  <li><strong>A general plugin raises.</strong> The engine core runs every general plugin function, and their errors are not caught ({{cite vllm/plugins/__init__.py:87-90}}). A plugin that fails to import is only logged ("Failed to load plugin", {{cite vllm/plugins/__init__.py:68-72}}). See {{link concepts/plugin-loading}}.</li>
+  <li><strong>A bad environment value.</strong> At the end of its <code>__init__</code>, the engine core reads every <code>VLLM_*</code> variable once to cache them ({{cite vllm/v1/engine/core.py:241-243}}, {{cite vllm/envs.py:2324-2326}}). A value that does not parse, for example <code>VLLM_XLA_CHECK_RECOMPILATION=yes</code> ({{cite vllm/envs.py:1086-1088}}), raises there, even when no code uses that variable. With TP &gt; 1, each worker process does the same earlier and logs "WorkerProc failed to start." ({{cite vllm/v1/executor/multiproc_executor.py:708-710}}). A variable that the API server reads when it imports a module fails earlier, in the API server: for example <code>VLLM_ENGINE_READY_TIMEOUT_S</code> ({{cite vllm/v1/engine/core_client.py:29}}).</li>
+  <li><strong>A wrong flag combination</strong> that only the engine core checks, for example an attention backend that the GPU does not support ({{link concepts/attention-backend-selection}}).</li>
+</ul>
+<p>Timeouts at start-up depend on the shape:</p>
+<ul>
+  <li>With one API server, the front end waits for the engine with no time limit ({{link concepts/engine-client}}).</li>
+  <li>With more than one API server, the API servers start before the engines and wait <code>VLLM_ENGINE_READY_TIMEOUT_S</code> (default 600 s) ({{cite vllm/envs.py:812-814}}, {{cite vllm/v1/engine/core_client.py:755-768}}). The message says that slow weight loading is a common cause; raise the value for large models.</li>
+  <li>The engine core waits at most 5 minutes for the init message of the front end ({{cite vllm/v1/engine/core.py:113}}, {{cite vllm/v1/engine/core.py:1408-1413}}).</li>
+</ul>
+
+<h3>Step 6: the engine dies while serving</h3>
+<p>An error in the loop of the engine core makes it log "EngineCore encountered a fatal error.". Then it sends a dead message to the front end and exits ({{cite vllm/v1/engine/core.py:1573-1576}}). The front end then raises <code>EngineDeadError</code> ({{cite vllm/v1/engine/core_client.py:581-584}}). The result is {{term engine-death}}:</p>
+<ul>
+  <li>Requests get HTTP 500 with the message "The server had an error while processing your request." ({{cite vllm/v1/engine/exceptions.py:12-22}}, {{cite vllm/entrypoints/serve/exception_handling/error_response.py:68-72}}).</li>
+  <li><code>GET /health</code> answers 503 ({{cite vllm/entrypoints/serve/instrumentator/health.py:29-33}}).</li>
+  <li>A watchdog checks every 5 s and stops the API server, unless <code>VLLM_KEEP_ALIVE_ON_ENGINE_DEATH=1</code> (default 0) ({{cite vllm/entrypoints/launchers/launcher.py:314-337}}, {{cite vllm/envs.py:1107-1109}}). Let your orchestrator restart the container.</li>
+</ul>
+<p>With worker processes, each <code>execute_model</code> call waits at most <code>VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS</code> (default 300) for the workers ({{cite vllm/envs.py:1859-1863}}, {{cite vllm/v1/executor/multiproc_executor.py:350}}). Then it raises <code>TimeoutError("RPC call to execute_model timed out.")</code> ({{cite vllm/v1/executor/multiproc_executor.py:443}}). This is an error in the engine core loop, so the engine dies as above (derived; with fault tolerance off, the default). The comment in <code>envs.py</code> says "only applies when TP &gt; 1"; the code applies it to every multiprocessing executor, also with PP or DP. A hang inside a collective (NCCL) usually shows up as this timeout (Step 10).</p>
+
+<h3>Step 7: HTTP 400 and 404</h3>
+<p>The error body names the cause and often the field ({{link learn/openai-api}}). It has the form <code>{"error": {"message": "...", "type": "BadRequestError", "param": "...", "code": 400}}</code>. The common ones:</p>
+<table>
+  <thead><tr><th>Status and message</th><th>Cause</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>400 "This model's maximum context length is N tokens. However, your prompt contains M input tokens ..."</td><td>the prompt is longer than <code>max_model_len</code></td><td>{{cite vllm/renderers/params.py:518-538}}</td></tr>
+    <tr><td>400 "Stream options can only be defined when `stream=True`."</td><td><code>stream_options</code> without <code>stream</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/protocol.py:847-855}}</td></tr>
+    <tr><td>400 "tool_choice=... requires --tool-call-parser to be set"</td><td>tools without the parser flags (Step 9)</td><td>{{link concepts/tool-and-reasoning-parsers}}</td></tr>
+    <tr><td>400 "Structured output processing only supports one backend per engine."</td><td>Step 9</td><td>{{cite vllm/v1/structured_output/__init__.py:143-150}}</td></tr>
+    <tr><td>404 "The model ... does not exist."</td><td><code>model</code> is not a served name or a loaded LoRA name</td><td>{{cite vllm/entrypoints/serve/engine/serving.py:75-84}}</td></tr>
+    <tr><td>503</td><td>queue limits (<code>--max-num-queued-reqs</code>, <code>--max-num-queued-tokens</code>) are full</td><td>{{link concepts/openai-server}}</td></tr>
+  </tbody>
+</table>
+<p>A <code>max_tokens</code> larger than the rest of the context is not an error: the server lowers it to <code>max_model_len − prompt length</code> ({{cite vllm/entrypoints/serve/utils/api_utils.py:253-270}}). For a 404, check <code>GET /v1/models</code>: the served name is <code>--served-model-name</code>, else the model path ({{cite vllm/config/model.py:2330-2334}}).</p>
+
+<h3>Step 8: slow serving: preemption and prefix-cache misses</h3>
+<p><strong>Preemption.</strong> When running requests need more blocks than are free, the scheduler preempts one and recomputes it later ({{link concepts/scheduler}}). The scheduler writes no log line per preemption. The signs are the counter <code>vllm:num_preemptions_total</code> and "Preemptions: N" in the periodic log line ({{cite vllm/v1/metrics/loggers.py:738-745}}, {{cite vllm/v1/metrics/loggers.py:310-312}}). Watch the {{term preemption-rate}}: <code>rate(vllm:num_preemptions_total[5m])</code>. The vLLM docs still show a V0-style warning line for preemption ({{cite docs/configuration/optimization.md:33-35}}); the current code does not print it. Fix: more KV memory, or fewer running requests ({{link concepts/tuning}}).</p>
+<p><strong>A low prefix-cache hit rate.</strong> The cache hits only when the hash chain of full blocks matches ({{link concepts/prefix-caching}}). Hits break when:</p>
+<ul>
+  <li>the shared prefix is shorter than one block, or the difference starts inside the first block: only full blocks hit ({{cite vllm/v1/core/kv_cache_manager.py:264-266}});</li>
+  <li>requests use different LoRA adapters, multimodal inputs or <code>cache_salt</code> values, which are part of the block hash ({{cite vllm/v1/core/kv_cache_utils.py:655-665}});</li>
+  <li>a request asks for <code>prompt_logprobs</code>: it skips reading the cache ({{cite vllm/sampling_params.py:625-632}});</li>
+  <li>the chat template puts a changing value (a date, an id) near the start of the prompt (general knowledge about templates);</li>
+  <li>you use a non-cryptographic hash (<code>xxhash</code>) without <code>PYTHONHASHSEED</code>. Then the hash seed is random per process, and tools that compare hashes across instances find no match ({{cite vllm/v1/core/kv_cache_utils.py:117-130}}).</li>
+</ul>
+<p>Also note that requests that come back after a preemption are not in the exported prefix counters ({{link concepts/metrics-and-observability}}).</p>
+
+<h3>Step 9: wrong output with HTTP 200</h3>
+<ul>
+  <li><strong>Tool calls arrive as plain text in <code>content</code>.</strong> The server needs both <code>--enable-auto-tool-choice</code> and <code>--tool-call-parser NAME</code>. The first alone stops the start-up with <code>TypeError</code> ({{cite vllm/entrypoints/common/cli_args.py:523-525}}); the second alone gives no parser ({{cite vllm/parser/parser_manager.py:34-35}}). The parser must match the model's output format ({{link concepts/tool-and-reasoning-parsers}}).</li>
+  <li><strong>Structured output requests fail after other ones worked.</strong> The API server picks a backend per request, but the engine core keeps the first backend it built and rejects others ({{cite vllm/v1/structured_output/__init__.py:143-150}}). Set one backend with <code>--structured-outputs-config.backend</code> ({{link concepts/structured-outputs}}).</li>
+  <li><strong>The output quality changed.</strong> By default, the server takes default sampling parameters from the model's <code>generation_config.json</code>; <code>--generation-config vllm</code> uses vLLM's own defaults ({{cite vllm/config/model.py:358-364}}). The vLLM docs describe this change ({{cite docs/usage/troubleshooting.md:25-31}}).</li>
+  <li><strong>A plugin does not load.</strong> When <code>VLLM_PLUGINS</code> is set, only the named plugins load; an empty value loads none ({{cite vllm/envs.py:1161-1167}}, {{cite vllm/plugins/__init__.py:63-66}}). General plugins log at DEBUG level only, so set <code>VLLM_LOGGING_LEVEL=DEBUG</code> to see "Available plugins for group ..." ({{cite vllm/plugins/__init__.py:48-54}}). Logits-processor plugins ignore <code>VLLM_PLUGINS</code> ({{link concepts/plugin-loading}}).</li>
+  <li><strong>A custom op switch has no effect.</strong> <code>custom_ops</code> entries use the registered op name, for example <code>+rms_norm</code>. A name that matches no op of the model only logs a WARNING "... has no effect" ({{cite vllm/config/compilation.py:1343-1361}}). Also, at the default -O2 with Inductor, vLLM disables most custom ops on purpose ({{link concepts/custom-ops}}).</li>
+</ul>
+
+<h3>Step 10: multi-node and NCCL hangs</h3>
+<p>The vLLM docs have the details; this page points to them:</p>
+<ul>
+  <li>Check GPU-to-GPU communication across the nodes first, and set network variables such as <code>NCCL_SOCKET_IFNAME</code> on all nodes ({{cite docs/serving/distributed_troubleshooting.md:5-7}}).</li>
+  <li>With several IP addresses per node, set <code>VLLM_HOST_IP</code> per node ({{cite docs/serving/distributed_troubleshooting.md:9-11}}).</li>
+  <li>A test script with <code>NCCL_DEBUG=TRACE</code> shows whether the hardware and drivers work ({{cite docs/usage/troubleshooting.md:83-175}}).</li>
+  <li>vLLM sets a few variables itself when it is imported: <code>PYTORCH_NVML_BASED_CUDA_CHECK=1</code> and <code>TORCHINDUCTOR_COMPILE_THREADS=1</code> ({{cite vllm/env_override.py:164-168}}). It sets <code>NCCL_GRAPH_REGISTER=0</code> only when sleep mode offloads CUDA graphs ({{cite vllm/config/vllm.py:2309-2316}}). Older versions set <code>NCCL_CUMEM_ENABLE=0</code>; the current code does not ({{cite docs/usage/troubleshooting.md:375}}).</li>
+  <li>Traffic between nodes is not encrypted; keep the nodes on an isolated network ({{cite docs/usage/security.md:3-10}}).</li>
+</ul>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: a 24 GiB GPU and a 128K-context model">
+<p>The per-token values are the same as in the Llama-3.1-8B example on {{link concepts/tuning}}; the memory values are made up (illustrative). Assume a 24 GiB GPU with <code>gpu_memory_utilization</code> 0.92. The profile finds 15 GiB weights, 1 GiB other memory, a 2.5 GiB activation peak and a 0.5 GiB graph estimate. The KV cache needs 128 KiB per token, and <code>max_model_len</code> is 131,072 from the model config.</p>
+<ol>
+  <li>Requested: ceil(24 × 0.92) = 22.08 GiB. Available: 22.08 − 16.0 − 2.5 − 0.5 = 3.08 GiB ({{cite vllm/v1/worker/gpu_worker.py:744-748}}).</li>
+  <li>One block (16 tokens) is 2 MiB, so there are 1,576 blocks ({{cite vllm/v1/core/kv_cache_planning.py:1610-1611}}).</li>
+  <li>The check keeps one block back: 3.08 GiB − 2 MiB. One request of 131,072 tokens needs 8,192 blocks = 16 GiB, which does not fit ({{cite vllm/v1/core/kv_cache_planning.py:1572-1582}}).</li>
+  <li>The error estimates the largest length that fits: 1,575 blocks × 16 = 25,200 tokens ({{cite vllm/v1/core/kv_cache_planning.py:1288-1334}}).</li>
+  <li>Fixes, each with its effect:<ul><li><code>--max-model-len 25200</code> or <code>auto</code>: the server starts with a maximum concurrency of 1.0x.</li><li><code>--max-model-len 8192</code>: 1,576 / 512 = 3.08x.</li><li><code>--kv-cache-dtype fp8</code>: a block is 1 MiB, so 3,153 blocks fit and the estimate becomes 50,432 tokens.</li><li>A quantized checkpoint frees weight memory.</li></ul></li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Error messages and where they come from">
+<table>
+  <thead><tr><th>Message (start)</th><th>Process</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>"Engine core initialization failed. See root cause above."</td><td>API server</td><td>{{cite vllm/v1/engine/utils.py:1468-1477}}</td></tr>
+    <tr><td>"EngineCore failed to start." / "EngineCore encountered a fatal error."</td><td>engine core</td><td>{{cite vllm/v1/engine/core.py:1570-1574}}</td></tr>
+    <tr><td>"WorkerProc failed to start."</td><td>worker</td><td>{{cite vllm/v1/executor/multiproc_executor.py:957}}</td></tr>
+    <tr><td>"Timed out waiting for engine core processes to start."</td><td>API server (N &gt; 1)</td><td>{{cite vllm/v1/engine/core_client.py:760-768}}</td></tr>
+    <tr><td>"Did not receive response from front-end process within 5 minutes"</td><td>engine core</td><td>{{cite vllm/v1/engine/core.py:1408-1413}}</td></tr>
+    <tr><td>"RPC call to execute_model timed out."</td><td>engine core (mp executor)</td><td>{{cite vllm/v1/executor/multiproc_executor.py:443}}</td></tr>
+    <tr><td>"Error in memory profiling. Initial free memory ..."</td><td>worker: another process freed GPU memory during the profile</td><td>{{cite vllm/v1/worker/gpu_worker.py:723-731}}</td></tr>
+    <tr><td>"max_num_batched_tokens (N) is smaller than max_model_len (M)."</td><td>front end: chunked prefill off</td><td>{{cite vllm/config/scheduler.py:318-329}}</td></tr>
+    <tr><td>"max_num_batched_tokens (N) must be greater than or equal to max_num_seqs (M)."</td><td>front end</td><td>{{cite vllm/config/scheduler.py:331-335}}</td></tr>
+    <tr><td>"Error: --enable-auto-tool-choice requires --tool-call-parser"</td><td>CLI</td><td>{{cite vllm/entrypoints/common/cli_args.py:523-525}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables for troubleshooting">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_LOGGING_LEVEL</code></td><td>INFO ({{cite vllm/envs.py:860}})</td><td>DEBUG shows plugin discovery, idle log lines and more</td></tr>
+    <tr><td><code>VLLM_ENGINE_READY_TIMEOUT_S</code></td><td>600 ({{cite vllm/envs.py:812-814}})</td><td>start-up wait with more than one API server</td></tr>
+    <tr><td><code>VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS</code></td><td>300 ({{cite vllm/envs.py:1861-1863}})</td><td>wait for workers per step (mp executor)</td></tr>
+    <tr><td><code>VLLM_KEEP_ALIVE_ON_ENGINE_DEATH</code></td><td>0 ({{cite vllm/envs.py:1107-1109}})</td><td>keep the HTTP server after engine death</td></tr>
+    <tr><td><code>VLLM_ALLOW_LONG_MAX_MODEL_LEN</code></td><td>0 ({{cite vllm/envs.py:1114-1117}})</td><td>allow a length above the model config (risky)</td></tr>
+    <tr><td><code>VLLM_PLUGINS</code></td><td>unset = all ({{cite vllm/envs.py:1163-1167}})</td><td>filter plugins by name</td></tr>
+    <tr><td><code>VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS</code></td><td>1 ({{cite vllm/envs.py:2217-2219}})</td><td>0 removes the graph estimate from the KV budget</td></tr>
+    <tr><td><code>VLLM_CACHE_ROOT</code></td><td><code>~/.cache/vllm</code> or under <code>XDG_CACHE_HOME</code> ({{cite vllm/envs.py:713-718}})</td><td>compile and model-info caches</td></tr>
+  </tbody>
+</table>
+<p>All variables are on {{link reference/env-vars}}.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<p>Troubleshooting itself has traps:</p>
+<ul>
+  <li><strong>Reading the last error instead of the first.</strong> The API server's "Engine core initialization failed" is a consequence; the cause is above it (Step 1).</li>
+  <li><strong>Copying the suggested <code>--kv-cache-memory=N</code> to another machine.</strong> The value is valid only for the same GPU with the same free memory (Step 2).</li>
+  <li><strong>Trusting old docs for preemption.</strong> The V0 warning line in the docs does not exist in the current code (Step 8).</li>
+  <li><strong>Raising <code>VLLM_ENGINE_READY_TIMEOUT_S</code> with one API server.</strong> It has no effect there (Step 5).</li>
+  <li><strong>Setting <code>VLLM_KEEP_ALIVE_ON_ENGINE_DEATH=1</code> in production.</strong> The server stays up but answers 500 to every request; the orchestrator does not restart it unless it checks <code>/health</code> (Step 6).</li>
+</ul>
+<p><strong>Why it matters.</strong> Most vLLM problems leave a precise message in the right process log. Know the phase, the process and the line of code that wrote the message. Then a fix usually takes minutes instead of hours.</p>
+
+<x-quiz>
+  <x-q level="easy">The log ends with "Engine core initialization failed. See root cause above." Where is the cause?
+    <x-a><p>In the first traceback of an <code>EngineCore</code> or worker line above it. The engine core logs "EngineCore failed to start." with the traceback and re-raises ({{cite vllm/v1/engine/core.py:1570-1572}}); the API server only reports that the process exited ({{cite vllm/v1/engine/utils.py:1468-1477}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">A client gets HTTP 404 "The model ... does not exist". What do you check?
+    <x-a><p>Compare the <code>model</code> field of the request with <code>GET /v1/models</code>. It must be a served name (<code>--served-model-name</code>, else the model path) or a loaded LoRA name ({{cite vllm/entrypoints/serve/engine/serving.py:75-84}}, {{cite vllm/config/model.py:2330-2334}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">After an hour of traffic, every request gets HTTP 500 and the server exits a few seconds later. What happened, and what keeps it from exiting?
+    <x-a><p>The engine core died ({{term engine-death}}): the front end raises <code>EngineDeadError</code>, requests get 500, and the watchdog stops the server within about 5 s ({{cite vllm/entrypoints/serve/exception_handling/error_response.py:68-72}}, {{cite vllm/entrypoints/launchers/launcher.py:314-337}}). <code>VLLM_KEEP_ALIVE_ON_ENGINE_DEATH=1</code> keeps it up, but the engine stays dead; read the engine core traceback instead.</p></x-a>
+  </x-q>
+  <x-q level="medium">Prefix caching is on, every request has the same 10-token system prompt, and the hit rate is 0 %. Why?
+    <x-a><p>Only full blocks can hit, and a block has 16 tokens by default ({{cite vllm/v1/core/kv_cache_manager.py:264-266}}, {{cite vllm/config/cache.py:182}}). A shared prefix of 10 tokens never fills a block, so no block hash matches.</p></x-a>
+  </x-q>
+  <x-q level="hard">On a 24 GiB GPU, start-up says "the estimated maximum model length is 25200". You set <code>--max-model-len 25200</code>. How many full-length requests fit at once, and how could you get about twice as many?
+    <x-a><p>One: the usable blocks (1,575) cover exactly 25,200 tokens, and the log shows a maximum concurrency of about 1.0x ({{cite vllm/v1/core/kv_cache_utils.py:1031-1047}}; deep dive). <code>--kv-cache-dtype fp8</code> halves the bytes per token ({{cite vllm/v1/kv_cache_interface.py:571-575}}), so about twice as many tokens fit; check the output quality after the change.</p></x-a>
+  </x-q>
+</x-quiz>

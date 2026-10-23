@@ -1,0 +1,233 @@
+---
+title: Tuning vLLM: throughput and latency knobs, their real defaults and what each one does
+nav_title: Tuning knobs
+level: Advanced
+prerequisites: concepts/kv-cache-manager, concepts/scheduler, learn/serving-metrics
+related: concepts/kv-cache-manager, concepts/scheduler, concepts/compile-and-cuda-graphs, concepts/async-scheduling, concepts/speculative-decoding, concepts/prefix-caching, concepts/metrics-and-observability, concepts/benchmarking, concepts/troubleshooting, reference/serve-flags, reference/env-vars
+summary: Which vllm serve flags change throughput and latency, where in the code each one acts, and its real default. With a KV cache playground that computes blocks and the maximum-concurrency log line from the code's formulas, and a symptom-to-knob table.
+scripts: viz/tuning_playground.js
+---
+<x-sentence>Memory knobs fix the KV block pool at start-up; scheduler knobs shape each step; execution and front-end knobs change the cost of a step.</x-sentence>
+
+<h2>The idea</h2>
+<p>A vLLM server has a few dozen flags that change speed. They act in three places, at three times. This page sorts them by place, gives each real default with the line that sets it, and says what the knob trades. It does not give performance numbers: measure your own workload with {{link concepts/benchmarking}}.</p>
+<ol>
+  <li><strong>Memory, once at start-up.</strong> <code>--gpu-memory-utilization</code>, <code>--kv-cache-memory-bytes</code>, <code>--kv-cache-dtype</code>, <code>--max-model-len</code> and the size of the weights decide how many KV blocks exist. The block count does not change while the server runs. The engine core logs it as the {{term max-concurrency | maximum concurrency}}.</li>
+  <li><strong>The scheduler, every step.</strong> <code>--max-num-seqs</code>, <code>--max-num-batched-tokens</code> (the {{term token-budget}}), chunked prefill and the scheduling policy decide which requests share a step. They trade time to first token (TTFT) against inter-token latency (ITL) and throughput ({{link learn/serving-metrics}}).</li>
+  <li><strong>Execution and the front end.</strong> CUDA graphs, <code>torch.compile</code>, speculative decoding and async scheduling change how long a step takes. <code>--api-server-count</code>, the renderer threads and <code>--stream-interval</code> change the CPU work in the API server.</li>
+</ol>
+<p>Most knobs have a default that the code computes. The dataclass default is often not the real default: for example, <code>SchedulerConfig</code> says 128 sequences, but <code>vllm serve</code> on an 80 GiB H100 uses 1024. The full flag list with real defaults is on {{link reference/serve-flags#tune-first | the serve-flags reference}}; this page explains the mechanisms behind the most important ones.</p>
+<p><strong>An everyday comparison.</strong> Think of a restaurant. The size of the dining room is fixed when it opens (memory knobs). The head waiter decides each minute which guests to seat and how many dishes the kitchen starts (scheduler knobs). The kitchen equipment and the number of waiters at the door decide how fast one round goes (execution and front-end knobs). The comparison stops at the tables. In vLLM, one long conversation can take the space of many short ones. A guest can also lose the table (preemption) when the room is full.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b9_tuning_knobs" alt="Panel 1, start-up, in green: GPU memory budget with --gpu-memory-utilization 0.92, requested equals ceil of total times utilization, and --kv-cache-memory-bytes that skips the memory profiling; bytes per block with --kv-cache-dtype fp8 using 1 byte instead of 2, --block-size 16, --quantization for smaller weights, and -tp N that divides weights and KV heads by N; blocks and concurrency, with blocks equal to available divided by bytes per block, --max-model-len that must fit, and the log line Maximum concurrency. Panel 2, each step, in violet: batch width --max-num-seqs 1024, which also sizes runner buffers and CUDA graph sizes; token budget --max-num-batched-tokens 8192, decode tokens first, --long-prefill-token-threshold 0, throughput mode doubles; order with --scheduling-policy fcfs or priority, preemption by recompute, prefix caching on. Panel 3: compile and CUDA graphs at -O2, --enforce-eager for a fast start and slower steps, interactivity sizes 1 to 32; fewer steps per token with --speculative-config and async scheduling; in amber the front-end CPU knobs --api-server-count, --renderer-num-workers, --stream-interval and -dp." caption="Figure: the three places where tuning knobs act. The values are the vllm serve defaults on one 80 GiB H100 (not an A100)." />
+<p>Read the panels from top to bottom. Panel 1 runs once, so its knobs need a restart. Panel 2 runs in the {{term engine-core}} process at every {{term engine-step | step}}. Panel 3 mixes the GPU workers (compile, graphs, drafts) and the API server process (amber).</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the memory budget and the KV cache size</h3>
+<p>At start-up, each worker measures how much memory is left for the KV cache. The page {{link concepts/kv-cache-manager}} explains the block pool; {{link concepts/executors-and-workers}} explains the {{term profile-run}}. The worker first computes the requested memory, a share of the whole GPU, and refuses to start when less is free ({{cite vllm/v1/worker/utils.py:724-726}}, {{cite vllm/v1/worker/utils.py:761-770}}). After a dummy forward pass with <code>max_num_batched_tokens</code> tokens, it computes the rest:</p>
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="738-748" highlight="744-748" />
+<p><code>non_kv_cache_memory</code> is the memory consumed since the start snapshot (weights, buffers, non-torch memory) plus the transient peak of the activations ({{cite vllm/utils/mem_utils.py:312-321}}). The CUDA graph estimate is on by default (<code>VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1</code>, {{cite vllm/envs.py:2217-2219}}). So the KV cache gets:</p>
+<pre><code class="language-none">available_kv = ceil(total × gpu_memory_utilization) − (consumed + peak_activation_headroom) − cudagraph_estimate</code></pre>
+<p>Four knobs change this result:</p>
+<ul>
+  <li><strong><code>--gpu-memory-utilization</code></strong>, default 0.92, is the share of the whole GPU for this instance ({{cite vllm/config/cache.py:212-221}}). Each 0.01 adds 1 % of the GPU to the KV cache.</li>
+  <li><strong><code>--max-num-batched-tokens</code></strong> sets the size of the profile run, so a larger budget measures a larger activation peak and leaves less KV memory ({{cite vllm/v1/worker/gpu/model_runner.py:231}}, {{cite vllm/v1/worker/gpu/model_runner.py:1022-1027}}).</li>
+  <li><strong><code>--enforce-eager</code></strong> turns off CUDA graphs, so the graph estimate is 0 and no graph is captured ({{cite vllm/v1/worker/gpu_worker.py:704-708}}, {{cite vllm/v1/worker/gpu_worker.py:983-985}}).</li>
+  <li><strong>{{term kv-cache-memory-bytes}}</strong> replaces the whole formula. The worker still runs the profile run (it compiles the model), but then returns the given size and logs that it does not respect <code>gpu_memory_utilization</code> ({{cite vllm/v1/worker/gpu_worker.py:653-679}}).</li>
+</ul>
+<x-warning title="The log suggests --kv-cache-memory, the flag is --kv-cache-memory-bytes">
+<p>After graph capture, the worker logs the measured parts and suggests a value: "Replace gpu_memory_utilization config with `--kv-cache-memory=N`" ({{cite vllm/v1/worker/gpu_worker.py:1035-1055}}). The flag is <code>--kv-cache-memory-bytes</code> ({{cite vllm/engine/arg_utils.py:1384-1386}}). The value takes plain bytes or a suffix: <code>40G</code> is 40 GiB, <code>40g</code> is 40 × 10<sup>9</sup> bytes ({{cite vllm/engine/arg_utils.py:396-409}}, {{cite vllm/utils/argparse_utils.py:30-74}}). The suggestion keeps a 150 MiB buffer ({{cite vllm/v1/worker/gpu_worker.py:1017}}). It is valid only for the same GPU with the same free memory at start-up.</p>
+</x-warning>
+
+<h3>Step 2: max_model_len and the maximum-concurrency line</h3>
+<p>After the KV cache is sized, the engine core stores the capacity and logs one line ({{cite vllm/v1/engine/core.py:342}}):</p>
+<x-code file="vllm/v1/core/kv_cache_utils.py" lines="1090-1108" highlight="1094,1101-1108" />
+<p>The concurrency is the number of blocks divided by the blocks that one request of <code>max_model_len</code> needs. For a model with one KV cache group, that is <code>num_blocks / cdiv(max_model_len, block_size)</code>. With several groups, vLLM adds the blocks per request of all groups ({{cite vllm/v1/core/kv_cache_utils.py:1031-1041}}). The token count in the log is <code>int(concurrency × max_model_len)</code> ({{cite vllm/v1/core/kv_cache_utils.py:1074-1082}}). So "Maximum concurrency 3.41x" means: 3.41 requests of the full length fit at once. Shorter requests fit many more times.</p>
+<p><code>--max-model-len</code> does not change the block count. It changes the check at start-up: one request of that length must fit in the KV cache, minus one block for the null block ({{cite vllm/v1/core/kv_cache_planning.py:1572-1582}}, {{cite vllm/v1/core/kv_cache_planning.py:1590-1598}}). If it does not fit, start-up stops with an estimate of the largest length that fits ({{cite vllm/v1/core/kv_cache_planning.py:68-87}}). With <code>--max-model-len auto</code> (or <code>-1</code>), vLLM lowers the length to that estimate and logs "Auto-fit max_model_len: reduced from ..." ({{cite vllm/v1/core/kv_cache_planning.py:1584-1587}}, {{cite vllm/v1/core/kv_cache_planning.py:1393-1410}}). The default is the length from the model's config ({{cite vllm/config/model.py:2639-2653}}).</p>
+
+<x-viz id="tuning-playground" title="KV cache sizing playground" caption="Change any value; the results update at once. All memory values are per GPU. The profile parts (weights, activations, graph estimate) are your inputs: vLLM measures them at start-up. A simplified model: see the formulas below and the box after them." />
+<p>The playground uses only these formulas from the code:</p>
+<ol>
+  <li><code>requested = ceil(total × gpu_memory_utilization)</code> ({{cite vllm/v1/worker/utils.py:724-726}}).</li>
+  <li><code>available = requested − (consumed + peak_headroom) − cudagraph_estimate</code> ({{cite vllm/v1/worker/gpu_worker.py:744-748}}, {{cite vllm/utils/mem_utils.py:312-321}}). With <code>--kv-cache-memory-bytes</code>: <code>available</code> = that value ({{cite vllm/v1/worker/gpu_worker.py:653-679}}).</li>
+  <li><code>bytes_per_block = bytes_per_token × block_size</code>, where bytes per token is the sum over the layers of <code>num_kv_heads × (head_size + head_size_v) × dtype_bytes</code> ({{cite vllm/v1/kv_cache_interface.py:571-579}}, {{cite vllm/v1/core/kv_cache_planning.py:587-593}}).</li>
+  <li><code>num_blocks = available // bytes_per_block</code> ({{cite vllm/v1/core/kv_cache_planning.py:1610-1611}}).</li>
+  <li>Fit check: <code>cdiv(max_model_len, block_size) × bytes_per_block ≤ available − bytes_per_block</code> ({{cite vllm/v1/core/kv_cache_planning.py:1572-1582}}, {{cite vllm/v1/core/kv_cache_planning.py:68-87}}). When <code>available − bytes_per_block ≤ 0</code>, start-up stops earlier with "No available memory for the cache blocks." ({{cite vllm/v1/core/kv_cache_planning.py:56-64}}).</li>
+  <li><code>max_concurrency = num_blocks / cdiv(max_model_len, block_size)</code>; logged tokens <code>= int(max_concurrency × max_model_len)</code> ({{cite vllm/v1/core/kv_cache_utils.py:1031-1047}}, {{cite vllm/v1/core/kv_cache_utils.py:1074-1082}}).</li>
+  <li>"Use vllm serve defaults" applies the memory tiers, the throughput doubling and the two caps of Step 3 ({{cite vllm/engine/arg_utils.py:2958-2993}}, {{cite vllm/engine/arg_utils.py:3171-3175}}, {{cite vllm/engine/arg_utils.py:3206-3221}}).</li>
+</ol>
+<x-simplified>
+<p>The playground assumes one KV cache group (a plain decoder such as Llama) and per-GPU values (with TP, enter the share of one GPU). "Requests that fit" divides the usable blocks by the blocks of one average request. The real scheduler admits a request only when all its current tokens fit ({{cite vllm/v1/core/kv_cache_manager.py:522-539}}). The request then grows during decode, and the scheduler preempts when blocks run out ({{link concepts/scheduler}}). Prefix-cache hits share blocks and let more requests fit. Hybrid models have several groups ({{link concepts/hybrid-kv-cache}}). The real profile also checks that the requested memory is free at start-up. Multimodal models also reserve some GPU memory for the front end, which the playground leaves out ({{cite vllm/v1/worker/gpu_worker.py:807-811}}).</p>
+</x-simplified>
+
+<h3>Step 3: max_num_seqs and max_num_batched_tokens</h3>
+<p>Both flags are <code>None</code> by default. <code>create_engine_config</code> fills them by the usage context and the memory of one GPU ({{term usage-context}}). For <code>vllm serve</code> (<code>OPENAI_API_SERVER</code>):</p>
+<x-code file="vllm/engine/arg_utils.py" lines="2958-2993" highlight="2960,2970-2974,2984" />
+<p>Then these rules apply, only to values that you did not set yourself:</p>
+<x-code file="vllm/engine/arg_utils.py" lines="3170-3175" />
+<ul>
+  <li>{{term performance-mode | --performance-mode throughput}} doubles both defaults (above). The other modes are <code>balanced</code> (default) and <code>interactivity</code> ({{cite vllm/config/vllm.py:146}}).</li>
+  <li>Without chunked prefill, the token budget is at least <code>max_model_len</code> ({{cite vllm/engine/arg_utils.py:3177-3186}}).</li>
+  <li>The token budget is at most <code>max_num_seqs × max_model_len</code> ({{cite vllm/engine/arg_utils.py:3206-3211}}).</li>
+  <li><code>max_num_seqs</code> is at most the token budget ({{cite vllm/engine/arg_utils.py:3219-3221}}).</li>
+  <li>For a multimodal prefix-LM model, the budget grows until the largest multimodal item fits ({{cite vllm/engine/arg_utils.py:3188-3203}}).</li>
+</ul>
+<p>Values that you set are checked, not changed. <code>max_num_seqs</code> larger than the token budget raises <code>ValueError</code> at start-up ({{cite vllm/config/scheduler.py:331-336}}). When chunked prefill is on, <code>SchedulerConfig</code> logs the budget once: "Chunked prefill is enabled with max_num_batched_tokens=N." ({{cite vllm/config/scheduler.py:309-313}}).</p>
+<p>What the two knobs change:</p>
+<ul>
+  <li><strong><code>max_num_seqs</code></strong> caps the running requests per step ({{cite vllm/v1/core/sched/scheduler.py:979-981}}). It also sizes the per-request buffers of the model runner and the default CUDA graph capture sizes (Step 6). A larger value gives more throughput only when the KV cache can hold that many requests. <code>--max-num-active-seqs</code> lowers only the admission limit and keeps the buffers ({{cite vllm/config/scheduler.py:69-76}}).</li>
+  <li><strong><code>max_num_batched_tokens</code></strong> caps the tokens per step. The scheduler gives running requests their tokens first, then admits waiting requests with the rest ({{cite vllm/v1/core/sched/scheduler.py:713-715}}, {{cite vllm/v1/core/sched/scheduler.py:956-957}}). A larger budget moves prompts through faster (lower TTFT under load) but makes the steps longer, so running requests see a higher ITL. It also sets the profile-run size (Step 1) and is part of the compile cache key, so a change compiles again ({{cite vllm/config/scheduler.py:271-284}}).</li>
+</ul>
+<x-note title="A practical rule">
+<p>Start from the defaults. Change <code>max_num_batched_tokens</code> first, and judge it by TTFT and ITL percentiles at your target request rate. The vLLM docs say: "For optimal throughput, we recommend setting <code>max_num_batched_tokens &gt; 8192</code> especially for smaller models on large GPUs" ({{cite docs/configuration/optimization.md:66}}). Raise <code>max_num_seqs</code> only when <code>vllm:num_requests_running</code> stays at the limit while the KV cache usage is low.</p>
+</x-note>
+
+<h3>Step 4: chunked prefill and the long-prefill cap</h3>
+<p>Chunked prefill is on for generative decoder models: the default comes from <code>is_chunked_prefill_supported</code> of the model, not from the dataclass ({{cite vllm/engine/arg_utils.py:3031-3040}}). A prompt that does not fit the rest of the budget gets a chunk, and the next steps continue it ({{deepinfer learn/batching | Batching}}). Without chunked prefill, the budget must be at least <code>max_model_len</code> ({{cite vllm/config/scheduler.py:318-329}}).</p>
+<p>A long prompt can still take the whole rest of a step. <code>--long-prefill-token-threshold N</code> caps the tokens that one prefill takes per step. The default 0 turns the cap off ({{cite vllm/config/scheduler.py:79-84}}):</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="674-689" highlight="679-683,684-689" />
+<p>The cap applies only when more than one request runs or waits (lines 679-683). With <code>--long-prefill-token-threshold-adaptive</code>, the cap is never below a fair share of the budget (lines 684-689). A smaller cap spreads a long prompt over more steps: its own TTFT grows, and the other requests get more room in each step.</p>
+
+<h3>Step 5: bytes per token: block size, prefix caching, KV dtype, quantization</h3>
+<ul>
+  <li><strong><code>--block-size</code></strong>: 16 tokens unless an attention backend needs another size ({{cite vllm/config/cache.py:182}}; {{link concepts/attention-backends}}). The block size does not change the bytes per token. It changes the rounding: a request uses <code>cdiv(tokens, block_size)</code> blocks, and only full blocks are cached for prefix hits.</li>
+  <li><strong><code>--enable-prefix-caching</code></strong>: on by default for generative decoder and hybrid models ({{cite vllm/engine/arg_utils.py:3062-3063}}). Requests with a shared prefix share blocks and skip that part of the prefill ({{link concepts/prefix-caching}}). It changes no block count, but more requests fit when they share blocks.</li>
+  <li><strong><code>--kv-cache-dtype fp8</code></strong>: 1 byte per value instead of 2, so the page size and the bytes per token halve (derived from {{cite vllm/v1/kv_cache_interface.py:571-575}}). The default <code>auto</code> uses the model data type ({{cite vllm/config/cache.py:232-233}}), unless the checkpoint declares a KV cache scheme, for example an FP8 one ({{cite vllm/utils/torch_utils.py:503-521}}, {{cite vllm/model_executor/layers/attention/attention.py:287-291}}). Without scales in the checkpoint, the layer uses the scale 1.0 ({{cite vllm/model_executor/layers/attention/attention.py:133-154}}). Check the output quality of your model after the change ({{deepinfer learn/number-formats | Number formats}}).</li>
+  <li><strong><code>--quantization</code></strong>: smaller weights leave more memory for the KV cache. The default is the <code>quantization_config</code> of the checkpoint ({{cite vllm/config/model.py:264-268}}); see {{link learn/quantized-checkpoints}} and {{link concepts/quantization-plugins}}.</li>
+</ul>
+
+<h3>Step 6: compile, CUDA graphs and -O levels: start-up time against step time</h3>
+<p>The default optimization level is O2 ({{cite vllm/config/vllm.py:434}}). O2 compiles the model with <code>torch.compile</code> and captures FULL and PIECEWISE CUDA graphs ({{cite vllm/config/vllm.py:131-143}}, {{cite vllm/config/vllm.py:310}}). {{link concepts/compile-and-cuda-graphs}} explains both. For tuning, the trade is simple: compile and capture cost start-up time and some memory, and save launch overhead in every step ({{deepinfer concepts/cuda-graphs | CUDA graphs}}).</p>
+<ul>
+  <li><strong><code>-O0</code> or <code>--enforce-eager</code></strong>: no compile, no graphs. <code>--enforce-eager</code> sets the compile mode and the graph mode to <code>NONE</code> ({{cite vllm/config/vllm.py:1745-1747}}). Start-up is fastest, and the graph memory goes to the KV cache (Step 1). Every step pays the full kernel launch cost.</li>
+  <li><strong><code>-O1</code></strong>: compile with PIECEWISE graphs only.</li>
+  <li><strong>Capture sizes.</strong> When you set no sizes, the largest captured batch is <code>min(max_num_seqs × decode_query_len × 2, 512)</code> (1024 on data-center Blackwell), then at most the token budget ({{cite vllm/config/vllm.py:2439-2449}}, {{cite vllm/config/vllm.py:2530-2531}}). The sizes are 1, 2, 4, then steps of 8 up to 248, then steps of 16 ({{cite vllm/config/vllm.py:2557-2570}}). A decode batch larger than the largest size runs without a graph.</li>
+  <li><strong><code>--performance-mode interactivity</code></strong> captures every size from 1 to 32 instead of 1, 2, 4, 8, 16, 24, 32 ({{cite vllm/config/vllm.py:2552-2556}}). Small batches then need less padding, and start-up captures more graphs.</li>
+</ul>
+<p>The warm start matters as much as the level: the compile cache under <code>VLLM_CACHE_ROOT</code> makes the second start-up much shorter ({{link tours/serve-startup}}, {{link concepts/troubleshooting}}).</p>
+
+<h3>Step 7: async scheduling and speculative decoding: fewer idle gaps, fewer steps</h3>
+<p><strong>Async scheduling</strong> is on by default for generative models when the executor supports it ({{cite vllm/config/vllm.py:1664-1698}}). The engine core schedules step N+1 while the GPU runs step N ({{link concepts/async-scheduling}}). Turn it off (<code>--no-async-scheduling</code>) only to compare.</p>
+<p><strong>Speculative decoding</strong> (<code>--speculative-config</code>, off by default, {{cite vllm/config/vllm.py:383}}) proposes <em>k</em> draft tokens and checks them in one target step ({{deepinfer concepts/speculative-decoding | Speculative decoding}}; {{link concepts/speculative-decoding}}). It saves steps only when drafts are accepted. The vLLM docs say that it reduces "inter-token latency under medium-to-low QPS (queries per second), memory-bound workloads" ({{cite docs/features/speculative_decoding/README.md:3}}). Their table rates the gain per method for low and high QPS ({{cite docs/features/speculative_decoding/README.md:30-39}}). Watch the acceptance with these PromQL formulas from the code ({{cite vllm/v1/spec_decode/metrics.py:178-196}}):</p>
+<pre><code class="language-none">acceptance rate      = rate(vllm:spec_decode_num_accepted_tokens_total[5m]) / rate(vllm:spec_decode_num_draft_tokens_total[5m])
+mean acceptance len  = 1 + rate(vllm:spec_decode_num_accepted_tokens_total[5m]) / rate(vllm:spec_decode_num_drafts_total[5m])</code></pre>
+<p>The log line "SpecDecoding metrics: Mean acceptance length: ..." shows the same values every log interval ({{cite vllm/v1/spec_decode/metrics.py:107-136}}). A mean acceptance length near 1 means that the drafts cost work and save no step.</p>
+
+<h3>Step 8: parallelism, API servers, streaming and priorities</h3>
+<ul>
+  <li><strong>TP or DP.</strong> {{term tensor-parallel | Tensor parallelism}} splits one model copy over several GPUs: it fits larger models and makes each step faster, with an all-reduce per layer ({{link learn/tp-pp-in-practice}}). {{term data-parallel | Data parallelism}} (<code>-dp N</code>) runs N engine copies; each has its own scheduler and KV cache ({{link concepts/data-parallel-serving}}). A practical rule, not a measured number: when one copy fits on one GPU, more copies give more throughput. TP gives a lower latency per request.</li>
+  <li><strong><code>--api-server-count</code></strong> runs N API server processes on one port. The default is the DP size with internal load balancing, the local DP size with hybrid load balancing, else 1 ({{cite vllm/entrypoints/cli/serve.py:113-130}}). Rendering, tokenization, detokenization and JSON run in the API server ({{link concepts/openai-server}}). When the API server process is at 100 % CPU, more API servers help; the vLLM docs show <code>--api-server-count 4</code> with one engine ({{cite docs/configuration/optimization.md:316-327}}). With more than one API server, the periodic log line is off and Prometheus uses a multiprocess directory ({{cite vllm/v1/metrics/loggers.py:1385-1389}}, {{cite vllm/entrypoints/cli/serve.py:282-283}}).</li>
+  <li><strong><code>--renderer-num-workers</code></strong>, default 1, is the number of threads that tokenize and render chat templates in each API server ({{cite vllm/config/model.py:412-420}}, {{cite vllm/renderers/base.py:143-144}}).</li>
+  <li><strong><code>--stream-interval N</code></strong>, default 1, makes the front end send a stream chunk only every N tokens, plus the first and the last ({{cite vllm/config/scheduler.py:216-220}}, {{cite vllm/v1/engine/output_processor.py:379-391}}). Fewer chunks mean less CPU work per token. A request can raise it with its own <code>stream_interval</code> field, never lower it ({{cite vllm/v1/engine/output_processor.py:300-302}}).</li>
+  <li><strong><code>--scheduling-policy priority</code></strong> admits requests by the <code>priority</code> field (lower value first) and preempts the request with the largest priority value first ({{cite vllm/config/scheduler.py:159-165}}; {{link concepts/scheduler}}). The header <code>X-Vllm-Priority</code> overrides the body field ({{cite vllm/entrypoints/generate/base/serving.py:253-265}}). With the default <code>fcfs</code>, the field has no effect.</li>
+</ul>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: Llama-3.1-8B on one 80 GiB H100, five changes">
+<p>Start: an 80 GiB GPU and <code>gpu_memory_utilization</code> 0.92. The profile finds 15 GiB weights, 1 GiB other consumed memory, a 2.5 GiB activation peak and a 0.5 GiB graph estimate. These four memory values are assumptions (the same as in the figure of {{link concepts/kv-cache-manager}}); vLLM measures them on your GPU. The KV values are from the model's Hugging Face config (inferred, not in the repository). One token needs 32 layers × 8 KV heads × (128 + 128) × 2 bytes = 128 KiB. With <code>block_size</code> 16, one block is 2 MiB.</p>
+<table>
+  <thead><tr><th>Setting</th><th>Available KV</th><th>Blocks</th><th>Log: tokens, concurrency</th><th>Requests of 2,500 tokens that fit</th></tr></thead>
+  <tbody>
+    <tr><td>Defaults, <code>max_model_len</code> 131,072</td><td>54.60 GiB</td><td>27,955</td><td>447,280; 3.41x</td><td>178</td></tr>
+    <tr><td><code>--kv-cache-dtype fp8</code></td><td>54.60 GiB</td><td>55,910</td><td>894,560; 6.82x</td><td>356</td></tr>
+    <tr><td><code>--max-model-len 32768</code></td><td>54.60 GiB</td><td>27,955</td><td>447,280; 13.65x</td><td>178</td></tr>
+    <tr><td><code>--gpu-memory-utilization 0.95</code></td><td>57.00 GiB</td><td>29,184</td><td>466,944; 3.56x</td><td>185</td></tr>
+    <tr><td><code>--enforce-eager</code> (graph estimate 0)</td><td>55.10 GiB</td><td>28,211</td><td>451,376; 3.44x</td><td>179</td></tr>
+  </tbody>
+</table>
+<ol>
+  <li>Requested: ceil(80 GiB × 0.92) = 73.6 GiB. Available: 73.6 − (16.0 + 2.5) − 0.5 = 54.6 GiB ({{cite vllm/v1/worker/gpu_worker.py:744-748}}).</li>
+  <li>Blocks: 54.6 GiB / 2 MiB = 27,955 ({{cite vllm/v1/core/kv_cache_planning.py:1610-1611}}).</li>
+  <li>Concurrency: 131,072 / 16 = 8,192 blocks per full request; 27,955 / 8,192 = 3.41 ({{cite vllm/v1/core/kv_cache_utils.py:1031-1047}}).</li>
+  <li>Requests that fit: one 2,500-token request uses cdiv(2500, 16) = 157 blocks; (27,955 − 1) / 157 = 178 (the null block is not usable).</li>
+</ol>
+<p>Three lessons follow. First, <code>--max-model-len</code> changes the concurrency in the log, but not the memory: the same 178 average requests fit. Second, <code>max_num_seqs</code> 1024 does not bind here: the KV cache stops this workload at about 178 running requests, so a larger <code>max_num_seqs</code> changes nothing. Third, the KV dtype doubles the capacity; the other knobs give a few percent.</p>
+<p>In one step at that load, 178 decode tokens use 178 of the 8,192 budget tokens. About 8,014 tokens are left for prefill chunks, so a new 2,500-token prompt fits into one step (derived from the order in {{cite vllm/v1/core/sched/scheduler.py:713-715}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Default capture sizes, counted">
+<p>On one 80 GiB H100 with the defaults (<code>max_num_seqs</code> 1024, budget 8,192, no speculative decoding):</p>
+<ol>
+  <li>Largest size: min(1024 × 1 × 2, 512) = 512, then min(8192, 512) = 512 ({{cite vllm/config/vllm.py:2442-2450}}, {{cite vllm/config/vllm.py:2530-2531}}).</li>
+  <li>Sizes: 1, 2, 4 (3 sizes); 8, 16, ..., 248 (31 sizes); 256, 272, ..., 512 (17 sizes) = <strong>51 sizes</strong> ({{cite vllm/config/vllm.py:2557-2570}}).</li>
+  <li>With <code>--performance-mode interactivity</code>: 1 to 32 (32 sizes) plus 40, ..., 248 (27 sizes) plus the 17 large sizes = <strong>76 sizes</strong> (derived from {{cite vllm/config/vllm.py:2552-2570}}).</li>
+  <li>On an A100 with 2,048 tokens and 256 sequences: min(256 × 2, 512) = 512, so again 51 sizes.</li>
+</ol>
+<p>Each size is captured for each graph mode that applies, so more sizes mean a longer capture at start-up and more graph memory. A decode batch of 600 requests is above 512 and runs without a CUDA graph ({{link concepts/compile-and-cuda-graphs}}).</p>
+</x-deepdive>
+
+<x-deepdive title="What --performance-mode really changes">
+<p>The docstring of the field says that <code>interactivity</code> uses "fine-grained CUDA graphs, latency-oriented kernels" and <code>throughput</code> uses "larger CUDA graphs, more aggressive batching, throughput-oriented kernels" ({{cite vllm/config/vllm.py:440-445}}). At this commit, the code reads the field in two places only: the doubling of the batch defaults ({{cite vllm/engine/arg_utils.py:3171-3175}}) and the interactivity capture sizes ({{cite vllm/config/vllm.py:2552-2556}}). A search of <code>vllm/</code> finds no other reader of <code>performance_mode</code> (a <code>git grep</code> at the pinned commit; open question for later commits). The doubling applies only to values that you did not set. A mode other than <code>balanced</code> is logged: "Performance mode set to ..." ({{cite vllm/config/vllm.py:1518-1519}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Flags and environment variables of this page">
+<table>
+  <thead><tr><th>Flag or variable</th><th>Real default for vllm serve</th><th>Read at</th></tr></thead>
+  <tbody>
+    <tr><td><code>--gpu-memory-utilization</code></td><td>0.92</td><td>{{cite vllm/config/cache.py:212}}</td></tr>
+    <tr><td><code>--kv-cache-memory-bytes</code></td><td>none (measure)</td><td>{{cite vllm/config/cache.py:371}}</td></tr>
+    <tr><td><code>--max-model-len</code></td><td>from the model config; <code>auto</code> fits to memory</td><td>{{cite vllm/config/model.py:2639-2653}}</td></tr>
+    <tr><td><code>--max-num-seqs</code>, <code>--max-num-batched-tokens</code></td><td>by GPU memory: 1024 / 16384 (≥ 160 GiB), 1024 / 8192 (≥ 70 GiB, not A100/GB10), 256 / 2048</td><td>{{cite vllm/engine/arg_utils.py:2958-2993}}</td></tr>
+    <tr><td><code>--performance-mode</code></td><td>balanced</td><td>{{cite vllm/config/vllm.py:440}}</td></tr>
+    <tr><td><code>--long-prefill-token-threshold</code></td><td>0 (off)</td><td>{{cite vllm/config/scheduler.py:79}}</td></tr>
+    <tr><td><code>--scheduling-policy</code></td><td>fcfs</td><td>{{cite vllm/config/scheduler.py:159}}</td></tr>
+    <tr><td><code>--stream-interval</code></td><td>1</td><td>{{cite vllm/config/scheduler.py:216}}</td></tr>
+    <tr><td><code>--async-scheduling</code></td><td>on unless incompatible</td><td>{{cite vllm/config/vllm.py:1664-1698}}</td></tr>
+    <tr><td><code>-O</code> / <code>--enforce-eager</code></td><td>O2 / off</td><td>{{cite vllm/config/vllm.py:434}}, {{cite vllm/config/model.py:276}}</td></tr>
+    <tr><td><code>--renderer-num-workers</code></td><td>1</td><td>{{cite vllm/config/model.py:412}}</td></tr>
+    <tr><td><code>--api-server-count</code></td><td>DP size (internal LB), local DP size (hybrid LB), else 1</td><td>{{cite vllm/entrypoints/cli/serve.py:113-130}}</td></tr>
+    <tr><td><code>VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS</code></td><td>1</td><td>{{cite vllm/envs.py:2217-2219}}</td></tr>
+  </tbody>
+</table>
+<p>The complete list is generated on {{link reference/serve-flags}} and {{link reference/env-vars}}; the config classes are on {{link reference/config-classes}}.</p>
+</x-deepdive>
+
+<x-deepdive title="A tuning method (advice)">
+<p>This method is advice, not code. Each step names the signal that the code gives.</p>
+<ol>
+  <li>Read the start-up log: "Available KV cache memory", "GPU KV cache size: N tokens, Maximum concurrency ..." ({{cite vllm/v1/worker/gpu_worker.py:763-766}}, {{cite vllm/v1/core/kv_cache_utils.py:1101-1108}}). If the concurrency for your real request length is low, fix memory first (Step 1, Step 5).</li>
+  <li>Run <code>vllm bench serve</code> with your request lengths at several request rates ({{link concepts/benchmarking}}).</li>
+  <li>Watch <code>vllm:num_requests_waiting</code>, <code>vllm:kv_cache_usage_perc</code> and <code>rate(vllm:num_preemptions_total[1m])</code> during the run ({{link concepts/metrics-and-observability}}). Waiting requests with low KV usage point to the token budget or <code>max_num_seqs</code>; high KV usage with preemptions points to memory.</li>
+  <li>Change one knob at a time, and compare the goodput at the same SLO.</li>
+</ol>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<p>The table maps a symptom to the knob to try first. Each row is advice; the cause column cites the code.</p>
+<table>
+  <thead><tr><th>Symptom</th><th>Likely cause (code)</th><th>Knob to try</th></tr></thead>
+  <tbody>
+    <tr><td>Start-up: "No available memory for the cache blocks"</td><td>weights + activation peak + graphs ≥ requested memory ({{cite vllm/v1/core/kv_cache_planning.py:56-64}})</td><td>raise <code>--gpu-memory-utilization</code>; lower <code>--max-num-batched-tokens</code>; <code>--enforce-eager</code>; TP or quantization</td></tr>
+    <tr><td>Start-up: "To serve at least one request with the model's max seq len ..."</td><td>one full-length request does not fit ({{cite vllm/v1/core/kv_cache_planning.py:68-87}})</td><td><code>--max-model-len</code> (or <code>auto</code>); <code>--kv-cache-dtype fp8</code></td></tr>
+    <tr><td><code>vllm:num_preemptions</code> rate above 0</td><td>running requests grow past the free blocks ({{link concepts/scheduler}})</td><td>more KV memory (Step 1, Step 5); lower <code>--max-num-seqs</code></td></tr>
+    <tr><td>High TTFT, many waiting requests, KV usage low</td><td>the token budget or <code>max_num_seqs</code> limits admission ({{cite vllm/v1/core/sched/scheduler.py:979-981}})</td><td>raise <code>--max-num-batched-tokens</code>, then <code>--max-num-seqs</code>; more replicas (<code>-dp</code>)</td></tr>
+    <tr><td>High ITL spikes when long prompts arrive</td><td>large prefill chunks share the step with decodes ({{cite vllm/v1/core/sched/scheduler.py:674-689}})</td><td>lower <code>--max-num-batched-tokens</code>; set <code>--long-prefill-token-threshold</code></td></tr>
+    <tr><td>Low GPU use, API server process at 100 % CPU</td><td>render, detokenize and JSON share one event loop ({{link concepts/openai-server}})</td><td><code>--api-server-count</code>; <code>--stream-interval</code>; <code>--renderer-num-workers</code></td></tr>
+    <tr><td>Slow start-up</td><td>compile and graph capture ({{link concepts/compile-and-cuda-graphs}})</td><td>keep the compile cache; <code>-O0</code> or <code>--enforce-eager</code> for development</td></tr>
+    <tr><td>Speculative decoding makes ITL worse</td><td>low acceptance ({{cite vllm/v1/spec_decode/metrics.py:107-115}})</td><td>fewer draft tokens, another method, or off</td></tr>
+    <tr><td>Changed <code>--max-num-batched-tokens</code>, start-up compiles again</td><td>the value is part of the compile hash ({{cite vllm/config/scheduler.py:271-284}})</td><td>expected; keep the value stable in production</td></tr>
+  </tbody>
+</table>
+<p><strong>Why it matters.</strong> Most slow servers have one binding limit: KV memory, the token budget, the batch width or the CPU of the front end. Know the code path of each knob. Then the start-up log and four metrics show the limit, and you change the right knob.</p>
+
+<x-quiz>
+  <x-q level="easy">Which two values set <code>max_num_seqs</code> and <code>max_num_batched_tokens</code> when you start <code>vllm serve</code> without these flags?
+    <x-a><p>The usage context (<code>OPENAI_API_SERVER</code> for <code>vllm serve</code>) and the memory of one GPU, plus a name check for A100 and GB10 ({{cite vllm/engine/arg_utils.py:2958-2993}}). <code>--performance-mode throughput</code> then doubles both ({{cite vllm/engine/arg_utils.py:3171-3175}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">The log says "Maximum concurrency for 131,072 tokens per request: 3.41x". Can the server run only 3 requests at once?
+    <x-a><p>No. The value is blocks divided by the blocks of one request of <code>max_model_len</code> ({{cite vllm/v1/core/kv_cache_utils.py:1031-1047}}). Shorter requests use fewer blocks, so many more fit; the running count is limited by <code>max_num_seqs</code> and the real request lengths.</p></x-a>
+  </x-q>
+  <x-q level="medium">You set <code>--max-num-seqs 2048 --max-num-batched-tokens 1024</code>. What happens?
+    <x-a><p>Start-up stops with <code>ValueError</code>: the token budget must be at least <code>max_num_seqs</code> ({{cite vllm/config/scheduler.py:331-335}}). vLLM caps <code>max_num_seqs</code> only when it fills the default itself ({{cite vllm/engine/arg_utils.py:3219-3221}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why can a larger <code>--max-num-batched-tokens</code> lower the KV cache size?
+    <x-a><p>The profile run uses <code>max_num_batched_tokens</code> tokens ({{cite vllm/v1/worker/gpu/model_runner.py:231}}, {{cite vllm/v1/worker/gpu/model_runner.py:1022-1027}}). A larger run has a larger activation peak, and the peak is subtracted from the requested memory ({{cite vllm/utils/mem_utils.py:318-321}}, {{cite vllm/v1/worker/gpu_worker.py:744-748}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">In the worked example, 178 requests of 2,500 tokens fit, and <code>max_num_seqs</code> is 1024. You raise <code>max_num_seqs</code> to 2048. What changes, and what does not?
+    <x-a><p>The KV cache still holds only about 178 such requests: the block count comes from memory, not from <code>max_num_seqs</code> (deep dive "Worked example"). The scheduler admits a request only when its tokens fit in free blocks ({{cite vllm/v1/core/kv_cache_manager.py:522-539}}), so the running count stays near 178. Three things do change. The per-request buffers of the runner grow. The default capture size stays at 512, because min(2048 × 2, 512) = 512 ({{cite vllm/config/vllm.py:2442-2450}}). The compile hash changes, so start-up compiles again ({{cite vllm/config/scheduler.py:271-284}}).</p></x-a>
+  </x-q>
+</x-quiz>

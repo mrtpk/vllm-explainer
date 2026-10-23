@@ -52,6 +52,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
 
+- FINAL-PASS TODO (B9 FC): openai-server and any page listing unguarded routes must add /generative_scoring and pooling routes; pages saying auto KV dtype = model dtype without the checkpoint scheme caveat; 'Engine 000:' is not DP-only.
+
 - FINAL-PASS TODO (B7b FC): concepts/model-runner ~165 'drafts never go to the CPU' wrong for structured-output batches; learn/lora-adapters + frontend-plugins: no 'adapter loads inside the step' wording; slot layouts follow activation at load.
 
 - FINAL-PASS TODO (B7b): compile-and-cuda-graphs should mention LoRA doubles CUDA graph captures by default; engine-hooks should mention custom logits processor add_request default True forces the FP32 copy.
@@ -157,7 +159,7 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-23 06:03 | B8a writer | done ~06:40; 2 diagrams, b8a.json 7 terms |
 | 2026-10-23 06:41 | B8a fact check | done ~07:30: ~330 claims, 22 defects |
 | 2026-10-23 07:31 | B9 writer (operating) | done ~08:25; 5 diagrams, tuning playground, b9.json 10 terms |
-| 2026-10-23 08:26 | B9 fact check | running |
+| 2026-10-23 08:26 | B9 fact check | done ~08:50: ~310 claims, 32 defects; playground verified |
 | 2026-10-23 07:21 | B8b writer | done ~08:15; 6 diagrams, b8b.json 16 terms |
 | 2026-10-23 08:16 | B8b fact check | done ~08:40: ~260 ranges + ~60 claims, ~36 defects; traced /scale_elastic_ep |
 | 2026-10-23 08:41 | B10 writer | running |

@@ -1,0 +1,198 @@
+---
+title: Deployment recipes: single GPU, TP, DP, multi-node, load balancers and security
+nav_title: Deployment recipes
+level: Advanced
+prerequisites: concepts/architecture-overview, concepts/openai-server
+related: concepts/data-parallel-serving, concepts/expert-parallel-moe, concepts/disaggregated-prefill, concepts/openai-server, concepts/executors-and-workers, concepts/tuning, concepts/troubleshooting, learn/tp-pp-in-practice, reference/serve-flags
+summary: The deployment shapes of vllm serve with their exact commands and the processes that each one starts: one GPU, tensor parallel on one node, data parallel with internal load balancing, DP+EP for MoE, multi-node, disaggregated prefill, and servers behind a load balancer with /health probes. Then what --api-key protects and what it does not.
+---
+<x-sentence>Each deployment shape is one vllm serve command per node; the flags decide which processes start, which port answers, and what is protected.</x-sentence>
+
+<h2>The idea</h2>
+<p><code>vllm serve</code> has one command line, but it starts different sets of processes. The {{term api-server}} can run inside the CLI process or in several child processes. The {{term engine-core}} can hold the worker itself or drive one worker process per GPU. A node can also run only workers or only engine cores, with no HTTP port at all (<code>--headless</code>). The page {{link concepts/architecture-overview}} explains the processes; this page gives the command for each common shape and what it starts.</p>
+<p>The second half of the page is about production. It shows how a load balancer sees a server (<code>/health</code>), how to start and stop it, and which routes need a proxy. <code>--api-key</code> alone does not protect a vLLM server.</p>
+<p><strong>An everyday comparison.</strong> Think of a kitchen. One cook can do everything at one stove. A large dish can need several cooks at one stove (tensor parallelism). A busy restaurant opens more stoves, each with its own cooks (data parallelism), and a host at the door spreads the guests (the load balancer). The comparison stops at the door. vLLM's lock (the API key) closes only some of the entrances, so the building needs its own guard (a proxy).</p>
+
+<h2>The picture</h2>
+<x-diagram name="b9_deploy_shapes" alt="Panel 1, one model copy on one node. Shape A, vllm serve M: the API server process is the vllm CLI with uvicorn, FastAPI and AsyncLLM on port 8000; it talks over ZMQ to the EngineCore process with the scheduler, the KV cache manager and the uni executor, so the worker runs there on GPU 0; 2 processes. Shape B, vllm serve M -tp 2: the same API server, an EngineCore with the mp executor, and over a shared-memory MessageQueue 2 worker processes Worker_TP0 on GPU 0 and Worker_TP1 on GPU 1; 4 processes. Panel 2, scale out. Shape C, vllm serve M -dp 2: the CLI process is only a supervisor; ApiServer_0 and ApiServer_1 share one port with SO_REUSEPORT, each with its own AsyncLLM; over ZMQ 2 EngineCore and 2 worker processes plus a DP coordinator process; 8 processes. Shape D, -tp 8 -pp 2 --nnodes 2: node 0 runs the API server and the EngineCore with an mp executor of 16 ranks and 8 worker processes on GPUs 0 to 7; node 1 runs with --headless: the CLI process is an executor monitor with 8 worker processes for ranks 8 to 15, no API server and no EngineCore; 10 plus 9 processes. Panel 3, behind a load balancer: the load balancer probes GET /health, which answers 200 or 503, and sends traffic to vllm serve M --port 8000 on GPU 0 and vllm serve M --port 8001 on GPU 1, two independent servers without --data-parallel flags." caption="Figure: four shapes as processes (panels 1 and 2), and two independent servers behind a load balancer (panel 3). The process counts are derived from the launch code." />
+<p>Read each shape from its command down. Blue boxes serve HTTP (or supervise), violet boxes schedule, green boxes own GPUs. The counts help you size the CPU: each box is at least one busy process.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: how vllm serve picks the shape</h3>
+<p>After the flags are parsed, <code>ServeSubcommand.cmd</code> chooses one of four launchers ({{link code/entrypoints-cli-serve}}):</p>
+<x-code file="vllm/entrypoints/cli/serve.py" lines="147-156" />
+<ul>
+  <li><code>run_server</code>: one API server inside the CLI process. This is the default for any TP and PP with DP = 1.</li>
+  <li><code>run_multi_api_server</code>: more than one API server. The default count is the DP size with internal load balancing ({{cite vllm/entrypoints/cli/serve.py:113-130}}).</li>
+  <li><code>run_headless</code>: no API server (<code>--headless</code> sets the count to 0, {{cite vllm/entrypoints/cli/serve.py:69-77}}).</li>
+  <li><code>run_dp_supervisor</code>: one external-LB server per local DP rank, with an aggregated health port (<code>--data-parallel-multi-port-external-lb</code>, {{cite vllm/engine/arg_utils.py:1284-1292}}).</li>
+</ul>
+<p>The engine side follows the parallel sizes. The worker runs inside the engine core (the uni executor) only when TP, PP and DP are all 1 ({{cite vllm/config/parallel.py:1055}}, {{cite vllm/config/parallel.py:1099-1100}}). With any larger size, each engine core starts one worker process per GPU ({{link concepts/executors-and-workers}}).</p>
+
+<h3>Step 2: one GPU, and tensor parallelism on one node</h3>
+<pre><code class="language-bash"># Shape A: one GPU (2 processes)
+vllm serve Qwen/Qwen3-8B
+# Shape B: one model over 2 GPUs of one node (4 processes)
+CUDA_VISIBLE_DEVICES=0,1 vllm serve Qwen/Qwen3-8B --tensor-parallel-size 2</code></pre>
+<p><code>-tp</code> and <code>-pp</code> default to 1 ({{cite vllm/config/parallel.py:142}}, {{cite vllm/config/parallel.py:140}}). With TP = 2, the engine core uses the multiprocessing executor and two worker processes, <code>Worker_TP0</code> and <code>Worker_TP1</code> ({{link concepts/executors-and-workers}}). The attention heads must divide by the TP size ({{link learn/tp-pp-in-practice}}).</p>
+
+<h3>Step 3: data parallelism on one node, and DP + EP for MoE models</h3>
+<pre><code class="language-bash"># Shape C: two independent engine copies behind one port (8 processes)
+vllm serve Qwen/Qwen3-8B --data-parallel-size 2
+# More front-end processes for the same engines
+vllm serve Qwen/Qwen3-8B --data-parallel-size 2 --api-server-count 4
+# A MoE model: 8 DP ranks, experts spread over all 8 GPUs
+vllm serve Qwen/Qwen3-30B-A3B --data-parallel-size 8 --enable-expert-parallel</code></pre>
+<p>With <code>-dp N</code> on one node, the CLI process becomes a supervisor. It starts N API servers on one port, a DP coordinator, and N engine cores ({{link concepts/data-parallel-serving}}). For a dense model, the engine cores are independent: each rank is set up like DP = 1 ({{cite vllm/v1/engine/core.py:1534-1543}}). For a MoE model, the ranks are <code>DPEngineCoreProc</code>s that step together in waves. <code>--enable-expert-parallel</code> (off by default, {{cite vllm/config/parallel.py:190}}) shards the experts over the ranks instead of over the TP group ({{link concepts/expert-parallel-moe}}). The DP coordinator runs for MoE models, and for dense models with internal or hybrid load balancing ({{cite vllm/config/vllm.py:854-874}}).</p>
+
+<h3>Step 4: one model over several nodes</h3>
+<p>A model that does not fit one node needs TP or PP across nodes. With the default multiprocessing backend, run one command per node. The vLLM docs give this example for 2 nodes with 8 GPUs each ({{cite docs/serving/parallelism_scaling.md:143-159}}):</p>
+<pre><code class="language-bash"># node 0 (the head)
+vllm serve /path/to/model --tensor-parallel-size 8 --pipeline-parallel-size 2 \
+  --nnodes 2 --node-rank 0 --master-addr &lt;HEAD_NODE_IP&gt;
+# node 1
+vllm serve /path/to/model --tensor-parallel-size 8 --pipeline-parallel-size 2 \
+  --nnodes 2 --node-rank 1 --master-addr &lt;HEAD_NODE_IP&gt; --headless</code></pre>
+<p><code>--nnodes</code>, <code>--node-rank</code> and <code>--master-addr</code> are parallel flags ({{cite vllm/engine/arg_utils.py:1165-1168}}). <code>--nnodes</code> must divide the total world size, and it needs the <code>mp</code> DP backend ({{cite vllm/engine/arg_utils.py:2379-2402}}). On node 1, <code>run_headless</code> sees that this node is not the first node of its DP group. Then it only starts a <code>MultiprocExecutor</code> for the local workers, with no engine core and no API server ({{cite vllm/entrypoints/cli/serve.py:218-231}}). The alternative is a Ray cluster with <code>--distributed-executor-backend ray</code> and one command on the head node ({{cite docs/serving/parallelism_scaling.md:122-130}}).</p>
+
+<h3>Step 5: data parallelism over several nodes</h3>
+<p>To run DP ranks on several nodes with one HTTP endpoint, start the head node with the API servers and the other nodes with <code>--headless</code>. The vLLM docs give this example for DP = 4 over 2 nodes ({{cite docs/serving/data_parallel_deployment.md:40-49}}):</p>
+<pre><code class="language-bash"># node 0, address 10.99.48.128: API servers + DP ranks 0 and 1
+vllm serve $MODEL --data-parallel-size 4 --data-parallel-size-local 2 \
+  --data-parallel-address 10.99.48.128 --data-parallel-rpc-port 13345
+# node 1: DP ranks 2 and 3, no API server
+vllm serve $MODEL --headless --data-parallel-size 4 --data-parallel-size-local 2 \
+  --data-parallel-start-rank 2 \
+  --data-parallel-address 10.99.48.128 --data-parallel-rpc-port 13345</code></pre>
+<table>
+  <thead><tr><th>Flag (short form)</th><th>Meaning</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>--data-parallel-size</code> (<code>-dp</code>)</td><td>DP ranks in total</td><td>{{cite vllm/engine/arg_utils.py:1230-1232}}</td></tr>
+    <tr><td><code>--data-parallel-size-local</code> (<code>-dpl</code>)</td><td>DP ranks on this node</td><td>{{cite vllm/engine/arg_utils.py:1248-1253}}</td></tr>
+    <tr><td><code>--data-parallel-start-rank</code> (<code>-dpr</code>)</td><td>first rank of this node; without <code>--headless</code> it turns on hybrid load balancing</td><td>{{cite vllm/engine/arg_utils.py:1242-1247}}, {{cite vllm/engine/arg_utils.py:2478-2480}}</td></tr>
+    <tr><td><code>--data-parallel-address</code> (<code>-dpa</code>), <code>--data-parallel-rpc-port</code> (<code>-dpp</code>)</td><td>the head node and its fixed RPC port, the same on all nodes</td><td>{{cite vllm/engine/arg_utils.py:1254-1266}}</td></tr>
+    <tr><td><code>--data-parallel-backend</code> (<code>-dpb</code>)</td><td><code>mp</code> (default) or <code>ray</code></td><td>{{cite vllm/engine/arg_utils.py:1267-1273}}</td></tr>
+    <tr><td><code>--data-parallel-hybrid-lb</code> (<code>-dph</code>)</td><td>each node runs its own API servers for its own ranks</td><td>{{cite vllm/engine/arg_utils.py:1274-1278}}</td></tr>
+    <tr><td><code>--data-parallel-external-lb</code> (<code>-dpe</code>), <code>--data-parallel-rank</code> (<code>-dpn</code>)</td><td>one server per DP rank behind your own router; MoE models only</td><td>{{cite vllm/engine/arg_utils.py:1233-1241}}, {{cite vllm/engine/arg_utils.py:1279-1283}}</td></tr>
+  </tbody>
+</table>
+<p>The head node runs the API servers (by default one per DP rank, so 4 here), the DP coordinator, and its local engine cores ({{cite vllm/entrypoints/cli/serve.py:124-130}}). On node 1, <code>run_headless</code> starts only the local engine cores, which connect to the head address ({{cite vllm/entrypoints/cli/serve.py:235-256}}).</p>
+
+<h3>Step 6: disaggregated prefill and decode</h3>
+<p>Disaggregated serving runs prefill and decode on separate vLLM instances and moves the KV cache with a KV connector. Each instance is one of the shapes above, with <code>--kv-transfer-config</code> ({{cite vllm/engine/arg_utils.py:1870-1872}}) and a router in front. The vLLM docs list the reasons, for example control of tail ITL ({{cite docs/features/disagg_prefill.md:8-13}}). The page {{link concepts/disaggregated-prefill}} explains the request flow, and {{link concepts/kv-connectors}} the connectors.</p>
+
+<h3>Step 7: behind a load balancer: independent servers, /health and readiness</h3>
+<p>For a dense model, the simplest scale-out is a set of independent servers behind any HTTP load balancer. vLLM refuses the external DP flags for dense models and says why:</p>
+<x-code file="vllm/engine/arg_utils.py" lines="2445-2454" />
+<p>So run one plain <code>vllm serve</code> per GPU group, each with its own port or host, and no <code>--data-parallel-*</code> flag. For MoE models, external load balancing keeps one DP group: each server gets <code>--data-parallel-size N --data-parallel-rank i</code> and its own port ({{cite docs/serving/data_parallel_deployment.md:104-127}}).</p>
+<p>The load balancer needs a health signal:</p>
+<x-code file="vllm/entrypoints/serve/instrumentator/health.py" lines="22-33" />
+<ul>
+  <li><strong>200</strong> while the engine runs. A render-only server has no engine and always answers 200 (line 26-28).</li>
+  <li><strong>503</strong> after {{term engine-death}}: <code>check_health()</code> raises <code>EngineDeadError</code> once the engine has failed ({{cite vllm/v1/engine/async_llm.py:1129-1134}}). A watchdog then stops the server within about 5 s, unless <code>VLLM_KEEP_ALIVE_ON_ENGINE_DEATH=1</code> ({{cite vllm/entrypoints/launchers/launcher.py:314-337}}). An orchestrator should restart it.</li>
+  <li><strong>No answer during start-up.</strong> The API server binds its socket first, then builds the engine, and starts uvicorn last ({{cite vllm/entrypoints/launchers/launcher.py:365-379}}, {{cite vllm/entrypoints/launchers/api_server/entry.py:179-201}}). Until uvicorn runs, the socket is bound but does not listen, so no HTTP request gets an answer (derived; uvicorn calls <code>listen()</code> when it starts, {{cite vllm/entrypoints/launchers/launcher.py:84-94}}). A start-up can take minutes (model download, compile, graph capture).</li>
+</ul>
+<p>The {{term readiness-probe}} for <code>vllm serve</code> is <code>GET /health</code>; the vLLM docs use it for both the liveness and the readiness probe in Kubernetes ({{cite docs/deployment/k8s.md:244-255}}). <code>GET /v1/models</code> also answers only when the server is up, and it confirms the served name. The docs warn that a startup probe with a low <code>failureThreshold</code> kills the container during start-up ({{cite docs/deployment/k8s.md:436-443}}). The log then shows "KeyboardInterrupt: terminated". That text comes from the SIGTERM handler that <code>run_server</code> installs during start-up ({{cite vllm/entrypoints/launchers/api_server/entry.py:170-175}}).</p>
+<p><strong>Shutdown.</strong> <code>--shutdown-timeout N</code> (default 0) lets running requests finish for up to N seconds after a stop signal; 0 aborts them ({{cite vllm/engine/arg_utils.py:1930-1935}}, {{cite vllm/config/vllm.py:453-457}}). Set it a little below the grace period of your orchestrator (a practical rule).</p>
+
+<h3>Step 8: Docker, Kubernetes and the recipes folder</h3>
+<p>The repository documents containers and orchestrators; this site does not repeat them:</p>
+<ul>
+  <li>Docker: the image <code>vllm/vllm-openai</code>, run with <code>--ipc=host</code> so that processes can share memory ({{cite docs/deployment/docker.md:20-30}}).</li>
+  <li>Kubernetes: a full example with a PVC, probes and <code>/dev/shm</code> ({{cite docs/deployment/k8s.md:1-12}}). Also nginx in front of several servers ({{cite docs/deployment/nginx.md}}), Helm ({{cite docs/deployment/frameworks/helm.md}}), and integrations such as llm-d, KServe and the production stack ({{cite docs/deployment/integrations/}}).</li>
+  <li><code>recipes/</code>: one YAML deployment recipe per model, at <code>recipes/models/&lt;org&gt;/&lt;repo&gt;.yaml</code>, rendered on recipes.vllm.ai ({{cite recipes/README.md:1-12}}). The schema lives in the separate <code>vllm-project/recipes</code> repository; <code>manifest.yaml</code> only declares the schema version ({{cite recipes/manifest.yaml:1-4}}). A recipe lists, for example, the minimum vLLM version and the extra arguments for tool calling. It also lists variants with <code>--tensor-parallel-size</code> and the needed GPU memory ({{cite recipes/models/ByteDance-Seed/Seed-OSS-36B-Instruct.yaml:12-48}}). Use it as a starting command for that model; the folder holds 186 files under <code>models/</code> at this commit.</li>
+</ul>
+
+<h3 id="security">Step 9: security: what --api-key protects</h3>
+<x-warning title="--api-key protects only four path prefixes">
+<p>The authentication middleware checks the key only for paths that start with <code>/v1</code>, <code>/v2</code>, <code>/inference</code> or <code>/cohere</code>:</p>
+<x-code file="vllm/entrypoints/serve/middleware/authenticate.py" lines="11" />
+<p>Every other route answers without a key ({{cite vllm/entrypoints/serve/middleware/authenticate.py:59-61}}). Every server registers the SageMaker routes <code>/ping</code> and <code>/invocations</code> ({{cite vllm/entrypoints/launchers/api_server/routers.py:40-44}}). <code>/invocations</code> picks a handler by the shape of the body. It runs the same serving objects as the <code>/v1</code> routes, so a client without the key can still generate text ({{cite vllm/entrypoints/serve/sagemaker/api_router.py:98-132}}). vLLM's own help text of <code>--api-key</code> says this and names <code>/invocations</code>; it lists <code>/v1</code>, <code>/v2</code> and <code>/inference</code> and leaves out <code>/cohere</code> ({{cite vllm/entrypoints/common/cli_args.py:326-336}}).</p>
+<p>A server that serves a generative model also registers <code>POST /scale_elastic_ep</code> ({{cite vllm/entrypoints/launchers/api_server/routers.py:55-66}}). Its path is outside the guarded prefixes. The handler reads <code>new_data_parallel_size</code> and <code>drain_timeout</code> from the request body and passes them to <code>engine_client.scale_elastic_ep</code> ({{cite vllm/entrypoints/serve/elastic_ep/api_router.py:38-65}}, {{cite vllm/v1/engine/async_llm.py:1291}}).</p>
+<p>Without <code>--enable-elastic-ep</code>, the call cannot change the engines of a default deployment. The same DP size is a no-op that answers HTTP 200 ({{cite vllm/v1/engine/async_llm.py:1301-1308}}, {{cite vllm/entrypoints/serve/elastic_ep/api_router.py:66-70}}). With one engine, the base client raises <code>NotImplementedError</code>, and the route answers HTTP 500 "Scale failed" ({{cite vllm/v1/engine/core_client.py:274-275}}, {{cite vllm/entrypoints/serve/elastic_ep/api_router.py:79-81}}). With DP &gt; 1 and external load balancing, the client raises "Elastic EP scaling requires enable_elastic_ep=True." ({{cite vllm/v1/engine/core_client.py:1659-1664}}). With internal load balancing and the default <code>mp</code> backend, an assertion fails ({{cite vllm/v1/engine/core_client.py:1920-1922}}). {{link concepts/expert-parallel-moe}} has the full table. The route is still reachable without a key.</p>
+<p>Also open: <code>/health</code>, <code>/ping</code>, <code>/metrics</code>, <code>/tokenize</code>, <code>/detokenize</code>, <code>/version</code>, <code>/load</code>, and the profiler and development routes when they are on. Two more groups run the model without a key: <code>POST /generative_scoring</code> on every generative server ({{cite vllm/entrypoints/generate/api_router.py:52-54}}, {{cite vllm/entrypoints/generate/generative_scoring/api_router.py:30-31}}), and <code>/pooling</code>, <code>/classify</code>, <code>/score</code> and <code>/rerank</code> on a pooling server ({{cite vllm/entrypoints/pooling/pooling/api_router.py:27-28}}, {{cite vllm/entrypoints/pooling/classify/api_router.py:26}}, {{cite vllm/entrypoints/pooling/scoring/api_router.py:37-38}}, {{cite vllm/entrypoints/pooling/scoring/api_router.py:69-70}}).</p>
+</x-warning>
+<p>A secure deployment therefore puts a proxy in front of vLLM (a practical rule that the vLLM docs also give, {{cite docs/usage/security.md:280-286}}):</p>
+<ol>
+  <li>Let the proxy pass only the routes your clients need, for example <code>/v1/chat/completions</code> and <code>/v1/models</code>. Block <code>/invocations</code>, <code>/ping</code>, <code>/scale_elastic_ep</code>, <code>/generative_scoring</code> and everything else from outside.</li>
+  <li>Do the authentication and rate limits in the proxy. Keep <code>--api-key</code> as a second check.</li>
+  <li>Expose <code>/health</code> and <code>/metrics</code> only to your orchestrator and your monitoring.</li>
+  <li>Bind vLLM to a private address (<code>--host</code>), not to all interfaces.</li>
+</ol>
+<p>Other switches that matter for security, all off by default:</p>
+<table>
+  <thead><tr><th>Switch</th><th>Risk when on</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_SERVER_DEV_MODE=1</code></td><td>adds development routes such as <code>/sleep</code>, <code>/reset_prefix_cache</code>, <code>/collective_rpc</code> and <code>/server_info</code>; the server logs "SECURITY WARNING"</td><td>{{cite vllm/entrypoints/launchers/api_server/routers.py:46-49}}, {{cite vllm/entrypoints/serve/__init__.py:43-47}}</td></tr>
+    <tr><td><code>--trust-remote-code</code></td><td>runs Python code from the model repository</td><td>{{cite vllm/config/model.py:197-199}}</td></tr>
+    <tr><td><code>--trust-request-mm-kwargs</code></td><td>lets clients change multimodal processing (CPU, memory)</td><td>{{cite vllm/entrypoints/common/cli_args.py:98-102}}</td></tr>
+    <tr><td><code>--trust-request-chat-template</code></td><td>lets clients send their own chat template</td><td>{{cite vllm/entrypoints/common/cli_args.py:94-97}}</td></tr>
+    <tr><td><code>--allowed-local-media-path</code></td><td>requests can read files from that server folder</td><td>{{cite vllm/config/model.py:231-234}}</td></tr>
+    <tr><td><code>VLLM_ALLOW_RUNTIME_LORA_UPDATING=1</code></td><td>clients can load LoRA adapters through HTTP</td><td>{{cite vllm/envs.py:1197-1200}}</td></tr>
+  </tbody>
+</table>
+<p>Media URLs are fetched by the server. Limit them with <code>--allowed-media-domains</code> ({{cite vllm/config/model.py:235-237}}) and <code>VLLM_MEDIA_URL_ALLOW_REDIRECTS=0</code> (default 1, {{cite vllm/envs.py:992-994}}); a single download is limited to <code>VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB</code>, default 256 ({{cite vllm/envs.py:987-989}}). <code>VLLM_MAX_N_SEQUENCES</code> (default 16384) caps <code>n</code> per request ({{cite vllm/envs.py:1140-1142}}). Traffic between nodes (PyTorch distributed, KV transfer, DP) is not encrypted; the docs require an isolated network for it ({{cite docs/usage/security.md:3-10}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Process counts per shape (derived)">
+<table>
+  <thead><tr><th>Command</th><th>Processes</th><th>Count</th></tr></thead>
+  <tbody>
+    <tr><td><code>vllm serve M</code></td><td>CLI = API server; engine core with the worker inside</td><td>2</td></tr>
+    <tr><td><code>vllm serve M -tp 2</code></td><td>API server; engine core; 2 workers</td><td>4</td></tr>
+    <tr><td><code>vllm serve M -tp 4</code></td><td>API server; engine core; 4 workers</td><td>6</td></tr>
+    <tr><td><code>vllm serve M -dp 2</code> (dense)</td><td>CLI supervisor; 2 API servers; coordinator; 2 engine cores; 2 workers</td><td>8</td></tr>
+    <tr><td><code>vllm serve M -dp 2 -tp 2</code> (dense)</td><td>CLI supervisor; 2 API servers; coordinator; 2 engine cores; 4 workers</td><td>10</td></tr>
+    <tr><td><code>vllm serve M -dp 2 --api-server-count 4</code></td><td>CLI supervisor; 4 API servers; coordinator; 2 engine cores; 2 workers</td><td>10</td></tr>
+    <tr><td>Step 4, node 0 / node 1</td><td>API server; engine core; 8 workers / CLI executor monitor; 8 workers</td><td>10 / 9</td></tr>
+    <tr><td>Step 5, node 0 / node 1</td><td>CLI supervisor; 4 API servers; coordinator; 2 engine cores; 2 workers / CLI; 2 engine cores; 2 workers</td><td>10 / 5</td></tr>
+  </tbody>
+</table>
+<p>Sources: the launchers ({{cite vllm/entrypoints/cli/serve.py:147-156}}), the executor choice ({{cite vllm/config/parallel.py:1055}}, {{cite vllm/config/parallel.py:1099-1100}}), the coordinator ({{cite vllm/config/vllm.py:854-874}}, {{cite vllm/v1/engine/coordinator.py:101-115}}). The counts leave out helper processes. One is the model-registry inspection subprocess on a cache miss. Another is the resource tracker process that Python's <code>spawn</code> start method can add (general Python knowledge). The vLLM docs count "2 + N" processes for N GPUs and 17 for DP = 4, TP = 2 ({{cite docs/configuration/optimization.md:432-436}}, {{cite docs/configuration/optimization.md:456-457}}). The code gives 2 for one GPU, because the worker runs in the engine core. For DP = 4, TP = 2 it gives 18: the docs leave out the CLI supervisor.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: from one GPU to two nodes">
+<p>A team serves an 8B dense model. The steps below are advice; each one names the flag and the shape.</p>
+<ol>
+  <li><strong>One GPU</strong> (shape A). Check the start-up log for the maximum concurrency ({{link concepts/tuning}}). Put a proxy in front (Step 9).</li>
+  <li><strong>More traffic, one node with 4 GPUs.</strong> The model fits one GPU. So use <code>-dp 4</code> for four copies behind one port (Step 3), or four independent servers behind your own load balancer (Step 7). <code>-dp 4</code> gives 4 API servers by default; the log line then stops, so use <code>/metrics</code> ({{link concepts/metrics-and-observability}}).</li>
+  <li><strong>Two nodes.</strong> Either one server per node behind an external load balancer, or one DP group over both nodes with <code>--headless</code> on node 1 (Step 5). For a dense model, the first is simpler: a failure stays on one node.</li>
+  <li><strong>A model that does not fit one node</strong>: TP inside the node, PP or TP across nodes (Step 4), on a fast and isolated network.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="What each process of a shape logs">
+<p>Each process puts a prefix on its log lines, so you can tell them apart in one container log. The prefixes are <code>(APIServer pid=...)</code>, <code>(EngineCore pid=...)</code> (<code>EngineCore_DP0</code> and so on with DP) and <code>Worker_TP0</code> and so on for the workers ({{cite vllm/entrypoints/launchers/api_server/entry.py:166}}, {{cite vllm/v1/engine/core.py:1467-1472}}, {{cite vllm/v1/engine/utils.py:284}}). A worker name gets a <code>_DP</code>, <code>_PP</code> or <code>_TP</code> part only when that size is above 1 ({{cite vllm/v1/executor/multiproc_executor.py:1101-1112}}). With several API servers, they are named <code>ApiServer_0</code>, <code>ApiServer_1</code>, ... ({{cite vllm/v1/utils.py:248-254}}). The page {{link tours/serve-startup}} follows the start-up log of shape A line by line.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>"Non-MoE models do not support external data parallel mode."</strong> You used <code>--data-parallel-rank</code> or <code>--data-parallel-external-lb</code> with a dense model; start independent servers instead (Step 7).</li>
+  <li><strong>Pods restart during start-up.</strong> The probe gives up before the model is loaded and compiled; raise the startup probe threshold (Step 7).</li>
+  <li><strong>A dead engine stays in the pool.</strong> <code>/health</code> answers 503, but the load balancer checks only the TCP port. Use an HTTP health check on <code>/health</code>.</li>
+  <li><strong>Text generation without a key.</strong> <code>/invocations</code> is open on every server (Step 9).</li>
+  <li><strong>Multi-node hangs at start-up.</strong> Wrong network interface or blocked ports; see {{link concepts/troubleshooting}}.</li>
+  <li><strong>Two servers on one GPU fail to start.</strong> Each <code>--gpu-memory-utilization</code> is a share of the whole GPU, and the second server finds too little free memory ({{cite vllm/v1/worker/utils.py:761-770}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> The shape decides the process count, the CPU need, the failure domain and which signals you can read. The security section decides who can use your GPUs. Both are deployment decisions that no tuning flag can fix later.</p>
+
+<x-quiz>
+  <x-q level="easy">Which paths does <code>--api-key</code> protect?
+    <x-a><p>Only paths that start with <code>/v1</code>, <code>/v2</code>, <code>/inference</code> or <code>/cohere</code> ({{cite vllm/entrypoints/serve/middleware/authenticate.py:11}}, {{cite vllm/entrypoints/serve/middleware/authenticate.py:59-61}}). <code>/invocations</code>, <code>/ping</code>, <code>/scale_elastic_ep</code>, <code>/generative_scoring</code>, <code>/health</code>, <code>/metrics</code> and the other routes need no key.</p></x-a>
+  </x-q>
+  <x-q level="easy">What does <code>GET /health</code> answer after the engine core process has died?
+    <x-a><p>503, because <code>check_health()</code> raises <code>EngineDeadError</code> ({{cite vllm/entrypoints/serve/instrumentator/health.py:29-33}}, {{cite vllm/v1/engine/async_llm.py:1133-1134}}). Soon after, the watchdog stops the server unless <code>VLLM_KEEP_ALIVE_ON_ENGINE_DEATH</code> is set ({{cite vllm/entrypoints/launchers/launcher.py:325-337}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You start <code>vllm serve M -tp 8 -pp 2 --nnodes 2 --node-rank 1 --master-addr X --headless</code> on the second node. Which processes run there?
+    <x-a><p><code>run_headless</code> sees that this node is not the first node of its DP group. It starts only a <code>MultiprocExecutor</code> with the local workers: the CLI process plus 8 worker processes, with no engine core and no API server ({{cite vllm/entrypoints/cli/serve.py:218-231}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>vllm serve M -dp 2</code> print no "Avg prompt throughput" log line, while <code>vllm serve M</code> does?
+    <x-a><p><code>-dp 2</code> defaults to 2 API servers ({{cite vllm/entrypoints/cli/serve.py:124-130}}), and with more than one API server the log-line logger is not added ({{cite vllm/v1/metrics/loggers.py:1384-1389}}). Prometheus still works.</p></x-a>
+  </x-q>
+  <x-q level="hard">You want four independent copies of a dense 8B model on one 4-GPU node, behind your company's load balancer, with one port each. Which commands do you use, and why not <code>--data-parallel-external-lb</code>?
+    <x-a><p>Four plain commands, for example <code>CUDA_VISIBLE_DEVICES=i vllm serve M --port 800i</code> for i = 0 to 3, each without <code>--data-parallel-*</code> flags. The external DP mode raises <code>ValueError</code> for non-MoE models, because dense DP ranks are independent anyway ({{cite vllm/engine/arg_utils.py:2445-2454}}, {{cite vllm/v1/engine/core.py:1538-1543}}). Each server is shape A with 2 processes; the load balancer probes each <code>/health</code>.</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,226 @@
+---
+title: Metrics and observability: how to watch a vLLM server
+nav_title: Metrics and observability
+level: Intermediate
+prerequisites: learn/serving-metrics, concepts/engine-client
+related: reference/metrics, learn/serving-metrics, concepts/tuning, concepts/benchmarking, concepts/troubleshooting, concepts/frontend-plugins, concepts/openai-server, concepts/kv-cache-manager, concepts/prefix-caching, reference/env-vars
+summary: Where the signals of vllm serve come from and how to read them: the /metrics endpoint and its multiprocess mode, the metrics to watch first with valid PromQL, the periodic log line, per-request metrics in responses, OpenTelemetry traces, stat logger plugins, the profiler routes, and the known gaps.
+---
+<x-sentence>The engine core sends timestamps and counters; the API server turns them into Prometheus metrics, a log line, traces and per-request fields.</x-sentence>
+
+<h2>The idea</h2>
+<p>A running <code>vllm serve</code> has four places where you can see what it does. All four get their numbers from the same source. The {{term engine-core}} sends events, timestamps and counters with its outputs, and the {{term front-end}} computes the metrics from them. {{link learn/serving-metrics}} defines TTFT, ITL, TPOT and E2E latency.</p>
+<ul>
+  <li><strong>Prometheus</strong>: <code>GET /metrics</code> on the API server port, with about 130 <code>vllm:*</code> metrics ({{link reference/metrics}} lists them all).</li>
+  <li><strong>The log line</strong>: every 10 seconds, "Avg prompt throughput ... Running ... Waiting ... GPU KV cache usage ...".</li>
+  <li><strong>Per request</strong>: an optional <code>metrics</code> object in each response, and an optional OpenTelemetry span per request.</li>
+  <li><strong>Profiles</strong>: the torch profiler, started and stopped with two HTTP routes.</li>
+</ul>
+<p>This page shows where each signal is made, what it really measures, and which flag turns it on or off. It ends with the known gaps, because several metrics do not mean what their names suggest.</p>
+<p><strong>An everyday comparison.</strong> Think of a car. The engine sends raw pulses from its sensors; the dashboard computes the speed and the fuel use from them. A trip computer can also print one summary every few minutes. The comparison stops at the clock. In vLLM, the dashboard (the API server) and the engine (the engine core) use two different clocks. Some times come from the front-end clock, others from the engine clock.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b9_signal_sources" alt="Panel 1, engine core process: request events QUEUED in add_request, SCHEDULED once per schedule call, PREEMPTED when recomputed; EngineCoreOutputs with new token ids and a time.monotonic timestamp; SchedulerStats with running, waiting, KV cache usage, prefix cache queries and hits, spec decode drafts and accepted tokens. Panel 2, API server process: IterationStats with TTFT as time.time minus arrival and ITL as the gap of engine timestamps; StatLoggerManager.record with the LoggingStatLogger for one API server, the PrometheusStatLogger always, and stat logger plugins; per-request finished stats with e2e, queue, prefill, decode, inference time and TPOT. Panel 3, where you read them: GET /metrics, off with --disable-log-stats, multiprocess directory with N API servers; the log line every 10 seconds, VLLM_LOG_STATS_INTERVAL, only with one API server; traces with --otlp-traces-endpoint and the llm_request span, and --enable-per-request-metrics with a metrics field in the response body." caption="Figure: the engine core only records times and counts (1); the API server computes the metrics (2); three places show them, each with its own switch (3)." />
+<p>Read the panels from top to bottom. Green boxes run in the engine core process, blue boxes in the API server. The engine core never computes a latency. It sends <code>time.monotonic()</code> timestamps, and the API server adds its own <code>time.time()</code> clock for TTFT and E2E latency.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the /metrics endpoint</h3>
+<p>The API server mounts the endpoint when it registers its routes ({{cite vllm/entrypoints/serve/instrumentator/__init__.py:16-18}}):</p>
+<x-code file="vllm/entrypoints/serve/instrumentator/metrics.py" lines="56-81" highlight="58,64-74,77,80" />
+<ol>
+  <li>Lines 64-74: the external library <code>prometheus_fastapi_instrumentator</code> adds <code>http_*</code> metrics for every route except the six excluded ones. Its <code>expose()</code> call adds a <code>/metrics</code> route.</li>
+  <li>Line 77: a second route mounts the <code>prometheus_client</code> ASGI app at <code>/metrics</code>; line 80 makes it also match <code>/metrics/</code> and longer paths. Both routes read the same registry (line 58).</li>
+</ol>
+<p>With one API server, the registry is the default <code>prometheus_client</code> registry ({{cite vllm/v1/metrics/prometheus.py:47-53}}). With <code>--api-server-count</code> above 1, each API server is its own process. Then <code>vllm serve</code> sets <code>PROMETHEUS_MULTIPROC_DIR</code> to a new temporary folder before it starts them ({{cite vllm/entrypoints/cli/serve.py:282-283}}, {{cite vllm/v1/metrics/prometheus.py:17-36}}). Each process writes its values there, and every <code>/metrics</code> answer merges all processes. If you set the variable yourself, vLLM warns that you must clean the folder between runs ({{cite vllm/v1/metrics/prometheus.py:30-36}}).</p>
+<p>Almost every engine metric has the labels <code>model_name</code> (the first served name) and <code>engine</code> (the DP rank as text, for example <code>"0"</code>) ({{cite vllm/v1/metrics/loggers.py:499-504}}). The label rules are on {{link reference/metrics}}.</p>
+
+<h3>Step 2: the metrics to watch first</h3>
+<p>The table lists the exported names, which are the names you query. <code>prometheus_client</code> adds <code>_total</code> to a {{term prometheus-counter | counter}} and <code>_bucket</code>, <code>_sum</code> and <code>_count</code> to a {{term prometheus-histogram | histogram}}.</p>
+<table>
+  <thead><tr><th>Question</th><th>Exported name (type)</th><th>What it counts</th></tr></thead>
+  <tbody>
+    <tr><td>How long until the first token?</td><td><code>vllm:time_to_first_token_seconds</code> (histogram, {{cite vllm/v1/metrics/loggers.py:931}})</td><td>front-end <code>time.time()</code> when the first output batch is handled, minus <code>arrival_time</code> ({{cite vllm/v1/metrics/stats.py:505-507}}, {{cite vllm/v1/metrics/stats.py:525}})</td></tr>
+    <tr><td>How smooth is the stream?</td><td><code>vllm:inter_token_latency_seconds</code> (histogram, {{cite vllm/v1/metrics/loggers.py:941}})</td><td>gap between two engine-core output timestamps of a request ({{cite vllm/v1/metrics/stats.py:555}})</td></tr>
+    <tr><td>Decode speed per request</td><td><code>vllm:request_time_per_output_token_seconds</code> (histogram, {{cite vllm/v1/metrics/loggers.py:951}})</td><td>decode time / (output tokens − 1); 0 for one token ({{cite vllm/v1/metrics/stats.py:612-616}})</td></tr>
+    <tr><td>Whole request</td><td><code>vllm:e2e_request_latency_seconds</code> (histogram, {{cite vllm/v1/metrics/loggers.py:961}})</td><td>finish time minus <code>arrival_time</code> ({{cite vllm/v1/metrics/stats.py:594}})</td></tr>
+    <tr><td>Time in the queue</td><td><code>vllm:request_queue_time_seconds</code> (histogram, {{cite vllm/v1/metrics/loggers.py:971}})</td><td>first QUEUED to first SCHEDULED event ({{cite vllm/v1/metrics/stats.py:596-597}})</td></tr>
+    <tr><td>Batch size now</td><td><code>vllm:num_requests_running</code> (gauge, {{cite vllm/v1/metrics/loggers.py:528}})</td><td>requests in the running queue</td></tr>
+    <tr><td>Backlog now</td><td><code>vllm:num_requests_waiting</code> (gauge, {{cite vllm/v1/metrics/loggers.py:538}})</td><td>waiting plus deferred requests ({{cite vllm/v1/metrics/loggers.py:1150-1154}}); split by <code>vllm:num_requests_waiting_by_reason</code> ({{cite vllm/v1/metrics/loggers.py:546-557}})</td></tr>
+    <tr><td>KV cache full?</td><td><code>vllm:kv_cache_usage_perc</code> (gauge, {{cite vllm/v1/metrics/loggers.py:619-623}})</td><td>a fraction from 0 to 1, in spite of the name; cached free blocks count as free ({{link concepts/kv-cache-manager}})</td></tr>
+    <tr><td>Prefix cache</td><td><code>vllm:prefix_cache_queries_total</code>, <code>vllm:prefix_cache_hits_total</code> (counters, {{cite vllm/v1/metrics/loggers.py:661-679}})</td><td>prompt tokens looked up and found, first admissions only (deep dive)</td></tr>
+    <tr><td>Preemptions</td><td><code>vllm:num_preemptions_total</code> (counter, {{cite vllm/v1/metrics/loggers.py:738-745}})</td><td>PREEMPTED events ({{cite vllm/v1/metrics/stats.py:580-583}})</td></tr>
+    <tr><td>Token throughput</td><td><code>vllm:prompt_tokens_total</code>, <code>vllm:generation_tokens_total</code> (counters, {{cite vllm/v1/metrics/loggers.py:748}}, {{cite vllm/v1/metrics/loggers.py:799}})</td><td>prompt and output tokens</td></tr>
+    <tr><td>Finished requests</td><td><code>vllm:request_success_total</code> (counter with <code>finished_reason</code>, {{cite vllm/v1/metrics/loggers.py:809}})</td><td>finished requests by reason (stop, length, abort, ...)</td></tr>
+    <tr><td>Spec decode</td><td><code>vllm:spec_decode_num_drafts_total</code>, <code>..._num_draft_tokens_total</code>, <code>..._num_accepted_tokens_total</code> ({{cite vllm/v1/spec_decode/metrics.py:228-232}})</td><td>only with <code>--speculative-config</code>; formulas on {{link concepts/tuning}}</td></tr>
+    <tr><td>Queue limits hit</td><td><code>vllm:admission_rejections_total</code> (counter, {{cite vllm/v1/metrics/loggers.py:847-859}})</td><td>requests refused by <code>--max-num-queued-reqs</code> or <code>--max-num-queued-tokens</code></td></tr>
+  </tbody>
+</table>
+
+<h3>Step 3: PromQL recipes</h3>
+<p>These queries use only the exported names above. Add <code>model_name</code> or <code>engine</code> to the <code>by</code> clauses when you serve several models or DP ranks.</p>
+<pre><code class="language-none"># p99 TTFT over 5 minutes, all engines together
+histogram_quantile(0.99, sum by (le) (rate(vllm:time_to_first_token_seconds_bucket[5m])))
+
+# p50 ITL per engine
+histogram_quantile(0.5, sum by (le, engine) (rate(vllm:inter_token_latency_seconds_bucket[5m])))
+
+# mean E2E latency
+rate(vllm:e2e_request_latency_seconds_sum[5m]) / rate(vllm:e2e_request_latency_seconds_count[5m])
+
+# output tokens per second
+sum(rate(vllm:generation_tokens_total[1m]))
+
+# prefix cache hit rate (tokens)
+rate(vllm:prefix_cache_hits_total[5m]) / rate(vllm:prefix_cache_queries_total[5m])
+
+# preemptions per second
+sum(rate(vllm:num_preemptions_total[5m]))
+
+# KV cache usage in percent (the gauge is 0-1)
+100 * vllm:kv_cache_usage_perc
+
+# finished requests per second by reason
+sum by (finished_reason) (rate(vllm:request_success_total[5m]))</code></pre>
+<x-note title="A practical rule: quantiles are estimates">
+<p><code>histogram_quantile</code> interpolates inside one bucket, so a p99 is only as exact as the bucket edges. The default TTFT buckets go from 1 ms to 2,560 s ({{cite vllm/v1/metrics/buckets.py:57-80}}). <code>--custom-histogram-buckets</code> replaces a bucket family; each extra bucket adds one time series per label set ({{cite vllm/config/observability.py:70-81}}).</p>
+</x-note>
+
+<h3>Step 4: the periodic log line</h3>
+<p>When stats are on, the API server starts a task that calls <code>do_log_stats()</code> every <code>VLLM_LOG_STATS_INTERVAL</code> seconds ({{cite vllm/entrypoints/launchers/utils/server_utils.py:75-89}}). The default is 10.0; a value of 0 or below becomes 10.0 ({{cite vllm/envs.py:874-878}}). The <code>LoggingStatLogger</code> builds the line:</p>
+<x-code file="vllm/v1/metrics/loggers.py" lines="276-312" highlight="280,283-286,288-291,299-301,310-312" />
+<ol>
+  <li>Line 280: an idle server logs at DEBUG, so the line disappears at the default INFO level. Idle means no prompt or output tokens in the last two intervals ({{cite vllm/v1/metrics/loggers.py:255-265}}).</li>
+  <li>Lines 283-286: the two throughputs are tokens since the last line divided by the elapsed time ({{cite vllm/v1/metrics/loggers.py:168-173}}). The prompt throughput counts computed prompt tokens, not prefix-cache hits ({{cite vllm/v1/metrics/loggers.py:162-163}}).</li>
+  <li>Lines 288-301: "Waiting" includes deferred requests, and "Deferred" appears only when there are some.</li>
+  <li>Lines 310-312: "Preemptions: N" appears only when there were preemptions in the interval. The scheduler itself logs nothing when it preempts ({{link concepts/scheduler}}).</li>
+</ol>
+<p>The line continues with "GPU KV cache usage: x%" and, after the first lookup, "Prefix cache hit rate: y%" ({{cite vllm/v1/metrics/loggers.py:314-323}}). The hit rate here covers about the last 1,000 requests, not the whole run ({{cite vllm/v1/metrics/stats.py:47}}). Each line starts with the engine index, for example "Engine 000: ", also with one engine ({{cite vllm/v1/metrics/loggers.py:176-178}}, {{cite vllm/v1/metrics/loggers.py:336}}). With several engines behind one API server, each engine gets its own line, unless <code>--aggregate-engine-logging</code> gives one line "N Engines Aggregated: " ({{cite vllm/v1/metrics/loggers.py:371-373}}, {{cite vllm/v1/metrics/loggers.py:1390-1395}}). With speculative decoding, a second line "SpecDecoding metrics: ..." follows ({{cite vllm/v1/metrics/loggers.py:340}}).</p>
+<x-warning title="No log line with more than one API server">
+<p>With <code>--api-server-count</code> above 1 (the default for <code>-dp N</code>), each API server sees only its own requests. So the stat logger manager does not add the log-line logger and warns "disabling stats logging to avoid incomplete stats" ({{cite vllm/v1/metrics/loggers.py:1384-1389}}). Prometheus stays on. Use <code>/metrics</code> for such servers.</p>
+</x-warning>
+
+<h3>Step 5: per-request metrics in the response</h3>
+<p><code>--enable-per-request-metrics</code> (off by default, {{cite vllm/entrypoints/common/cli_args.py:150-151}}) adds a <code>metrics</code> object to each chat or completion response. It needs the stats: with <code>--disable-log-stats</code>, start-up stops with <code>ValueError</code> ({{cite vllm/entrypoints/common/cli_args.py:536-542}}). The fields come from the engine-core timestamps of the request:</p>
+<x-code file="vllm/entrypoints/generate/base/serving.py" lines="73-89" highlight="73-74" />
+<p>Note line 74: this <code>time_to_first_token_ms</code> runs from the first SCHEDULED event to the first token. It is the prefill time on the engine clock, without the queue and without the time in the API server. It is shorter than the Prometheus TTFT of the same request, because its interval lies inside the Prometheus interval (derived). In a stream, the object comes only in the final usage chunk, so the client must ask for usage (<code>stream_options.include_usage</code>) ({{cite vllm/entrypoints/openai/chat_completion/serving.py:873-885}}). For <code>n</code> &gt; 1, the chat server sends no metrics, because the stats belong to one of the <code>n</code> outputs only ({{cite vllm/entrypoints/openai/chat_completion/serving.py:1173-1176}}).</p>
+
+<h3>Step 6: OpenTelemetry traces</h3>
+<p><code>--otlp-traces-endpoint URL</code> turns tracing on ({{cite vllm/config/observability.py:38-39}}). The value is checked at start-up: without the OpenTelemetry packages, it raises <code>ValueError</code> ({{cite vllm/config/observability.py:153-165}}). <code>AsyncLLM</code> then sets up a tracer ({{cite vllm/v1/engine/async_llm.py:149-151}}). The exporter uses gRPC by default; <code>OTEL_EXPORTER_OTLP_TRACES_PROTOCOL=http/protobuf</code> switches to HTTP ({{cite vllm/tracing/otel.py:94-101}}).</p>
+<p>When a request finishes, the output processor makes one span named <code>llm_request</code>. It starts at <code>arrival_time</code> and carries the queue, prefill, decode and inference times, the token counts and some sampling parameters ({{cite vllm/v1/engine/output_processor.py:957-1001}}). The serving classes pass the <code>traceparent</code> and <code>tracestate</code> headers of the HTTP request, so the span joins the caller's trace ({{cite vllm/tracing/utils.py:12}}, {{cite vllm/entrypoints/openai/chat_completion/serving.py:378-382}}). A request with trace headers to a server without tracing logs one warning and drops the headers ({{cite vllm/v1/engine/async_llm.py:421-423}}). <code>--collect-detailed-traces model,worker</code> adds model forward and execute times, with a cost in speed ({{cite vllm/config/observability.py:41-48}}).</p>
+<x-warning title="Keep stats on when you trace">
+<p>The span is built from the request stats, and <code>do_tracing</code> asserts that they exist ({{cite vllm/v1/engine/output_processor.py:947-948}}). The stats exist only when stats are on ({{cite vllm/v1/engine/output_processor.py:236}}). A search of <code>otlp_traces_endpoint</code> at the pinned commit finds no start-up check for this pair of flags. So the assertion can fail when a request finishes (derived). Do not combine <code>--otlp-traces-endpoint</code> with <code>--disable-log-stats</code> unless a stat logger plugin keeps the stats on.</p>
+</x-warning>
+
+<h3>Step 7: stat logger plugins</h3>
+<p>A plugin in the entry-point group <code>vllm.stat_logger_plugins</code> adds its own stat logger ({{cite vllm/v1/metrics/loggers.py:84-98}}; {{link concepts/frontend-plugins}}). <code>AsyncLLM</code> loads the plugins in every API server process. When a plugin is found, stats stay on even with <code>--disable-log-stats</code>; only the default log-line logger is left out ({{cite vllm/v1/engine/async_llm.py:154-164}}). The manager adds a <code>PrometheusStatLogger</code> unless a custom logger already is one ({{cite vllm/v1/metrics/loggers.py:1396-1419}}). The plugin's <code>record()</code> runs once per batch of engine outputs, and <code>log()</code> every log interval.</p>
+
+<h3>Step 8: the profiler routes</h3>
+<p><code>POST /start_profile</code> and <code>POST /stop_profile</code> exist only when <code>--profiler-config</code> names a profiler; the server then logs that this "should ONLY be used for local development" ({{cite vllm/entrypoints/serve/profile/api_router.py:56-65}}). The profilers are <code>torch</code>, <code>cuda</code> and <code>proton</code> ({{cite vllm/config/profiler.py:15}}, {{cite vllm/config/profiler.py:70-76}}). The torch profiler needs <code>torch_profiler_dir</code> ({{cite vllm/config/profiler.py:235-241}}). A start request can pass <code>profile_prefix</code>, <code>delay_iterations</code> and <code>max_iterations</code> ({{cite vllm/entrypoints/serve/profile/api_router.py:18-28}}). An example (not in the repository):</p>
+<pre><code class="language-bash">vllm serve Qwen/Qwen3-0.6B --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/tmp/vllm_profile"}'
+curl -X POST localhost:8000/start_profile -H "Content-Type: application/json" -d '{"max_iterations": 20}'
+# send some requests, then:
+curl -X POST localhost:8000/stop_profile</code></pre>
+
+<h3>Step 9: what --disable-log-stats turns off</h3>
+<p><code>--disable-log-stats</code> sets <code>log_stats</code> to False ({{cite vllm/engine/arg_utils.py:1909-1914}}). Without a stat logger plugin, <code>AsyncLLM</code> then makes no stat logger manager ({{cite vllm/v1/engine/async_llm.py:203-213}}), and:</p>
+<ul>
+  <li><code>/metrics</code> has no <code>vllm:*</code> engine metrics; the <code>http_*</code> metrics stay ({{link reference/metrics}});</li>
+  <li>the log line stops, because the log task starts only with stats on ({{cite vllm/entrypoints/launchers/utils/server_utils.py:78}});</li>
+  <li>the engine core records no QUEUED, SCHEDULED or PREEMPTED events ({{cite vllm/v1/core/sched/scheduler.py:2746-2747}});</li>
+  <li>requests carry no stats, so per-request metrics and traces have no data.</li>
+</ul>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Each latency metric: start, end, clock">
+<table>
+  <thead><tr><th>Metric</th><th>Start</th><th>End</th><th>Clock</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Prometheus TTFT</td><td><code>arrival_time</code>, set before the chat template</td><td>first output batch handled in the API server</td><td>front end, <code>time.time()</code></td><td>{{cite vllm/renderers/base.py:1380}}, {{cite vllm/v1/metrics/stats.py:525}}</td></tr>
+    <tr><td>Prometheus E2E</td><td><code>arrival_time</code></td><td>finished output handled</td><td>front end</td><td>{{cite vllm/v1/metrics/stats.py:594}}</td></tr>
+    <tr><td>Queue time</td><td>first QUEUED</td><td>first SCHEDULED</td><td>engine, <code>time.monotonic()</code></td><td>{{cite vllm/v1/metrics/stats.py:596-597}}</td></tr>
+    <tr><td>Prefill time</td><td>first SCHEDULED</td><td>first token</td><td>engine</td><td>{{cite vllm/v1/metrics/stats.py:599-601}}</td></tr>
+    <tr><td>ITL</td><td>previous output timestamp</td><td>this output timestamp</td><td>engine</td><td>{{cite vllm/v1/metrics/stats.py:553-558}}</td></tr>
+    <tr><td>TPOT</td><td colspan="2">decode time / (output tokens − 1)</td><td>engine</td><td>{{cite vllm/v1/metrics/stats.py:603-616}}</td></tr>
+    <tr><td>Per-request TTFT</td><td>first SCHEDULED</td><td>first token</td><td>engine</td><td>{{cite vllm/entrypoints/generate/base/serving.py:73-74}}</td></tr>
+  </tbody>
+</table>
+<p>The engine core stamps one <code>time.monotonic()</code> value on each batch of outputs ({{cite vllm/v1/engine/__init__.py:296-297}}). So ITL is a gap between two engine steps that produced a token for the request. It does not include the time of the HTTP stream. <code>--stream-interval</code> changes how often the client gets a chunk, not the Prometheus ITL. The docs describe ITL as a wall-clock gap between streamed outputs ({{cite docs/design/metrics.md:69-70}}); the code uses engine timestamps. A preemption does not restart the queue time: only the first SCHEDULED event counts ({{cite vllm/v1/metrics/stats.py:576-577}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Known gaps and traps">
+<ul>
+  <li><strong><code>--show-hidden-metrics-for-version</code> has no effect.</strong> The Prometheus logger stores the value ({{cite vllm/v1/metrics/loggers.py:494}}), and no code reads it after that. The docs describe hidden deprecated metrics ({{cite docs/usage/metrics.md:132-136}}). See {{link reference/metrics#known-issues}}.</li>
+  <li><strong>Preempted requests are not in the prefix-cache counters.</strong> A request that comes back after a preemption looks up the cache again, but <code>PrefixCacheStats.record</code> puts it into <code>preempted_*</code> fields, which no metric exports ({{cite vllm/v1/metrics/stats.py:146-156}}). So <code>vllm:prefix_cache_queries_total</code> counts first admissions only.</li>
+  <li><strong>Two clocks.</strong> TTFT and E2E use the front-end clock; queue, prefill, decode, ITL and TPOT use the engine clock. Do not subtract a front-end time from an engine time.</li>
+  <li><strong>Client disconnects.</strong> A request that the client aborts does not add finished-request stats (E2E, TPOT, request_success) ({{cite vllm/v1/engine/async_llm.py:807-809}}).</li>
+  <li><strong>KV usage is not cache fullness.</strong> <code>vllm:kv_cache_usage_perc</code> counts blocks outside the free queue; cached prefix blocks with no user are free ({{cite vllm/v1/core/block_pool.py:881-892}}).</li>
+  <li><strong>Log-line hit rate vs. PromQL hit rate.</strong> The log line uses about the last 1,000 requests ({{cite vllm/v1/metrics/stats.py:47}}); a PromQL rate uses your time window.</li>
+  <li><strong>Waiting includes deferred.</strong> <code>vllm:num_requests_waiting</code> adds requests that wait for a LoRA slot, a KV transfer or another blocked state ({{cite vllm/v1/metrics/loggers.py:1150-1154}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Worked example: one log line and the same numbers in PromQL">
+<p>An illustrative log line from one engine (the numbers are made up; the format is from {{cite vllm/v1/metrics/loggers.py:276-337}}):</p>
+<pre><code class="language-none">(APIServer pid=4121) INFO ... Engine 000: Avg prompt throughput: 5120.4 tokens/s, Avg generation throughput: 1835.0 tokens/s, Running: 64 reqs, Waiting: 12 reqs, Preemptions: 3, GPU KV cache usage: 97.8%, Prefix cache hit rate: 41.2%</code></pre>
+<ol>
+  <li><strong>Prompt throughput 5,120 tokens/s</strong> counts computed prompt tokens only. Hits in the prefix cache are not in it.</li>
+  <li><strong>Running 64, waiting 12</strong>: requests wait while the batch has room for more sequences. The cause is not <code>max_num_seqs</code>.</li>
+  <li><strong>KV usage 97.8 % and "Preemptions: 3"</strong>: the block pool is full, and the scheduler preempted running requests in the last interval. Waiting requests do not start because their tokens do not fit ({{cite vllm/v1/core/kv_cache_manager.py:522-539}}).</li>
+  <li>The same view in PromQL: <code>vllm:num_requests_running</code>, <code>vllm:num_requests_waiting</code>, <code>100 * vllm:kv_cache_usage_perc</code>, <code>rate(vllm:num_preemptions_total[1m])</code>.</li>
+</ol>
+<p>Conclusion: this server is limited by KV memory, not by the token budget. {{link concepts/tuning}} lists the memory knobs.</p>
+</x-deepdive>
+
+<x-deepdive title="Flags and environment variables">
+<table>
+  <thead><tr><th>Flag or variable</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--disable-log-stats</code></td><td>off ({{cite vllm/engine/arg_utils.py:624}})</td><td>no stat loggers, no events (Step 9)</td></tr>
+    <tr><td><code>--aggregate-engine-logging</code></td><td>off ({{cite vllm/engine/arg_utils.py:625}})</td><td>one log line for all DP engines</td></tr>
+    <tr><td><code>VLLM_LOG_STATS_INTERVAL</code></td><td>10.0 s ({{cite vllm/envs.py:874-878}})</td><td>log-line interval</td></tr>
+    <tr><td><code>--enable-per-request-metrics</code></td><td>off ({{cite vllm/entrypoints/common/cli_args.py:150}})</td><td><code>metrics</code> in responses</td></tr>
+    <tr><td><code>--otlp-traces-endpoint</code></td><td>none ({{cite vllm/config/observability.py:38}})</td><td>OpenTelemetry spans</td></tr>
+    <tr><td><code>--collect-detailed-traces</code></td><td>none ({{cite vllm/config/observability.py:41}})</td><td>model / worker times in spans</td></tr>
+    <tr><td><code>--custom-histogram-buckets</code></td><td>none ({{cite vllm/config/observability.py:70}})</td><td>replace a bucket family</td></tr>
+    <tr><td><code>--kv-cache-metrics</code></td><td>off ({{cite vllm/config/observability.py:62}})</td><td>sampled KV block lifetime metrics</td></tr>
+    <tr><td><code>--cudagraph-metrics</code></td><td>off ({{cite vllm/config/observability.py:82}})</td><td>CUDA graph padding and mode counts</td></tr>
+    <tr><td><code>--enable-mfu-metrics</code></td><td>off ({{cite vllm/config/observability.py:91}})</td><td>model FLOPs utilization estimates</td></tr>
+    <tr><td><code>--enable-logging-iteration-details</code></td><td>off ({{cite vllm/config/observability.py:99}})</td><td>one log line per step</td></tr>
+    <tr><td><code>--profiler-config</code></td><td>no profiler ({{cite vllm/config/profiler.py:70}})</td><td>adds the profile routes</td></tr>
+    <tr><td><code>PROMETHEUS_MULTIPROC_DIR</code></td><td>set by vLLM with N API servers</td><td>shared metric files ({{cite vllm/v1/metrics/prometheus.py:17-36}})</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong><code>/metrics</code> has only <code>http_*</code> metrics.</strong> The server runs with <code>--disable-log-stats</code> (Step 9).</li>
+  <li><strong>No log line.</strong> More than one API server (Step 4), an idle server (DEBUG level), or <code>VLLM_LOGGING_LEVEL</code> above INFO.</li>
+  <li><strong>A dashboard shows KV usage of 0.98 %.</strong> The gauge is a fraction; multiply by 100 ({{cite vllm/v1/metrics/loggers.py:621}}).</li>
+  <li><strong>Old metrics files after a restart.</strong> You set <code>PROMETHEUS_MULTIPROC_DIR</code> yourself and did not clean it ({{cite vllm/v1/metrics/prometheus.py:30-36}}).</li>
+  <li><strong>Per-request TTFT disagrees with the dashboard.</strong> They measure different intervals (Step 5).</li>
+  <li><strong><code>/start_profile</code> answers 404.</strong> No <code>--profiler-config</code> with a profiler (Step 8).</li>
+  <li><strong>The client and the server disagree on TTFT.</strong> The client clock starts earlier and stops later; see {{link concepts/benchmarking}}.</li>
+</ul>
+<p><strong>Why it matters.</strong> You can tune and debug a server only through these signals. Each one has a start point, a clock and a switch. If you know them, you can compare the right numbers and find the binding limit ({{link concepts/troubleshooting}}).</p>
+
+<x-quiz>
+  <x-q level="easy">Which flag removes all <code>vllm:*</code> metrics from <code>/metrics</code>, and which metrics stay?
+    <x-a><p><code>--disable-log-stats</code> without a stat logger plugin: <code>AsyncLLM</code> makes no stat logger manager ({{cite vllm/v1/engine/async_llm.py:203-213}}). The <code>http_*</code> metrics of the instrumentator stay ({{cite vllm/entrypoints/serve/instrumentator/metrics.py:64-74}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">The gauge <code>vllm:kv_cache_usage_perc</code> shows 0.5. How full is the KV cache?
+    <x-a><p>Half of the usable blocks are outside the free queue: the gauge is a fraction from 0 to 1 ({{cite vllm/v1/metrics/loggers.py:619-623}}). Cached free blocks count as free, so the prefix cache can hold more data than this suggests.</p></x-a>
+  </x-q>
+  <x-q level="medium">You run <code>vllm serve M -dp 4</code> and see no "Avg prompt throughput" line. Why, and where do you look instead?
+    <x-a><p>The API server count defaults to the DP size, 4 ({{cite vllm/entrypoints/cli/serve.py:124-130}}). With more than one API server, the log-line logger is not added ({{cite vllm/v1/metrics/loggers.py:1384-1389}}). <code>/metrics</code> still works and merges all API servers through the multiprocess directory ({{cite vllm/entrypoints/cli/serve.py:282-283}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A response has <code>"time_to_first_token_ms": 42</code>, but the Prometheus TTFT p50 is 300 ms at low load. Is one of them wrong?
+    <x-a><p>No. The per-request value runs from the first SCHEDULED event to the first token on the engine clock ({{cite vllm/entrypoints/generate/base/serving.py:73-74}}). The Prometheus TTFT starts at <code>arrival_time</code> before the chat template, and ends when the API server handles the output ({{cite vllm/renderers/base.py:1380}}, {{cite vllm/v1/metrics/stats.py:525}}). It adds rendering, tokenization, the queue and the trip back to the front end.</p></x-a>
+  </x-q>
+  <x-q level="hard">During heavy preemption, the prefix cache hit rate from PromQL stays high, but prefill throughput rises. How can both be true?
+    <x-a><p>A preempted request loses its blocks and computes its prompt again (recompute). Its new cache lookup is recorded in <code>preempted_queries</code> and <code>preempted_hits</code>, which no metric exports ({{cite vllm/v1/metrics/stats.py:146-156}}). So the exported counters see only first admissions, while the recomputed prompt tokens add to the prompt throughput ({{cite vllm/v1/metrics/loggers.py:162-163}}).</p></x-a>
+  </x-q>
+</x-quiz>

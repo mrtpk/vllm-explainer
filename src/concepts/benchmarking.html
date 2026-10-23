@@ -1,0 +1,218 @@
+---
+title: Benchmarking vLLM: vllm bench serve, throughput, latency and startup
+nav_title: Benchmarking
+level: Intermediate
+prerequisites: learn/serving-metrics, concepts/metrics-and-observability
+related: learn/serving-metrics, concepts/metrics-and-observability, concepts/tuning, concepts/openai-server, reference/metrics, concepts/compile-and-cuda-graphs
+summary: How vllm bench serve loads a running server (datasets, request rate, burstiness, max concurrency), how it computes TTFT, TPOT, ITL, E2EL and goodput, why its numbers differ from the server's Prometheus numbers, what vllm bench throughput, latency and startup measure, and a benchmarking method.
+---
+<x-sentence>vllm bench serve is an HTTP client. It sends requests at a chosen rate, times the stream chunks, and reports latency percentiles and goodput.</x-sentence>
+
+<h2>The idea</h2>
+<p>To tune a server, you need numbers that you can repeat. <code>vllm bench</code> has several subcommands. Only one of them talks to a running server:</p>
+<ul>
+  <li><strong><code>vllm bench serve</code></strong> sends HTTP requests to a server that you started with <code>vllm serve</code>. It measures what a client sees. The metrics are time to first token (TTFT), time per output token (TPOT), inter-token latency (ITL), end-to-end latency (E2EL), throughput and goodput ({{link learn/serving-metrics}}).</li>
+  <li><strong><code>vllm bench throughput</code></strong>, <strong><code>latency</code></strong> and <strong><code>startup</code></strong> start their own engine in the same command, with the offline <code>LLM</code> class. They measure the engine without HTTP.</li>
+</ul>
+<p>The client controls the load: how many requests, how long each prompt is, how fast they arrive, and how many run at once. The server's own metrics measure the same requests from the inside ({{link concepts/metrics-and-observability}}). The two views differ by design, and this page shows where.</p>
+<p><strong>An everyday comparison.</strong> Think of a test shopper. The shopper starts a stopwatch at the shop door and stops it when the bag is in the hand. The shop's own records start when the order reaches the counter. Both are correct; they time different things. The comparison stops at the crowd. The test shopper of vLLM can be a thousand shoppers at once, with a random rhythm of arrivals that you choose.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b9_bench_timing" alt="Panel 1: a schematic time axis. Above it, the client timing points of vllm bench serve: POST sent (st), chunk 1, chunk 2, chunk 3 and the last chunk; client TTFT runs from st to chunk 1, and ITL is one gap per chunk. Below it, the server points: arrival_time in the API server, QUEUED, SCHEDULED, first token and last token in the engine core. The Prometheus TTFT runs from arrival_time to the output handling after the first token, on the front-end clock. The per-request time_to_first_token_ms runs from SCHEDULED to the first token, on the engine clock. Panel 2: three boxes. vllm bench serve: TTFT POST to first chunk, TPOT (E2EL minus TTFT) over n minus 1 only for n above 1, ITL gap between SSE chunks, E2EL POST to last chunk. Prometheus: TTFT arrival to output handled, TPOT decode over n minus 1 or 0, ITL gap of engine timestamps, e2e arrival to finished. Per-request metrics field: time_to_first_token_ms SCHEDULED to first token, prefill only, and queue_time_ms QUEUED to SCHEDULED." caption="Figure: the client clock starts before the server clocks and stops after them (1); the same metric names mean three different intervals (2)." />
+<p>Read panel 1 from left to right. The client clock starts when the POST leaves the client, before the server parses HTTP. The server clocks start only when rendering starts. Panel 2 is the summary to keep: compare a client number only with a client number.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the command and the request function</h3>
+<p><code>vllm bench serve</code> is a thin subcommand: it adds the arguments of <code>vllm/benchmarks/serve.py</code> and calls its <code>main</code> ({{cite vllm/entrypoints/cli/benchmark/serve.py:10-21}}). The default backend is <code>openai</code> and the default endpoint is <code>/v1/completions</code> ({{cite vllm/benchmarks/serve.py:1647-1668}}). The backend picks a request function; <code>openai-chat</code> sends chat requests, and there are functions for embeddings and rerank servers ({{cite vllm/benchmarks/lib/endpoint_request_func.py:1155-1172}}). Without <code>--model</code>, the client asks the server's <code>/v1/models</code> for the first model ({{cite vllm/benchmarks/serve.py:2126-2131}}, {{cite vllm/benchmarks/serve.py:170-176}}).</p>
+<p>Each request is a stream with usage in the last chunk, so the client gets the server's token count ({{cite vllm/benchmarks/lib/endpoint_request_func.py:226-238}}). The client takes its time points here:</p>
+<x-code file="vllm/benchmarks/lib/endpoint_request_func.py" lines="278-297" highlight="282,286,290,295" />
+<ol>
+  <li>The clock starts with <code>time.perf_counter()</code> just before the POST ({{cite vllm/benchmarks/lib/endpoint_request_func.py:248-252}}).</li>
+  <li>Line 286: TTFT is the time of the first SSE chunk that has <code>choices</code>, even when its text is empty.</li>
+  <li>Line 290: each later chunk with <code>choices</code> adds one ITL value. One chunk can carry several tokens (for example with <code>--stream-interval</code>), so the client ITL is per chunk, not per token.</li>
+  <li>Line 295: the usage chunk gives <code>completion_tokens</code>; it does not move the end time.</li>
+  <li>E2EL (<code>latency</code>) is the time of the last chunk with <code>choices</code> ({{cite vllm/benchmarks/lib/endpoint_request_func.py:307}}). A request with no such chunk is a failure ({{cite vllm/benchmarks/lib/endpoint_request_func.py:298-305}}).</li>
+</ol>
+
+<h3>Step 2: datasets</h3>
+<p><code>--dataset-name</code> picks where the prompts come from; the default is <code>random</code> ({{cite vllm/benchmarks/datasets/datasets.py:1593-1612}}):</p>
+<table>
+  <thead><tr><th>Name</th><th>What it gives</th></tr></thead>
+  <tbody>
+    <tr><td><code>random</code></td><td>synthetic prompts of <code>--random-input-len</code> tokens (default 1024) and <code>--random-output-len</code> output tokens (default 128); <code>--random-range-ratio</code> spreads the lengths; <code>--random-prefix-len</code> adds a shared prefix ({{cite vllm/benchmarks/datasets/datasets.py:1887-1921}})</td></tr>
+    <tr><td><code>random-mm</code>, <code>random-rerank</code></td><td>random multimodal prompts; random rerank pairs</td></tr>
+    <tr><td><code>sharegpt</code>, <code>burstgpt</code></td><td>real conversations or a real request trace, from <code>--dataset-path</code></td></tr>
+    <tr><td><code>hf</code></td><td>Hugging Face datasets with their own loader classes (for example MT-Bench, GSM8K, VisionArena, InstructCoder), all based on <code>HuggingFaceDataset</code> ({{cite vllm/benchmarks/datasets/datasets.py:3094-3128}})</td></tr>
+    <tr><td><code>custom</code>, <code>custom_audio</code>, <code>custom_image</code></td><td>your own JSONL file</td></tr>
+    <tr><td><code>prefix_repetition</code></td><td>prompts with repeated prefixes, to test prefix caching</td></tr>
+    <tr><td><code>spec_bench</code>, <code>speed_bench</code></td><td>speculative decoding workloads</td></tr>
+    <tr><td><code>timed_trace</code></td><td>a trace with its own timestamps; <code>--self-timed</code> then defaults to on, and <code>--ignore-eos</code> is set ({{cite vllm/benchmarks/serve.py:2196-2201}})</td></tr>
+  </tbody>
+</table>
+<p>The random dataset makes token ids from a seeded generator, decodes them and encodes them again, so the prompt has the asked length ({{cite vllm/benchmarks/datasets/datasets.py:556-579}}). <code>--seed</code> (default 0) seeds it and the arrival times ({{cite vllm/benchmarks/datasets/datasets.py:1585}}, {{cite vllm/benchmarks/serve.py:2060-2061}}). <code>--num-prompts</code> defaults to 1,000 ({{cite vllm/benchmarks/datasets/datasets.py:70}}).</p>
+<x-warning title="max_tokens is a maximum, not a length">
+<p>The client sends the output length as <code>max_tokens</code> ({{cite vllm/benchmarks/lib/endpoint_request_func.py:232}}). The model can stop earlier at an end token. Add <code>--ignore-eos</code> when every request must produce exactly that many tokens ({{cite vllm/benchmarks/serve.py:1831-1836}}). Also note: the client sends no <code>temperature</code> unless you pass <code>--temperature</code>, so the server's default sampling applies ({{cite vllm/benchmarks/serve.py:2246-2252}}).</p>
+</x-warning>
+
+<h3>Step 3: request rate, burstiness and max concurrency</h3>
+<p>{{term request-rate | --request-rate}} is in requests per second; the default <code>inf</code> sends all requests at time 0 ({{cite vllm/benchmarks/serve.py:1745-1753}}). For a finite rate, the client draws the gap before each request from a gamma distribution:</p>
+<x-code file="vllm/benchmarks/serve.py" lines="497-526" highlight="504-508,513-526" />
+<ul>
+  <li>{{term burstiness | --burstiness}} is the shape of the gamma distribution, default 1.0 ({{cite vllm/benchmarks/serve.py:1754-1765}}). The scale is <code>1 / (rate × burstiness)</code>, so the mean gap is always <code>1 / rate</code>. Burstiness 1 gives exponential gaps (a Poisson process). Below 1, gaps vary more (bursts); above 1, they are more even.</li>
+  <li>Lines 513-526: without a ramp-up, the client then scales all gaps so that the last request starts exactly at <code>num_prompts / rate</code>. The comment says that this keeps the throughput stable across seeds.</li>
+  <li><code>--max-concurrency N</code> wraps each request in an <code>asyncio.Semaphore(N)</code> ({{cite vllm/benchmarks/serve.py:1001-1013}}). Requests that wait for the semaphore start their TTFT clock only when they get it; the wait is kept as <code>client_queue_time</code> ({{cite vllm/benchmarks/serve.py:1014-1016}}). With a rate and a concurrency limit, the real rate can be lower than the asked rate ({{cite vllm/benchmarks/serve.py:1679-1690}}).</li>
+  <li><code>--ramp-up-strategy linear|exponential</code> with start and end rates changes the rate during the run ({{cite vllm/benchmarks/serve.py:1965-1987}}).</li>
+</ul>
+
+<h3>Step 4: warm-up and the ready check</h3>
+<p>Two start steps are off by default. <code>--ready-check-timeout-sec</code> defaults to 0, so the client skips the initial test request and prints "Skipping endpoint ready check." ({{cite vllm/benchmarks/serve.py:1989-1994}}, {{cite vllm/benchmarks/serve.py:908-925}}). <code>--num-warmups</code> defaults to 0 ({{cite vllm/benchmarks/serve.py:1780-1785}}). A first request after a server start can pay one-time costs, so a run without warm-up includes them in its first results.</p>
+
+<h3>Step 5: how the metrics are computed</h3>
+<p>After all requests finish, <code>calculate_metrics</code> builds the result. TPOT is computed per request:</p>
+<x-code file="vllm/benchmarks/serve.py" lines="652-662" highlight="655-658,660" />
+<ul>
+  <li>TPOT = (E2EL − TTFT) / (output tokens − 1), and only requests with more than one output token enter the TPOT statistics (lines 655-658). For goodput, a one-token request has TPOT 0 (line 660).</li>
+  <li>The output token count comes from the server's usage; without it, the client tokenizes the text ({{cite vllm/benchmarks/serve.py:635-650}}).</li>
+  <li>Throughputs divide by the benchmark duration, from the start of the send loop to the end of the last request ({{cite vllm/benchmarks/serve.py:773-781}}, {{cite vllm/benchmarks/serve.py:1048}}, {{cite vllm/benchmarks/serve.py:1123}}).</li>
+  <li>Mean, median, standard deviation and percentiles use NumPy over all requests (TTFT, TPOT, E2EL) or over all chunk gaps (ITL) ({{cite vllm/benchmarks/serve.py:782-806}}). <code>--metric-percentiles</code> defaults to 99 ({{cite vllm/benchmarks/serve.py:1858-1866}}); <code>--percentile-metrics</code> defaults to <code>ttft,tpot,itl</code> for generative models ({{cite vllm/benchmarks/serve.py:2255}}).</li>
+  <li>{{term goodput-slo | --goodput}} <code>ttft:500 tpot:50</code> sets SLOs in milliseconds ({{cite vllm/benchmarks/serve.py:1867-1878}}). A request is good when each given SLO is at least its measured value. Request goodput = good requests / duration ({{cite vllm/benchmarks/serve.py:669-692}}, {{cite vllm/benchmarks/serve.py:779}}).</li>
+</ul>
+
+<h3>Step 6: client numbers vs server numbers</h3>
+<p>Run <code>vllm bench serve</code> against a server and watch its <code>/metrics</code> at the same time: the numbers differ. These are the reasons, each from the code:</p>
+<table>
+  <thead><tr><th>Metric</th><th>vllm bench serve (client)</th><th>Prometheus (server)</th></tr></thead>
+  <tbody>
+    <tr><td>TTFT</td><td>POST sent → first chunk received; includes the network, HTTP parsing and SSE output</td><td><code>arrival_time</code> (render start) → first output handled in the API server ({{cite vllm/renderers/base.py:1380}}, {{cite vllm/v1/metrics/stats.py:525}})</td></tr>
+    <tr><td>ITL</td><td>gap between SSE chunks</td><td>gap between engine-core output timestamps ({{cite vllm/v1/metrics/stats.py:555}})</td></tr>
+    <tr><td>TPOT</td><td>(E2EL − TTFT) / (n − 1), only n &gt; 1</td><td>decode time / (n − 1), and 0 for n = 1, which enters the histogram ({{cite vllm/v1/metrics/stats.py:612-616}})</td></tr>
+    <tr><td>Aborted requests</td><td>counted as failed</td><td>no finished-request stats after a client disconnect ({{cite vllm/v1/engine/async_llm.py:807-809}})</td></tr>
+    <tr><td>Clock</td><td><code>time.perf_counter()</code></td><td><code>time.time()</code> (front end) and <code>time.monotonic()</code> (engine core)</td></tr>
+  </tbody>
+</table>
+<p>With <code>--enable-per-request-metrics</code> on the server, the client also stores the server's <code>queue_time_ms</code> and <code>time_to_first_token_ms</code> per request in its result data ({{cite vllm/benchmarks/lib/endpoint_request_func.py:110-125}}, {{cite vllm/benchmarks/serve.py:391-403}}). That server TTFT is the prefill interval only ({{link concepts/metrics-and-observability}}). With speculative decoding, the client reads the server's <code>vllm:spec_decode_*</code> counters before and after the run and reports the acceptance ({{cite vllm/benchmarks/serve.py:996}}, {{cite vllm/benchmarks/serve.py:210-260}}).</p>
+
+<h3>Step 7: vllm bench throughput</h3>
+<p><code>vllm bench throughput</code> measures offline throughput: it builds an <code>LLM</code> from the engine flags and sends all prompts in one <code>generate()</code> call ({{cite vllm/benchmarks/throughput.py:37-48}}, {{cite vllm/benchmarks/throughput.py:129-151}}). It prints requests/s, total tokens/s and output tokens/s ({{cite vllm/benchmarks/throughput.py:1108-1114}}). Without <code>--dataset-path</code>, it uses the random dataset and needs <code>--input-len</code> or <code>--random-input-len</code> ({{cite vllm/benchmarks/throughput.py:642-650}}). <code>--async-engine</code> uses an in-process <code>AsyncLLM</code> instead ({{cite vllm/benchmarks/throughput.py:863-867}}, {{cite vllm/benchmarks/throughput.py:308-314}}). There is no HTTP, no SLO and no arrival process: all requests wait at time 0.</p>
+
+<h3>Step 8: vllm bench latency</h3>
+<p><code>vllm bench latency</code> measures the time of one batch. The batch has <code>--batch-size</code> (default 8) random prompts of <code>--input-len</code> (32) tokens. Each prompt gets exactly <code>--output-len</code> (128) tokens, because the command sets <code>ignore_eos</code> ({{cite vllm/benchmarks/latency.py:35-37}}, {{cite vllm/benchmarks/latency.py:96-103}}). It runs 10 warm-up iterations and 30 measured ones, and prints the mean and the 10th to 99th percentiles of the batch time ({{cite vllm/benchmarks/latency.py:45-53}}, {{cite vllm/benchmarks/latency.py:158-168}}).</p>
+
+<h3>Step 9: vllm bench startup</h3>
+<p><code>vllm bench startup</code> measures how long <code>LLM(...)</code> takes to start, cold and warm ({{cite vllm/benchmarks/startup.py:3-9}}). A cold run uses a new temporary <code>VLLM_CACHE_ROOT</code> and a fresh Inductor cache; a warm run reuses the caches ({{cite vllm/benchmarks/startup.py:109-128}}). Each run is a new subprocess ({{cite vllm/benchmarks/startup.py:133-147}}). The defaults are 3 cold runs, 1 warm-up and 3 warm runs ({{cite vllm/benchmarks/startup.py:193-210}}). It reports the start-up time and the compilation time of each run.</p>
+<x-note title="The offline subcommands use the LLM-class defaults">
+<p><code>throughput</code>, <code>latency</code> and <code>startup</code> start the engine with the usage context <code>LLM_CLASS</code> ({{cite vllm/entrypoints/llm.py:341-343}}). The exception is <code>throughput --async-engine</code>: it uses the <code>vllm serve</code> context <code>OPENAI_API_SERVER</code> ({{cite vllm/entrypoints/launchers/api_server/entry.py:69-82}}). On an 80 GiB H100, that gives a token budget of 16,384, but <code>vllm serve</code> uses 8,192 ({{cite vllm/engine/arg_utils.py:2970-2981}}). Set <code>--max-num-batched-tokens</code> explicitly when you compare with a server. <code>vllm bench sweep</code> runs <code>vllm bench serve</code> over a grid of server and client settings ({{cite vllm/benchmarks/sweep/cli.py:19-25}}, {{cite vllm/benchmarks/sweep/serve.py:465-520}}).</p>
+</x-note>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: reading one result block (illustrative numbers)">
+<p>Command (an example, not from the repository):</p>
+<pre><code class="language-bash">vllm bench serve --model meta-llama/Llama-3.1-8B-Instruct --dataset-name random \
+  --random-input-len 1024 --random-output-len 128 --ignore-eos --num-prompts 1000 \
+  --request-rate 20 --num-warmups 20 --metric-percentiles 50,99 --goodput ttft:500 tpot:50</code></pre>
+<p>Output (the format is from {{cite vllm/benchmarks/serve.py:1220-1280}} and {{cite vllm/benchmarks/serve.py:1423-1440}}; <strong>all numbers are made up</strong> to show how to read them):</p>
+<pre><code class="language-none">============ Serving Benchmark Result ============
+Successful requests:                     1000
+Failed requests:                         0
+Request rate configured (RPS):           20.00
+Benchmark duration (s):                  52.10
+Total input tokens:                      1024000
+Total generated tokens:                  128000
+Request throughput (req/s):              19.19
+Request goodput (req/s):                 17.60
+Output token throughput (tok/s):         2456.81
+Peak output token throughput (tok/s):    3120.00
+Peak concurrent requests:                61.00
+Total token throughput (tok/s):          22111.32
+---------------Time to First Token----------------
+Mean TTFT (ms):                          182.40
+Median TTFT (ms):                        140.10
+P50 TTFT (ms):                           140.10
+P99 TTFT (ms):                           690.50
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          24.30
+Median TPOT (ms):                        23.90
+P50 TPOT (ms):                           23.90
+P99 TPOT (ms):                           38.20
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           24.20
+Median ITL (ms):                         19.80
+P50 ITL (ms):                            19.80
+P99 ITL (ms):                            95.70
+==================================================</code></pre>
+<ol>
+  <li><strong>Duration and throughput.</strong> 1,000 requests at 20 RPS start over 50 s (Step 3); the last ones finish at 52.1 s. Request throughput = 1000 / 52.10 = 19.19. It is below 20 because the duration includes the tail after the last send.</li>
+  <li><strong>Total token throughput</strong> = (1,024,000 + 128,000) / 52.10 = 22,111 ({{cite vllm/benchmarks/serve.py:781}}). Prompt tokens dominate it, so it says little about decode speed.</li>
+  <li><strong>Goodput</strong> 17.60 req/s = 917 good requests / 52.10 s. So 8.3 % of the requests missed at least one SLO. The mean TTFT (182 ms) and the mean TPOT (24 ms) are still far below the SLOs. The P99 TTFT (690 ms) shows the misses.</li>
+  <li><strong>ITL vs TPOT.</strong> The ITL median (19.8 ms) is below the TPOT median (23.9 ms), and the ITL P99 is high (95.7 ms). Some gaps contain a step with a large prefill chunk; TPOT spreads such spikes over the whole request.</li>
+  <li><strong>Peak values</strong> come from one-second buckets of the client's token times ({{cite vllm/benchmarks/serve.py:715-760}}). "Peak concurrent requests: 61" is the largest number of requests that were active in one second, as the client saw them. It is an upper bound for the requests in flight at one moment.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="A benchmarking method (advice)">
+<p>This method is advice; each step names the code that makes it work.</p>
+<ol>
+  <li><strong>Fix the inputs.</strong> Use one <code>--seed</code>, one dataset and fixed lengths, with <code>--ignore-eos</code> for synthetic data (Step 2).</li>
+  <li><strong>Warm up.</strong> Set <code>--num-warmups</code> (default 0) and <code>--ready-check-timeout-sec</code> (default 0) (Step 4). Better: run one short benchmark after each server start and throw it away.</li>
+  <li><strong>Sweep the request rate</strong>, not only <code>inf</code>. With <code>inf</code>, all requests arrive at once, and TTFT mostly measures the queue. Sweep for example 2, 4, 8, 16 RPS until goodput stops rising. <code>vllm bench sweep</code> automates grids.</li>
+  <li><strong>Compare at equal goodput.</strong> For two configurations, compare the highest request rate at which goodput stays at, say, 95 % of throughput, with the same SLOs.</li>
+  <li><strong>Watch the server at the same time.</strong> <code>vllm:num_requests_waiting</code>, <code>vllm:kv_cache_usage_perc</code> and preemptions explain why a rate fails ({{link concepts/metrics-and-observability}}).</li>
+  <li><strong>Run the client on another machine</strong> or on free CPU cores. The client is one Python process; a busy client delays its own timestamps.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Burstiness, in numbers">
+<p>For <code>--request-rate 10</code>, the mean gap is 0.1 s at every burstiness b. The gamma mean is shape × scale = b × 1/(10 b) = 0.1 s ({{cite vllm/benchmarks/serve.py:504-508}}). The spread changes: the coefficient of variation of a gamma distribution is 1/√b (general statistics). So b = 1 gives a standard deviation of 0.1 s, and b = 4 gives 0.05 s. b = 0.25 gives 0.2 s: arrivals come in clusters with long pauses. <code>--burstiness inf</code> gives a constant gap of 0.1 s ({{cite vllm/benchmarks/serve.py:499-502}}). A lower burstiness at the same rate gives higher TTFT percentiles, because requests come in groups.</p>
+</x-deepdive>
+
+<x-deepdive title="Flags of vllm bench serve">
+<table>
+  <thead><tr><th>Flag</th><th>Default</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>--backend</code>, <code>--endpoint</code></td><td><code>openai</code>, <code>/v1/completions</code></td><td>{{cite vllm/benchmarks/serve.py:1647-1668}}</td></tr>
+    <tr><td><code>--dataset-name</code>, <code>--num-prompts</code>, <code>--seed</code></td><td><code>random</code>, 1000, 0</td><td>{{cite vllm/benchmarks/datasets/datasets.py:1585-1612}}</td></tr>
+    <tr><td><code>--random-input-len</code>, <code>--random-output-len</code></td><td>1024, 128</td><td>{{cite vllm/benchmarks/datasets/datasets.py:1887-1898}}</td></tr>
+    <tr><td><code>--request-rate</code>, <code>--burstiness</code></td><td>inf, 1.0</td><td>{{cite vllm/benchmarks/serve.py:1745-1765}}</td></tr>
+    <tr><td><code>--max-concurrency</code></td><td>none</td><td>{{cite vllm/benchmarks/serve.py:1678-1690}}</td></tr>
+    <tr><td><code>--num-warmups</code>, <code>--ready-check-timeout-sec</code></td><td>0, 0</td><td>{{cite vllm/benchmarks/serve.py:1780-1785}}, {{cite vllm/benchmarks/serve.py:1988-1994}}</td></tr>
+    <tr><td><code>--percentile-metrics</code>, <code>--metric-percentiles</code></td><td><code>ttft,tpot,itl</code>, 99</td><td>{{cite vllm/benchmarks/serve.py:1847-1866}}</td></tr>
+    <tr><td><code>--goodput</code></td><td>none</td><td>{{cite vllm/benchmarks/serve.py:1867-1878}}</td></tr>
+    <tr><td><code>--ignore-eos</code></td><td>off</td><td>{{cite vllm/benchmarks/serve.py:1831-1836}}</td></tr>
+    <tr><td><code>--profile</code></td><td>off; the server needs <code>--profiler-config</code></td><td>{{cite vllm/benchmarks/serve.py:1786-1790}}</td></tr>
+    <tr><td><code>--save-result</code>, <code>--save-detailed</code></td><td>off</td><td>{{cite vllm/benchmarks/serve.py:1791-1801}}</td></tr>
+  </tbody>
+</table>
+<p>The HTTP session has a total time limit of 6 hours per request ({{cite vllm/benchmarks/serve.py:867-871}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Huge TTFT at <code>--request-rate inf</code>.</strong> All requests arrive at time 0, so most of them wait in the queue (Step 3). Use a finite rate or <code>--max-concurrency</code>.</li>
+  <li><strong>Output tokens below the asked length.</strong> The model stopped at an end token; use <code>--ignore-eos</code> (Step 2).</li>
+  <li><strong>The first run is slower than the next ones.</strong> No warm-up by default (Step 4).</li>
+  <li><strong>Client ITL is much larger than Prometheus ITL.</strong> The server sends several tokens per chunk (<code>--stream-interval</code>), or the client process is busy (Step 1, Step 6).</li>
+  <li><strong>All requests fail with "Never received a valid chunk".</strong> The endpoint does not stream <code>choices</code>, for example the wrong <code>--backend</code> for <code>--endpoint</code> ({{cite vllm/benchmarks/lib/endpoint_request_func.py:298-305}}).</li>
+  <li><strong><code>vllm bench throughput</code> is faster than the server.</strong> It has no HTTP, no arrival process, and a larger default token budget (note in Step 9).</li>
+</ul>
+<p><strong>Why it matters.</strong> A benchmark number is only useful when you know its start point, its clock and its load. With that, you can compare two configurations fairly and explain the gap between the client view and the server view.</p>
+
+<x-quiz>
+  <x-q level="easy">Which <code>vllm bench</code> subcommand needs a running <code>vllm serve</code>?
+    <x-a><p>Only <code>serve</code>: it sends HTTP requests to <code>--host</code>/<code>--port</code> or <code>--base-url</code> ({{cite vllm/benchmarks/serve.py:1654-1662}}). <code>throughput</code>, <code>latency</code> and <code>startup</code> build an <code>LLM</code> themselves ({{cite vllm/benchmarks/throughput.py:48}}, {{cite vllm/benchmarks/latency.py:88}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">A request produced exactly 1 output token. How does it count in the TPOT statistics of <code>vllm bench serve</code>, and in the goodput check?
+    <x-a><p>It is not in the TPOT statistics, because TPOT needs more than one token ({{cite vllm/benchmarks/serve.py:655-658}}). In the goodput check, its TPOT is 0 ({{cite vllm/benchmarks/serve.py:660}}), so it can only miss the TTFT or E2EL SLO.</p></x-a>
+  </x-q>
+  <x-q level="medium">With <code>--request-rate 10 --burstiness 0.5</code>, what is the mean gap between requests, and how does the arrival pattern differ from the default?
+    <x-a><p>The mean gap is still 0.1 s: shape 0.5 × scale 1/(10 × 0.5) ({{cite vllm/benchmarks/serve.py:504-508}}). The gaps vary more than with the default 1.0, so requests come in bursts. The client also scales the gaps so that the last request starts at 100 s for 1,000 prompts ({{cite vllm/benchmarks/serve.py:513-526}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With <code>--max-concurrency 8</code>, a request waits 2 s for the semaphore. Is the wait in its TTFT?
+    <x-a><p>No. The request function starts the clock only when it runs, after the semaphore ({{cite vllm/benchmarks/serve.py:1010-1013}}, {{cite vllm/benchmarks/lib/endpoint_request_func.py:248}}). The wait is kept as <code>client_queue_time</code> ({{cite vllm/benchmarks/serve.py:1016}}), which is reported only if you select it in <code>--percentile-metrics</code>.</p></x-a>
+  </x-q>
+  <x-q level="hard">The client reports a P50 TTFT of 140 ms, the server's Prometheus P50 TTFT is 110 ms, and the per-request <code>time_to_first_token_ms</code> median is 60 ms. Explain all three.
+    <x-a><p>The client clock runs from the POST to the first chunk, with the network, HTTP parsing and SSE output ({{cite vllm/benchmarks/lib/endpoint_request_func.py:248}}, {{cite vllm/benchmarks/lib/endpoint_request_func.py:286}}). Prometheus runs from <code>arrival_time</code> at render start to the handled first output ({{cite vllm/renderers/base.py:1380}}, {{cite vllm/v1/metrics/stats.py:525}}): rendering, tokenization, the queue and prefill. The per-request value is only SCHEDULED to first token, the prefill on the engine clock ({{cite vllm/entrypoints/generate/base/serving.py:73-74}}). So 140 − 110 ms is outside the server, and 110 − 60 ms is front-end work plus the queue.</p></x-a>
+  </x-q>
+</x-quiz>
