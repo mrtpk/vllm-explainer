@@ -1,0 +1,164 @@
+---
+title: envs.py: environment variables as a dict of lambdas
+nav_title: envs.py
+level: Intermediate
+prerequisites: concepts/config-system, reference/env-vars
+related: reference/env-vars, concepts/config-system, code/engine-arg-utils, code/config-vllm, concepts/plugin-loading, concepts/compile-and-cuda-graphs, tours/serve-startup
+summary: vllm/envs.py declares every VLLM_* environment variable twice - a TYPE_CHECKING block for type checkers and a dict of reader functions for the run time - and makes them module attributes with a module-level __getattr__. This page reads the structure, the helpers, the cache that the engine core and the workers turn on, and compile_factors.
+---
+<h2>Purpose</h2>
+<p><code>vllm/envs.py</code> is the one place where vLLM declares its environment variables. Code reads a variable as <code>envs.VLLM_X</code>. The module computes the value from <code>os.environ</code> on each read, until the process turns on the {{term env-cache}}.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/envs.py</code>, 2,493 lines of Python. No classes. One dict with 317 entries; 16 helper functions; the module functions <code>__getattr__</code>, <code>__dir__</code>, <code>is_set</code>, <code>enable_envs_cache</code>, <code>disable_envs_cache</code> and <code>compile_factors</code>.</td></tr>
+    <tr><th>Main object</th><td><code>environment_variables: dict[str, Callable[[], Any]]</code> ({{cite vllm/envs.py:618}}).</td></tr>
+    <tr><th>Runs in</th><td>Every vLLM process, and <code>setup.py</code> at build time ({{cite setup.py:56}}). Reads happen in the thread of the caller.</td></tr>
+    <tr><th>Called by</th><td>About 300 modules in <code>vllm/</code> import it as <code>import vllm.envs as envs</code> or <code>from vllm import envs</code> (derived from a search).</td></tr>
+    <tr><th>Calls</th><td><code>os.environ</code>, <code>os.getenv</code>; a few readers import from <code>vllm.utils</code> or <code>urllib3</code> when they run.</td></tr>
+    <tr><th>Not in this file</th><td>The table of all variables ({{link reference/env-vars}}, generated from this file); <code>validate_environ</code>, which warns about unknown names ({{cite vllm/platforms/interface.py:1459-1467}}); the callers of <code>enable_envs_cache</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<p>Panel 3 of the diagram on {{link concepts/config-system#the-picture}} shows the environment as a separate channel next to <code>VllmConfig</code>. Each spawned process inherits <code>os.environ</code> and imports this module again.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li>Almost every part of vLLM reads <code>envs.X</code>. Some modules copy a value once at import, for example <code>from vllm.envs import VLLM_ENGINE_READY_TIMEOUT_S</code> ({{cite vllm/v1/engine/core_client.py:29}}).</li>
+  <li><code>EngineCore.__init__</code> and <code>WorkerProc.__init__</code> call <code>enable_envs_cache()</code> at their end ({{cite vllm/v1/engine/core.py:241-243}}, {{cite vllm/v1/executor/multiproc_executor.py:708-710}}).</li>
+  <li><code>cleanup_dist_env_and_memory</code> calls <code>disable_envs_cache()</code> ({{cite vllm/distributed/parallel_state.py:2543-2544}}).</li>
+  <li>The compile backend and the AOT cache call <code>compile_factors()</code> ({{cite vllm/compilation/backends.py:1059}}, {{cite vllm/compilation/caching.py:576}}).</li>
+  <li><code>vllm/collect_env.py</code> imports the dict ({{cite vllm/collect_env.py:20}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<p>Only the standard library at import. The readers call <code>os.getenv</code> when they run. <code>use_aot_compile</code> imports a torch version helper ({{cite vllm/envs.py:378-387}}); <code>get_vllm_port</code> imports <code>urllib3</code> only on a parse error ({{cite vllm/envs.py:532-544}}).</p>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Lines</th><th>Section</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td>{{cite vllm/envs.py:14-336}}</td><td><code>if TYPE_CHECKING:</code> block</td><td>310 typed names with defaults, for type checkers only.</td></tr>
+    <tr><td>{{cite vllm/envs.py:339-350}}</td><td><code>get_default_cache_root</code>, <code>get_default_config_root</code></td><td><code>XDG_*</code> roots, else <code>~/.cache</code> and <code>~/.config</code>.</td></tr>
+    <tr><td>{{cite vllm/envs.py:353-371}}</td><td><code>maybe_convert_int</code>, <code>maybe_convert_bool</code>, <code>maybe_convert_json_str_or_file</code></td><td>Parsers where "not set" means <code>None</code>.</td></tr>
+    <tr><td>{{cite vllm/envs.py:374-397}}</td><td><code>disable_compile_cache</code>, <code>use_aot_compile</code>, <code>use_mega_aot_artifact</code></td><td>Readers with a computed default.</td></tr>
+    <tr><td>{{cite vllm/envs.py:400-514}}</td><td><code>env_with_choices</code>, <code>env_list_with_choices</code>, <code>env_set_with_choices</code></td><td>Readers that check the value against a list.</td></tr>
+    <tr><td>{{cite vllm/envs.py:517-544}}</td><td><code>get_vllm_port</code></td><td>Parses <code>VLLM_PORT</code>; a URI raises.</td></tr>
+    <tr><td>{{cite vllm/envs.py:547-572}}</td><td><code>_generate_shm_name</code>, <code>get_env_or_set_default</code></td><td>A reader that writes a generated value back into <code>os.environ</code>.</td></tr>
+    <tr><td>{{cite vllm/envs.py:575-615}}</td><td>Doc markers, <code>_resolve_rust_cli_path</code></td><td>Markers for the docs generator; the Rust binary path.</td></tr>
+    <tr><td>{{cite vllm/envs.py:618-2285}}</td><td><code>environment_variables</code></td><td>The 317 readers.</td></tr>
+    <tr><td>{{cite vllm/envs.py:2291-2299}}</td><td><code>__getattr__</code></td><td><code>envs.X</code> calls the reader.</td></tr>
+    <tr><td>{{cite vllm/envs.py:2302-2337}}</td><td><code>_is_envs_cache_enabled</code>, <code>enable_envs_cache</code>, <code>disable_envs_cache</code></td><td>The cache.</td></tr>
+    <tr><td>{{cite vllm/envs.py:2340-2348}}</td><td><code>__dir__</code>, <code>is_set</code></td><td>All names; "is it in <code>os.environ</code>?".</td></tr>
+    <tr><td>{{cite vllm/envs.py:2351-2493}}</td><td><code>compile_factors</code></td><td>The environment part of the compile cache key.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3>The two declarations</h3>
+<p>Each variable has a typed line in the <code>TYPE_CHECKING</code> block, for example:</p>
+<x-code file="vllm/envs.py" lines="24-27" highlight="26" />
+<p>Python does not run this block, so these defaults have no effect. They give type checkers and editors a type for <code>envs.VLLM_ENGINE_READY_TIMEOUT_S</code>. The run-time reader is the dict entry:</p>
+<x-code file="vllm/envs.py" lines="810-814" highlight="812-814" />
+<p>The dict has 317 entries: 295 lambdas, 16 <code>env_with_choices</code> readers, one <code>env_set_with_choices</code>, one <code>get_env_or_set_default</code> and four named functions (derived from the source with <code>ast</code>). The code comment above each key is its description. Two comments split the dict: "Installation Time Env Vars" and "Runtime Env Vars" ({{cite vllm/envs.py:619}}, {{cite vllm/envs.py:710}}).</p>
+<x-warning title="The two defaults can differ">
+<p>The default in <code>TYPE_CHECKING</code> and the fallback in the reader are written by hand, two times. For a few variables they differ, and the reader wins. The page {{link reference/env-vars#known-issues}} lists them.</p>
+</x-warning>
+
+<h3>A reader with choices</h3>
+<x-code file="vllm/envs.py" lines="419-442" highlight="420-422,434-438" />
+<ol>
+  <li><strong>Lines 420-422.</strong> Not set: the default, with no check.</li>
+  <li><strong>Lines 434-438.</strong> A value that is not in the list raises <code>ValueError</code>. The error comes at the first read, not at start-up.</li>
+</ol>
+<p>The list form splits at commas and strips spaces ({{cite vllm/envs.py:472}}). The plain lambda of <code>VLLM_PLUGINS</code> does not strip them ({{cite vllm/envs.py:1163-1167}}). So <code>VLLM_PLUGINS="a, b"</code> gives <code>["a", " b"]</code>, and no plugin is named <code>" b"</code> (derived).</p>
+
+<h3><code>__getattr__</code>: a read is a function call</h3>
+<x-code file="vllm/envs.py" lines="2291-2299" highlight="2297-2298" />
+<p>The module defines no attribute <code>VLLM_X</code>. So Python calls this module-level <code>__getattr__</code> for <code>envs.VLLM_X</code> (PEP 562), and also for <code>from vllm.envs import VLLM_X</code>. Line 2298 calls the reader each time. The <code>from ... import</code> form keeps the value of that one moment in the importing module.</p>
+
+<h3><code>enable_envs_cache</code>: freeze the values</h3>
+<x-code file="vllm/envs.py" lines="2308-2326" highlight="2317-2319,2321-2322,2325-2326" />
+<ol>
+  <li><strong>Lines 2317-2319.</strong> A second call does nothing. <code>_is_envs_cache_enabled</code> checks for the <code>cache_clear</code> attribute of <code>functools.cache</code> ({{cite vllm/envs.py:2302-2305}}).</li>
+  <li><strong>Lines 2321-2322.</strong> The module <code>__getattr__</code> is replaced by a cached version of itself.</li>
+  <li><strong>Lines 2325-2326.</strong> Every reader runs once now, so the cache holds all 317 values.</li>
+</ol>
+<p><code>disable_envs_cache</code> puts the original function back through <code>__wrapped__</code> ({{cite vllm/envs.py:2329-2337}}). <code>is_set(name)</code> does not use the reader: it checks <code>name in os.environ</code> ({{cite vllm/envs.py:2344-2348}}).</p>
+
+<h3><code>compile_factors</code>: the environment in the compile cache key</h3>
+<x-code file="vllm/envs.py" lines="2451-2466" highlight="2452-2454,2456-2464" />
+<p>Every variable that is not in <code>ignored_factors</code> joins the key. The ignore list has 82 names, for example <code>VLLM_PORT</code>, <code>VLLM_CACHE_ROOT</code>, the logging variables and <code>VLLM_API_KEY</code> ({{cite vllm/envs.py:2356-2447}}). A reader that raises is skipped with a warning (lines 2456-2464). Nine Ray variables join the key too (lines 2468-2491). The compile backend hashes this dict into the env hash of the {{term compile-cache}} ({{cite vllm/compilation/backends.py:1059-1060}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Processes and the cache: when a value is fixed">
+<table>
+  <thead><tr><th>Process</th><th>Environment comes from</th><th>Cache</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td>API server</td><td>the shell</td><td>never on</td><td>Each <code>envs.X</code> reads <code>os.environ</code> again. A comment in the metrics code says the same ({{cite vllm/v1/metrics/stats.py:479-481}}).</td></tr>
+    <tr><td>Engine core</td><td>a copy of the API server environment at spawn</td><td>on at the end of <code>EngineCore.__init__</code></td><td>Reads during start-up are live; later reads return the cached value.</td></tr>
+    <tr><td>Worker process (TP &gt; 1)</td><td>a copy of the engine core environment at spawn</td><td>on at the end of <code>WorkerProc.__init__</code></td><td>Same as the engine core.</td></tr>
+    <tr><td>Worker with TP = 1</td><td>it is in the engine core process</td><td>the engine core's cache</td><td>One module, one cache.</td></tr>
+  </tbody>
+</table>
+<p>Code in vLLM can write <code>os.environ</code> before it spawns a child. The CLI sets <code>VLLM_WORKER_MULTIPROC_METHOD=spawn</code> ({{cite vllm/entrypoints/common/startup.py:147-149}}), and <code>VllmConfig.__post_init__</code> can set <code>VLLM_USE_BREAKABLE_CUDAGRAPH=1</code> ({{cite vllm/config/vllm.py:824-831}}). The children see these values. A reader made with <code>get_env_or_set_default</code> writes its generated default into <code>os.environ</code>, so a child that spawns later gets the same value ({{cite vllm/envs.py:555-572}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: VLLM_ENGINE_READY_TIMEOUT_S">
+<ol>
+  <li>The shell has <code>VLLM_ENGINE_READY_TIMEOUT_S=1200</code>.</li>
+  <li>The API server imports <code>vllm/v1/engine/core_client.py</code>. Line 29 runs <code>from vllm.envs import VLLM_ENGINE_READY_TIMEOUT_S</code>. <code>__getattr__</code> calls the reader once: <code>int("1200")</code> = 1200 ({{cite vllm/envs.py:812-814}}).</li>
+  <li>The client uses that module constant for its wait: <code>poll(timeout=1200 * 1000)</code> milliseconds ({{cite vllm/v1/engine/core_client.py:757-759}}).</li>
+  <li>A change of <code>os.environ</code> after the import does not change the constant, although the API server has no cache.</li>
+  <li>The name is not in <code>ignored_factors</code>, so the value 1200 is also part of the env hash of the compile cache (derived from {{cite vllm/envs.py:2356-2447}}).</li>
+</ol>
+<p>A value such as <code>20m</code> is not accepted: <code>int("20m")</code> raises <code>ValueError</code> at the import of <code>core_client.py</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: when a bad value raises">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>A value outside the list of an <code>env_with_choices</code> reader</td><td><code>ValueError("Invalid value ...")</code> at the first read</td><td>{{cite vllm/envs.py:434-438}}</td></tr>
+    <tr><td><code>true</code> for a <code>bool(int(...))</code> reader</td><td><code>ValueError</code> at the read</td><td>{{cite vllm/envs.py:1086-1088}} (an example)</td></tr>
+    <tr><td><code>VLLM_PORT</code> is a URI (a Kubernetes service named <code>vllm</code>)</td><td><code>ValueError</code> with a hint</td><td>{{cite vllm/envs.py:532-543}}</td></tr>
+    <tr><td>Unknown <code>VLLM_*</code> name</td><td>warning in <code>create_engine_config</code>; <code>ValueError</code> with <code>--fail-on-environ-validation</code></td><td>{{cite vllm/platforms/interface.py:1459-1467}}</td></tr>
+    <tr><td>Unknown attribute <code>envs.NOT_A_VAR</code></td><td><code>AttributeError</code></td><td>{{cite vllm/envs.py:2299}}</td></tr>
+    <tr><td>A reader raises inside <code>compile_factors</code></td><td>warning; the name is skipped</td><td>{{cite vllm/envs.py:2456-2464}}</td></tr>
+  </tbody>
+</table>
+<x-warning title="A bad value of an unused variable can stop the engine core">
+<p><code>enable_envs_cache</code> runs every reader once, with no <code>try</code> (lines 2325-2326). So a bad value, for example <code>VLLM_XLA_CHECK_RECOMPILATION=yes</code>, raises at the end of <code>EngineCore.__init__</code>, even when no code uses that variable on your platform. The engine core then logs "EngineCore failed to start." at ERROR level ({{cite vllm/v1/engine/core.py:1570-1572}}). This happens after the model load, the compilation and the CUDA graph capture. With TP &gt; 1, each worker process runs every reader earlier, at the end of <code>WorkerProc.__init__</code>, and logs "WorkerProc failed to start." ({{cite vllm/v1/executor/multiproc_executor.py:708-710}}, {{cite vllm/v1/executor/multiproc_executor.py:956-957}}). (Derived from these lines; the API server does not run every reader, so it does not see the error first.)</p>
+</x-warning>
+</x-deepdive>
+
+<x-deepdive title="Environment variables and config fields">
+<p>Some settings exist in both forms. The config field is then the main form, and the variable gives its default. For example, <code>LoggingConfig.log_level</code> takes its default from <code>VLLM_LOGGING_LEVEL</code> ({{cite vllm/config/logging.py:26-28}}), and the flag <code>--log-level</code> overrides it. <code>vllm/config/utils.py</code> has helpers that read a deprecated variable into a config field with a warning ({{cite vllm/config/utils.py:458-518}}); no code in <code>vllm/</code> calls them at this commit (derived from a search). The page {{link concepts/config-system}} compares the two channels.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link reference/env-vars}}: every variable with its default, its reader and its users.</li>
+  <li>{{link concepts/config-system}}: flags, <code>VllmConfig</code> and the environment side by side.</li>
+  <li>{{link concepts/plugin-loading}}: <code>VLLM_PLUGINS</code> and the cache, in practice.</li>
+  <li>{{link concepts/compile-and-cuda-graphs}}: the compile cache key that uses <code>compile_factors</code>.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">What is the real default of a variable: the value in the <code>TYPE_CHECKING</code> block or the fallback in the dict?
+    <x-a><p>The fallback in the dict. Python does not run the <code>TYPE_CHECKING</code> block at run time ({{cite vllm/envs.py:14}}); <code>__getattr__</code> calls the dict entry ({{cite vllm/envs.py:2297-2298}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You change <code>os.environ["VLLM_LOG_STATS_INTERVAL"]</code> inside the API server while it runs. Does the next read of <code>envs.VLLM_LOG_STATS_INTERVAL</code> see the new value?
+    <x-a><p>Yes, in the API server. No front-end code calls <code>enable_envs_cache</code>, so each read calls the reader again ({{cite vllm/envs.py:2291-2299}}). The engine core and the workers would not see it: they have their own environment and their own cache.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>VLLM_PLUGINS="a, b"</code> not load a plugin named <code>b</code>?
+    <x-a><p>The reader splits at commas and does not strip spaces, so the second name is <code>" b"</code> ({{cite vllm/envs.py:1163-1167}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You set <code>VLLM_ENGINE_READY_TIMEOUT_S</code> to a new value and restart with the same flags. Why can the start compile the model again?
+    <x-a><p><code>compile_factors</code> puts every variable that is not in the ignore list into the env hash ({{cite vllm/envs.py:2451-2466}}). <code>VLLM_ENGINE_READY_TIMEOUT_S</code> is not in the list ({{cite vllm/envs.py:2356-2447}}), and the cache folder name includes the env hash ({{cite vllm/compilation/backends.py:1091-1097}}). (Derived.)</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,220 @@
+---
+title: engine/arg_utils.py: EngineArgs, the flags and create_engine_config
+nav_title: engine/arg_utils.py
+level: Advanced
+prerequisites: concepts/config-system, reference/serve-flags
+related: concepts/config-system, code/config-vllm, code/envs, reference/serve-flags, reference/config-classes, tours/serve-startup, code/entrypoints-cli-serve
+summary: vllm/engine/arg_utils.py defines EngineArgs (one flat field per engine flag), builds the argparse flags from the config dataclasses, and turns the parsed values into one VllmConfig in create_engine_config, where most None defaults get their real values.
+---
+<h2>Purpose</h2>
+<p><code>vllm/engine/arg_utils.py</code> is the bridge from the command line to the engine. It makes the engine flags from the config classes, holds the parsed values in {{term engine-args}}, and builds the {{term vllm-config}} in {{term create-engine-config}}.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/engine/arg_utils.py</code>, 3,266 lines of Python. Two dataclasses, one argparse action and 17 module-level functions.</td></tr>
+    <tr><th>Main classes</th><td><code>EngineArgs</code> ({{cite vllm/engine/arg_utils.py:482-483}}), <code>AsyncEngineArgs</code> ({{cite vllm/engine/arg_utils.py:3230-3235}}).</td></tr>
+    <tr><th>Runs in</th><td>The process that parses the flags and builds the config: the API server process of <code>vllm serve</code> (main thread), or the process of the offline <code>LLM</code> class. The engine core and the workers do not use it.</td></tr>
+    <tr><th>Called by</th><td><code>make_arg_parser</code> (flags), <code>build_async_engine_client</code> (from_cli_args and create_engine_config), <code>run_multi_api_server</code>, <code>run_headless</code>, the gRPC and render launchers, <code>AsyncLLM.from_engine_args</code>, <code>LLMEngine</code>.</td></tr>
+    <tr><th>Calls</th><td>The constructors of the config classes, <code>current_platform</code> (hooks, device name and memory), <code>load_general_plugins</code>, <code>FlexibleArgumentParser</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The argv rewrite (<code>--config</code>, <code>-O</code>, dotted keys: <code>vllm/utils/argparse_utils.py</code>), the front-end flags (<code>FrontendArgs</code> in <code>vllm/entrypoints/common/cli_args.py</code>), the late defaults (<code>VllmConfig.__post_init__</code>, {{link code/config-vllm}}).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/config-system}} explains the ideas. This page reads the file section by section.</p>
+
+<h2>Where it sits</h2>
+<p>The diagram on {{link concepts/config-system#the-picture}} shows the file in panels 1 and 2: the parser fills <code>EngineArgs</code>, and <code>create_engine_config</code> builds the sub-configs and <code>VllmConfig</code>.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>The serve parser.</strong> <code>make_arg_parser</code> calls <code>AsyncEngineArgs.add_cli_args</code> ({{cite vllm/entrypoints/common/cli_args.py:465-466}}). So do the parsers of <code>vllm launch</code> and <code>vllm run-batch</code> ({{cite vllm/entrypoints/cli/launch.py:39}}, {{cite vllm/entrypoints/launchers/run_batch.py:294-296}}).</li>
+  <li><strong>The single API server.</strong> <code>build_async_engine_client</code> calls <code>from_cli_args</code> and then <code>create_engine_config</code> ({{cite vllm/entrypoints/launchers/api_server/entry.py:52}}, {{cite vllm/entrypoints/launchers/api_server/entry.py:82}}).</li>
+  <li><strong>Other launch modes.</strong> <code>run_headless</code> and <code>run_multi_api_server</code> ({{cite vllm/entrypoints/cli/serve.py:189-194}}, {{cite vllm/entrypoints/cli/serve.py:307-313}}); <code>vllm preload</code> ({{cite vllm/entrypoints/cli/preload.py:160-167}}).</li>
+  <li><strong>Engine classes.</strong> <code>AsyncLLM.from_engine_args</code> and <code>LLMEngine.from_engine_args</code> ({{cite vllm/v1/engine/async_llm.py:288}}, {{cite vllm/v1/engine/llm_engine.py:183}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li>The config classes of <code>vllm/config/</code>, and <code>get_field</code> for default factories ({{cite vllm/engine/arg_utils.py:118}}).</li>
+  <li><code>current_platform</code>, imported at module level ({{cite vllm/engine/arg_utils.py:122}}): <code>pre_register_and_update</code>, <code>validate_environ</code>, <code>get_device_total_memory</code>, <code>get_device_name</code>.</li>
+  <li><code>load_general_plugins</code> ({{cite vllm/engine/arg_utils.py:123}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<p>A map of the file, in line order:</p>
+<table>
+  <thead><tr><th>Lines</th><th>Section</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td>{{cite vllm/engine/arg_utils.py:1-153}}</td><td>Imports</td><td>Every config class; <code>current_platform</code> at module level.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:161-282}}</td><td>Type helpers</td><td><code>parse_type</code>, <code>optional_type</code>, <code>union_dict_and_str</code>, <code>get_type_hints</code>: turn a type hint into an argparse <code>type</code>.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:285-321}}</td><td><code>NEEDS_HELP</code>, docs URL, JSON numbers</td><td>Read help text only for <code>--help</code>; accept <code>80m</code> inside JSON.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:324-453}}</td><td><code>_compute_kwargs</code>, <code>get_kwargs</code></td><td>argparse settings for each field of a config class.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:456-479}}</td><td>Deprecations</td><td>Messages and an action for three deprecated flags.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:482-871}}</td><td><code>EngineArgs</code> fields</td><td>One field per flag.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:873-949}}</td><td><code>EngineArgs.__post_init__</code></td><td>Dicts to config objects, quantization config, general plugins, offline paths.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:951-1959}}</td><td><code>add_cli_args</code></td><td>About 1,000 lines: one argument group per config class.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:1961-1970}}</td><td><code>from_cli_args</code></td><td>Namespace to dataclass.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:1972-2232}}</td><td><code>create_*_config</code> helpers</td><td>Model, load, speculative, diffusion, watermark, structured outputs, observability, logging.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:2234-2905}}</td><td><code>create_engine_config</code></td><td>Builds every sub-config and <code>VllmConfig</code>.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:2907-2924}}</td><td><code>_check_feature_supported</code></td><td>Pipeline parallelism needs a supported executor.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:2926-3026}}</td><td><code>get_batch_defaults</code></td><td>Token budget and request limit per usage context and GPU.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:3028-3096}}</td><td><code>_set_default_chunked_prefill_and_prefix_caching_args</code></td><td><code>None</code> becomes the model's support.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:3098-3136}}</td><td>Reasoning config, multimodal minimum</td><td>Small helpers.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:3138-3227}}</td><td><code>_set_default_max_num_seqs_and_batched_tokens_args</code></td><td>Applies the batch defaults and the caps.</td></tr>
+    <tr><td>{{cite vllm/engine/arg_utils.py:3230-3258}}</td><td><code>AsyncEngineArgs</code></td><td>Adds <code>--enable-log-requests</code>; plugins and the platform hook.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>_compute_kwargs</code>: a config field becomes argparse settings</h3>
+<x-code file="vllm/engine/arg_utils.py" lines="324-361" highlight="324,327,329,336-337,340-352,356" />
+<ol>
+  <li><strong>Line 324.</strong> <code>lru_cache(maxsize=30)</code>: each config class is read once per process. <code>get_kwargs</code> returns a deep copy, so a caller can change it ({{cite vllm/engine/arg_utils.py:443-453}}).</li>
+  <li><strong>Line 327.</strong> The docstrings are read with <code>ast</code> only when <code>NEEDS_HELP</code> is true, that is with <code>--help</code> in argv or <code>mkdocs</code> loaded ({{cite vllm/engine/arg_utils.py:285-288}}).</li>
+  <li><strong>Lines 336-337.</strong> A field whose type is a dataclass is found here. It gets a JSON parser later (lines 367-378).</li>
+  <li><strong>Lines 340-352.</strong> The default: a plain value, a pydantic <code>Field</code> default, or the result of a default factory. Factories of <code>VllmConfig</code> fields run with logging off.</li>
+</ol>
+<p>The rest of the function picks the argparse type from the type hint. The order of the checks matters: dataclass, <code>bool | str | None</code>, <code>bool</code>, <code>Literal</code>, tuple, list, set, <code>int</code>, <code>float</code>, dict, <code>str</code> ({{cite vllm/engine/arg_utils.py:367-427}}). Five <code>int</code> fields accept <code>1k</code> or <code>2G</code>; <code>max_model_len</code> also accepts <code>auto</code> (lines 397-409). A type hint with <code>None</code> wraps the type in <code>optional_type</code>, so the text <code>None</code> is accepted (lines 434-439, {{cite vllm/engine/arg_utils.py:173-179}}).</p>
+
+<h3><code>EngineArgs</code>: the fields</h3>
+<x-code file="vllm/engine/arg_utils.py" lines="482-503" highlight="486,503" />
+<p>Most fields copy the default of a config field, for example <code>model = ModelConfig.model</code> (line 486). A field with a default factory uses <code>get_field(VllmConfig, "compilation_config")</code>, which copies the factory ({{cite vllm/engine/arg_utils.py:765}}, {{cite vllm/config/utils.py:85-114}}). The fields that <code>create_engine_config</code> decides are <code>None</code>: <code>block_size</code>, <code>enable_prefix_caching</code>, <code>max_num_batched_tokens</code>, <code>max_num_seqs</code> and <code>enable_chunked_prefill</code> ({{cite vllm/engine/arg_utils.py:591-592}}, {{cite vllm/engine/arg_utils.py:610}}, {{cite vllm/engine/arg_utils.py:616}}, {{cite vllm/engine/arg_utils.py:707}}).</p>
+<x-note title="For vllm serve, the flag default wins over the field default">
+<p><code>from_cli_args</code> copies every parsed value, so a field default of <code>EngineArgs</code> is never used by <code>vllm serve</code>. The parser default is used. The two are the same for most flags, because both come from the config class. The field defaults matter for code that makes <code>EngineArgs(...)</code> directly, for example the offline <code>LLM</code> class.</p>
+</x-note>
+
+<h3><code>EngineArgs.__post_init__</code></h3>
+<x-code file="vllm/engine/arg_utils.py" lines="873-878" />
+<p>The method repeats this pattern for the attention, auxiliary output, Engram, Mamba, kernel, encoder cache, EPLB, weight transfer, fault tolerance, IR priority and watchdog configs ({{cite vllm/engine/arg_utils.py:879-913}}). A dict passed for <code>--fault-tolerance-config</code> also turns fault tolerance on, with a warning (lines 899-908). Then it resolves the quantization config, loads the general plugins, and with <code>HF_HUB_OFFLINE</code> replaces the model name by a local path (lines 915-949).</p>
+
+<h3><code>add_cli_args</code>: about 1,000 lines of flags</h3>
+<x-code file="vllm/engine/arg_utils.py" lines="954-966" highlight="955,957-960,961-962" />
+<ol>
+  <li><strong>Line 955.</strong> The settings of all <code>ModelConfig</code> fields.</li>
+  <li><strong>Lines 957-960.</strong> One argument group, with the class name as title. <code>--help=ModelConfig</code> shows only this group.</li>
+  <li><strong>Lines 961-962.</strong> <code>--model</code> is hidden from <code>vllm serve --help</code>, because <code>serve</code> takes the model as a positional argument.</li>
+</ol>
+<p>The groups, in order: <code>ModelConfig</code>, <code>LoadConfig</code>, <code>AttentionConfig</code>, <code>MambaConfig</code>, <code>StructuredOutputsConfig</code>, <code>ParallelConfig</code>, <code>CacheConfig</code>, <code>OffloadConfig</code>, <code>MultiModalConfig</code>, <code>LoRAConfig</code>, <code>LoggingConfig</code>, <code>ObservabilityConfig</code>, <code>SchedulerConfig</code>, <code>CompilationConfig</code>, <code>KernelConfig</code> and <code>VllmConfig</code> ({{cite vllm/engine/arg_utils.py:957}}, {{cite vllm/engine/arg_utils.py:1071}}, {{cite vllm/engine/arg_utils.py:1153}}, {{cite vllm/engine/arg_utils.py:1374}}, {{cite vllm/engine/arg_utils.py:1726}}, {{cite vllm/engine/arg_utils.py:1848}}). Seven flags without a group come last (lines 1908-1958). The full list is generated on {{link reference/serve-flags}}.</p>
+<p>The <code>VllmConfig</code> group takes whole sub-configs as JSON. Three of them are parsed with <code>json.loads</code> only, so their pydantic check runs later, in <code>create_engine_config</code>:</p>
+<x-code file="vllm/engine/arg_utils.py" lines="1851-1857" highlight="1854" />
+
+<h3><code>from_cli_args</code></h3>
+<x-code file="vllm/engine/arg_utils.py" lines="1961-1970" />
+<p>Only names that are both a dataclass field and a Namespace attribute are copied. Front-end flags such as <code>--port</code> stay in the Namespace. <code>AsyncEngineArgs</code> is the class here, so <code>enable_log_requests</code> is copied too.</p>
+
+<h3><code>create_engine_config</code>, part 1: platform and model</h3>
+<x-code file="vllm/engine/arg_utils.py" lines="2243-2275" highlight="2246,2248,2250,2257-2267,2269,2275" />
+<ol>
+  <li><strong>Line 2246.</strong> The platform hook, without a parser this time ({{link concepts/platform-interface}}).</li>
+  <li><strong>Line 2250.</strong> Unknown <code>VLLM_*</code> names give a warning, or <code>ValueError</code> with <code>--fail-on-environ-validation</code>.</li>
+  <li><strong>Lines 2257-2267.</strong> A speculators checkpoint can replace the model, the tokenizer and the speculative config before <code>ModelConfig</code> exists.</li>
+  <li><strong>Line 2269.</strong> <code>create_model_config</code> passes about 70 fields to <code>ModelConfig</code> ({{cite vllm/engine/arg_utils.py:1984-2054}}).</li>
+  <li><strong>Line 2275.</strong> The model decides chunked prefill and prefix caching ({{cite vllm/engine/arg_utils.py:3031-3035}}, {{cite vllm/engine/arg_utils.py:3062-3063}}).</li>
+</ol>
+
+<h3><code>create_engine_config</code>, part 2: cache, parallel, scheduler</h3>
+<p>Lines 2277-2321 build <code>CacheConfig</code> with the resolved KV cache dtype. Lines 2342-2557 read the Ray context and check the data parallel options. They raise a <code>ValueError</code> for each invalid mix ({{cite vllm/engine/arg_utils.py:2372-2378}}). Then <code>ParallelConfig</code> is made ({{cite vllm/engine/arg_utils.py:2558}}), followed by the speculative config and the batch defaults:</p>
+<x-code file="vllm/engine/arg_utils.py" lines="2624-2646" highlight="2631-2635,2637-2646" />
+<p>The asserts make sure that every <code>None</code> default is resolved before <code>SchedulerConfig</code> is made (lines 2637-2646, then 2647-2672). After that come LoRA, attention, Mamba, kernel, load, structured outputs, observability, compilation and offload ({{cite vllm/engine/arg_utils.py:2680-2850}}). Two shortcut flags conflict with their JSON form: <code>--attention-backend</code> with <code>attention_config.backend</code>, and <code>--cudagraph-capture-sizes</code> with <code>compilation_config.cudagraph_capture_sizes</code> ({{cite vllm/engine/arg_utils.py:2717-2722}}, {{cite vllm/engine/arg_utils.py:2821-2827}}). The function ends with <code>VllmConfig(...)</code> ({{cite vllm/engine/arg_utils.py:2870-2905}}).</p>
+
+<h3><code>get_batch_defaults</code> and <code>_set_default_max_num_seqs_and_batched_tokens_args</code></h3>
+<x-code file="vllm/engine/arg_utils.py" lines="2945-2955" highlight="2946-2950,2951-2955" />
+<p>The memory and the name come from the platform. If the query fails, the memory is 0, so the small tier applies (lines 2951-2955). The tiers are in lines 2960-2993; TPU and CPU override them (lines 2995-3024). The caller then applies the values:</p>
+<x-code file="vllm/engine/arg_utils.py" lines="3177-3211" highlight="3181-3186,3208-3211" />
+<ol>
+  <li><strong>Lines 3181-3186.</strong> Without chunked prefill, a full prompt must fit in one step, so the budget is at least <code>max_model_len</code>.</li>
+  <li><strong>Lines 3208-3211.</strong> The budget is at most <code>max_num_seqs × max_model_len</code>; the comment names Whisper.</li>
+  <li><strong>Lines 3219-3221</strong> (after the excerpt). <code>max_num_seqs</code> is at most the budget ({{cite vllm/engine/arg_utils.py:3219-3221}}).</li>
+</ol>
+<p>Each cap applies only to a value that you did not set (the <code>orig_*</code> checks at lines 3177 and 3219). The final values are logged at DEBUG level only (lines 3213-3227).</p>
+
+<h3><code>AsyncEngineArgs.add_cli_args</code></h3>
+<x-code file="vllm/engine/arg_utils.py" lines="3237-3258" highlight="3243,3244-3245,3257" />
+<p>The general plugins load first, so that a plugin can add choices to a flag, for example a new quantization method (comment at lines 3240-3242). The platform hook runs last, with the finished parser. <code>async_args_only=True</code> skips the engine flags; no caller in <code>vllm/</code> passes it (derived from a search).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types in and out">
+<table>
+  <thead><tr><th>Value</th><th>Type</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>argparse settings of one class</td><td><code>dict[str, dict[str, Any]]</code>: field name → <code>{"default", "help", "type", ...}</code></td><td>{{cite vllm/engine/arg_utils.py:325}}</td></tr>
+    <tr><td>parsed flags</td><td><code>argparse.Namespace</code></td><td>{{cite vllm/engine/arg_utils.py:1962}}</td></tr>
+    <tr><td>engine arguments</td><td><code>AsyncEngineArgs</code> (a stdlib <code>dataclass</code>, not pydantic)</td><td>{{cite vllm/engine/arg_utils.py:482}}, {{cite vllm/engine/arg_utils.py:3230}}</td></tr>
+    <tr><td>usage context</td><td><code>UsageContext</code> enum, for example <code>OPENAI_API_SERVER</code></td><td>{{cite vllm/usage/usage_lib.py:111-117}}</td></tr>
+    <tr><td>batch defaults</td><td><code>tuple[dict[UsageContext, int], dict[UsageContext, int]]</code></td><td>{{cite vllm/engine/arg_utils.py:2927-2930}}</td></tr>
+    <tr><td>result</td><td><code>VllmConfig</code></td><td>{{cite vllm/engine/arg_utils.py:2238}}</td></tr>
+  </tbody>
+</table>
+<p><code>EngineArgs</code> is a plain <code>dataclasses.dataclass</code>, so it does no type checks. The checks happen in the config classes that <code>create_engine_config</code> makes.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: three runs of the batch defaults">
+<p>Model <code>meta-llama/Llama-3.1-8B-Instruct</code> with <code>--max-model-len 8192</code>, usage context <code>OPENAI_API_SERVER</code>, chunked prefill on unless stated. (Derived from {{cite vllm/engine/arg_utils.py:2960-2993}} and {{cite vllm/engine/arg_utils.py:3153-3221}}.)</p>
+<table>
+  <thead><tr><th>GPU and flags</th><th>Tier values</th><th>After the steps</th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td>80 GB A100, no flags</td><td>2048 tokens, 256 requests</td><td>tokens = min(256 × 8192, 2048) = 2048; requests = min(256, 2048) = 256</td><td>2048 / 256</td></tr>
+    <tr><td>80 GB A100, <code>--no-enable-chunked-prefill</code></td><td>2048, 256</td><td>tokens = max(8192, 2048) = 8192; then min(256 × 8192, 8192) = 8192</td><td>8192 / 256</td></tr>
+    <tr><td>80 GB H100, <code>--performance-mode throughput</code></td><td>8192, 1024</td><td>× 2 → 16384, 2048; min(2048 × 8192, 16384) = 16384; min(2048, 16384) = 2048</td><td>16384 / 2048</td></tr>
+  </tbody>
+</table>
+<p>The H100 row assumes that the driver reports 70 GiB or more. A change of either value also changes the {{term compile-cache}} key, because <code>SchedulerConfig.compute_hash</code> includes both ({{cite vllm/config/scheduler.py:280-284}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Processes and threads">
+<p>Everything in this file runs in the main thread of the process that builds the config. For <code>vllm serve</code> with one API server, that is the CLI process. With several API servers, the CLI process builds a config to launch the engines, and each API server process builds its own config again from the same Namespace (derived from {{cite vllm/entrypoints/cli/serve.py:307-313}} and {{cite vllm/v1/utils.py:509-529}}). The engine core and the workers never import the parser code paths: they get the finished <code>VllmConfig</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only warns">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>JSON flag with an unknown key or a bad value</td><td><code>argparse.ArgumentTypeError</code>; argparse exits</td><td>{{cite vllm/engine/arg_utils.py:369-374}}</td></tr>
+    <tr><td>A config field type that the parser does not know</td><td><code>ValueError("Unsupported type ...")</code> when the parser is built</td><td>{{cite vllm/engine/arg_utils.py:426-427}}</td></tr>
+    <tr><td>A deprecated flag</td><td>warning; the flag is ignored or forwarded</td><td>{{cite vllm/engine/arg_utils.py:456-479}}</td></tr>
+    <tr><td>Pipeline parallelism with an unsupported executor</td><td><code>NotImplementedError</code></td><td>{{cite vllm/engine/arg_utils.py:2909-2924}}, {{cite vllm/engine/arg_utils.py:3261-3266}}</td></tr>
+    <tr><td>Two DP load-balancing modes, or bad <code>--nnodes</code></td><td><code>ValueError</code></td><td>{{cite vllm/engine/arg_utils.py:2372-2409}}</td></tr>
+    <tr><td>External DP load balancing with a non-MoE model</td><td><code>ValueError</code></td><td>{{cite vllm/engine/arg_utils.py:2445-2454}}</td></tr>
+    <tr><td>LoRA + speculative decoding with too small a token budget</td><td><code>ValueError</code></td><td>{{cite vllm/engine/arg_utils.py:2701-2713}}</td></tr>
+    <tr><td>A shortcut flag and its JSON form together</td><td><code>ValueError</code> "mutually exclusive"</td><td>{{cite vllm/engine/arg_utils.py:2717-2722}}, {{cite vllm/engine/arg_utils.py:2821-2836}}</td></tr>
+    <tr><td>Disabling chunked prefill for a model that supports it</td><td>warning only</td><td>{{cite vllm/engine/arg_utils.py:3041-3050}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables read in this file">
+<table>
+  <thead><tr><th>Name</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_ENABLE_V1_MULTIPROCESSING</code></td><td>{{cite vllm/engine/arg_utils.py:1973}}</td><td>Only a warning about the global seed when it is off.</td></tr>
+    <tr><td><code>VLLM_BATCH_INVARIANT</code></td><td>{{cite vllm/engine/arg_utils.py:2730-2739}}</td><td>On XPU with no backend set: Triton attention.</td></tr>
+    <tr><td><code>HF_HUB_OFFLINE</code> (through <code>huggingface_hub</code>)</td><td>{{cite vllm/engine/arg_utils.py:926}}</td><td>Replaces model and tokenizer names with local paths.</td></tr>
+  </tbody>
+</table>
+<p>All other environment variables are read elsewhere ({{link code/envs}}).</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/config-system}}: the layers of the config system and the default recipe.</li>
+  <li>{{link code/config-vllm}}: what <code>VllmConfig.__post_init__</code> does with the result.</li>
+  <li>{{link reference/serve-flags}}: every flag, generated from this file.</li>
+  <li>{{link tours/serve-startup}}: where this file runs in the start-up (stops 2 and 5-7).</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Where does the help text of a flag such as <code>--max-model-len</code> come from?
+    <x-a><p>From the docstring of the field <code>ModelConfig.max_model_len</code>. <code>_compute_kwargs</code> reads the docstrings with <code>get_attr_docs</code>, but only when <code>--help</code> is in argv ({{cite vllm/engine/arg_utils.py:327}}, {{cite vllm/engine/arg_utils.py:356}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why is <code>--max-num-seqs</code> <code>None</code> by default, when <code>SchedulerConfig.max_num_seqs</code> is 128?
+    <x-a><p>The flag replaces the field default with <code>None</code> ({{cite vllm/engine/arg_utils.py:1743-1749}}). <code>None</code> lets <code>_set_default_max_num_seqs_and_batched_tokens_args</code> choose a value from the usage context and the GPU ({{cite vllm/engine/arg_utils.py:3164-3168}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You pass <code>--attention-backend FLASHINFER -ac '{"backend": "FLASH_ATTN"}'</code>. What happens?
+    <x-a><p><code>create_engine_config</code> raises <code>ValueError</code>: "attention_backend and attention_config.backend are mutually exclusive" ({{cite vllm/engine/arg_utils.py:2717-2722}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With <code>--no-enable-chunked-prefill</code> and <code>--max-model-len 32768</code> on an 80 GB A100, what token budget does <code>vllm serve</code> use, and why?
+    <x-a><p>32768. The tier gives 2048 ({{cite vllm/engine/arg_utils.py:2986-2989}}). Without chunked prefill the budget becomes <code>max(32768, 2048)</code>, then <code>min(256 × 32768, 32768)</code> ({{cite vllm/engine/arg_utils.py:3181-3211}}). The requests stay at <code>min(256, 32768) = 256</code> (lines 3219-3221).</p></x-a>
+  </x-q>
+</x-quiz>

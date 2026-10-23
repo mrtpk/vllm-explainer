@@ -1,0 +1,250 @@
+---
+title: How configuration works
+nav_title: The config system
+level: Intermediate
+prerequisites: concepts/architecture-overview, reference/serve-flags
+related: reference/serve-flags, reference/config-classes, reference/env-vars, code/engine-arg-utils, code/config-vllm, code/envs, tours/serve-startup, concepts/compile-and-cuda-graphs, concepts/platform-interface
+summary: vllm serve turns about 300 flags and the VLLM_* environment variables into one VllmConfig object. This page shows the @config classes, EngineArgs, the parser, create_engine_config, VllmConfig.__post_init__, how the config reaches the other processes, compute_hash, and a recipe to find the real default of any setting.
+---
+<x-sentence>The front end parses the flags into EngineArgs, builds one VllmConfig from them, and sends a pickled copy of it to every other process.</x-sentence>
+
+<h2>The idea</h2>
+<p><code>vllm serve</code> has about 300 flags ({{link reference/serve-flags}}) and more than 300 <code>VLLM_*</code> environment variables ({{link reference/env-vars}}). The engine does not read the flags directly. It reads one object, the {{term vllm-config}}. The config system is the code that makes this object. It has three layers:</p>
+<ol>
+  <li><strong>Config classes.</strong> Each part of the engine has one class in <code>vllm/config/</code>, for example <code>CacheConfig</code> or <code>SchedulerConfig</code>. The {{term config-decorator}} makes each class a checked dataclass ({{link reference/config-classes}}).</li>
+  <li><strong>EngineArgs.</strong> One flat dataclass has a field for each flag. The parser fills it ({{term engine-args}}).</li>
+  <li><strong>VllmConfig.</strong> {{term create-engine-config}} builds the sub-configs from <code>EngineArgs</code> and puts them into one <code>VllmConfig</code>. Its {{term post-init}} then checks them together and sets the late defaults.</li>
+</ol>
+<p>Many flags have the default <code>None</code>. <code>None</code> means "vLLM decides later", from the model, the GPU, the platform or other settings. So the real default of a setting is often not the dataclass default. This page ends with a recipe to find it.</p>
+<p><strong>An everyday comparison.</strong> Think of an order form in a restaurant. The guest fills some boxes and leaves others empty: an empty box means "the chef decides". The head chef fills the empty boxes from the menu and the kitchen stock, and writes one final ticket. Each station gets a copy of the ticket. The comparison stops in two places. A station can write on its own copy. The copies do not go back to the head chef, except for a few values in the ready message.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b8a_config_flow" alt="Panel 1: the command line and an optional YAML file go into FlexibleArgumentParser, which inserts the YAML keys, changes underscores to dashes, turns -O1 into --optimization-level 1 and turns -cc.mode=3 into a JSON value. The result fills EngineArgs with from_cli_args; unset tuning flags are None. Panel 2: create_engine_config builds, in order, 1 the platform hook and DeviceConfig, 2 ModelConfig, 3 the model-based defaults for chunked prefill and prefix caching, 4 CacheConfig and ParallelConfig, 5 the batch defaults from the usage context and the GPU memory, 6 VllmConfig with 34 attributes. Then 7 VllmConfig.__post_init__ runs its phases: model hooks, async scheduling, enforce eager, platform defaults, compile mode, optimization level defaults, CUDA graph sizes, check_and_update_config, KV transfer and the hybrid KV cache manager. Panel 3: the API server process builds VllmConfig once and reads environment variables live. The engine core process gets a pickled copy, runs __post_init__ again after the handshake, and caches environment variables after start-up. A worker process with TP greater than 1 gets another pickled copy; with TP 1 the worker is inside the engine core. The engine core sends max_model_len and num_gpu_blocks back in the ready message." caption="Figure: where the values come from (panel 1), how EngineArgs becomes one VllmConfig (panel 2), and how the config reaches the other processes (panel 3)." />
+<p>Read the panels from top to bottom. Panels 1 and 2 run only in the API server process. Panel 3 shows that the other processes do not parse flags. They get the finished object.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the @config decorator</h3>
+<p>Every config class uses the decorator <code>config</code> ({{cite vllm/config/utils.py:51-61}}). It wraps the class in a pydantic dataclass with <code>extra="forbid"</code>:</p>
+<x-code file="vllm/config/utils.py" lines="70-82" highlight="71,75-76" />
+<ol>
+  <li><strong>Line 71.</strong> An unknown key is an error. So <code>-cc '{"mod": 3}'</code> stops start-up, and a typo does not pass in silence.</li>
+  <li><strong>Lines 75-76.</strong> <code>dataclass</code> is <code>pydantic.dataclasses.dataclass</code> ({{cite vllm/config/utils.py:20}}). Pydantic checks the types and limits such as <code>Field(ge=1)</code> when the object is made.</li>
+</ol>
+<p>Each field has a docstring, a string literal on the line after the field. The parser uses these strings as the <code>--help</code> text. The page {{link reference/config-classes}} lists every class and field; this page does not repeat the tables.</p>
+
+<h3>Step 2: VllmConfig holds the top-level configs</h3>
+<x-code file="vllm/config/vllm.py" lines="347-366" highlight="347,355,357,361-363" />
+<p><code>VllmConfig</code> has 34 attributes ({{cite vllm/config/vllm.py:355-453}}). Most use a default factory, so a plain <code>VllmConfig()</code> makes default sub-configs. <code>model_config</code> is <code>None</code> by default, because a default <code>ModelConfig</code> would download a model (comment at lines 353-354). Optional features, for example <code>lora_config</code> and <code>speculative_config</code>, are <code>None</code> when they are off ({{cite vllm/config/vllm.py:381-384}}). Model code reads the config through <code>get_current_vllm_config()</code>, inside a <code>set_current_vllm_config()</code> block ({{cite vllm/config/vllm.py:3516-3540}}).</p>
+
+<h3>Step 3: EngineArgs, one flat dataclass</h3>
+<p>{{term engine-args}} has one field for each flag. Most fields copy their default from a config class:</p>
+<x-code file="vllm/engine/arg_utils.py" lines="482-499" highlight="486,492" />
+<p>A field with a default factory uses <code>get_field</code>, which copies the factory of the config field ({{cite vllm/config/utils.py:85-114}}). Some fields do not copy a default. They start as <code>None</code>, so that <code>create_engine_config</code> can decide:</p>
+<x-code file="vllm/engine/arg_utils.py" lines="591-592" />
+<x-code file="vllm/engine/arg_utils.py" lines="610-616" highlight="610,616" />
+<p><code>enable_chunked_prefill</code> is also <code>None</code> ({{cite vllm/engine/arg_utils.py:707}}). <code>EngineArgs.__post_init__</code> turns dict values into config objects, for example a <code>compilation_config</code> dict, and loads the general plugins ({{cite vllm/engine/arg_utils.py:873-924}}).</p>
+
+<h3>Step 4: add_cli_args makes the flags from the config classes</h3>
+<p><code>EngineArgs.add_cli_args</code> makes one argument group for most config classes. Each group has the class name as its title and the class docstring as its description:</p>
+<x-code file="vllm/engine/arg_utils.py" lines="954-962" highlight="955,957-960,961" />
+<p>The flag name is written by hand. All other argparse settings come from <code>get_kwargs(ModelConfig)["model"]</code>. <code>get_kwargs</code> returns a deep copy of a cached result ({{cite vllm/engine/arg_utils.py:443-453}}). The cached function reads each dataclass field ({{cite vllm/engine/arg_utils.py:324-440}}):</p>
+<ul>
+  <li><strong>Default:</strong> the field default, or the result of its default factory (lines 339-352).</li>
+  <li><strong>Help:</strong> the field docstring. The parser reads the docstrings only when the command line contains <code>--help</code>, because that is slow ({{cite vllm/engine/arg_utils.py:285-288}}, {{cite vllm/engine/arg_utils.py:327}}).</li>
+  <li><strong>JSON:</strong> a field whose type is a dataclass takes a JSON string, which pydantic checks (lines 367-378).</li>
+  <li><strong>Booleans:</strong> a <code>bool</code> field gets <code>BooleanOptionalAction</code> (lines 384-386). <code>FlexibleArgumentParser</code> replaces it with <code>EnableDisableAction</code>, which pairs <code>--enable-x</code> with <code>--disable-x</code> ({{cite vllm/utils/argparse_utils.py:120-145}}, {{cite vllm/utils/argparse_utils.py:179}}).</li>
+</ul>
+<p>Some flags replace the field default with <code>None</code>, for example <code>--max-num-seqs</code> ({{cite vllm/engine/arg_utils.py:1743-1749}}). The <code>VllmConfig</code> group holds the JSON flags of whole sub-configs, for example <code>--compilation-config</code> and its short form <code>-cc</code> ({{cite vllm/engine/arg_utils.py:1880-1882}}).</p>
+
+<h3>Step 5: the parser rewrites the command line</h3>
+<p><code>FlexibleArgumentParser.parse_args</code> changes the list of arguments before argparse sees it:</p>
+<x-code file="vllm/utils/argparse_utils.py" lines="371-407" highlight="371-372,379,395-399,400-406" />
+<ol>
+  <li><strong>Lines 371-372.</strong> <code>--config file.yaml</code> inserts the keys of a YAML file as flags (next step).</li>
+  <li><strong>Lines 379-394.</strong> In a flag name, <code>_</code> becomes <code>-</code>, up to the first dot. So <code>--max_num_seqs</code> works. Keys after a dot keep their underscores.</li>
+  <li><strong>Lines 395-406.</strong> <code>-O3</code>, <code>-O=3</code> and <code>-O 3</code> become <code>--optimization-level 3</code>.</li>
+</ol>
+<p>Then a flag with a dot becomes a JSON value: <code>-cc.mode=3</code> becomes <code>-cc '{"mode": 3}'</code>. Several dotted flags with the same prefix merge into one dict ({{cite vllm/utils/argparse_utils.py:462-500}}). A key that ends with <code>+</code> appends list items (lines 472-474). The help text of the JSON flags shows these forms ({{cite vllm/utils/argparse_utils.py:159-167}}).</p>
+<p><strong>Config files.</strong> The parser supports YAML only: another file extension raises <code>ValueError</code> ({{cite vllm/utils/argparse_utils.py:633-637}}). A <code>true</code> value becomes <code>--key</code>, a list becomes <code>--key v1 v2</code>, and a nested dict becomes a JSON string ({{cite vllm/utils/argparse_utils.py:653-671}}). The file arguments go right after <code>serve</code> and the model. So a flag on the command line wins: "cli &gt; config &gt; defaults" ({{cite vllm/utils/argparse_utils.py:563-600}}).</p>
+
+<h3>Step 6: create_engine_config, step by step</h3>
+<p>The API server calls <code>AsyncEngineArgs.from_cli_args(args)</code>. It copies each parsed value into the field of the same name ({{cite vllm/engine/arg_utils.py:1961-1970}}). Then it calls {{term create-engine-config}} with the {{term usage-context}} <code>OPENAI_API_SERVER</code> ({{cite vllm/entrypoints/launchers/api_server/entry.py:52}}, {{cite vllm/entrypoints/launchers/api_server/entry.py:82}}). The function starts like this:</p>
+<x-code file="vllm/engine/arg_utils.py" lines="2243-2250" highlight="2246,2248,2250" />
+<p>The order of the work matters, because later steps read the results of earlier ones:</p>
+<table>
+  <thead><tr><th>#</th><th>What</th><th>Where</th><th>Why here</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>Logging; <code>pre_register_and_update()</code>; <code>DeviceConfig</code> from the platform; <code>validate_environ</code> warns about unknown <code>VLLM_*</code> names</td><td>{{cite vllm/engine/arg_utils.py:2243-2250}}</td><td>A platform plugin can register things before any config is built.</td></tr>
+    <tr><td>2</td><td><code>ModelConfig</code>: Hugging Face config, <code>max_model_len</code>, model registry</td><td>{{cite vllm/engine/arg_utils.py:2269}}</td><td>Almost every later default depends on the model.</td></tr>
+    <tr><td>3</td><td>Chunked prefill and prefix caching: <code>None</code> becomes the model's support</td><td>{{cite vllm/engine/arg_utils.py:2275}}, {{cite vllm/engine/arg_utils.py:3028-3068}}</td><td>Needs the model type.</td></tr>
+    <tr><td>4</td><td><code>CacheConfig</code>, with the resolved KV cache dtype</td><td>{{cite vllm/engine/arg_utils.py:2286-2321}}</td><td>Needs the model dtype.</td></tr>
+    <tr><td>5</td><td><code>ParallelConfig</code>; its <code>__post_init__</code> picks the executor backend</td><td>{{cite vllm/engine/arg_utils.py:2558}}, {{cite vllm/config/parallel.py:1055-1100}}</td><td>Needs the data parallel checks above it.</td></tr>
+    <tr><td>6</td><td><code>SpeculativeConfig</code></td><td>{{cite vllm/engine/arg_utils.py:2624-2627}}</td><td>Needs the target model and parallel configs.</td></tr>
+    <tr><td>7</td><td>Batch defaults: <code>max_num_seqs</code>, <code>max_num_batched_tokens</code></td><td>{{cite vllm/engine/arg_utils.py:2631-2635}}</td><td>Needs the usage context, the GPU, the world size and <code>max_model_len</code>.</td></tr>
+    <tr><td>8</td><td><code>SchedulerConfig</code>, <code>LoRAConfig</code>, attention, kernel, load, observability and compilation configs</td><td>{{cite vllm/engine/arg_utils.py:2647-2850}}</td><td>Uses the values from steps 2 to 7.</td></tr>
+    <tr><td>9</td><td><code>VllmConfig(...)</code></td><td>{{cite vllm/engine/arg_utils.py:2870-2903}}</td><td>Its <code>__post_init__</code> runs now.</td></tr>
+  </tbody>
+</table>
+<p>Step 2 can take time on a cold start. <code>ModelConfig</code> loads the Hugging Face config and asks the model registry, which can start a subprocess on a cache miss ({{link concepts/oot-models}}). It logs "Resolved architecture: ..." ({{cite vllm/config/model.py:741-744}}).</p>
+
+<h3>Step 7: defaults from the usage context and the GPU</h3>
+<p><code>_set_default_max_num_seqs_and_batched_tokens_args</code> fills the two batch limits when they are <code>None</code>:</p>
+<x-code file="vllm/engine/arg_utils.py" lines="3153-3175" highlight="3159-3162,3165-3168,3171-3175" />
+<p><code>get_batch_defaults</code> gives one dict per limit, keyed by the usage context ({{cite vllm/engine/arg_utils.py:2926-3026}}). Take <code>OPENAI_API_SERVER</code> on a GPU with 70 GiB or more and less than 160 GiB. If it is not an A100 or GB10, the values are 8192 tokens and 1024 requests ({{cite vllm/engine/arg_utils.py:2970-2983}}). A usage context that is not in the dict falls back to the <code>SchedulerConfig</code> constants 2048 and 128 ({{cite vllm/config/scheduler.py:41-43}}). The table {{link reference/serve-flags#tune-first}} lists all tiers.</p>
+<p>Then caps apply, only to values that you did not set. Without chunked prefill, the budget is at least <code>max_model_len</code> tokens. The budget is at most <code>max_num_seqs × max_model_len</code> tokens, and the request limit is at most the budget ({{cite vllm/engine/arg_utils.py:3177-3221}}). A multimodal prefix-LM model can also raise the budget, so that one multimodal item fits in one step (lines 3191-3202).</p>
+
+<h3>Step 8: VllmConfig.__post_init__, the late defaults</h3>
+<p>The {{term post-init}} of <code>VllmConfig</code> is about 830 lines long ({{cite vllm/config/vllm.py:1492-2318}}). Its phases, in code order:</p>
+<ol>
+  <li><strong>Model hooks.</strong> <code>try_verify_and_update_config</code> runs the per-architecture config class of the model, once ({{cite vllm/config/vllm.py:1521}}, {{cite vllm/config/vllm.py:2714-2743}}).</li>
+  <li><strong>Quantization.</strong> It builds <code>quant_config</code> from the model ({{cite vllm/config/vllm.py:1586-1589}}).</li>
+  <li><strong>Async scheduling.</strong> When <code>async_scheduling</code> is <code>None</code>, it turns it on unless a pooling model, the executor or another option conflicts ({{cite vllm/config/vllm.py:1664-1698}}). See {{link concepts/async-scheduling}}.</li>
+  <li><strong>Eager mode.</strong> <code>--enforce-eager</code> sets the compilation mode and the CUDA graph mode to <code>NONE</code> ({{cite vllm/config/vllm.py:1745-1747}}).</li>
+  <li><strong>Platform defaults and compilation.</strong> <code>apply_config_platform_defaults</code>, then the compilation mode from the {{term optimization-level}}, then the defaults table of that level ({{cite vllm/config/vllm.py:1804-1810}}, {{cite vllm/config/vllm.py:1833-1834}}).</li>
+  <li><strong>CUDA graph sizes</strong> on platforms with static graphs ({{cite vllm/config/vllm.py:1929-1995}}).</li>
+  <li><strong>The platform's last word.</strong> <code>current_platform.check_and_update_config(self)</code> ({{cite vllm/config/vllm.py:2046}}). CUDA sets the worker class here ({{cite vllm/platforms/cuda.py:330-331}}).</li>
+  <li><strong>Model runner checks and compile ranges</strong> ({{cite vllm/config/vllm.py:2071-2083}}).</li>
+  <li><strong>KV transfer and the hybrid KV cache manager</strong> ({{cite vllm/config/vllm.py:2199}}, {{cite vllm/config/vllm.py:2236-2273}}).</li>
+</ol>
+<p>The defaults of an optimization level fill only fields that are still <code>None</code>. A value that you set is never overwritten:</p>
+<x-code file="vllm/config/vllm.py" lines="1014-1019" />
+<p>So <code>-O1 -cc.cudagraph_mode=FULL_AND_PIECEWISE</code> keeps your graph mode, and takes the other O1 defaults ({{cite vllm/config/vllm.py:275-295}}). The page {{link code/config-vllm}} walks through every phase.</p>
+
+<h3>Step 9: how the config reaches the other processes</h3>
+<p>The front end does not send flags to the {{term engine-core}}. It sends the finished <code>VllmConfig</code> object as an argument of the new process:</p>
+<x-code file="vllm/v1/engine/utils.py" lines="256-264" highlight="256,258" />
+<p>The CLI selects the <code>spawn</code> start method ({{cite vllm/entrypoints/common/startup.py:147-149}}). With <code>spawn</code>, Python pickles the process arguments at <code>start()</code>; a comment in the same class relies on this ({{cite vllm/v1/engine/utils.py:295-298}}). The executor does the same for each worker process ({{cite vllm/v1/executor/multiproc_executor.py:731-750}}). With TP = 1 there is no worker process: the worker object lives in the engine core and uses its copy ({{cite vllm/v1/executor/uniproc_executor.py:54-68}}).</p>
+<x-warning title="The engine core runs __post_init__ again">
+<p>After the {{term startup-handshake}}, the engine core calls <code>vllm_config.__post_init__()</code> on its own copy. The comment says: "Update config which may have changed from the handshake":</p>
+<x-code file="vllm/v1/engine/core.py" lines="1317-1337" highlight="1336-1337" />
+<p>This line is in the context manager that wraps <code>EngineCore.__init__</code>, after the <code>yield</code>. So it runs after the engine is built and READY is sent (derived from the indentation of lines 1190-1226 and 1317-1337). The platform hooks of <code>__post_init__</code>, for example <code>check_and_update_config</code>, therefore run again in each engine core process.</p>
+</x-warning>
+<p>Values do not flow back, with one exception. The ready response of each engine core carries values that it found at start-up. The front end copies <code>max_model_len</code> (the smaller one), <code>num_gpu_blocks</code> (the sum over engines) and <code>block_size</code> into its own config ({{cite vllm/v1/engine/core_client.py:847-879}}).</p>
+
+<h3>Step 10: compute_hash, one key for compiled code</h3>
+<p><code>VllmConfig.compute_hash()</code> collects the hash of each sub-config and adds the vLLM version. It keeps the first 10 hex digits of an MD5 hash (SHA-256 in FIPS mode):</p>
+<x-code file="vllm/config/vllm.py" lines="570-575" />
+<p>Each sub-config decides which fields count. The docstring says that the hash covers the configs "that affect the structure of the computation graph" ({{cite vllm/config/vllm.py:464-468}}). <code>SchedulerConfig</code> counts <code>max_num_batched_tokens</code> and <code>max_num_seqs</code>, because compiled graphs capture buffer sizes that depend on them ({{cite vllm/config/scheduler.py:271-284}}). Three users of the hash:</p>
+<ul>
+  <li>The {{term compile-cache}} folder name, when <code>compilation_config.cache_dir</code> is empty: a SHA-256 of the env hash, the config hash, the code hash and the compiler hash ({{cite vllm/compilation/backends.py:1059-1063}}, {{cite vllm/compilation/backends.py:1086-1098}}).</li>
+  <li>The AOT compile cache, keyed by the env hash and the config hash ({{cite vllm/compilation/caching.py:572-588}}).</li>
+  <li>The optional start-up memory plan of <code>VLLM_ENABLE_STARTUP_PLAN</code> ({{cite vllm/v1/worker/startup_plan.py:61-74}}).</li>
+</ul>
+<p>So a change of <code>--max-num-seqs</code> gives a new hash, and the next start compiles again. The page {{link concepts/compile-and-cuda-graphs}} explains the cache.</p>
+
+<h3>Step 11: environment variables and flags</h3>
+<p>Environment variables are a separate channel. They are not fields of <code>VllmConfig</code>. <code>vllm/envs.py</code> maps each name to a function, mostly a lambda ({{cite vllm/envs.py:618}}). A read of <code>envs.X</code> calls the module <code>__getattr__</code>, which runs the function again:</p>
+<x-code file="vllm/envs.py" lines="2291-2299" highlight="2297-2298" />
+<p>The {{term env-cache}} stops this. <code>enable_envs_cache()</code> runs at the end of <code>EngineCore.__init__</code> and at the end of <code>WorkerProc.__init__</code> ({{cite vllm/v1/engine/core.py:241-243}}, {{cite vllm/v1/executor/multiproc_executor.py:708-710}}). No front-end code calls it, so the API server reads the environment live. The page {{link code/envs}} reads the module, and {{link reference/env-vars}} lists every variable.</p>
+<table>
+  <thead><tr><th></th><th>Flag (config field)</th><th>Environment variable</th></tr></thead>
+  <tbody>
+    <tr><td>Type check</td><td>pydantic, at start-up; unknown keys raise</td><td>each lambda parses its own text; an unknown <code>VLLM_*</code> name only warns ({{cite vllm/engine/arg_utils.py:2250}})</td></tr>
+    <tr><td>Reaches other processes</td><td>inside the pickled <code>VllmConfig</code></td><td>inherited <code>os.environ</code> of each child</td></tr>
+    <tr><td>In <code>--help</code></td><td>yes</td><td>no</td></tr>
+    <tr><td>In the compile cache key</td><td>through <code>compute_hash</code>, only the fields that each config counts</td><td>all names except an ignore list of 82 names ({{cite vllm/envs.py:2351-2466}})</td></tr>
+  </tbody>
+</table>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Recipe: find the real default of any setting">
+<p>A setting can get its value in up to seven places. Check them in this order. The last place that writes the value wins.</p>
+<ol>
+  <li><strong>The config field.</strong> Find the field and its docstring in {{link reference/config-classes}}. A docstring that says "set in <code>EngineArgs.create_engine_config</code>" is a hint that the dataclass default is not used ({{cite vllm/config/scheduler.py:48-53}}).</li>
+  <li><strong>The flag.</strong> Find the <code>add_argument</code> call in <code>EngineArgs.add_cli_args</code>. Look for <code>"default": None</code>, which hides the field default ({{cite vllm/engine/arg_utils.py:1729-1749}}).</li>
+  <li><strong>The EngineArgs field.</strong> A field that is <code>None</code> ({{cite vllm/engine/arg_utils.py:591-592}}) is filled later.</li>
+  <li><strong><code>create_engine_config</code> and its helpers.</strong> Search for the field name in <code>_set_default_*</code> and <code>get_batch_defaults</code> ({{cite vllm/engine/arg_utils.py:2926-3227}}).</li>
+  <li><strong>The sub-config's own validators.</strong> For example, <code>CacheConfig</code> turns <code>block_size=None</code> into 16 ({{cite vllm/config/cache.py:452-462}}).</li>
+  <li><strong><code>VllmConfig.__post_init__</code></strong> and the optimization level table ({{cite vllm/config/vllm.py:254-344}}).</li>
+  <li><strong>The platform and the engine core.</strong> <code>apply_config_platform_defaults</code> and <code>check_and_update_config</code> in the platform class; <code>update_block_size_for_backend</code> after the model loads ({{cite vllm/v1/executor/uniproc_executor.py:74-75}}); the KV cache planner in the engine core, which can lower <code>max_model_len</code> ({{cite vllm/v1/engine/core.py:308-322}}).</li>
+</ol>
+<p>A shortcut: read the logs. The API server logs "non-default args: {...}", which shows what you set ({{cite vllm/entrypoints/common/startup.py:94-96}}). The engine core logs "Initializing a V1 LLM engine (v...) with config: ..." after <code>__post_init__</code> ({{cite vllm/v1/engine/core.py:135-140}}). That line prints 33 resolved fields, among them <code>enable_prefix_caching</code>, <code>enable_chunked_prefill</code> and the full <code>compilation_config</code> ({{cite vllm/config/vllm.py:2788-2823}}). It does not print <code>max_num_seqs</code>; the batch limits are only in DEBUG logs ({{cite vllm/engine/arg_utils.py:3213-3227}}).</p>
+<p><strong>Five worked examples</strong> for <code>vllm serve meta-llama/Llama-3.1-8B-Instruct</code> on one 80 GB H100, with no flags:</p>
+<table>
+  <thead><tr><th>Setting</th><th>Dataclass default</th><th>Where the value changes</th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td><code>max_num_seqs</code></td><td>128 ({{cite vllm/config/scheduler.py:62}})</td><td>flag default <code>None</code> → <code>get_batch_defaults</code> → caps</td><td>1024 (when the driver reports 70 GiB or more)</td></tr>
+    <tr><td><code>enable_prefix_caching</code></td><td><code>True</code> ({{cite vllm/config/cache.py:254}})</td><td>flag default <code>None</code> → <code>is_prefix_caching_supported</code> ({{cite vllm/engine/arg_utils.py:3062-3063}})</td><td>on (a decoder-only generative model)</td></tr>
+    <tr><td><code>block_size</code></td><td><code>None</code> ({{cite vllm/config/cache.py:184}})</td><td>validator → 16; the platform may change it after the model loads</td><td>16, unless the attention backend needs another size</td></tr>
+    <tr><td><code>cudagraph_mode</code></td><td><code>None</code> ({{cite vllm/config/compilation.py:610}})</td><td>O2 table → <code>FULL_AND_PIECEWISE</code> ({{cite vllm/config/vllm.py:310}})</td><td><code>FULL_AND_PIECEWISE</code>; the attention backend can lower it at start-up</td></tr>
+    <tr><td><code>async_scheduling</code></td><td><code>None</code> ({{cite vllm/config/scheduler.py:211}})</td><td><code>__post_init__</code> ({{cite vllm/config/vllm.py:1697-1698}})</td><td>on</td></tr>
+  </tbody>
+</table>
+<x-simplified><p>The H100 result assumes that <code>get_device_total_memory()</code> reports 70 GiB or more and less than 160 GiB, as the reference page also assumes ({{link reference/serve-flags#tune-first}}). The lowering of the CUDA graph mode by the attention backend is explained on {{link concepts/compile-and-cuda-graphs}}.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="The parser in detail: one command line, step by step">
+<p>Take this command and a file <code>serve.yaml</code> with the keys <code>max-model-len: 8192</code>, <code>enforce-eager: true</code> and <code>compilation-config: {mode: 0}</code>:</p>
+<pre><code class="language-bash">vllm serve Qwen/Qwen3-0.6B --config serve.yaml --max_model_len 4096 -O1 -cc.cudagraph_mode=PIECEWISE</code></pre>
+<ol>
+  <li><strong>YAML.</strong> <code>load_config_file</code> returns <code>["--max-model-len", "8192", "--enforce-eager", "--compilation-config", "{\"mode\": 0}"]</code> ({{cite vllm/utils/argparse_utils.py:653-671}}). The model is on the command line, so the list goes after <code>Qwen/Qwen3-0.6B</code> ({{cite vllm/utils/argparse_utils.py:585-592}}).</li>
+  <li><strong>Names.</strong> <code>--max_model_len</code> becomes <code>--max-model-len</code> ({{cite vllm/utils/argparse_utils.py:387-394}}).</li>
+  <li><strong>-O1.</strong> It becomes <code>--optimization-level 1</code> ({{cite vllm/utils/argparse_utils.py:395-399}}).</li>
+  <li><strong>Duplicates.</strong> <code>--max-model-len</code> now appears twice. The parser logs "Found duplicate keys --max-model-len" ({{cite vllm/utils/argparse_utils.py:450-459}}, {{cite vllm/utils/argparse_utils.py:494-495}}). argparse keeps the last value, 4096, from the command line.</li>
+  <li><strong>Dotted key.</strong> <code>-cc.cudagraph_mode=PIECEWISE</code> becomes <code>-cc '{"cudagraph_mode": "PIECEWISE"}'</code> at the end of the list ({{cite vllm/utils/argparse_utils.py:462-500}}). It does not merge with the <code>--compilation-config</code> value from the file, because the prefixes differ. argparse sees two values for the same destination and keeps the last one, so the file's <code>{"mode": 0}</code> is lost. (Derived: argparse keeps the last value of an option.)</li>
+  <li><strong>Types.</strong> The JSON goes through <code>TypeAdapter(CompilationConfig).validate_json</code>, so an unknown key or value raises an argparse error ({{cite vllm/engine/arg_utils.py:369-376}}).</li>
+</ol>
+<p>The result: <code>max_model_len=4096</code>, <code>enforce_eager=True</code>, <code>optimization_level=1</code>, <code>compilation_config.cudagraph_mode=PIECEWISE</code>. Then <code>__post_init__</code> sees <code>enforce_eager</code> and sets the mode and the graph mode to <code>NONE</code> anyway ({{cite vllm/config/vllm.py:1745-1747}}).</p>
+<x-note title="Use one form for a JSON flag">
+<p>Write all keys of one sub-config with the same prefix, for example only <code>-cc.x</code> forms, or one complete JSON value. Mixed forms do not merge.</p>
+</x-note>
+</x-deepdive>
+
+<x-deepdive title="Where each piece runs, and how many times">
+<table>
+  <thead><tr><th>Code</th><th>API server</th><th>Engine core</th><th>Worker process</th></tr></thead>
+  <tbody>
+    <tr><td><code>add_cli_args</code> (with <code>pre_register_and_update(parser)</code>)</td><td>4 times (see below)</td><td>0</td><td>0</td></tr>
+    <tr><td><code>create_engine_config</code></td><td>1</td><td>0</td><td>0</td></tr>
+    <tr><td><code>VllmConfig.__post_init__</code></td><td>1</td><td>1 (after the handshake)</td><td>0 in a plain start-up</td></tr>
+    <tr><td><code>enable_envs_cache</code></td><td>never</td><td>1</td><td>1</td></tr>
+  </tbody>
+</table>
+<p>The API server builds the parser four times. The CLI builds the parsers of <code>serve</code>, <code>launch render</code> and <code>run-batch</code> before it parses argv ({{cite vllm/entrypoints/cli/main.py:100-110}}, {{cite vllm/entrypoints/cli/launch.py:39}}, {{cite vllm/entrypoints/cli/run_batch.py:62}}). <code>setup_server</code> then logs the non-default arguments ({{cite vllm/entrypoints/launchers/launcher.py:367-368}}). To find them, <code>get_non_default_args</code> builds one more parser with <code>make_arg_parser</code> and parses an empty list ({{cite vllm/entrypoints/common/startup.py:63-74}}). Each parser build calls <code>AsyncEngineArgs.add_cli_args</code>, which calls <code>pre_register_and_update(parser)</code> ({{cite vllm/engine/arg_utils.py:3257}}). <code>create_engine_config</code> calls the hook a fifth time, without a parser ({{cite vllm/engine/arg_utils.py:2246}}). (Derived from these call sites.)</p>
+<p>A worker can make a new <code>VllmConfig</code> with vLLM's <code>replace()</code> helper, which calls the constructor and so runs <code>__post_init__</code> again ({{cite vllm/config/utils.py:121-129}}).</p>
+</x-deepdive>
+
+<x-deepdive title="compute_hash in numbers">
+<ol>
+  <li>The factor list starts with the vLLM version, then one hash per sub-config, in a fixed order ({{cite vllm/config/vllm.py:474-570}}).</li>
+  <li>A missing optional config adds the text <code>"None"</code>, so turning LoRA on changes the list (lines 525-528).</li>
+  <li><code>additional_config</code>, a free dict for platforms, is hashed as sorted JSON (lines 559-567).</li>
+  <li><code>str(factors)</code> goes through <code>safe_hash</code>: MD5, or SHA-256 when MD5 is not allowed ({{cite vllm/utils/hashing.py:106-121}}). The first 10 hex digits are the result, for example <code>3f2a9c41d0</code> (an illustrative value).</li>
+</ol>
+<p>The {{term compile-cache}} folder <code>torch_compile_cache/&lt;10 hex&gt;</code> uses its own SHA-256 over four hashes, of which this is one ({{cite vllm/compilation/backends.py:1091-1097}}). The env hash covers every variable of <code>envs.py</code> that is not in the ignore list ({{cite vllm/envs.py:2451-2466}}). For example, <code>VLLM_ENGINE_READY_TIMEOUT_S</code> is not in the list, so a new timeout value also gives a new cache folder. (Derived from the list at {{cite vllm/envs.py:2356-2447}}.)</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="A dataclass default is often not the real default">
+<p><code>SchedulerConfig</code> says <code>max_num_seqs = 128</code>, but <code>vllm serve</code> on a large GPU uses 1024. Use the recipe in the deep dive, or read the "Initializing a V1 LLM engine" log line.</p>
+</x-warning>
+<ul>
+  <li><strong>A typo in a JSON key.</strong> <code>extra="forbid"</code> rejects it, and argparse stops with the pydantic error ({{cite vllm/engine/arg_utils.py:369-374}}). This is a feature: fix the key.</li>
+  <li><strong>A typo in an environment variable.</strong> It is only a warning, unless you add <code>--fail-on-environ-validation</code> ({{cite vllm/engine/arg_utils.py:1922-1928}}).</li>
+  <li><strong><code>--config=serve.yaml</code>.</strong> The parser expands the file only when <code>--config</code> is a separate word ({{cite vllm/utils/argparse_utils.py:371-372}}). No code in <code>vllm/</code> reads the value of <code>args.config</code>, so the file is ignored with no error. Write <code>--config serve.yaml</code>. (Derived from a search of the repository.)</li>
+  <li><strong>A file with another extension.</strong> <code>serve.json</code> raises "Config file must be of a yaml/yml type" ({{cite vllm/utils/argparse_utils.py:633-637}}).</li>
+  <li><strong>A change of the environment after start-up.</strong> It does not reach the engine core or the workers: they inherited the environment at spawn and cache it after start-up.</li>
+  <li><strong>An unexpected recompile.</strong> A change of <code>--max-num-seqs</code>, <code>--max-num-batched-tokens</code> or most <code>VLLM_*</code> variables gives a new cache key (Step 10).</li>
+</ul>
+<p><strong>Why it matters.</strong> To tune a server, you must know the value that the engine really uses. The value can come from a flag, the model, the GPU, the platform or the engine core. The config system decides it in a fixed order, and only in the front end, except for the steps in the engine core.</p>
+
+<x-quiz>
+  <x-q level="easy">Which object do the engine core and the workers read their settings from, and how do they get it?
+    <x-a><p>From <code>VllmConfig</code>. The front end builds it and passes it as an argument of each spawned process, so each process gets a pickled copy ({{cite vllm/v1/engine/utils.py:256-288}}, {{cite vllm/v1/executor/multiproc_executor.py:731-750}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">What does <code>-cc.mode=3</code> become before argparse sees it?
+    <x-a><p><code>-cc '{"mode": 3}'</code>. The parser turns a flag with a dot into a nested dict and adds it back as JSON ({{cite vllm/utils/argparse_utils.py:462-500}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You start <code>vllm serve</code> with <code>-O1 -cc.cudagraph_mode=FULL_AND_PIECEWISE</code>. Which CUDA graph mode do you get, and why?
+    <x-a><p><code>FULL_AND_PIECEWISE</code>. The O1 table would set <code>PIECEWISE</code>, but <code>_set_config_default</code> writes a default only when the field is still <code>None</code> ({{cite vllm/config/vllm.py:1014-1019}}). Your value is already set.</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>vllm serve</code> on an 80 GB A100 get a smaller token budget than on an 80 GB H100?
+    <x-a><p><code>get_batch_defaults</code> uses the large tier only when the device name does not contain "a100" ({{cite vllm/engine/arg_utils.py:2970-2983}}). The A100 gets 2048 tokens and 256 requests for <code>OPENAI_API_SERVER</code> ({{cite vllm/engine/arg_utils.py:2986-2993}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A platform plugin changes a field in <code>check_and_update_config</code>. In which processes of a TP = 1 <code>vllm serve</code> does the hook run, and when?
+    <x-a><p>In the API server, inside <code>VllmConfig.__post_init__</code> during <code>create_engine_config</code> ({{cite vllm/config/vllm.py:2046}}). It runs again in the engine core, because the engine core calls <code>vllm_config.__post_init__()</code> after the handshake ({{cite vllm/v1/engine/core.py:1336-1337}}). That second call comes after <code>EngineCore.__init__</code>, so the model is already built at that time (derived from the context manager at {{cite vllm/v1/engine/core.py:1190-1226}}). With TP = 1 there is no worker process.</p></x-a>
+  </x-q>
+</x-quiz>

@@ -154,7 +154,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-23 06:56 | B7b fact check | done ~07:20: ~190 claims, ~50 defects |
 | 2026-10-23 07:21 | B8b writer | running |
 | 2026-10-23 06:03 | B8a writer | done ~06:40; 2 diagrams, b8a.json 7 terms |
-| 2026-10-23 06:41 | B8a fact check | running |
+| 2026-10-23 06:41 | B8a fact check | done ~07:30: ~330 claims, 22 defects |
+| 2026-10-23 07:31 | B9 writer (operating) | running |
 | 2026-10-22 22:47 | B4a writer (plugin-map, platform-plugins, platform-interface + 2 modules + plugin timeline) | done ~23:25; 3 diagrams, b4a.json 5 terms |
 | 2026-10-22 23:26 | B4a fact check | done ~23:55: ~270 claims, 24 defects; OOT quant open question answered |
 | 2026-10-22 23:56 | B4b writer | cut off ~00:05, resumed 01:01, done ~01:45; 3 diagrams, b4b.json 11 terms |

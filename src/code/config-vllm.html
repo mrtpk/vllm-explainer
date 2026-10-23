@@ -1,0 +1,211 @@
+---
+title: config/vllm.py: VllmConfig, __post_init__ and compute_hash
+nav_title: config/vllm.py
+level: Advanced
+prerequisites: concepts/config-system, code/engine-arg-utils
+related: concepts/config-system, code/engine-arg-utils, reference/config-classes, concepts/compile-and-cuda-graphs, concepts/async-scheduling, concepts/model-runner, concepts/platform-interface, tours/serve-startup
+summary: vllm/config/vllm.py defines VllmConfig, the container of all top-level configs. Its __post_init__ checks the sub-configs together and sets the late defaults in a fixed order; compute_hash gives the 10-digit key of the compile caches; the optimization level tables and use_v2_model_runner also live here.
+---
+<h2>Purpose</h2>
+<p><code>vllm/config/vllm.py</code> defines the {{term vllm-config}}: one object that holds every top-level config of the engine. Its {{term post-init}} turns a set of separate sub-configs into one consistent configuration.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/config/vllm.py</code>, 3,617 lines of Python. One class, <code>VllmConfig</code>, of about 3,160 lines; an enum, four level tables, eight fusion helpers, and the "current config" functions.</td></tr>
+    <tr><th>Main class</th><td><code>VllmConfig</code> ({{cite vllm/config/vllm.py:347-348}}).</td></tr>
+    <tr><th>Runs in</th><td><code>__post_init__</code> runs where a <code>VllmConfig</code> is made: the API server process of <code>vllm serve</code>, and again in each engine core process after the handshake. The properties and <code>compute_hash</code> run in every process that holds a copy.</td></tr>
+    <tr><th>Called by</th><td><code>EngineArgs.create_engine_config</code> (construction); the engine core, the workers, the model runner and the compile backend (properties, <code>compute_hash</code>, <code>get_current_vllm_config</code>).</td></tr>
+    <tr><th>Calls</th><td>The platform hooks, <code>Executor.get_class</code>, the model registry and config classes, the KV connector factory (class lookup only).</td></tr>
+    <tr><th>Not in this file</th><td>The sub-config classes (<code>vllm/config/*.py</code>), the flag parser and the batch defaults ({{link code/engine-arg-utils}}), the compile backend that uses the hash (<code>vllm/compilation/</code>).</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<p>Panel 2 of the diagram on {{link concepts/config-system#the-picture}} shows <code>VllmConfig(...)</code> at the end of <code>create_engine_config</code>, and the phases of <code>__post_init__</code>. Panel 3 shows the copies in the other processes.</p>
+
+<h3>Who calls it</h3>
+<ul>
+  <li><code>EngineArgs.create_engine_config</code> makes the object ({{cite vllm/engine/arg_utils.py:2870-2903}}).</li>
+  <li>The engine core calls <code>vllm_config.__post_init__()</code> a second time after the handshake ({{cite vllm/v1/engine/core.py:1336-1337}}).</li>
+  <li>vLLM's <code>replace()</code> helper makes a new object with the constructor, so <code>__post_init__</code> runs again ({{cite vllm/config/utils.py:121-129}}).</li>
+  <li>The compile backend calls <code>compute_hash()</code> for its cache folder ({{cite vllm/compilation/backends.py:1062}}).</li>
+  <li>Model code reads the active config with <code>get_current_vllm_config()</code> ({{cite vllm/config/vllm.py:3576-3586}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li>The platform hooks <code>apply_config_platform_defaults</code> and <code>check_and_update_config</code> ({{cite vllm/config/vllm.py:1804}}, {{cite vllm/config/vllm.py:2046}}).</li>
+  <li><code>Executor.get_class(self)</code>, to ask whether the executor supports async scheduling ({{cite vllm/config/vllm.py:1622-1623}}).</li>
+  <li>The per-architecture config hooks in <code>MODELS_CONFIG_MAP</code> ({{cite vllm/config/vllm.py:2727-2743}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Lines</th><th>Name</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td>{{cite vllm/config/vllm.py:75-128}}</td><td><code>DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES</code></td><td>Model classes that get breakable CUDA graphs by default.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:131-143}}</td><td><code>OptimizationLevel</code></td><td>O0 to O3.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:156-251}}</td><td><code>enable_*_fusion</code></td><td>Callables that the level tables use to decide a fusion pass from the config.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:254-344}}</td><td><code>OPTIMIZATION_LEVEL_00</code> ... <code>_03</code></td><td>The defaults of each level.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:347-457}}</td><td><code>VllmConfig</code> fields</td><td>34 attributes.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:459-575}}</td><td><code>compute_hash</code></td><td>The 10-digit config hash.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:586-597}}</td><td><code>max_concurrent_batches</code></td><td>Size of the engine core batch queue.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:712-749}}</td><td><code>use_v2_model_runner</code></td><td>Model Runner V2 or V1.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:854-874}}</td><td><code>needs_dp_coordinator</code></td><td>Whether a DP coordinator process starts.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:1005-1049}}</td><td><code>_set_config_default</code>, <code>_apply_optimization_level_defaults</code></td><td>Fill only fields that are <code>None</code>.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:1492-2318}}</td><td><code>__post_init__</code></td><td>Cross-checks and late defaults.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:2377-2636}}</td><td><code>_set_cudagraph_sizes</code></td><td>CUDA graph capture sizes.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:2637-2713}}</td><td><code>_set_compile_ranges</code></td><td>Token ranges for compiled graphs.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:2714-2774}}</td><td><code>try_verify_and_update_config</code></td><td>Per-architecture hooks, once.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:2788-2823}}</td><td><code>__str__</code></td><td>The text of the "Initializing a V1 LLM engine" log line.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:2999-3033}}</td><td><code>_get_v2_model_runner_unsupported_features</code></td><td>The fallback reasons to Model Runner V1.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:3381-3511}}</td><td>Model validators</td><td>Pydantic checks after the constructor.</td></tr>
+    <tr><td>{{cite vllm/config/vllm.py:3516-3590}}</td><td><code>set_current_vllm_config</code>, <code>get_current_vllm_config</code></td><td>The active config as a module global.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3>The fields</h3>
+<x-code file="vllm/config/vllm.py" lines="430-446" highlight="434,440" />
+<p>Most fields are sub-configs with a default factory ({{cite vllm/config/vllm.py:357-422}}). The top-level settings are <code>additional_config</code>, <code>instance_id</code>, <code>optimization_level</code> (default O2), <code>performance_mode</code> (default <code>"balanced"</code>) and <code>shutdown_timeout</code> ({{cite vllm/config/vllm.py:428-457}}). The generated table of all fields is on {{link reference/config-classes}}.</p>
+
+<h3>The optimization level tables</h3>
+<x-code file="vllm/config/vllm.py" lines="296-316" highlight="301,310" />
+<p>O0 turns all fusions off and sets CUDA graphs to <code>NONE</code>; O1 uses <code>PIECEWISE</code>; O2 and O3 use <code>FULL_AND_PIECEWISE</code> and are equal at this commit ({{cite vllm/config/vllm.py:254-337}}). The docstring of O3 says "Currently the same as -O2s." ({{cite vllm/config/vllm.py:142-143}}). A value is either a constant or a function of the config, for example <code>enable_allreduce_rms_fusion</code> ({{cite vllm/config/vllm.py:178-202}}). <code>apply_recursive</code> walks the nested table. For each leaf it calls <code>_set_config_default</code>, which calls the function and writes the result only when the field is <code>None</code> ({{cite vllm/config/vllm.py:1014-1019}}):</p>
+<x-code file="vllm/config/vllm.py" lines="1037-1049" highlight="1044-1047" />
+<p>So the tables never overwrite a value that the user or an earlier phase set. The page {{link concepts/compile-and-cuda-graphs}} explains what each pass and mode does.</p>
+<x-note title="Docs and code differ on O0 custom ops">
+<p>The design doc says that <code>-O0</code> sets <code>-cc.mode=NONE</code> "(also resulting in <code>-cc.custom_ops=["none"]</code>)" ({{cite docs/design/optimization_levels.md:37}}). The code does the opposite: with the mode <code>NONE</code>, the base entry of the list is <code>"all"</code>, so all custom ops are on ({{cite vllm/config/vllm.py:1819-1826}}).</p>
+</x-note>
+
+<h3><code>__post_init__</code>, phase by phase</h3>
+<p>The method is about 830 lines long. Its docstring is "Verify configs are valid &amp; consistent with each other." ({{cite vllm/config/vllm.py:1493}}). We read it in nine phases.</p>
+<p><strong>Phase 1: early exits and model hooks.</strong></p>
+<x-code file="vllm/config/vllm.py" lines="1495-1534" highlight="1495,1497-1501,1505-1516,1521,1531,1534" />
+<ol>
+  <li><strong>Line 1495.</strong> <code>instance_id</code> from the clock, for profile names.</li>
+  <li><strong>Lines 1497-1501.</strong> A sub-model view made by <code>with_hf_config</code> skips all checks.</li>
+  <li><strong>Lines 1505-1516.</strong> An instance that runs only the multimodal encoder turns prefix caching off.</li>
+  <li><strong>Line 1521.</strong> The per-architecture hooks run once; a flag on the model config stops a second run ({{cite vllm/config/vllm.py:2718-2721}}).</li>
+  <li><strong>Lines 1531-1534.</strong> The model checks itself against the parallel config, and the parallel config learns if the model is MoE.</li>
+</ol>
+<p><strong>Phase 2: quantization and weights.</strong> <code>quant_config</code> comes from the model and load configs ({{cite vllm/config/vllm.py:1586-1589}}). For most load formats, the model config may untie the word embeddings (lines 1594-1599).</p>
+<p><strong>Phase 3: async scheduling.</strong></p>
+<x-code file="vllm/config/vllm.py" lines="1664-1698" highlight="1666-1675,1676-1682,1697-1698" />
+<p>An explicit <code>--async-scheduling</code> raises on a conflict; an unset value only switches it off, with a log (lines 1647-1663). The page {{link concepts/async-scheduling}} explains the feature.</p>
+<p><strong>Phase 4: eager mode and compile switches.</strong> <code>--enforce-eager</code> sets the compile mode and the CUDA graph mode to <code>NONE</code> ({{cite vllm/config/vllm.py:1745-1763}}). <code>TORCH_COMPILE_DISABLE=1</code> sets the compile mode to <code>NONE</code> (lines 1765-1770). For some architectures, <code>_maybe_enable_breakable_cudagraph</code> writes <code>VLLM_USE_BREAKABLE_CUDAGRAPH=1</code> into <code>os.environ</code> and turns compilation off ({{cite vllm/config/vllm.py:824-851}}).</p>
+<p><strong>Phase 5: platform defaults, compile mode, level defaults.</strong></p>
+<x-code file="vllm/config/vllm.py" lines="1804-1834" highlight="1804,1806-1810,1819-1826,1831,1833-1834" />
+<ol>
+  <li><strong>Line 1804.</strong> The first platform hook. It runs before the level defaults, so a platform can set a field and keep it.</li>
+  <li><strong>Lines 1806-1810.</strong> No mode set: <code>VLLM_COMPILE</code> above O0, else <code>NONE</code>.</li>
+  <li><strong>Lines 1819-1826.</strong> The base entry of the custom op list: <code>"none"</code> with Inductor and compilation, else <code>"all"</code> ({{link concepts/custom-ops}}).</li>
+  <li><strong>Line 1831.</strong> The IR op priorities, before the fusion defaults that depend on them.</li>
+  <li><strong>Lines 1833-1834.</strong> The level table.</li>
+</ol>
+<p><strong>Phase 6: CUDA graphs.</strong> Piecewise modes need <code>VLLM_COMPILE</code>, else the mode falls back ({{cite vllm/config/vllm.py:1111-1131}}, {{cite vllm/config/vllm.py:1909-1911}}). On a platform with static graphs, pooling models get <code>PIECEWISE</code>, encoder-decoder models <code>FULL_DECODE_ONLY</code>, and some KV connectors <code>PIECEWISE</code> ({{cite vllm/config/vllm.py:1929-1980}}). With <code>--enforce-eager</code>, the eager branch clears the sizes. Then <code>_set_cudagraph_sizes</code> runs in both cases ({{cite vllm/config/vllm.py:1982-1992}}).</p>
+<p><strong>Phase 7: the platform's last word.</strong> <code>current_platform.check_and_update_config(self)</code> ({{cite vllm/config/vllm.py:2046}}). A comment right after it says that the platform "has the last word on async scheduling" (line 2048).</p>
+<p><strong>Phase 8: model runner and compile ranges.</strong></p>
+<x-code file="vllm/config/vllm.py" lines="2071-2083" highlight="2071-2075,2083" />
+<p>An unsupported feature normally selects Model Runner V1 (the <code>use_v2_model_runner</code> property below). It raises <code>ValueError</code> only when Model Runner V2 is forced, for example with <code>VLLM_USE_V2_MODEL_RUNNER=1</code> ({{cite vllm/config/vllm.py:3283-3292}}, {{cite vllm/config/vllm.py:730-732}}). The compile ranges are computed again, because the platform hook can change <code>max_num_batched_tokens</code> (comment at lines 2081-2082).</p>
+<p><strong>Phase 9: KV transfer, hybrid KV cache manager, final checks.</strong> <code>_post_init_kv_transfer_config</code> resolves KV offloading ({{cite vllm/config/vllm.py:2199}}). The hybrid KV cache manager is turned off when the platform or the KV connector does not support it; an explicit <code>--enable-hybrid-kv-cache-manager</code> then raises ({{cite vllm/config/vllm.py:2236-2273}}). The last line logs the enabled compile passes ({{cite vllm/config/vllm.py:2318}}).</p>
+
+<h3><code>compute_hash</code></h3>
+<x-code file="vllm/config/vllm.py" lines="474-501" highlight="478-481,482-483,500-501" />
+<p>The method collects one hash per sub-config in a fixed order; a missing optional config adds <code>"None"</code>. <code>additional_config</code> is hashed as sorted JSON ({{cite vllm/config/vllm.py:559-567}}). The result is the first 10 hex digits of <code>safe_hash(str(factors))</code> ({{cite vllm/config/vllm.py:572-575}}), which is MD5, or SHA-256 when MD5 is not available ({{cite vllm/utils/hashing.py:106-121}}). The docstring warns that a new field must join the list if it changes the computation graph ({{cite vllm/config/vllm.py:460-468}}).</p>
+
+<h3><code>use_v2_model_runner</code> and <code>max_concurrent_batches</code></h3>
+<x-code file="vllm/config/vllm.py" lines="712-749" highlight="714-720,722-728,730-732,734-738,740-747" />
+<ol>
+  <li><strong>Lines 714-728.</strong> HiSparse and watermarking need Model Runner V2. HiSparse with <code>VLLM_USE_V2_MODEL_RUNNER=0</code> raises; watermarking ignores the 0.</li>
+  <li><strong>Lines 730-732.</strong> Otherwise the variable decides, if it is set.</li>
+  <li><strong>Lines 734-747.</strong> No Triton, or a feature from <code>_get_v2_model_runner_unsupported_features</code>: Model Runner V1, with a warning ({{link concepts/model-runner}}).</li>
+</ol>
+<p><code>max_concurrent_batches</code> is <code>pp_size + 1</code> with async scheduling and Model Runner V2, so 2 on one GPU ({{cite vllm/config/vllm.py:586-597}}). The engine core makes a batch queue only when the value is above 1 ({{cite vllm/v1/engine/core.py:205-211}}).</p>
+
+<h3><code>set_current_vllm_config</code></h3>
+<x-code file="vllm/config/vllm.py" lines="3516-3540" highlight="3536,3538,3540" />
+<p>The context manager puts the config into a module global for the time of the block, for example while the worker builds the model ({{cite vllm/v1/worker/gpu_worker.py:592-598}}). <code>get_current_vllm_config()</code> raises an <code>AssertionError</code> outside such a block (lines 3576-3586). A <code>CustomOp</code> made at import time hits this error, as the message says.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: the compilation fields of one start">
+<p><code>vllm serve meta-llama/Llama-3.1-8B-Instruct</code> on one H100, with no flags. The table follows the compilation fields through <code>__post_init__</code>. (Derived from the lines named.)</p>
+<table>
+  <thead><tr><th>Field</th><th>After the constructor</th><th>Phase and line</th><th>Value after</th></tr></thead>
+  <tbody>
+    <tr><td><code>compilation_config.mode</code></td><td><code>None</code> ({{cite vllm/config/compilation.py:432}})</td><td>5: {{cite vllm/config/vllm.py:1806-1808}}</td><td><code>VLLM_COMPILE</code></td></tr>
+    <tr><td><code>custom_ops</code></td><td><code>[]</code></td><td>5: {{cite vllm/config/vllm.py:1819-1824}}</td><td><code>["none"]</code></td></tr>
+    <tr><td><code>cudagraph_mode</code></td><td><code>None</code> ({{cite vllm/config/compilation.py:610}})</td><td>5: O2 table, {{cite vllm/config/vllm.py:310}}</td><td><code>FULL_AND_PIECEWISE</code></td></tr>
+    <tr><td><code>max_cudagraph_capture_size</code></td><td><code>None</code></td><td>6: {{cite vllm/config/vllm.py:2439-2449}}</td><td>min(1024 × 1 × 2, 512) = 512</td></tr>
+    <tr><td><code>scheduler_config.async_scheduling</code></td><td><code>None</code></td><td>3: {{cite vllm/config/vllm.py:1697-1698}}</td><td><code>True</code></td></tr>
+    <tr><td><code>parallel_config.worker_cls</code></td><td><code>"auto"</code></td><td>7: {{cite vllm/platforms/cuda.py:330-331}}</td><td><code>vllm.v1.worker.gpu_worker.Worker</code></td></tr>
+  </tbody>
+</table>
+<p>With <code>--enforce-eager</code>, phase 4 sets the mode and the graph mode to <code>NONE</code> first. The level table then leaves both alone, because they are not <code>None</code> any more ({{cite vllm/config/vllm.py:1014-1019}}).</p>
+</x-deepdive>
+
+<x-deepdive title="__post_init__ also writes the environment">
+<p>Two places in <code>__post_init__</code> write <code>os.environ</code>:</p>
+<ul>
+  <li><code>VLLM_USE_BREAKABLE_CUDAGRAPH=1</code> for the default breakable-graph architectures, or for some batch-invariant BF16 models ({{cite vllm/config/vllm.py:824-843}}).</li>
+  <li><code>NCCL_GRAPH_REGISTER=0</code> when the CUDA graph pool uses cumem, with a warning if the user set another value ({{cite vllm/config/vllm.py:2309-2316}}).</li>
+</ul>
+<p>In <code>vllm serve</code>, this runs in the API server before the engine core starts. A spawned child gets a copy of the parent environment, so the engine core and the workers see the values (derived; see {{link concepts/config-system}}, Step 9). So in vLLM some configuration travels in the environment, not in the config object.</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Explicit <code>--async-scheduling</code> with an unsupported executor</td><td><code>ValueError</code></td><td>{{cite vllm/config/vllm.py:1660-1663}}</td></tr>
+    <tr><td>Async scheduling unset, executor unsupported</td><td>warning; async off</td><td>{{cite vllm/config/vllm.py:1676-1682}}</td></tr>
+    <tr><td><code>--language-model-only</code> with <code>cudagraph_mm_encoder</code></td><td><code>ValueError</code></td><td>{{cite vllm/config/vllm.py:1536-1547}}</td></tr>
+    <tr><td><code>mm_tensor_ipc="torch_shm"</code> without spawn</td><td><code>ValueError</code></td><td>{{cite vllm/config/vllm.py:1722-1731}}</td></tr>
+    <tr><td>Inductor turned off while fusion options are set</td><td>warning: those options "will be ignored"</td><td>{{cite vllm/config/vllm.py:1774-1785}}</td></tr>
+    <tr><td>Pooling model with full CUDA graphs</td><td>warning; mode becomes <code>PIECEWISE</code></td><td>{{cite vllm/config/vllm.py:1933-1940}}</td></tr>
+    <tr><td>Model Runner V2 and an unsupported feature (forced V2)</td><td><code>ValueError</code></td><td>{{cite vllm/config/vllm.py:3283-3292}}</td></tr>
+    <tr><td>Explicit hybrid KV cache manager that the setup cannot use</td><td><code>ValueError</code></td><td>{{cite vllm/config/vllm.py:2260-2269}}</td></tr>
+    <tr><td><code>get_current_vllm_config()</code> outside a config block</td><td><code>AssertionError</code></td><td>{{cite vllm/config/vllm.py:3576-3586}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables read in this file">
+<table>
+  <thead><tr><th>Name</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_USE_V2_MODEL_RUNNER</code></td><td>{{cite vllm/config/vllm.py:715}}, {{cite vllm/config/vllm.py:730}}</td><td>Forces Model Runner V2 or V1 (with exceptions).</td></tr>
+    <tr><td><code>TORCH_COMPILE_DISABLE</code> (read with <code>os.environ</code>)</td><td>{{cite vllm/config/vllm.py:1765}}</td><td>Compilation mode <code>NONE</code>.</td></tr>
+    <tr><td><code>VLLM_USE_BREAKABLE_CUDAGRAPH</code> (read and written)</td><td>{{cite vllm/config/vllm.py:826}}</td><td>Breakable CUDA graphs; turns compilation off.</td></tr>
+    <tr><td><code>VLLM_WORKER_MULTIPROC_METHOD</code> (read with <code>os.environ</code>)</td><td>{{cite vllm/config/vllm.py:1726}}, {{cite vllm/config/vllm.py:2017}}</td><td>Checks for <code>torch_shm</code> and Whisper.</td></tr>
+    <tr><td><code>VLLM_DEBUG_DUMP_PATH</code></td><td>{{cite vllm/config/vllm.py:2289-2297}}</td><td>Overrides the compile debug dump path.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/config-system}}: the whole path from flags to processes.</li>
+  <li>{{link code/engine-arg-utils}}: the code that makes this object.</li>
+  <li>{{link concepts/compile-and-cuda-graphs}}: the compile modes, graph modes and the cache that uses <code>compute_hash</code>.</li>
+  <li>{{link concepts/platform-interface}}: the two platform hooks inside <code>__post_init__</code>.</li>
+  <li>{{link reference/config-classes}}: every field of every config class.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">What does <code>-O3</code> change compared to the default at this commit?
+    <x-a><p>Nothing. The O3 table has the same values as the O2 table ({{cite vllm/config/vllm.py:296-337}}), and the docstring says "Currently the same as -O2s." ({{cite vllm/config/vllm.py:142-143}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A platform plugin wants a different default CUDA graph mode, but it must not override a user's value. Which hook should it use?
+    <x-a><p><code>apply_config_platform_defaults</code>. It runs before the level defaults ({{cite vllm/config/vllm.py:1804}}, {{cite vllm/config/vllm.py:1833-1834}}). If the hook sets the mode only when it is <code>None</code>, the level table then keeps the value, because it fills only <code>None</code> fields ({{cite vllm/config/vllm.py:1014-1019}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does a change of <code>--max-num-seqs</code> make the next start compile again?
+    <x-a><p><code>SchedulerConfig.compute_hash</code> includes <code>max_num_seqs</code> ({{cite vllm/config/scheduler.py:282-284}}). <code>VllmConfig.compute_hash</code> includes that hash ({{cite vllm/config/vllm.py:500-501}}), and the compile cache folder name depends on it ({{cite vllm/compilation/backends.py:1091-1097}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You start <code>vllm serve</code> with <code>--enforce-eager -O2</code>. Which CUDA graph capture sizes does the config end with, and which lines decide it?
+    <x-a><p>An empty list, with <code>max_cudagraph_capture_size = 0</code>. Phase 4 sets the graph mode to <code>NONE</code> ({{cite vllm/config/vllm.py:1745-1747}}); the O2 table does not override it, because the field is not <code>None</code> ({{cite vllm/config/vllm.py:1014-1019}}). On a static-graph platform, the eager branch then clears the sizes ({{cite vllm/config/vllm.py:1983-1988}}).</p></x-a>
+  </x-q>
+</x-quiz>

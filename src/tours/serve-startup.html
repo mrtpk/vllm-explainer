@@ -1,0 +1,373 @@
+---
+title: Tour: Start-up of vllm serve
+nav_title: Start-up of vllm serve
+level: Intermediate
+prerequisites: concepts/architecture-overview, concepts/config-system, concepts/executors-and-workers
+related: concepts/config-system, concepts/architecture-overview, concepts/executors-and-workers, concepts/kv-cache-manager, concepts/compile-and-cuda-graphs, concepts/openai-server, tours/life-of-a-plugin, tours/life-of-a-chat-request, code/engine-arg-utils, code/config-vllm, code/v1-engine-core
+summary: Follow vllm serve on one GPU in 18 stops, from the console script to "Application startup complete" - the parsers, create_engine_config, VllmConfig, AsyncLLM, the spawned engine core, model loading, the memory profile, compilation, CUDA graph capture, the READY handshake and uvicorn - with the log line of each stop.
+---
+<x-sentence>We follow vllm serve on one GPU from the shell command to "Application startup complete", in two processes and 18 stops.</x-sentence>
+
+<h2>The idea</h2>
+<p>A cold start of <code>vllm serve</code> can take minutes. The log shows many lines, from two processes. This tour connects each part of the log to the code that writes it. Then you can read your own server log and see where the time goes.</p>
+<p>With one GPU (TP = PP = DP = 1), <code>vllm serve</code> runs two processes. The {{term api-server}} process is the <code>vllm</code> command itself: it parses the flags, builds the {{term vllm-config}} and later runs the HTTP server. The {{term engine-core}} process is a child. With one GPU, the {{term uni-executor}} runs the {{term worker}} inside that process, so it also loads the model and owns the GPU ({{link concepts/architecture-overview}}).</p>
+<p><strong>An everyday comparison.</strong> Think of a theatre before the first show. The front office prints the tickets and the cast list, and it opens the doors only when the stage manager calls "ready". Backstage, the crew builds the set, tunes the lights and rehearses each scene once. The comparison stops in one place. Here the front office writes the full script (the config) before the crew starts, and the crew gets a copy.</p>
+<p>The tour {{link tours/life-of-a-plugin}} walks the same start-up from the side of the plugins, with TP = 2. This tour follows the config, the processes and the GPU work.</p>
+
+<h3>The example</h3>
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-8B-Instruct     # one 80 GB H100, no other flags</code></pre>
+<ul>
+  <li>Usage context <code>OPENAI_API_SERVER</code>, so the token budget is 8192 and <code>max_num_seqs</code> is 1024 when the driver reports 70 GiB or more ({{cite vllm/engine/arg_utils.py:2970-2983}}).</li>
+  <li>Optimization level O2: <code>torch.compile</code> and CUDA graph mode <code>FULL_AND_PIECEWISE</code> ({{cite vllm/config/vllm.py:434}}, {{cite vllm/config/vllm.py:310}}).</li>
+  <li>The executor backend is <code>uni</code>, because the world size is 1 ({{cite vllm/config/parallel.py:1099-1100}}).</li>
+</ul>
+<x-simplified><p>The model and the GPU are an example. Numbers such as GiB values and times are illustrative; the log texts and the order are from the code. We assume a cold start: no compile cache, weights already downloaded.</p></x-simplified>
+
+<h2>The picture</h2>
+<x-diagram name="b8a_startup_timeline" alt="Two lanes. Left lane, API server process with log prefix APIServer: stop 1 cli/main.py main, env setup and spawn mode; 2 build parsers and parse argv, plugins, pre_register three times; 3 ServeSubcommand.cmd, one API server, run_server; 4 setup_server binds the port and logs non-default args; 5 AsyncEngineArgs.from_cli_args; 6 create_engine_config builds the model config and logs Resolved architecture; 7 create_engine_config builds the cache, parallel and scheduler configs; 8 VllmConfig.__post_init__ sets async scheduling, O2 and CUDA graphs; 9 AsyncLLM init with tokenizer and input and output processors; 10 MPClient and launch_core_engines make the ZMQ sockets and spawn the engine core. Then the left lane waits in wait_for_engine_startup, polling every 10 seconds with no time limit for one API server. Right lane, engine core process with log prefix EngineCore, not started before stop 10: 11 run_engine_core, handshake HELLO, Initializing a V1 LLM engine; 12 uni executor init_device with torch.distributed world size 1; 13 load_model, Model loading took GiB; 14 _initialize_kv_caches, compile in the profile run and the KV cache size; 15 initialize_from_config allocates the KV cache tensors; 16 compile_or_warm_up_model, Graph capturing finished. An arrow labelled ready goes back to the left lane: 17 READY and wait_for_engine_startup, ready response on the input socket; 18 build_and_serve and uvicorn, Application startup complete." caption="Figure: the 18 stops on a time line. Stops 1-10 and 17-18 run in the API server process, stops 11-16 in the engine core process." />
+<p>Read the left lane from the top to stop 10. Then follow the arrow to the right lane for stops 11 to 16, and back to the left lane for stops 17 and 18. Each log line of vLLM starts with the process name and the PID, for example <code>(EngineCore pid=4242) INFO ...</code> ({{cite vllm/logger.py:28-32}}).</p>
+
+<table>
+  <thead><tr><th>Stop</th><th>What happens</th><th>File and function</th><th>Process</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>The console script starts; spawn mode</td><td><code>entrypoints/cli/main.py</code>: <code>main</code></td><td>API server</td></tr>
+    <tr><td>2</td><td>Parsers are built, argv is parsed</td><td><code>cli/main.py</code>; <code>engine/arg_utils.py</code>: <code>AsyncEngineArgs.add_cli_args</code></td><td>API server</td></tr>
+    <tr><td>3</td><td>The serve command picks one API server</td><td><code>entrypoints/cli/serve.py</code>: <code>ServeSubcommand.cmd</code></td><td>API server</td></tr>
+    <tr><td>4</td><td>The port is bound before the engine starts</td><td><code>launchers/launcher.py</code>: <code>setup_server</code></td><td>API server</td></tr>
+    <tr><td>5</td><td>Namespace to EngineArgs</td><td><code>launchers/api_server/entry.py</code>: <code>build_async_engine_client</code></td><td>API server</td></tr>
+    <tr><td>6</td><td>The model config, first</td><td><code>arg_utils.py</code>: <code>create_engine_config</code></td><td>API server</td></tr>
+    <tr><td>7</td><td>The other sub-configs and <code>VllmConfig(...)</code></td><td><code>arg_utils.py</code>: <code>create_engine_config</code></td><td>API server</td></tr>
+    <tr><td>8</td><td>The late defaults</td><td><code>config/vllm.py</code>: <code>VllmConfig.__post_init__</code></td><td>API server</td></tr>
+    <tr><td>9</td><td>The front-end engine object</td><td><code>v1/engine/async_llm.py</code>: <code>AsyncLLM.__init__</code></td><td>API server</td></tr>
+    <tr><td>10</td><td>Sockets, and the engine core process starts</td><td><code>v1/engine/core_client.py</code>: <code>MPClient.__init__</code>; <code>v1/engine/utils.py</code>: <code>launch_core_engines</code></td><td>API server</td></tr>
+    <tr><td>11</td><td>The handshake and <code>EngineCore.__init__</code></td><td><code>v1/engine/core.py</code>: <code>run_engine_core</code>, <code>EngineCoreProc.__init__</code></td><td>engine core</td></tr>
+    <tr><td>12</td><td>The worker sets up the GPU</td><td><code>v1/executor/uniproc_executor.py</code>; <code>v1/worker/gpu_worker.py</code>: <code>init_device</code></td><td>engine core</td></tr>
+    <tr><td>13</td><td>The weights load</td><td><code>gpu_worker.py</code>: <code>load_model</code>; <code>v1/worker/gpu/model_runner.py</code></td><td>engine core</td></tr>
+    <tr><td>14</td><td>Profile run (with compilation) and KV cache size</td><td><code>core.py</code>: <code>_initialize_kv_caches</code>; <code>gpu_worker.py</code>: <code>determine_available_memory</code></td><td>engine core</td></tr>
+    <tr><td>15</td><td>The KV cache tensors are allocated</td><td><code>gpu_worker.py</code>: <code>initialize_from_config</code></td><td>engine core</td></tr>
+    <tr><td>16</td><td>Warm-up and CUDA graph capture</td><td><code>gpu_worker.py</code>: <code>compile_or_warm_up_model</code></td><td>engine core</td></tr>
+    <tr><td>17</td><td>READY, and the front end continues</td><td><code>core.py</code>: <code>_perform_handshake</code>; <code>v1/engine/utils.py</code>: <code>wait_for_engine_startup</code></td><td>both</td></tr>
+    <tr><td>18</td><td>The app is built and uvicorn serves</td><td><code>entry.py</code>: <code>build_and_serve</code>; <code>launcher.py</code>: <code>serve_http</code></td><td>API server</td></tr>
+  </tbody>
+</table>
+<p>All paths are under <code>vllm/</code>; <code>launchers/</code> is <code>vllm/entrypoints/launchers/</code>.</p>
+
+<x-stop n="1" title="The console script starts, and the CLI selects spawn">
+<p>The command <code>vllm</code> is a console script for <code>vllm.entrypoints.cli.main:main</code> ({{cite pyproject.toml:42-43}}). <code>main()</code> first imports the module of each subcommand, then prepares the environment:</p>
+<x-code file="vllm/entrypoints/cli/main.py" lines="39-68" highlight="43-51,67-68" />
+<ol>
+  <li><strong>Lines 43-51.</strong> The imports already do work. <code>cli/serve.py</code> imports <code>common/cli_args.py</code>, which imports <code>engine/arg_utils.py</code>. That module has a module-level <code>from vllm.platforms import current_platform</code>, so the platform is detected now ({{cite vllm/entrypoints/cli/serve.py:13}}, {{cite vllm/entrypoints/common/cli_args.py:16}}, {{cite vllm/engine/arg_utils.py:122}}). The page {{link concepts/platform-plugins}} explains the detection.</li>
+  <li><strong>Lines 67-68.</strong> <code>cli_env_setup()</code> sets <code>VLLM_WORKER_MULTIPROC_METHOD=spawn</code> when you did not set it ({{cite vllm/entrypoints/common/startup.py:147-149}}). So the engine core of stop 10 is a new Python interpreter, a {{term spawn | spawned}} process.</li>
+</ol>
+</x-stop>
+
+<x-stop n="2" title="The parsers are built, and argv is parsed">
+<p>The CLI builds the parser of every subcommand before it reads your flags:</p>
+<x-code file="vllm/entrypoints/cli/main.py" lines="98-117" highlight="100-109,110,113-114,116-117" />
+<p>The <code>serve</code> parser calls <code>make_arg_parser</code>, which ends with <code>AsyncEngineArgs.add_cli_args</code> ({{cite vllm/entrypoints/cli/serve.py:172}}, {{cite vllm/entrypoints/common/cli_args.py:465-466}}):</p>
+<x-code file="vllm/engine/arg_utils.py" lines="3237-3258" highlight="3243,3245,3257" />
+<ol>
+  <li><strong>Line 3243.</strong> The general plugins run for the first time in this process. Later calls return at once ({{cite vllm/plugins/__init__.py:82-85}}).</li>
+  <li><strong>Line 3245.</strong> About 300 flags are made from the config classes ({{link concepts/config-system}}, Step 4). The help text is read only with <code>--help</code>, which saves time ({{cite vllm/engine/arg_utils.py:285-288}}).</li>
+  <li><strong>Line 3257.</strong> The platform hook <code>pre_register_and_update(parser)</code>. The parsers of <code>launch render</code> and <code>run-batch</code> call <code>add_cli_args</code> too, so the hook runs three times here ({{cite vllm/entrypoints/cli/launch.py:39}}, {{cite vllm/entrypoints/cli/run_batch.py:62}}).</li>
+</ol>
+<p>Line 110 of <code>main.py</code> parses the command line. <code>FlexibleArgumentParser</code> first inserts a <code>--config</code> YAML file, changes <code>_</code> to <code>-</code>, expands <code>-O3</code> and turns <code>-cc.key=value</code> into JSON ({{cite vllm/utils/argparse_utils.py:313-502}}). Line 113 configures logging; line 114 checks the serve flags.</p>
+</x-stop>
+
+<x-stop n="3" title="ServeSubcommand.cmd picks one API server">
+<p><code>args.dispatch_function</code> is <code>ServeSubcommand.cmd</code>. It moves the positional model into <code>args.model</code> and decides how many API server processes to run ({{cite vllm/entrypoints/cli/serve.py:54-57}}). <code>--api-server-count</code> is not set, so it becomes the data parallel size, 1 ({{cite vllm/entrypoints/cli/serve.py:113-130}}):</p>
+<x-code file="vllm/entrypoints/cli/serve.py" lines="147-156" highlight="151-152,153-156" />
+<p>One API server runs in this process, inside a uvloop event loop (lines 155-156). With more API servers, the CLI process would stay a supervisor and start them as children (line 152, deep dive "DP = 2").</p>
+</x-stop>
+
+<x-stop n="4" title="setup_server binds the port before the engine starts">
+<p><code>run_server</code> names the process for the log, catches an early SIGTERM, and calls <code>setup_server</code> ({{cite vllm/entrypoints/launchers/api_server/entry.py:164-176}}):</p>
+<x-code file="vllm/entrypoints/launchers/launcher.py" lines="365-379" highlight="367-368,372-379" />
+<ol>
+  <li><strong>Line 367.</strong> The banner: "vLLM server version %s, serving model %s", or an ASCII logo with the same values ({{cite vllm/entrypoints/common/startup.py:16-38}}).</li>
+  <li><strong>Line 368.</strong> "non-default args: {...}" lists every flag that differs from its default, with secrets shown as <code>***</code> ({{cite vllm/entrypoints/common/startup.py:49-60}}, {{cite vllm/entrypoints/common/startup.py:94-96}}). To find the defaults, it builds the whole parser once more ({{cite vllm/entrypoints/common/startup.py:70-74}}). So <code>pre_register_and_update(parser)</code> runs a fourth time.</li>
+  <li><strong>Lines 372-379.</strong> The socket is bound now, before the engine starts. The comment names a race with Ray as the reason. A busy port therefore fails in seconds, not after the model loads.</li>
+</ol>
+<p>The API server only binds the port here. It does not accept connections until uvicorn runs at stop 18.</p>
+</x-stop>
+
+<x-stop n="5" title="The Namespace becomes EngineArgs">
+<p><code>run_server_worker</code> enters <code>build_async_engine_client</code>, which makes the {{term engine-args}}:</p>
+<x-code file="vllm/entrypoints/launchers/api_server/entry.py" lines="50-58" highlight="52" />
+<p><code>from_cli_args</code> copies each parsed value into the dataclass field of the same name ({{cite vllm/engine/arg_utils.py:1961-1970}}). Then <code>EngineArgs.__post_init__</code> runs. It turns dict values into config objects and calls <code>load_general_plugins()</code>, which returns at once here ({{cite vllm/engine/arg_utils.py:873-924}}). The call is for the offline <code>LLM</code> class, which builds no parser.</p>
+</x-stop>
+
+<x-stop n="6" title="create_engine_config: the model config first">
+<p><code>build_async_engine_client_from_engine_args</code> calls {{term create-engine-config}} with the {{term usage-context}} <code>OPENAI_API_SERVER</code> ({{cite vllm/entrypoints/launchers/api_server/entry.py:68-82}}):</p>
+<x-code file="vllm/engine/arg_utils.py" lines="2243-2275" highlight="2246,2248,2250,2269,2275" />
+<ol>
+  <li><strong>Line 2246.</strong> <code>pre_register_and_update()</code> runs a fifth time, now without a parser.</li>
+  <li><strong>Line 2250.</strong> <code>validate_environ</code> warns about each <code>VLLM_*</code> name in the environment that vLLM does not know ({{link reference/env-vars}}).</li>
+  <li><strong>Line 2269.</strong> <code>ModelConfig</code> reads the Hugging Face config. It asks the model registry and logs "Resolved architecture: LlamaForCausalLM" ({{cite vllm/config/model.py:741-744}}). Later in the same <code>__post_init__</code>, it computes <code>max_model_len</code> and logs "Using max model len 131072" ({{cite vllm/config/model.py:824}}, {{cite vllm/config/model.py:2170}}).</li>
+  <li><strong>Line 2275.</strong> Chunked prefill and prefix caching get their defaults from the model: both on for Llama ({{cite vllm/engine/arg_utils.py:3028-3068}}).</li>
+</ol>
+<x-simplified><p>131,072 is the context length of Llama 3.1 in its Hugging Face config (inferred, not in the vLLM repository). On a cold machine, this stop also downloads <code>config.json</code> and the tokenizer files. The registry can start a short subprocess on a cache miss ({{link concepts/oot-models}}).</p></x-simplified>
+</x-stop>
+
+<x-stop n="7" title="create_engine_config: the other sub-configs">
+<p>The function builds <code>CacheConfig</code>, <code>ParallelConfig</code>, the speculative config, the batch defaults, <code>SchedulerConfig</code> and the rest, in this order ({{cite vllm/engine/arg_utils.py:2296}}, {{cite vllm/engine/arg_utils.py:2558}}, {{cite vllm/engine/arg_utils.py:2624-2672}}). Three values of our example are decided here:</p>
+<ul>
+  <li><strong>Executor backend.</strong> <code>ParallelConfig.__post_init__</code> sets <code>"uni"</code>, because the world size is 1 ({{cite vllm/config/parallel.py:1099-1100}}).</li>
+  <li><strong>Batch limits.</strong> 8192 tokens and 1024 requests, from <code>get_batch_defaults</code> ({{cite vllm/engine/arg_utils.py:3153-3168}}).</li>
+  <li><strong>Block size.</strong> <code>None</code> becomes 16 in a <code>CacheConfig</code> validator ({{cite vllm/config/cache.py:452-462}}). The platform can change it after the model loads (stop 13).</li>
+</ul>
+<p>The function ends with one constructor call:</p>
+<x-code file="vllm/engine/arg_utils.py" lines="2870-2878" highlight="2870" />
+</x-stop>
+
+<x-stop n="8" title="VllmConfig.__post_init__ sets the late defaults">
+<p>The constructor runs the {{term post-init}} of <code>VllmConfig</code> ({{cite vllm/config/vllm.py:1492-2318}}). For our example, it turns async scheduling on ({{cite vllm/config/vllm.py:1697-1698}}) and sets the compilation defaults:</p>
+<x-code file="vllm/config/vllm.py" lines="1804-1834" highlight="1804,1806-1810,1819-1826,1833-1834" />
+<ol>
+  <li><strong>Line 1804.</strong> The platform hook <code>apply_config_platform_defaults</code>.</li>
+  <li><strong>Lines 1806-1810.</strong> O2 is above O0, so the compilation mode is <code>VLLM_COMPILE</code>.</li>
+  <li><strong>Lines 1819-1826.</strong> With Inductor, the custom op list gets <code>"none"</code> ({{link concepts/custom-ops}}).</li>
+  <li><strong>Lines 1833-1834.</strong> The O2 table fills the fields that are still <code>None</code>: CUDA graph mode <code>FULL_AND_PIECEWISE</code> and the fusion passes ({{cite vllm/config/vllm.py:296-316}}).</li>
+</ol>
+<p>Later in the method, <code>_set_cudagraph_sizes</code> picks the capture sizes, at most 512 here: <code>min(1024 × 1 × 2, 512)</code> ({{cite vllm/config/vllm.py:2439-2449}}). Then the platform has the last word: CUDA sets <code>worker_cls</code> to <code>vllm.v1.worker.gpu_worker.Worker</code> ({{cite vllm/config/vllm.py:2046}}, {{cite vllm/platforms/cuda.py:330-331}}). The config is now complete in the API server.</p>
+</x-stop>
+
+<x-stop n="9" title="AsyncLLM: tokenizer, processors, then the engine core">
+<p>The API server makes {{term async-llm | AsyncLLM}} ({{cite vllm/entrypoints/launchers/api_server/entry.py:93-103}}). <code>from_vllm_config</code> picks the executor class from the config: <code>UniProcExecutor</code> for <code>"uni"</code> ({{cite vllm/v1/engine/async_llm.py:264-276}}, {{cite vllm/v1/executor/abstract.py:84-87}}). The constructor loads the stat logger plugins, the renderer with the tokenizer, and the input and output processors ({{cite vllm/v1/engine/async_llm.py:155-186}}). Then it starts the engine core:</p>
+<x-code file="vllm/v1/engine/async_llm.py" lines="188-201" highlight="193" />
+<p><code>AsyncLLM</code> always uses a multiprocess client, so the engine core always runs in its own process for <code>vllm serve</code>. With DP = 1, the client class is <code>AsyncMPClient</code> ({{cite vllm/v1/engine/core_client.py:158-173}}).</p>
+</x-stop>
+
+<x-stop n="10" title="MPClient binds the sockets and spawns the engine core">
+<p><code>MPClient.__init__</code> binds two {{term zmq | ZMQ}} sockets: a ROUTER for requests to the engines, and a PULL for their outputs. Then it launches the engines:</p>
+<x-code file="vllm/v1/engine/core_client.py" lines="670-697" highlight="672-682,695-697" />
+<p><code>launch_core_engines</code> binds a third socket, the handshake ROUTER, and starts the process:</p>
+<x-code file="vllm/v1/engine/utils.py" lines="1357-1395" highlight="1357-1359,1362-1373,1387-1395" />
+<ol>
+  <li><strong>Lines 1362-1373.</strong> <code>CoreEngineProcManager</code> makes a process with the target <code>EngineCoreProc.run_engine_core</code> and the name <code>EngineCore</code>, and starts it ({{cite vllm/v1/engine/utils.py:279-288}}, {{cite vllm/v1/engine/utils.py:330}}). The <code>vllm_config</code> is a keyword argument, so <code>spawn</code> pickles it ({{cite vllm/v1/engine/utils.py:257-264}}).</li>
+  <li><strong>Line 1387.</strong> The <code>yield</code> returns to <code>MPClient</code>, which starts the multimodal warm-up of the front end ({{cite vllm/v1/engine/core_client.py:710}}).</li>
+  <li><strong>Lines 1388-1395.</strong> When the <code>with</code> block of <code>MPClient</code> ends, <code>wait_for_engine_startup</code> runs. The API server now waits for stop 17.</li>
+</ol>
+</x-stop>
+
+<x-stop n="11" title="The engine core process: handshake and EngineCore.__init__">
+<p>We are now in the new process. <code>run_engine_core</code> sets the process title and the log prefix <code>EngineCore</code> ({{cite vllm/v1/engine/core.py:1462-1472}}), installs signal handlers, and makes an <code>EngineCoreProc</code> ({{cite vllm/v1/engine/core.py:1538-1543}}). Its constructor first does the {{term startup-handshake}} with the front end:</p>
+<x-code file="vllm/v1/engine/core.py" lines="1395-1414" highlight="1396-1404,1408-1413" />
+<p>The engine sends HELLO and waits at most 5 minutes for the init message with the socket addresses ({{cite vllm/v1/engine/core.py:113}}). The front end answers at once ({{cite vllm/v1/engine/utils.py:1512-1546}}). Inside the handshake context, <code>EngineCore.__init__</code> runs ({{cite vllm/v1/engine/core.py:1190-1226}}):</p>
+<x-code file="vllm/v1/engine/core.py" lines="129-147" highlight="132,135-140,147" />
+<ol>
+  <li><strong>Line 132.</strong> The general plugins run again: this is a new interpreter.</li>
+  <li><strong>Lines 135-140.</strong> The log line "Initializing a V1 LLM engine (v...) with config: model='meta-llama/Llama-3.1-8B-Instruct', ...". It prints 33 resolved fields of the config ({{cite vllm/config/vllm.py:2788-2823}}).</li>
+  <li><strong>Line 147.</strong> The executor constructor. Stops 12 and 13 run inside it.</li>
+</ol>
+</x-stop>
+
+<x-stop n="12" title="The uni executor: init_device">
+<p>The {{term uni-executor}} makes the worker object in this process and starts it:</p>
+<x-code file="vllm/v1/executor/uniproc_executor.py" lines="52-75" highlight="68,69,74,75" />
+<p><code>init_worker</code> resolves <code>worker_cls</code> from stop 8 and makes the GPU worker ({{cite vllm/v1/worker/worker_base.py:292-302}}, {{link concepts/engine-hooks}}). <code>init_device</code> then prepares the GPU:</p>
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="497-514" highlight="501-507,509-510" />
+<ol>
+  <li><strong>Lines 501-507.</strong> <code>torch.distributed</code> starts with a world size of 1. The comment says that this must happen before the memory snapshot, so that NCCL buffers count as used memory.</li>
+  <li><strong>Line 510.</strong> The log line "Using V2 Model Runner".</li>
+</ol>
+<p>Then the worker makes cuBLAS handles, takes the memory snapshot and computes the requested memory, <code>gpu_memory_utilization</code> × total ({{cite vllm/v1/worker/gpu_worker.py:523-541}}). It builds Model Runner V2 ({{cite vllm/v1/worker/gpu_worker.py:567-580}}).</p>
+</x-stop>
+
+<x-stop n="13" title="load_model: the weights">
+<p><code>Worker.load_model</code> calls the model runner ({{cite vllm/v1/worker/gpu_worker.py:591-598}}). The runner builds the model and loads the weights:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="397-406" highlight="399,403-406" />
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="428-435" highlight="431-435" />
+<p>The log shows four lines here. The first is "Loading model from scratch...". Then the constructors log "Initializing model took 0.412310 seconds" ({{cite vllm/model_executor/model_loader/base_loader.py:82-85}}). The default loader logs "Loading weights took 4.12 seconds" ({{cite vllm/model_executor/model_loader/default_loader.py:505-508}}). The last is "Model loading took 14.99 GiB memory and 5.031062 seconds" (illustrative values; the code prints the seconds with six decimals).</p>
+<p>A download of the weights, if needed, happens inside <code>load_model</code>: the default loader downloads a model that is not local before it reads the files ({{cite vllm/model_executor/model_loader/default_loader.py:155-157}}, {{cite vllm/model_executor/model_loader/default_loader.py:269-277}}). The page {{link concepts/weight-loading}} explains the loader.</p>
+<p>Back in the executor, <code>update_block_size_for_backend</code> checks that block size 16 suits the attention backend (line 75 of the excerpt in stop 12).</p>
+</x-stop>
+
+<x-stop n="14" title="_initialize_kv_caches: the profile run, compilation and the KV cache size">
+<p>Back in <code>EngineCore.__init__</code>, the engine sizes the KV cache ({{cite vllm/v1/engine/core.py:160}}):</p>
+<x-code file="vllm/v1/engine/core.py" lines="288-313" highlight="300,311-313" />
+<p><code>determine_available_memory</code> runs a {{term profile-run}}: one forward pass with <code>max_num_batched_tokens</code> dummy tokens ({{cite vllm/v1/worker/gpu_worker.py:682-697}}). This is the first call of the compiled model, so <code>torch.compile</code> runs now. The log shows:</p>
+<ul>
+  <li>"Starting torch.compile" ({{cite vllm/compilation/monitor.py:39-40}});</li>
+  <li>"Dynamo bytecode transform time: 6.10 s" ({{cite vllm/compilation/backends.py:1186-1190}});</li>
+  <li>"Compiling a graph for compile range ... takes 20.31 s", once per compile range ({{cite vllm/compilation/backends.py:415-422}});</li>
+  <li>"torch.compile took 29.70 s in total" ({{cite vllm/compilation/monitor.py:20}}, {{cite vllm/compilation/monitor.py:56-62}}).</li>
+</ul>
+<p>Then the worker measures the memory and logs "Available KV cache memory: 54.6 GiB" ({{cite vllm/v1/worker/gpu_worker.py:744-748}}, {{cite vllm/v1/worker/gpu_worker.py:763-766}}). Line 311 turns the bytes into blocks. With 2 MiB per block for Llama-3.1-8B, that is 27,955 blocks ({{link code/v1-worker-gpu-worker}}). Then the engine core logs the capacity:</p>
+<x-code file="vllm/v1/core/kv_cache_utils.py" lines="1101-1108" />
+<p>The call is at {{cite vllm/v1/engine/core.py:342}}. With the numbers of the worked example on {{link concepts/kv-cache-manager}}, the line is:</p>
+<pre><code class="language-none">GPU KV cache size: 447,280 tokens, Maximum concurrency for 131,072 tokens per request: 3.41x</code></pre>
+<x-simplified><p>All times and GiB values are illustrative. The real compile messages depend on the cache state; with PyTorch 2.14 (the pinned version, {{cite pyproject.toml:10}}) the AOT compile path is on by default ({{cite vllm/envs.py:378-387}}). The deep dive "A warm start" shows the messages with a filled cache.</p></x-simplified>
+</x-stop>
+
+<x-stop n="15" title="initialize_from_config: the KV cache tensors">
+<p>The engine core sends the KV cache config to the worker ({{cite vllm/v1/engine/core.py:362}}). The worker allocates the tensors:</p>
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="857-861" highlight="861" />
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="897-901" highlight="898-901" />
+<p>A KV connector would start here too ({{cite vllm/v1/worker/gpu_worker.py:878}}). In our example there is none. After this stop, about 54.6 GiB of the GPU belong to the KV cache.</p>
+</x-stop>
+
+<x-stop n="16" title="compile_or_warm_up_model: warm-up and CUDA graph capture">
+<p>The last GPU stop ({{cite vllm/v1/engine/core.py:378-379}}):</p>
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="956-985" highlight="961-968,973,983-985" />
+<ol>
+  <li><strong>Lines 956-968.</strong> Each compile range that has no captured size gets one warm-up run at its end size. Each size in <code>compile_sizes</code> that is not a capture size gets one too (lines 941-948). In our example, the capture sizes cover the one compile range, so this loop does not run. The log is "Compile and warming up model for size %d".</li>
+  <li><strong>Line 973.</strong> Kernel warm-up and tuning before capture.</li>
+  <li><strong>Lines 983-985.</strong> CUDA graph capture, unless <code>--enforce-eager</code>. The log is "Graph capturing finished in 9 secs, took 0.46 GiB" ({{cite vllm/v1/worker/gpu/model_runner.py:1146-1152}}). The comment there says it "usually takes 5~20 seconds".</li>
+</ol>
+<p>Then the worker logs "CUDA graph pool memory: ..." and a long line "Free memory on device ... Replace gpu_memory_utilization config with <code>--kv-cache-memory=...</code>" ({{cite vllm/v1/worker/gpu_worker.py:994-1057}}). The real flag name is <code>--kv-cache-memory-bytes</code> ({{cite vllm/engine/arg_utils.py:1385}}). The short form also works, because argparse accepts a unique prefix of a flag name by default (derived; no <code>allow_abbrev=False</code> in <code>vllm/</code>). Back in the engine core, one line sums up stops 14 to 16:</p>
+<x-code file="vllm/v1/engine/core.py" lines="394-400" />
+<p>For example: "init engine (profile, create kv cache, warmup model) took 52.40 s (compilation: 29.70 s)". <code>EngineCore.__init__</code> then builds the scheduler with the final block count, picks <code>step_with_batch_queue</code>, and turns on the {{term env-cache}} ({{cite vllm/v1/engine/core.py:177-185}}, {{cite vllm/v1/engine/core.py:227-229}}, {{cite vllm/v1/engine/core.py:241-243}}).</p>
+</x-stop>
+
+<x-stop n="17" title="READY: the front end continues">
+<p><code>EngineCore.__init__</code> has returned. When the handshake context ends, the engine sends READY:</p>
+<x-code file="vllm/v1/engine/core.py" lines="1364-1386" highlight="1365-1369,1386" />
+<p>Before READY, still inside the <code>with</code> block, the engine core starts its input and output threads ({{cite vllm/v1/engine/core.py:1243-1265}}). The input thread connects to the front end and sends the ready response as its first message ({{cite vllm/v1/engine/core.py:1961-1968}}). The constructor waits for the input thread, then the block ends and READY goes out ({{cite vllm/v1/engine/core.py:1267-1272}}). After READY, the engine core calls <code>vllm_config.__post_init__()</code> again on its copy ({{cite vllm/v1/engine/core.py:1336-1337}}; see {{link concepts/config-system}}, Step 9).</p>
+<p>In the API server, <code>wait_for_engine_startup</code> has polled the handshake socket every 10 seconds ({{cite vllm/v1/engine/utils.py:43}}):</p>
+<x-code file="vllm/v1/engine/utils.py" lines="1434-1447" highlight="1435-1447" />
+<p>A poll with no event logs at DEBUG level and continues, so this wait has no time limit. Only a dead process stops it, with "Engine core initialization failed. See root cause above." (lines 1448-1477). The READY message moves the engine to the state <code>READY</code> (lines 1547-1578). Then <code>MPClient</code> waits for the ready response on its ROUTER socket, now with the limit <code>VLLM_ENGINE_READY_TIMEOUT_S</code>, 600 s by default ({{cite vllm/v1/engine/core_client.py:753-771}}, {{cite vllm/envs.py:810-814}}). It copies <code>max_model_len</code>, <code>num_gpu_blocks</code> and <code>block_size</code> from the response into its own config ({{cite vllm/v1/engine/core_client.py:865-879}}).</p>
+<x-note title="VLLM_ENGINE_READY_TIMEOUT_S and one API server">
+<p>The timeout error text says that a timeout "is often caused by slow weight loading" ({{cite vllm/v1/engine/core_client.py:760-768}}). With one API server, the weights load during the wait of <code>wait_for_engine_startup</code>, which has no limit. The 600 s limit starts only after READY. At that time the ready response is already on the socket, because the engine core sends it before READY. The limit matters when several API servers start before the engines (deep dive "DP = 2").</p>
+</x-note>
+</x-stop>
+
+<x-stop n="18" title="build_and_serve: the app, then uvicorn">
+<p><code>AsyncLLM</code> exists now. Back in <code>run_server_worker</code>, the API server builds the HTTP app and serves it:</p>
+<x-code file="vllm/entrypoints/launchers/api_server/entry.py" lines="132-141" highlight="132,135-137,139" />
+<ol>
+  <li><strong>Line 132.</strong> A utility call asks the engine core for its tasks. The log shows a tuple, for example "Supported tasks: ('generate',)" ({{cite vllm/v1/engine/async_llm.py:390}}).</li>
+  <li><strong>Line 136.</strong> <code>build_app</code> makes the FastAPI app with the routes, endpoint plugins, exception handlers and middleware ({{cite vllm/entrypoints/launchers/app.py:19-56}}). See {{link concepts/openai-server}}.</li>
+  <li><strong>Line 137.</strong> <code>init_app_state</code> makes the serving objects, for example the chat serving class ({{cite vllm/entrypoints/launchers/api_server/app_state.py:24-30}}).</li>
+  <li><strong>Line 139.</strong> "Starting vLLM server on http://0.0.0.0:8000".</li>
+</ol>
+<p><code>serve_http</code> logs "Available routes are:" and one line per route ({{cite vllm/entrypoints/launchers/launcher.py:188-208}}). Then it starts uvicorn on the socket from stop 4:</p>
+<x-code file="vllm/entrypoints/launchers/launcher.py" lines="232-238" highlight="238" />
+<p>uvicorn runs the app's lifespan function. It starts the periodic stats log and freezes the start-up heap for the garbage collector ({{cite vllm/entrypoints/launchers/utils/server_utils.py:76-96}}). uvicorn then prints "Application startup complete." This text is in uvicorn, not in the vLLM repository. From now on, requests reach the server; the tour {{link tours/life-of-a-chat-request}} follows one.</p>
+</x-stop>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Your start-up log, line by line">
+<p>The INFO lines of a cold start, in order, with the stop and the code that writes each one. Values are illustrative.</p>
+<table>
+  <thead><tr><th>Stop</th><th>Prefix</th><th>Log text</th><th>Written at</th></tr></thead>
+  <tbody>
+    <tr><td>4</td><td>APIServer</td><td>vLLM server version ..., serving model ... (or the logo)</td><td>{{cite vllm/entrypoints/common/startup.py:16-38}}</td></tr>
+    <tr><td>4</td><td>APIServer</td><td>non-default args: {'model_tag': '...', 'model': '...'}</td><td>{{cite vllm/entrypoints/common/startup.py:94-96}}</td></tr>
+    <tr><td>6</td><td>APIServer</td><td>Resolved architecture: LlamaForCausalLM</td><td>{{cite vllm/config/model.py:744}}</td></tr>
+    <tr><td>6</td><td>APIServer</td><td>Using max model len 131072</td><td>{{cite vllm/config/model.py:2170}}</td></tr>
+    <tr><td>11</td><td>EngineCore</td><td>Initializing a V1 LLM engine (v...) with config: model=..., ...</td><td>{{cite vllm/v1/engine/core.py:136-140}}</td></tr>
+    <tr><td>12</td><td>EngineCore</td><td>Using V2 Model Runner</td><td>{{cite vllm/v1/worker/gpu_worker.py:510}}</td></tr>
+    <tr><td>13</td><td>EngineCore</td><td>Loading model from scratch...</td><td>{{cite vllm/v1/worker/gpu/model_runner.py:399}}</td></tr>
+    <tr><td>13</td><td>EngineCore</td><td>Initializing model took 0.412310 seconds</td><td>{{cite vllm/model_executor/model_loader/base_loader.py:82-85}}</td></tr>
+    <tr><td>13</td><td>EngineCore</td><td>Loading weights took 4.12 seconds</td><td>{{cite vllm/model_executor/model_loader/default_loader.py:506-508}}</td></tr>
+    <tr><td>13</td><td>EngineCore</td><td>Model loading took 14.99 GiB memory and 5.031062 seconds</td><td>{{cite vllm/v1/worker/gpu/model_runner.py:431-435}}</td></tr>
+    <tr><td>14</td><td>EngineCore</td><td>Starting torch.compile</td><td>{{cite vllm/compilation/monitor.py:39-40}}</td></tr>
+    <tr><td>14</td><td>EngineCore</td><td>Dynamo bytecode transform time: 6.10 s</td><td>{{cite vllm/compilation/backends.py:1186-1190}}</td></tr>
+    <tr><td>14</td><td>EngineCore</td><td>Compiling a graph for compile range ... takes 20.31 s</td><td>{{cite vllm/compilation/backends.py:415-422}}</td></tr>
+    <tr><td>14</td><td>EngineCore</td><td>torch.compile took 29.70 s in total</td><td>{{cite vllm/compilation/monitor.py:56-62}}</td></tr>
+    <tr><td>14</td><td>EngineCore</td><td>Available KV cache memory: 54.6 GiB</td><td>{{cite vllm/v1/worker/gpu_worker.py:763-766}}</td></tr>
+    <tr><td>14</td><td>EngineCore</td><td>GPU KV cache size: 447,280 tokens, Maximum concurrency for 131,072 tokens per request: 3.41x</td><td>{{cite vllm/v1/core/kv_cache_utils.py:1101-1108}}</td></tr>
+    <tr><td>16</td><td>EngineCore</td><td>Graph capturing finished in 9 secs, took 0.46 GiB</td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1148-1152}}</td></tr>
+    <tr><td>16</td><td>EngineCore</td><td>init engine (profile, create kv cache, warmup model) took 52.40 s (compilation: 29.70 s)</td><td>{{cite vllm/v1/engine/core.py:394-400}}</td></tr>
+    <tr><td>18</td><td>APIServer</td><td>Supported tasks: ('generate',)</td><td>{{cite vllm/entrypoints/launchers/api_server/entry.py:135}}</td></tr>
+    <tr><td>18</td><td>APIServer</td><td>Starting vLLM server on http://0.0.0.0:8000</td><td>{{cite vllm/entrypoints/launchers/api_server/entry.py:139}}</td></tr>
+    <tr><td>18</td><td>APIServer</td><td>Available routes are: / Route: ..., Methods: ...</td><td>{{cite vllm/entrypoints/launchers/launcher.py:188-197}}</td></tr>
+    <tr><td>18</td><td>(uvicorn)</td><td>Application startup complete.</td><td>uvicorn, outside this repository</td></tr>
+  </tbody>
+</table>
+<p>Other lines can appear between them, for example the attention backend choice ({{cite vllm/platforms/cuda.py:508-511}}) and the CUDA graph memory lines of stop 16. With one GPU, the worker's lines carry the prefix <code>EngineCore</code>, because the worker runs in that process.</p>
+</x-deepdive>
+
+<x-deepdive title="What changes with TP = 2">
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-8B-Instruct -tp 2</code></pre>
+<ol>
+  <li><strong>Stop 7.</strong> The world size is 2, so <code>ParallelConfig</code> picks <code>"mp"</code> when Ray is not active ({{cite vllm/config/parallel.py:1055-1061}}, {{cite vllm/config/parallel.py:1096}}). Stop 9 picks <code>MultiprocExecutor</code> ({{cite vllm/v1/executor/abstract.py:80-83}}).</li>
+  <li><strong>Stop 12.</strong> The executor makes a shared-memory broadcast queue and spawns one process per rank, named <code>VllmWorker-0</code> and <code>VllmWorker-1</code> ({{cite vllm/v1/executor/multiproc_executor.py:165-216}}, {{cite vllm/v1/executor/multiproc_executor.py:745-750}}). Each worker gets its own pickled <code>vllm_config</code> (lines 731-743).</li>
+  <li><strong>Stops 12-13 in parallel.</strong> Each worker runs <code>init_device</code> and <code>load_model</code> at the same time. The log prefixes become <code>Worker_TP0</code> and <code>Worker_TP1</code> after the process groups exist ({{cite vllm/v1/executor/multiproc_executor.py:1083-1116}}). Each worker sends READY over a pipe ({{cite vllm/v1/executor/multiproc_executor.py:930-937}}), and the executor waits for both ({{cite vllm/v1/executor/multiproc_executor.py:787-811}}).</li>
+  <li><strong>Stop 14.</strong> Each worker measures its own memory. The planner uses the smallest block count of all ranks ({{cite vllm/v1/core/kv_cache_planning.py:1619-1634}}).</li>
+  <li><strong>Stop 13.</strong> Each worker turns on its own environment cache at the end of <code>WorkerProc.__init__</code>, after <code>load_model</code> and before the profile run ({{cite vllm/v1/executor/multiproc_executor.py:680-688}}, {{cite vllm/v1/executor/multiproc_executor.py:708-710}}).</li>
+</ol>
+<p>So the server has four vLLM processes: API server, engine core and two workers. The page {{link concepts/executors-and-workers}} lists every executor call. Tensor parallelism itself is explained in {{deepinfer learn/parallelism | Parallelism basics}}.</p>
+</x-deepdive>
+
+<x-deepdive title="What changes with DP = 2">
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-8B-Instruct -dp 2</code></pre>
+<ol>
+  <li><strong>Stop 3.</strong> <code>--api-server-count</code> defaults to the DP size, 2 ({{cite vllm/entrypoints/cli/serve.py:124-130}}). So <code>run_multi_api_server</code> runs, not <code>run_server</code> ({{cite vllm/entrypoints/cli/serve.py:151-152}}).</li>
+  <li><strong>Stops 4-8 in the CLI process.</strong> It binds the port with <code>SO_REUSEPORT</code>, builds its own <code>VllmConfig</code> and binds the ZMQ listeners for both API servers ({{cite vllm/entrypoints/cli/serve.py:298}}, {{cite vllm/entrypoints/cli/serve.py:307-334}}).</li>
+  <li><strong>Stop 10.</strong> <code>launch_core_engines</code> starts a DP coordinator process, because the internal load balancer needs its queue statistics ({{cite vllm/v1/engine/utils.py:1230-1274}}). It starts two engine core processes, <code>EngineCore_DP0</code> and <code>EngineCore_DP1</code> ({{cite vllm/v1/engine/utils.py:284}}).</li>
+  <li><strong>Inside the <code>with</code> block</strong>, before the engines are ready, the CLI process starts two API server processes, <code>ApiServer_0</code> and <code>ApiServer_1</code> ({{cite vllm/entrypoints/cli/serve.py:366-377}}, {{cite vllm/v1/utils.py:248-254}}). Each one runs stops 5-9 again: its own <code>EngineArgs</code>, <code>create_engine_config</code> and <code>AsyncLLM</code>, which connects to the existing engines ({{cite vllm/v1/utils.py:509-529}}, {{cite vllm/v1/engine/core_client.py:643-669}}).</li>
+  <li><strong>Engines.</strong> Llama is not a MoE model, so each engine core is an independent <code>EngineCoreProc</code> ({{cite vllm/v1/engine/core.py:1534-1543}}). The world size across DP is 2, so the backend is <code>"mp"</code> and each engine core has one worker process.</li>
+  <li><strong>Stop 17.</strong> The API server processes did not launch the engines, so they skip <code>wait_for_engine_startup</code>. They wait for the ready responses with the 600 s limit of <code>VLLM_ENGINE_READY_TIMEOUT_S</code> ({{cite vllm/v1/engine/core_client.py:753-768}}). If the engines load for longer than that, the API servers fail with the timeout error.</li>
+</ol>
+<p>The count of vLLM processes is 8: the CLI supervisor, 2 API servers, the coordinator, 2 engine cores and 2 workers (derived). Helper processes of Python's <code>multiprocessing</code> are not counted. See {{link concepts/data-parallel-serving}}.</p>
+</x-deepdive>
+
+<x-deepdive title="What changes with --enforce-eager">
+<ol>
+  <li><strong>Stop 8.</strong> <code>__post_init__</code> sets the compilation mode and the CUDA graph mode to <code>NONE</code> and turns off the JIT kernel warm-up. It logs "Enforce eager set, disabling torch.compile, CUDAGraphs, and JIT kernel warmup ..." ({{cite vllm/config/vllm.py:1745-1763}}). Later it clears the capture sizes ({{cite vllm/config/vllm.py:1982-1988}}).</li>
+  <li><strong>Stop 14.</strong> The profile run runs the model eagerly: no "torch.compile took" line.</li>
+  <li><strong>Stop 16.</strong> No capture ({{cite vllm/v1/worker/gpu_worker.py:983-985}}). The summary line has no "(compilation: ...)" part, because the compile time is 0 ({{cite vllm/v1/engine/core.py:401-405}}).</li>
+</ol>
+<p>Start-up is faster, but each decode step pays the full Python and kernel launch cost. <code>-O0</code> has the same effect on compilation and graphs ({{cite vllm/config/vllm.py:254-274}}, {{cite vllm/config/vllm.py:1806-1810}}). The CUDA graph idea is in {{deepinfer learn/gpus-kernels | GPUs and kernels}}.</p>
+</x-deepdive>
+
+<x-deepdive title="A warm start: the compile cache">
+<p>Start the same command a second time, with the same config, code and environment. Stop 14 changes:</p>
+<ul>
+  <li>The AOT path finds its file under <code>$VLLM_CACHE_ROOT/torch_compile_cache/torch_aot_compile/&lt;sha256&gt;/rank_0_0/model</code> ({{cite vllm/compilation/decorators.py:570-596}}). It logs "Directly load AOT compilation from path ..." ({{cite vllm/compilation/decorators.py:326-330}}) and still logs the total time, now small ({{cite vllm/compilation/decorators.py:302-307}}).</li>
+  <li>The key of that folder is a hash of the env factors, <code>VllmConfig.compute_hash()</code> and, with the mega artifact, the Inductor factors ({{cite vllm/compilation/caching.py:572-588}}).</li>
+  <li>A changed source file or a load error falls back to a full compile, with "Compiling model again due to a load failure from ..." ({{cite vllm/compilation/decorators.py:332-348}}).</li>
+</ul>
+<p>Stop 16 does not change: CUDA graphs are captured at every start ({{cite vllm/v1/worker/gpu_worker.py:983-985}}). Weight loading does not change either. The page {{link concepts/compile-and-cuda-graphs}} explains both cache folders.</p>
+</x-deepdive>
+
+<x-deepdive title="Where start-up time goes, and how to reduce it">
+<table>
+  <thead><tr><th>Phase (stop)</th><th>Log line to read</th><th>What reduces it</th></tr></thead>
+  <tbody>
+    <tr><td>Imports and parsers (1-4)</td><td>time to "non-default args"</td><td>Nothing to tune; <code>--help</code> is slow because it reads all docstrings ({{cite vllm/engine/arg_utils.py:285-288}}).</td></tr>
+    <tr><td>Config, tokenizer, registry (6-9)</td><td>"Resolved architecture"</td><td>Keep the Hugging Face cache and <code>$VLLM_CACHE_ROOT/modelinfos</code> between starts ({{link concepts/oot-models}}).</td></tr>
+    <tr><td>Weights (13)</td><td>"Loading weights took", "Model loading took"</td><td>A fast local disk; download the weights before the start; <code>--load-format</code> for a faster loader ({{link concepts/weight-loading}}); <code>vllm preload</code>, which keeps weights in GPU memory for fast restarts ({{cite vllm/entrypoints/cli/preload.py:342-349}}).</td></tr>
+    <tr><td>Compile (14)</td><td>"torch.compile took ... in total"</td><td>Keep <code>$VLLM_CACHE_ROOT</code> (a container volume); do not change the hashed settings; <code>-O0</code> or <code>--enforce-eager</code> skip it.</td></tr>
+    <tr><td>Memory profile (14)</td><td>"Available KV cache memory"</td><td><code>VLLM_ENABLE_STARTUP_PLAN=1</code> reuses the measured value on the same hardware and config ({{cite vllm/v1/worker/startup_plan.py:3-18}}). The profile run itself still runs.</td></tr>
+    <tr><td>Capture (16)</td><td>"Graph capturing finished in ..."</td><td><code>-O1</code> (piecewise graphs only); fewer sizes with <code>-cc.max_cudagraph_capture_size</code>; <code>--enforce-eager</code> skips it.</td></tr>
+    <tr><td>Wait for READY (17)</td><td>(none at INFO)</td><td>With one API server there is no limit. With several API servers, raise <code>VLLM_ENGINE_READY_TIMEOUT_S</code> when the engines load slowly.</td></tr>
+  </tbody>
+</table>
+<x-warning title="A faster start can cost speed per step">
+<p><code>-O0</code> and <code>--enforce-eager</code> remove compilation and CUDA graphs for the whole life of the server. Use them for a quick test, not for production. A warm compile cache gives most of the gain with no cost per step.</p>
+</x-warning>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>The port is busy.</strong> <code>sock.bind</code> fails at stop 4, before any GPU work ({{cite vllm/entrypoints/launchers/launcher.py:349-353}}).</li>
+  <li><strong>The engine core fails.</strong> It logs "EngineCore failed to start." with the stack trace ({{cite vllm/v1/engine/core.py:1570-1572}}). The API server then raises "Engine core initialization failed. See root cause above." ({{cite vllm/v1/engine/utils.py:1468-1477}}). Read the <code>EngineCore</code> lines above it for the real error, for example a CUDA out-of-memory error.</li>
+  <li><strong>Not enough free memory.</strong> The worker checks at start that the free memory is at least <code>gpu_memory_utilization</code> × total, and raises <code>ValueError</code> if not ({{cite vllm/v1/worker/utils.py:761-770}}). Another process on the same GPU is the usual cause.</li>
+  <li><strong>The KV cache is too small for <code>max_model_len</code>.</strong> The planner raises <code>ValueError</code> at stop 14: "To serve at least one request with the model's max seq len ...". The message gives an estimated maximum length ({{cite vllm/v1/core/kv_cache_planning.py:68-88}}).</li>
+  <li><strong>The front end waits for a long time with no log.</strong> With one API server, the wait at stop 17 logs only at DEBUG level. Read the <code>EngineCore</code> lines to see the progress.</li>
+  <li><strong>A timeout with several API servers.</strong> "Timed out waiting for engine core processes to start" after <code>VLLM_ENGINE_READY_TIMEOUT_S</code> ({{cite vllm/v1/engine/core_client.py:757-768}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> A server that does not start, or starts slowly, costs capacity during each deploy and each restart. When you know the 18 stops, you can read the log, find the slow phase, and pick the setting that shortens it.</p>
+
+<x-quiz>
+  <x-q level="easy">In which process does the model load when you run <code>vllm serve</code> on one GPU?
+    <x-a><p>In the engine core process. The uni executor makes the worker object in that process and calls <code>load_model</code> on it ({{cite vllm/v1/executor/uniproc_executor.py:54-74}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Why does a busy port fail in seconds and not after the model loads?
+    <x-a><p><code>setup_server</code> binds the socket before the engine starts, at stop 4 ({{cite vllm/entrypoints/launchers/launcher.py:372-379}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Which stop runs <code>torch.compile</code> on a cold start, and why there?
+    <x-a><p>Stop 14. The profile run in <code>determine_available_memory</code> is the first call of the compiled model, so the compilation happens inside it ({{cite vllm/v1/worker/gpu_worker.py:682-697}}). The memory profile then also measures the compiled model.</p></x-a>
+  </x-q>
+  <x-q level="medium">You set <code>VLLM_ENGINE_READY_TIMEOUT_S=60</code> and start a single-GPU server whose weights take 5 minutes to load. What happens?
+    <x-a><p>The server starts normally. With one API server, the front end waits in <code>wait_for_engine_startup</code>, which has no time limit ({{cite vllm/v1/engine/utils.py:1434-1447}}). The 60 s limit applies only to the ready response after READY ({{cite vllm/v1/engine/core_client.py:753-768}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">How many times does <code>pre_register_and_update</code> run in the API server process for <code>vllm serve &lt;model&gt;</code>, and where?
+    <x-a><p>Five times. Three parser builds at stop 2 (<code>serve</code>, <code>launch render</code>, <code>run-batch</code>) each call <code>AsyncEngineArgs.add_cli_args</code> ({{cite vllm/engine/arg_utils.py:3257}}). <code>log_non_default_args</code> at stop 4 builds a fourth parser ({{cite vllm/entrypoints/common/startup.py:70-71}}). <code>create_engine_config</code> calls the hook a fifth time, without a parser ({{cite vllm/engine/arg_utils.py:2246}}). (Derived from these call sites.)</p></x-a>
+  </x-q>
+</x-quiz>
