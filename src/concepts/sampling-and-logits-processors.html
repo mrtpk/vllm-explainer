@@ -1,0 +1,180 @@
+---
+title: Sampling and logits processors in Model Runner V2
+nav_title: Sampling and logits processors
+level: Advanced
+prerequisites: concepts/model-runner, learn/openai-api
+related: concepts/engine-hooks, concepts/structured-outputs, concepts/speculative-decoding, tours/forward-pass, concepts/model-runner, learn/openai-api
+summary: How the Model Runner V2 sampler turns logits into tokens - the order of the built-in stages, where custom logits processors plug in, when the fused FlashInfer sampler runs and when the Gumbel sampler runs, how seeds work, and what logprobs and prompt_logprobs cost.
+---
+<x-sentence>The sampler copies the logits to FP32 only when needed and runs a fixed chain of processors. Then it draws one token per row.</x-sentence>
+
+<h2>The idea</h2>
+<p>Sampling picks the next token from the logits. Temperature, top-k and top-p shape the distribution, and a seed makes the random draw repeatable ({{deepinfer learn/sampling | Sampling: temperature, top-k, top-p, seeds}}). This page shows how vLLM's sampler does these steps for a whole batch, and where your own code can change the logits.</p>
+<p>Each request brings its {{term sampling-params}}. When a request enters the batch, the sampler writes its settings into per-slot GPU buffers, one row per {{term request-slot}}. In every step, it works on all logits rows at once. First come the {{term logits-processor | logits processors}} (logit bias, penalties, bad words, then yours). Then come temperature, min_p, top-k and top-p, and then the draw. A stage that no request in the batch uses is skipped, without a kernel launch.</p>
+<p><strong>An everyday comparison.</strong> Think of a mail sorting line. Each letter (a logits row) passes the same stations in a fixed order: stamps, weight check, address check, then the bin. Each letter carries a slip that says which stations apply to it. The comparison stops being true in one place. vLLM runs a whole tray through each station at once, and a station turns on when one letter needs it.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b7b_sampler_pipeline" alt="Three panels. Panel 1, before the sampler: compute_logits on hidden_states at logits_indices gives logits of shape rows by vocab in the model dtype; the grammar bitmask sets -inf on structured-output rows; the sampler then checks if any request needs processing, which is true for a non-zero temperature with a temperature other than 1 or a set min_p, top-k or top-p, or for a processor that returns True; if none, the raw logits are used. Panel 2, the order of changes on an FP32 copy: built-in processors LogitBiasState with allowed token ids, logit_bias and min_tokens, then PenaltiesState with repetition, frequency and presence penalties, then BadWordsState; then the custom processors from the vllm.logits_processors group and --logits-processors with add_request, apply_staged_writes and apply; then thinking-budget forcing, temperature and min_p. Panel 3, the draw: the fused FlashInfer path when the batch uses top-k or top-p, has no greedy request, no seeded request, no processed logprobs and the GPU supports it; otherwise native top-k/top-p masking and the Gumbel sampler, which takes the argmax of logits over temperature plus noise from the seed and the position, or the plain argmax at temperature 0; the SamplerOutput holds sampled ids of shape rows by 1 and optional logprobs, raw by default." caption="Figure: the sampler of Model Runner V2. Your processors run after the built-in bias, penalty and bad-word stages and before temperature (panel 2). The draw takes one of two paths for the whole batch (panel 3)." />
+<p>Read the panels from top to bottom. Teal stages are built in, violet is where custom processors run, and emerald is the token draw. The dashed arrow in panel 3 means "or": one batch takes one path.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the sampling parameters of a request</h3>
+<p>The OpenAI server turns the request into a <code>SamplingParams</code> object. Unset fields take the server default, which comes from the model's <code>generation_config.json</code> with the default <code>--generation-config auto</code> ({{link learn/openai-api}}). These fields change the sampler:</p>
+<table>
+  <thead><tr><th>Field</th><th>Default</th><th>Stage</th></tr></thead>
+  <tbody>
+    <tr><td><code>temperature</code></td><td>1.0 ({{cite vllm/sampling_params.py:308}})</td><td>scaling; 0 means greedy</td></tr>
+    <tr><td><code>top_p</code>, <code>top_k</code>, <code>min_p</code></td><td>1.0, 0 (all), 0.0 ({{cite vllm/sampling_params.py:315-321}})</td><td>filtering</td></tr>
+    <tr><td><code>seed</code></td><td><code>None</code> ({{cite vllm/sampling_params.py:325}})</td><td>Gumbel noise; forces the non-fused path</td></tr>
+    <tr><td><code>presence_penalty</code>, <code>frequency_penalty</code>, <code>repetition_penalty</code></td><td>0.0, 0.0, 1.0 ({{cite vllm/sampling_params.py:296-304}})</td><td>PenaltiesState</td></tr>
+    <tr><td><code>min_tokens</code></td><td>0 ({{cite vllm/sampling_params.py:339}})</td><td>LogitBiasState masks stop tokens</td></tr>
+    <tr><td><code>logit_bias</code>, <code>allowed_token_ids</code></td><td><code>None</code> ({{cite vllm/sampling_params.py:409-412}})</td><td>LogitBiasState</td></tr>
+    <tr><td><code>bad_words</code></td><td><code>None</code> ({{cite vllm/sampling_params.py:420}})</td><td>BadWordsState</td></tr>
+    <tr><td><code>thinking_token_budget</code></td><td><code>None</code> ({{cite vllm/sampling_params.py:427}})</td><td>forcing the end of thinking</td></tr>
+    <tr><td><code>logprobs</code>, <code>prompt_logprobs</code></td><td><code>None</code> ({{cite vllm/sampling_params.py:342-352}})</td><td>extra outputs</td></tr>
+    <tr><td><code>extra_args</code></td><td><code>None</code> ({{cite vllm/sampling_params.py:415}})</td><td>free-form; custom processors read it</td></tr>
+  </tbody>
+</table>
+<p>A temperature below <code>1e-5</code> means greedy: vLLM resets <code>top_p</code>, <code>top_k</code> and <code>min_p</code> and requires <code>n = 1</code> ({{cite vllm/sampling_params.py:615-620}}, {{cite vllm/sampling_params.py:769-773}}). In the OpenAI API, <code>vllm_xargs</code> becomes <code>extra_args</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:770}}).</p>
+
+<h3>Step 2: per-slot state, written once per request</h3>
+<p>The sampler is built in <code>load_model</code>, only on the last pipeline rank and only for generative models ({{cite vllm/v1/worker/gpu/model_runner.py:463-467}}). Its constructor fixes the list of processors:</p>
+<x-code file="vllm/v1/worker/gpu/sample/sampler.py" lines="62-90" highlight="69-76,88-90" />
+<p>When the model runner adds a new request, the sampler calls <code>add_request(slot, params)</code> on every stage. Each stage returns whether it changes the logits of this request; the OR of all answers is stored per slot ({{cite vllm/v1/worker/gpu/sample/sampler.py:96-107}}). The sampling state itself returns true only for a non-zero temperature together with a temperature other than 1, or a set min_p, top-k or top-p:</p>
+<x-code file="vllm/v1/worker/gpu/sample/states.py" lines="41-72" highlight="54-58,67-72" />
+<p>The writes are staged on the CPU. The model runner calls <code>sampler.apply_staged_writes()</code> once per step, which copies them to the GPU buffers ({{cite vllm/v1/worker/gpu/model_runner.py:1251-1255}}, {{cite vllm/v1/worker/gpu/sample/sampler.py:109-116}}).</p>
+
+<h3>Step 3: the processing chain</h3>
+<p>In each step the model runner computes the logits for the sampled rows and applies the grammar bitmask ({{link concepts/structured-outputs}}). Then the sampler runs <code>apply_sampling_params</code>:</p>
+<x-code file="vllm/v1/worker/gpu/sample/sampler.py" lines="238-276" highlight="238-239,242,255-256,260,263-268" />
+<ol>
+  <li>Lines 238-239: if no request in the batch needs processing, the raw logits go straight to the draw. There is no copy.</li>
+  <li>Line 242: else the logits are copied into a new FP32 tensor, <code>[rows, vocab]</code>.</li>
+  <li>Lines 255-256: the processors run in list order. <code>LogitBiasState</code> does allowed token ids, <code>logit_bias</code> and <code>min_tokens</code> in one kernel. <code>PenaltiesState</code> does the three penalties. <code>BadWordsState</code> masks the last token of a bad word when the earlier ones match. Then come the custom processors.</li>
+  <li>Line 260: thinking-budget forcing runs after all processors, so no processor can overwrite it (the code comment at lines 258-259).</li>
+  <li>Lines 263-268: temperature and min_p, in place. Each skips its kernel when no request in the batch uses it ({{cite vllm/v1/worker/gpu/sample/states.py:87-103}}).</li>
+</ol>
+<p>The order matters. The code comment says that bias adds and penalties scale, "so the two do not commute" ({{cite vllm/v1/worker/gpu/sample/sampler.py:69-70}}).</p>
+
+<h3>Step 4: the draw - fused FlashInfer or Gumbel</h3>
+<x-code file="vllm/v1/worker/gpu/sample/sampler.py" lines="301-359" highlight="307-315,339-343,347-359" />
+<ul>
+  <li><strong>Fused path</strong> (lines 307-315, 339-343). It runs only when the batch uses top-k or top-p, and no request is greedy, has a seed, or asks for processed logprobs. The sampling mask must be off, which is the default. FlashInfer's sampler must also support the GPU: CUDA, a supported compute capability, more than 16 SMs, and a working JIT build. <code>VLLM_USE_FLASHINFER_SAMPLER</code> must be on, the default ({{cite vllm/v1/worker/gpu/sample/sampler.py:88-90}}, {{cite vllm/v1/sample/ops/topk_topp_sampler.py:102-150}}, {{cite vllm/envs.py:886-890}}). The {{link tours/forward-pass}} (stop 14) walks through this for a default request.</li>
+  <li><strong>Fallback</strong> (lines 347-359). vLLM masks top-k and top-p itself and runs the Gumbel sampler. Gumbel-max adds noise to <code>logits / T</code> and takes the argmax; at temperature 0 it is a plain argmax ({{cite vllm/v1/worker/gpu/sample/gumbel.py:182-187}}).</li>
+</ul>
+<p>The conditions are for the whole batch. One greedy or seeded request sends every request of that step to the fallback path.</p>
+
+<h3>Step 5: seeds without generators</h3>
+<p>Model Runner V2 keeps no <code>torch.Generator</code> per request. The Gumbel noise is a hash of the request's seed, the token position and the token id ({{cite vllm/v1/worker/gpu/sample/gumbel.py:197-209}}). A request without a seed gets a random 64-bit seed when it enters the batch ({{cite vllm/v1/worker/gpu/sample/states.py:54-58}}). So the noise of a seeded request does not depend on the other rows of the batch (derived from the hash inputs above). Its logits must still be the same; see {{deepinfer concepts/determinism | Determinism and batch invariance}}.</p>
+
+<h3>Step 6: custom logits processors</h3>
+<p>A custom processor subclasses the Model Runner V2 <code>LogitsProcessor</code>:</p>
+<x-code file="vllm/v1/worker/gpu/sample/logits_processor/interface.py" lines="92-107" />
+<p>The methods are <code>validate_params</code> (class method, at admission), <code>add_request(req_idx, params)</code>, <code>apply_staged_writes()</code> and <code>apply(logits, ctx)</code> ({{cite vllm/v1/worker/gpu/sample/logits_processor/interface.py:118-158}}). <code>ctx</code> is a <code>LogitsContext</code>: the slot of each row, the positions, the input ids and a CPU bound of the sequence lengths ({{cite vllm/v1/worker/gpu/sample/logits_processor/interface.py:63-89}}). Rows are reordered every step, so a processor must find its rows through <code>ctx.expanded_idx_mapping</code>.</p>
+<p>There are two sources, and the loader puts entry-point plugins first ({{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:136-146}}):</p>
+<ul>
+  <li>the entry-point group <code>vllm.logits_processors</code>, which <code>VLLM_PLUGINS</code> does not filter;</li>
+  <li><code>--logits-processors</code> (<code>ModelConfig.logits_processors</code>), with <code>"module:Class"</code> strings ({{cite vllm/config/model.py:407}}).</li>
+</ul>
+<p>{{link concepts/engine-hooks}} (Step 3) covers loading, errors and the front-end check. The repository has a full example, a DRY repetition penalty that reads <code>extra_args</code> ({{cite examples/features/logits_processor/dry.py:659-688}}).</p>
+<x-warning title="add_request returns True by default">
+<p>The base <code>add_request</code> returns <code>True</code> ({{cite vllm/v1/worker/gpu/sample/logits_processor/interface.py:126-134}}). A processor that does not override it marks every request as "needs processing". Then every step copies the logits to FP32, and the fast skip of Step 3 never happens (derived from {{cite vllm/v1/worker/gpu/sample/sampler.py:101-103}}). Return <code>False</code> for requests that your processor ignores.</p>
+</x-warning>
+<p>The Model Runner V2 interface has no "argmax invariant" flag. The legacy V1 interface has <code>is_argmax_invariant</code>, and a <code>BatchUpdate</code> object with the added, removed and moved rows of the batch. Model Runner V2 rejects such classes ({{cite vllm/v1/sample/logits_processor/interface.py:37-40}}, {{cite vllm/v1/sample/logits_processor/interface.py:86-87}}, {{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:67-72}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: temperature 0.6, top_p 0.9, repetition_penalty 1.1, seed 7">
+<p>Request (example), alone in the batch on an H100, Llama-3.1-8B (vocabulary 128,256):</p>
+<pre><code class="language-json">{"model": "meta-llama/Llama-3.1-8B-Instruct",
+ "messages": [{"role": "user", "content": "Name three rivers."}],
+ "temperature": 0.6, "top_p": 0.9, "seed": 7,
+ "repetition_penalty": 1.1}</code></pre>
+<p><strong>At add_request (once):</strong></p>
+<ol>
+  <li><code>SamplingStates</code>: temperature 0.6, top_p 0.9, top_k 0 → 128,256 (no limit), min_p 0, seed 7 with <code>seeds_set = True</code>. It returns <code>True</code>, because 0.6 is not 0 or 1.</li>
+  <li><code>LogitBiasState</code>: no allowed ids, no bias, <code>min_tokens</code> 0 → <code>False</code>.</li>
+  <li><code>PenaltiesState</code>: repetition 1.1 → <code>True</code>. It queues the request for a bincount of its prompt into <code>prompt_bin_mask</code> ({{cite vllm/v1/worker/gpu/sample/penalties.py:53-82}}).</li>
+  <li><code>BadWordsState</code>: no bad words → <code>False</code>. No custom processors, no thinking budget.</li>
+</ol>
+<p><strong>In each decode step:</strong></p>
+<ol>
+  <li>Logits <code>[1, 128256]</code> BF16 → copy to FP32: 513,024 bytes.</li>
+  <li>Bias stage: no request in the batch uses it → skipped.</li>
+  <li>Penalties: take each token that is in the prompt or the output so far. Its logit is divided by 1.1 if positive, else multiplied by 1.1 ({{cite vllm/v1/worker/gpu/sample/penalties.py:174-177}}). A logit of 5.5 becomes 5.0; a logit of -2.0 becomes -2.2.</li>
+  <li>Bad words: skipped. Temperature: all logits divided by 0.6. min_p: skipped.</li>
+  <li>Top-p is set, but the request has a seed. So the fused path is not eligible (<code>any_explicit_seed</code>), even on an H100. vLLM applies top-p itself and runs the Gumbel sampler with seed 7 and the position of the token.</li>
+  <li>After the draw, <code>post_update</code> adds the new token to <code>output_bin_counts</code>, so the next step penalises it too ({{cite vllm/v1/worker/gpu/input_batch.py:588-602}}).</li>
+</ol>
+<p>Without <code>"seed": 7</code>, the same request would take the fused FlashInfer path on an H100. Penalties and temperature still run first, on the FP32 copy.</p>
+</x-deepdive>
+
+<x-deepdive title="logprobs and prompt_logprobs: what they return and what they cost">
+<ul>
+  <li><strong>Limit.</strong> <code>--max-logprobs</code> defaults to 20; -1 means no cap ({{cite vllm/config/model.py:286-290}}). A request above the cap gets a validation error ({{cite vllm/sampling_params.py:922-937}}). <code>logprobs: -1</code> means the whole vocabulary ({{cite vllm/v1/worker/gpu/sample/states.py:60-65}}).</li>
+  <li><strong>Raw or processed.</strong> <code>--logprobs-mode</code> defaults to <code>raw_logprobs</code>: values before any processor. <code>processed_*</code> modes return values after all processors, temperature and top-k/top-p ({{cite vllm/config/model.py:291-299}}). The sampler picks the tensor in lines {{cite vllm/v1/worker/gpu/sample/sampler.py:171-186}}. A processed mode with any logprobs request disables the fused sampler for the batch (Step 4).</li>
+  <li><strong>Output logprobs cost</strong> one top-k over the vocabulary per sampled row, on the GPU.</li>
+  <li><strong>prompt_logprobs</strong> cost much more. The worker computes logits for every prompt token, not only the last, in chunks of 1,024 rows ({{cite vllm/v1/worker/gpu/sample/prompt_logprob.py:20}}, {{cite vllm/v1/worker/gpu/sample/prompt_logprob.py:283-301}}). Take a 4,000-token prompt and a 128,256-token vocabulary. That is 4 chunks of up to 1,024 × 128,256 logits, about 263 MB in BF16 each. Such a request also skips reading the prefix cache ({{cite vllm/sampling_params.py:624-632}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Buffers, shapes and memory">
+<table>
+  <thead><tr><th>Buffer</th><th>Shape and type</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>temperature, top_p, min_p</td><td>float32 <code>[max_num_reqs]</code></td><td>UVA-backed ({{cite vllm/v1/worker/gpu/sample/states.py:22-26}})</td></tr>
+    <tr><td>top_k</td><td>int32 <code>[max_num_reqs]</code>, filled with the vocabulary size</td><td>{{cite vllm/v1/worker/gpu/sample/states.py:31-35}}</td></tr>
+    <tr><td>seeds</td><td>int64 <code>[max_num_reqs]</code></td><td>{{cite vllm/v1/worker/gpu/sample/states.py:26}}</td></tr>
+    <tr><td>prompt_bin_mask</td><td>int32 <code>[max_num_reqs, cdiv(vocab, 32)]</code>, one bit per token</td><td>{{cite vllm/v1/worker/gpu/sample/penalties.py:42-45}}</td></tr>
+    <tr><td>output_bin_counts</td><td>int32 <code>[max_num_reqs, vocab]</code></td><td>{{cite vllm/v1/worker/gpu/sample/penalties.py:46-50}}</td></tr>
+    <tr><td>allowed ids, logit-bias ids</td><td><code>[max_num_reqs, 1024]</code> each; more raises <code>ValueError</code></td><td>{{cite vllm/v1/worker/gpu/sample/logit_bias.py:20-22}}, {{cite vllm/v1/worker/gpu/sample/logit_bias.py:63-70}}</td></tr>
+  </tbody>
+</table>
+<p><strong>Worked number.</strong> <code>output_bin_counts</code> exists even when no request uses penalties. The code comment warns that it can take "GBs of GPU memory" ({{cite vllm/v1/worker/gpu/sample/penalties.py:46-50}}). With <code>max_num_seqs = 1024</code> and a 128,256-token vocabulary: 1,024 × 128,256 × 4 bytes = 525 MB. With a 151,936-token vocabulary: 622 MB. This memory is taken before the KV cache gets its share.</p>
+<p>Other limits: <code>VLLM_MAX_NUM_BAD_WORDS</code> 128 and <code>VLLM_MAX_BAD_WORDS_TOTAL_TOKENS</code> 1024 ({{cite vllm/envs.py:1152-1159}}); stop tokens for <code>min_tokens</code> at most 128 ({{cite vllm/v1/worker/gpu/sample/logit_bias.py:22}}, {{cite vllm/v1/worker/gpu/sample/logit_bias.py:98-104}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Built-in logits-processor-like states">
+<table>
+  <thead><tr><th>State</th><th>Request field</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>LogitBiasState</code></td><td><code>allowed_token_ids</code>, <code>logit_bias</code>, <code>min_tokens</code></td><td>Keeps only allowed ids, adds biases, and sets stop tokens to -inf until <code>prompt_len + min_tokens</code> ({{cite vllm/v1/worker/gpu/sample/logit_bias.py:57-116}}).</td></tr>
+    <tr><td><code>PenaltiesState</code></td><td>three penalties</td><td>Repetition scales by sign; frequency and presence subtract ({{cite vllm/v1/worker/gpu/sample/penalties.py:174-182}}).</td></tr>
+    <tr><td><code>BadWordsState</code></td><td><code>bad_words</code></td><td>Up to <code>VLLM_MAX_NUM_BAD_WORDS</code> words per request, 128 by default ({{cite vllm/v1/worker/gpu/sample/bad_words.py:46-52}}, {{cite vllm/envs.py:1152-1154}}).</td></tr>
+    <tr><td><code>ThinkingBudgetState</code></td><td><code>thinking_token_budget</code></td><td>Forces the end of thinking after the budget. Active only when the reasoning config has start, end and natural-end token ids ({{cite vllm/v1/worker/gpu/sample/thinking_budget.py:34-51}}).</td></tr>
+    <tr><td>min_p</td><td><code>min_p</code></td><td>Part of <code>SamplingStates</code>, after temperature ({{cite vllm/v1/worker/gpu/sample/states.py:94-103}}).</td></tr>
+    <tr><td>watermarking</td><td><code>watermarking</code></td><td>Not a processor: <code>--watermark-config</code> swaps the whole sampler for <code>GPUWatermarkSampler</code> ({{cite vllm/v1/worker/gpu/model_runner.py:493-507}}).</td></tr>
+  </tbody>
+</table>
+<p>With speculative decoding, <code>min_p</code> and <code>logit_bias</code> are not supported; a request with them gets a validation error ({{cite vllm/sampling_params.py:1185-1197}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>The model's defaults change your sampling.</strong> A request without <code>temperature</code> uses the value from <code>generation_config.json</code>, not 1.0. Use <code>--generation-config vllm</code> for vLLM's neutral defaults ({{link learn/openai-api}}).</li>
+  <li><strong>One seeded request slows the batch.</strong> A seed, a greedy request or a processed-logprobs request makes the whole step skip the fused sampler (Step 4).</li>
+  <li><strong>A V1 logits processor plugin stops the start-up.</strong> Model Runner V2 raises <code>ValueError</code> at model load ({{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:67-72}}).</li>
+  <li><strong><code>--logits-processors</code> on a pooling model.</strong> It raises <code>ValueError</code>. Entry-point processors are skipped for pooling models, with only a debug log ({{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:172-179}}).</li>
+  <li><strong>Too many ids.</strong> More than 1,024 allowed ids or bias entries, or more than 128 stop tokens with <code>min_tokens</code>, raise <code>ValueError</code> in the worker ({{cite vllm/v1/worker/gpu/sample/logit_bias.py:63-104}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> The sampler runs in every step for every request. Know which stage runs and which settings force the slower path. Then you can choose good server defaults, and write processors that cost nothing for other requests.</p>
+
+<x-quiz>
+  <x-q level="easy">In which order do the built-in processors run?
+    <x-a><p><code>LogitBiasState</code>, <code>PenaltiesState</code>, <code>BadWordsState</code>, then the custom processors ({{cite vllm/v1/worker/gpu/sample/sampler.py:71-76}}). Temperature and min_p come after them ({{cite vllm/v1/worker/gpu/sample/sampler.py:262-268}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A batch has 63 requests with temperature 0.7 and top_p 0.95, and one request with temperature 0. Which sampler draws the tokens on an H100?
+    <x-a><p>The Gumbel fallback for all 64. One greedy request makes <code>any_greedy</code> true, so the fused path is not eligible for the batch ({{cite vllm/v1/worker/gpu/sample/sampler.py:307-315}}). The greedy request gets a plain argmax inside the Gumbel kernel ({{cite vllm/v1/worker/gpu/sample/gumbel.py:182-187}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Your processor changes the logits only for requests with <code>extra_args["boost"]</code>. Why should <code>add_request</code> return <code>False</code> for the others?
+    <x-a><p>The sampler stores the OR of all stages per slot. If any stage says True, the step copies the logits to FP32 and runs the chain ({{cite vllm/v1/worker/gpu/sample/sampler.py:101-103}}, {{cite vllm/v1/worker/gpu/sample/sampler.py:238-242}}). The default <code>add_request</code> returns True ({{cite vllm/v1/worker/gpu/sample/logits_processor/interface.py:126-134}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Two servers run the same seeded request (seed 7), one alone and one in a batch of 200. Why can the sampled tokens match, and what must also be true?
+    <x-a><p>The Gumbel noise depends only on the seed, the position and the token id ({{cite vllm/v1/worker/gpu/sample/gumbel.py:197-209}}), not on the other rows, so the noise is the same. The logits must also be the same in both batches, which needs batch-invariant kernels.</p></x-a>
+  </x-q>
+  <x-q level="hard">How much GPU memory does <code>output_bin_counts</code> take with <code>max_num_seqs = 512</code> and a 151,936-token vocabulary, and does it depend on penalty use?
+    <x-a><p>512 × 151,936 × 4 bytes = 311 MB. It is allocated in the constructor, whether or not a request uses penalties ({{cite vllm/v1/worker/gpu/sample/penalties.py:46-50}}).</p></x-a>
+  </x-q>
+</x-quiz>

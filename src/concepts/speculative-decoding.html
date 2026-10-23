@@ -1,0 +1,197 @@
+---
+title: Speculative decoding in vLLM serving
+nav_title: Speculative decoding
+level: Advanced
+prerequisites: concepts/scheduler, concepts/model-runner, concepts/async-scheduling
+related: concepts/sampling-and-logits-processors, concepts/compile-and-cuda-graphs, concepts/structured-outputs, concepts/async-scheduling, concepts/scheduler, concepts/model-runner, learn/serving-metrics
+summary: How vLLM serves with draft tokens - SpeculativeConfig and the methods, how drafts take part in the token budget and in async scheduling, the Model Runner V2 speculator, verification with the RejectionSampler and its four variants, multi-token outputs, the acceptance metrics, CUDA graphs and tuning.
+---
+<x-sentence>A drafter proposes k tokens per request on the GPU. The next forward pass checks them all, so one step can emit up to k + 1 tokens.</x-sentence>
+
+<h2>The idea</h2>
+<p>Speculative decoding lets a cheap drafter guess the next tokens. The large target model then checks all guesses in one forward pass. A rejection test keeps the output distribution of the target model ({{deepinfer concepts/speculative-decoding | Speculative decoding: draft, verify, accept/reject}}). This page shows how vLLM does this inside <code>vllm serve</code>.</p>
+<p>You turn it on with one flag, <code>--speculative-config</code>, a JSON object that becomes a {{term speculative-config}}. The method names the drafter: an {{term eagle}} head, an {{term mtp}} layer of the model, a separate {{term draft-model}}, an n-gram lookup, and others. {{term num-speculative-tokens}} (k) sets how many drafts each request gets per step.</p>
+<p>In Model Runner V2 the drafts stay on the GPU until the next step checks them. Only a batch with structured outputs copies them to the CPU for the grammar check ({{cite vllm/v1/worker/gpu/spec_decode/utils.py:64-80}}). The scheduler only reserves room for them, with <code>-1</code> placeholders. The worker samples, drafts the next k tokens right away on the GPU, and puts them into the next input. The {{term rejection-sampler}} checks them in the next step.</p>
+<p><strong>An everyday comparison.</strong> Think of a junior writer and an editor. The junior writes the next three words. The editor reads them in one pass, keeps the words up to the first wrong one, and writes one correct word there. If all three are right, the editor adds a fourth word. The comparison stops being true in one place: the editor is not slower per word than the junior. The target model checks four positions for about the price of one decode step, because decode is memory-bound ({{deepinfer learn/prefill-decode | Prefill and decode}}).</p>
+
+<h2>The picture</h2>
+<x-diagram name="b7b_spec_step" alt="Three panels for one step with EAGLE and k equal to 3. Panel 1, GPU verification: the target model gets input ids x0, d1, d2, d3 at positions 100 to 103 and writes KV for them; it returns 4 logits rows; the RejectionSampler accepts d1 and d2, rejects d3 and resamples r from the residual of row 2, so sampled is d1, d2, r with num_sampled 3 and num_rejected 1. Panel 2, GPU after sampling: post_update adds 4 minus 1 equals 3 to num_computed_tokens, from 100 to 103, and sets last_sampled_tokens to r; position 103 still holds the stale KV of d3; the EAGLE speculator runs a draft prefill with the same batch shape as the target, then 2 draft decode steps of 1 token each; the new drafts e1, e2, e3 stay in req_states.draft_tokens on the GPU, and the next input is r, e1, e2, e3 at positions 103 to 106, so r overwrites the KV at 103. Panel 3, engine core: the AsyncScheduler already scheduled the step with num_computed_tokens 100 to 104, 4 placeholders and spec_token_ids of three -1 values, and allocate_slots reserved 4 tokens plus 3 lookahead slots; update_from_output gets 3 tokens, computes 2 accepted and 1 rejected and rolls num_computed_tokens back from 104 to 103; the output is one EngineCoreOutput with 3 tokens, one ITL sample, and the metrics add 1 draft, 3 draft tokens and 2 accepted tokens." caption="Figure: one step with EAGLE and k = 3. The GPU verifies and drafts again without a CPU round trip (panels 1-2); the engine core only fixes its counters when the result arrives (panel 3)." />
+<p>Read the panels from top to bottom. Blue and teal are the target forward pass and the check, amber and violet are the GPU work after sampling, emerald is the engine core. The numbers are one example request; the worked example in the deep dive follows the same numbers.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: SpeculativeConfig and the methods</h3>
+<p><code>--speculative-config</code> (short <code>-sc</code>) takes a JSON string. vLLM keeps it as a dict until it builds the engine config, because <code>SpeculativeConfig</code> needs the target model config ({{cite vllm/engine/arg_utils.py:1851-1857}}). Three short flags exist too: <code>--spec-method</code>, <code>--spec-model</code> and <code>--spec-tokens</code>. A short flag and the same key in the JSON raise <code>ValueError</code> ({{cite vllm/engine/arg_utils.py:2098-2110}}).</p>
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --speculative-config '{"method": "eagle3",
+                         "model": "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B",
+                         "num_speculative_tokens": 3}'</code></pre>
+<p>The method names are a <code>Literal</code> type:</p>
+<x-code file="vllm/config/speculative.py" lines="68-84" />
+<ul>
+  <li><strong>Draft heads that read the target's hidden states:</strong> <code>eagle</code>, <code>eagle3</code>, <code>mtp</code>, <code>dflash</code> and <code>dspark</code>. <code>use_eagle()</code> is true for all five ({{cite vllm/config/speculative.py:2013-2017}}). <code>dflash</code> and <code>dspark</code> always draft in parallel ({{cite vllm/config/speculative.py:1505-1506}}).</li>
+  <li><strong>MTP.</strong> The 27 model-specific MTP names in <code>MTPModelTypes</code> (for example <code>deepseek_mtp</code>) are deprecated ({{cite vllm/config/speculative.py:38-67}}). vLLM logs a warning and uses <code>mtp</code> ({{cite vllm/config/speculative.py:1197-1201}}). Without <code>model</code>, MTP uses the target checkpoint itself ({{cite vllm/config/speculative.py:1204-1215}}).</li>
+  <li><strong>A separate small model:</strong> <code>draft_model</code>. It is also the fallback when <code>method</code> is missing and the model name gives no other hint ({{cite vllm/config/speculative.py:1186-1195}}).</li>
+  <li><strong>No model at all:</strong> <code>ngram</code> and <code>ngram_gpu</code> look up the last tokens in the prompt and the output. Both look-up sizes default to 5 when you set neither ({{cite vllm/config/speculative.py:1252-1256}}).</li>
+  <li><strong>Others:</strong> <code>suffix</code> (suffix decoding), <code>custom_class</code> (your own proposer class, "experimental") and <code>extract_hidden_states</code> (no drafting; it only exports hidden states) ({{cite vllm/config/speculative.py:1286-1293}}, {{cite vllm/config/speculative.py:1298-1304}}).</li>
+</ul>
+<p>With a <code>model</code> but no <code>method</code>, vLLM guesses the method from the model name and architecture. It looks for "eagle-", "eagle3", "dflash", "dspark" or an MTP <code>model_type</code> ({{cite vllm/config/speculative.py:1363-1398}}). <code>num_speculative_tokens</code> has no default. It comes from <code>n_predict</code> in the draft config when that exists (for DSpark, from its block size); otherwise it is required ({{cite vllm/config/speculative.py:1508-1542}}).</p>
+
+<h3>Step 2: which methods Model Runner V2 supports</h3>
+<p>Model Runner V2 is the default. Some speculative settings switch the whole worker back to Model Runner V1 ({{link concepts/model-runner}}):</p>
+<x-code file="vllm/config/vllm.py" lines="3012-3028" highlight="3013-3014,3019-3023,3027-3028" />
+<p>So <code>suffix</code>, <code>custom_class</code>, parallel drafting with EAGLE (P-EAGLE) and draft models with a different vocabulary run on the fallback. vLLM logs <em>"Model Runner V2 does not yet support ..."</em> ({{cite vllm/config/vllm.py:740-747}}). The reverse also exists: <code>dspark</code>, adaptive verification and draft LM-head quantization work only on Model Runner V2 ({{cite vllm/config/vllm.py:3056-3063}}).</p>
+<p>In Model Runner V2, <code>init_speculator</code> maps the method to a speculator class. <code>ngram</code> and <code>ngram_gpu</code> both get the GPU n-gram speculator ({{cite vllm/v1/worker/gpu/spec_decode/__init__.py:81-86}}, {{cite vllm/config/speculative.py:2048-2049}}). Only the last pipeline-parallel rank builds a speculator ({{cite vllm/v1/worker/gpu/model_runner.py:298-308}}).</p>
+
+<h3>Step 3: drafts in the scheduler</h3>
+<p>The scheduler treats drafts as normal tokens of the request. A decode with k drafts schedules <code>1 + k</code> tokens, and they count against the {{term token-budget}}. After scheduling, it keeps only the drafts that fit and moves them into <code>scheduled_spec_decode_tokens</code> ({{cite vllm/v1/core/sched/scheduler.py:916-932}}). The page {{link concepts/scheduler}} (Step 6) shows the budget rule.</p>
+<p>Two extra reservations exist:</p>
+<ul>
+  <li><strong>Draft slots</strong> in the input budget: rows that the drafter adds to the batch. They are 0 for EAGLE, MTP, n-gram, DFlash and DSpark, 1 for a separate draft model, and more with parallel drafting ({{cite vllm/config/speculative.py:1955-1995}}, {{cite vllm/v1/core/sched/scheduler.py:644}}).</li>
+  <li><strong>Lookahead KV slots.</strong> The drafter writes KV past the target's query. So <code>allocate_slots</code> gets <code>num_lookahead_tokens</code>: k for EAGLE-type and draft-model methods, k + 1 for DFlash, 0 for n-gram ({{cite vllm/config/vllm.py:625-650}}, {{cite vllm/v1/core/sched/scheduler.py:834-838}}).</li>
+</ul>
+<p>With async scheduling (the default), the scheduler plans step N+1 before the drafts of step N exist. It puts <code>[-1] * k</code> as placeholder drafts and adds <code>1 + k</code> output placeholders ({{cite vllm/v1/core/sched/async_scheduler.py:28-50}}). The real drafts are only on the GPU. {{link concepts/async-scheduling}} explains the placeholders.</p>
+
+<h3>Step 4: verify, then draft again, in one sample_tokens call</h3>
+<p>In <code>sample()</code>, the model runner chooses the sampler. Without drafts in the batch the normal {{link concepts/sampling-and-logits-processors | sampler}} runs; with drafts the <code>RejectionSampler</code> runs:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1658-1676" highlight="1663-1665,1666-1676" />
+<p>After sampling, <code>sample_tokens</code> starts the output copy ({{cite vllm/v1/worker/gpu/model_runner.py:2209-2218}}), updates the request state ({{cite vllm/v1/worker/gpu/model_runner.py:2249-2255}}), and then calls the speculator at once:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="2270-2289" highlight="2271,2287-2289" />
+<ol>
+  <li>Line 2271: <code>propose()</code> gets the hidden states, the number of sampled and rejected tokens, and the last sampled token, all on the GPU.</li>
+  <li>Lines 2287-2288: with dynamic speculative decoding the step may use fewer drafts; the unused columns become <code>-1</code>.</li>
+  <li>Line 2289: the drafts go into <code>req_states.draft_tokens</code>. The next <code>prepare_inputs</code> copies them into <code>input_ids</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1493-1504}}).</li>
+</ol>
+<p>The EAGLE speculator first runs a "draft prefill" over the same token rows as the target. So it can reuse the target's attention metadata and slot mappings. Then it runs <code>k - 1</code> decode steps of one token per request ({{cite vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py:204-209}}, {{cite vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py:281-299}}, {{cite vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py:331-366}}).</p>
+
+<h3>Step 5: the RejectionSampler</h3>
+<p>The RejectionSampler wraps the normal sampler. First it applies the sampling parameters of each request (penalties, temperature, top-k, top-p) to all <code>1 + k</code> logits rows; then it runs the test ({{cite vllm/v1/worker/gpu/spec_decode/rejection_sampler.py:264-293}}). The test depends on <code>rejection_sample_method</code>:</p>
+<x-code file="vllm/config/speculative.py" lines="536-543" />
+<table>
+  <thead><tr><th>Variant</th><th>What it does (high level)</th><th>Lossless?</th></tr></thead>
+  <tbody>
+    <tr><td><code>standard</code> (default)</td><td>Checks each draft in order. Greedy requests accept a draft only if it equals the target argmax ({{cite vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:600-616}}). Random requests accept x when <code>p(x) &gt; u · q(x)</code> ({{cite vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:695-697}}).</td><td>yes</td></tr>
+    <tr><td><code>block</code></td><td>Block verification (Sun et al.): judges the drafts as one block, with the joint probability of the prefix ({{cite vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:628-660}}).</td><td>yes (per the paper)</td></tr>
+    <tr><td><code>synthetic</code></td><td>Ignores the logits for the decision and accepts with fixed per-position rates. You must give exactly one of <code>synthetic_acceptance_rates</code> and <code>synthetic_acceptance_length</code> ({{cite vllm/config/speculative.py:581-585}}). For benchmarks.</td><td>no</td></tr>
+    <tr><td><code>fly</code></td><td>FLy: a lossy, entropy-gated window over the normal decisions. Needs k ≥ 2; the window defaults to <code>min(6, k - 1)</code>; vLLM logs a warning ({{cite vllm/config/speculative.py:1913-1931}}).</td><td>no</td></tr>
+  </tbody>
+</table>
+<p><strong>The acceptance math.</strong> p is the target probability and q the draft probability of the draft token x, both after temperature. u is a uniform random number. The draft is kept when <code>p(x) &gt; u · q(x)</code>, that is with probability <code>min(1, p(x) / q(x))</code>. The default <code>draft_sample_method</code> is <code>greedy</code>: the drafter takes the argmax, and q counts as one-hot. So <code>q(x) = 1</code>, and the draft is kept with probability <code>p(x)</code> ({{cite vllm/config/speculative.py:608-614}}, {{cite vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:191-194}}). At the first rejection, vLLM draws a new token from the residual <code>max(p - q, 0)</code>. With a one-hot draft, that is the target distribution without the rejected token ({{cite vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:937-938}}, {{cite vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:950-951}}). If all k drafts pass, the last row gives a bonus token.</p>
+<x-note title="No FlashInfer sampler for verification">
+<p>The fused FlashInfer top-k/top-p sampler is not used for verification. Speculative decoding uses vLLM's own top-k/top-p masking, even when plain sampling could use the fused path ({{cite vllm/v1/worker/gpu/model_runner.py:468-479}}).</p>
+</x-note>
+
+<h3>Step 6: the engine core rolls back rejected drafts</h3>
+<p>The model runner already corrected its own GPU counters. <code>num_rejected</code> is the number of logits rows minus the number of sampled tokens, and <code>num_computed_tokens</code> grows by the query length minus that ({{cite vllm/v1/worker/gpu/input_batch.py:528-534}}, {{cite vllm/v1/worker/gpu/input_batch.py:612-615}}). The scheduler does the same on the CPU when the output arrives:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="2203-2228" highlight="2211-2212,2218-2221" />
+<p>The KV entries of rejected drafts are not freed. The blocks stay with the request: the KV manager notes that a request can hold more blocks than it needs after a rejection ({{cite vllm/v1/core/single_type_kv_cache_manager.py:233-236}}). The next step writes the correct token over the stale entry, because <code>num_computed_tokens</code> moved back (derived from the counters above). With async scheduling, <code>post_step</code> does not take draft tokens from the workers ({{cite vllm/v1/engine/core.py:689-696}}). The engine core takes them only for the grammar check of a structured-output step ({{cite vllm/v1/engine/core.py:792-803}}).</p>
+
+<h3>Step 7: outputs with more than one token</h3>
+<p>One step can give a request up to <code>1 + k</code> new tokens, and they travel in one <code>EngineCoreOutput</code>. This changes the latency numbers:</p>
+<ul>
+  <li><strong>ITL.</strong> The front end adds one inter-token latency sample per output, not per token ({{cite vllm/v1/metrics/stats.py:551-557}}). With 3 tokens per step, there are a third as many ITL samples, and each is longer.</li>
+  <li><strong>TPOT.</strong> The decode time is divided by all output tokens minus one, so TPOT goes down ({{cite vllm/v1/metrics/stats.py:612-616}}). See {{link learn/serving-metrics}}.</li>
+  <li><strong>Streaming.</strong> A stream gets the new tokens of a step together, so one SSE chunk can hold several tokens of text.</li>
+</ul>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: EAGLE, k = 3, two drafts accepted">
+<p>Server: <code>vllm serve meta-llama/Llama-3.1-8B-Instruct</code> with the EAGLE3 command of Step 1, one GPU, block size 16, async scheduling on. One request is in decode. 100 of its tokens are in the KV cache (positions 0 to 99). Its last sampled token x0 (position 100) is not computed yet. The drafter proposed d1, d2, d3 in the previous step.</p>
+<ol>
+  <li><strong>Schedule.</strong> The scheduler plans <code>1 + 3 = 4</code> tokens. <code>num_computed_tokens</code> goes from 100 to 104 at once ({{cite vllm/v1/core/sched/scheduler.py:1716}}). <code>allocate_slots</code> must hold 4 tokens plus 3 lookahead slots: positions up to 106, all inside block 6 (positions 96 to 111). The placeholders grow by 4, and the next draft list is <code>[-1, -1, -1]</code>.</li>
+  <li><strong>Forward.</strong> The input is <code>[x0, d1, d2, d3]</code> at positions <code>[100, 101, 102, 103]</code>. The KV of all four positions is written. Logits come back for all 4 rows: <code>cu_num_logits</code> gives this request 4 rows, not 1.</li>
+  <li><strong>Verify.</strong> Row 0 checks d1 (accept). Row 1 checks d2 (accept). Row 2 checks d3: reject. A recovered token r is drawn from row 2 without d3. Row 3 (the bonus row) is not used. Result: <code>sampled = [d1, d2, r]</code>, <code>num_sampled = 3</code>, <code>num_rejected = 4 - 3 = 1</code>.</li>
+  <li><strong>Worker counters.</strong> <code>num_computed_tokens</code> on the GPU grows by <code>4 - 1 = 3</code>: from 100 to 103. <code>last_sampled_tokens = r</code>. The KV at position 103 still holds d3, but position 103 is not computed any more.</li>
+  <li><strong>Draft again.</strong> EAGLE runs the draft prefill over the 4 rows, then 2 draft decode steps, and writes <code>[e1, e2, e3]</code> into <code>req_states.draft_tokens</code>.</li>
+  <li><strong>Next step.</strong> The input is <code>[r, e1, e2, e3]</code> at positions 103 to 106. The KV of r overwrites the stale d3 entry at 103.</li>
+  <li><strong>Engine core.</strong> The output has 3 tokens. <code>num_accepted = 3 - 1 = 2</code>, <code>num_rejected = 3 - 2 = 1</code>, so <code>num_computed_tokens</code> goes from 104 to 103 and the placeholders drop by 1 ({{cite vllm/v1/core/sched/scheduler.py:2209-2221}}). The 3 new tokens remove the other 3 placeholders ({{cite vllm/v1/core/sched/async_scheduler.py:71-73}}). The client gets d1, d2 and r: 3 tokens for one target forward pass.</li>
+  <li><strong>Metrics.</strong> <code>num_drafts</code> +1, <code>num_draft_tokens</code> +3, <code>num_accepted_tokens</code> +2, and the per-position counters +1 at positions 0 and 1 ({{cite vllm/v1/spec_decode/metrics.py:41-49}}).</li>
+</ol>
+<x-simplified><p>The worker writes its counters on the GPU before the engine core sees the output. So steps 4-6 run while the engine core still waits for the previous output. The block size and the request length are example values.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Metrics: acceptance rate and mean acceptance length">
+<p>The scheduler builds <code>SpecDecodingStats</code> per step when stats logging is on ({{cite vllm/v1/core/sched/scheduler.py:3061-3078}}). Prometheus gets four counters ({{cite vllm/v1/spec_decode/metrics.py:229-231}}, {{cite vllm/v1/spec_decode/metrics.py:254-258}}):</p>
+<table>
+  <thead><tr><th>Metric</th><th>Counts</th></tr></thead>
+  <tbody>
+    <tr><td><code>vllm:spec_decode_num_drafts</code></td><td>verification rounds (one per request per step with drafts)</td></tr>
+    <tr><td><code>vllm:spec_decode_num_draft_tokens</code></td><td>draft tokens that were checked</td></tr>
+    <tr><td><code>vllm:spec_decode_num_accepted_tokens</code></td><td>accepted drafts (not the bonus or recovered token)</td></tr>
+    <tr><td><code>vllm:spec_decode_num_accepted_tokens_per_pos</code></td><td>accepted drafts per draft position, label <code>position</code></td></tr>
+  </tbody>
+</table>
+<p>The class docstring gives the PromQL ({{cite vllm/v1/spec_decode/metrics.py:177-196}}):</p>
+<ul>
+  <li>{{term acceptance-rate}} = <code>rate(..._num_accepted_tokens_total) / rate(..._num_draft_tokens_total)</code>.</li>
+  <li>Mean acceptance length = <code>1 + rate(..._num_accepted_tokens_total) / rate(..._num_drafts_total)</code>. The 1 is the bonus or recovered token of each round ({{cite vllm/v1/spec_decode/metrics.py:113-114}}).</li>
+</ul>
+<p>In the worked example: acceptance rate 2/3 = 67 %, acceptance length 1 + 2/1 = 3. The log line "SpecDecoding metrics: Mean acceptance length ..." prints the same numbers every log interval ({{cite vllm/v1/spec_decode/metrics.py:120-137}}). <code>--per-request-spec-decode-metrics summary</code> or <code>detailed</code> adds per-request numbers to the response; the default is <code>none</code>, and it needs speculative decoding ({{cite vllm/config/observability.py:50-56}}, {{cite vllm/config/vllm.py:1713-1720}}).</p>
+</x-deepdive>
+
+<x-deepdive title="CUDA graphs with drafts">
+<p>A decode with k drafts has <code>1 + k</code> query tokens. vLLM calls this the uniform decode query length ({{cite vllm/config/vllm.py:676-695}}); Model Runner V2 stores it as <code>decode_query_len</code> ({{cite vllm/v1/worker/gpu/model_runner.py:442-445}}). A FULL CUDA graph replays only for a batch in which every request has exactly that many tokens. Prefill chunks in the batch give a PIECEWISE graph. Without dynamic k, the scheduler pads a waiting 1-token request to <code>1 + k</code> tokens when no prefill runs, to keep the batch uniform ({{cite vllm/v1/core/sched/scheduler.py:1196-1216}}).</p>
+<p>vLLM adds decode capture sizes of <code>1 + k</code> times 1, 2 or 4 requests, or a multiple of 8 requests ({{cite vllm/config/vllm.py:2466-2473}}, {{cite vllm/config/vllm.py:2520-2527}}). With k = 3, a batch of 3 verifying requests (12 tokens) replays the FULL graph of 16 tokens; {{link concepts/compile-and-cuda-graphs}} has this example. The drafter has its own graphs. The draft prefill can replay a FULL graph when all requests decode. Each draft decode step is a uniform 1-token batch ({{cite vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py:248-258}}, {{cite vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py:331-345}}).</p>
+</x-deepdive>
+
+<x-deepdive title="SpeculativeConfig fields that matter for serving">
+<table>
+  <thead><tr><th>Field</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>method</code></td><td>guessed, else <code>draft_model</code></td><td>Step 1 ({{cite vllm/config/speculative.py:1186-1195}}).</td></tr>
+    <tr><td><code>num_speculative_tokens</code></td><td>none; from <code>n_predict</code> if present</td><td>k ({{cite vllm/config/speculative.py:393-395}}).</td></tr>
+    <tr><td><code>draft_tensor_parallel_size</code></td><td>target TP</td><td>Only 1 or the target TP size ({{cite vllm/config/speculative.py:407-409}}). <code>tensor_parallel_size</code> inside the JSON raises <code>ValueError</code> ({{cite vllm/config/speculative.py:1837-1841}}).</td></tr>
+    <tr><td><code>rejection_sample_method</code></td><td><code>standard</code></td><td>Step 5.</td></tr>
+    <tr><td><code>draft_sample_method</code></td><td><code>greedy</code></td><td><code>probabilistic</code> samples drafts and keeps draft logits, at the cost of GPU memory ({{cite vllm/config/speculative.py:608-614}}).</td></tr>
+    <tr><td><code>prompt_lookup_min</code> / <code>max</code></td><td>5 / 5 (n-gram)</td><td>n-gram window ({{cite vllm/config/speculative.py:1252-1256}}).</td></tr>
+    <tr><td><code>num_speculative_tokens_per_batch_size</code></td><td>none</td><td>Dynamic k by batch size, as <code>(start, end, k)</code> ranges ({{cite vllm/config/speculative.py:498-503}}). Turned off with data parallelism ({{cite vllm/config/vllm.py:1092-1109}}).</td></tr>
+    <tr><td><code>parallel_drafting</code></td><td>false (true for DFlash, DSpark)</td><td>EAGLE with it falls back to Model Runner V1 (Step 2).</td></tr>
+  </tbody>
+</table>
+<p>One cross-check applies with LoRA and speculative decoding together. Then <code>max_num_batched_tokens</code> must be at least <code>max_num_seqs × (k + 1)</code>, else start-up fails with "Consider increasing max_num_batched_tokens or decreasing num_speculative_tokens" ({{cite vllm/engine/arg_utils.py:2700-2713}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Tuning with the defaults that the code gives">
+<p>The code does not choose k for you. The only exceptions are opt-in: dynamic k by batch size, and adaptive verification for DSpark ({{cite vllm/config/speculative.py:559-561}}). Use the metrics above to choose:</p>
+<ul>
+  <li><strong>Start from the drafter's own k.</strong> EAGLE-type and MTP checkpoints often carry <code>n_predict</code>, which vLLM uses when you omit k ({{cite vllm/config/speculative.py:1524-1536}}). If you set k above <code>n_predict</code>, k must be a multiple of <code>n_predict</code> (same lines).</li>
+  <li><strong>Watch the per-position rates.</strong> If position 3 rarely accepts, k = 3 wastes target compute on the third row. Each extra draft costs one more logits row and one more draft step for every request.</li>
+  <li><strong>Batch size matters.</strong> Verification adds k tokens per request to the token budget. In large batches the step is less memory-bound, so drafts cost more. <code>num_speculative_tokens_per_batch_size</code> lowers k for larger batches.</li>
+  <li><strong>Greedy requests</strong> accept only exact argmax matches; random requests use the probability test. The same drafter can show different rates for different temperatures.</li>
+</ul>
+<p>The docs give measured speedups only for a few setups, for example FLy against standard verification ({{cite docs/features/speculative_decoding/fly.md:55-62}}). Measure your own workload with <code>vllm bench serve</code> ({{link concepts/benchmarking}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="Some methods silently switch the model runner">
+<p><code>suffix</code>, <code>custom_class</code>, P-EAGLE (<code>parallel_drafting</code> with EAGLE) and heterogeneous-vocabulary drafts run on Model Runner V1. vLLM logs only one warning ({{cite vllm/config/vllm.py:740-747}}). The behaviour on this page is the Model Runner V2 behaviour.</p>
+</x-warning>
+<ul>
+  <li><strong>"num_speculative_tokens was provided but without speculative model."</strong> You set k for a method that needs a model, without <code>model</code> ({{cite vllm/config/speculative.py:1243-1246}}).</li>
+  <li><strong>"Target and draft model should have the same vocabulary size."</strong> A <code>draft_model</code> with another tokenizer ({{cite vllm/config/speculative.py:1937-1953}}).</li>
+  <li><strong>"The min_p and logit_bias sampling parameters are not yet supported with speculative decoding."</strong> Such a request gets a validation error ({{cite vllm/sampling_params.py:1192-1197}}).</li>
+  <li><strong>ITL looks worse, TPOT better.</strong> This is expected: one output holds several tokens (Step 7).</li>
+  <li><strong>Low acceptance with structured outputs.</strong> Drafts that the grammar rejects become <code>-1</code> before verification and count as invalid ({{link concepts/structured-outputs}}).</li>
+  <li><strong>FLy or synthetic in production.</strong> Both change the output distribution; FLy logs <em>"FLy verification is a lossy speculative decoding method"</em> ({{cite vllm/config/speculative.py:1928-1931}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Speculative decoding trades extra GPU work per step for fewer steps per answer. It helps most at small batch sizes, where decode leaves the GPU idle. The acceptance metrics tell you whether the trade pays off.</p>
+
+<x-quiz>
+  <x-q level="easy">Which flag turns on speculative decoding, and what is k?
+    <x-a><p><code>--speculative-config</code> with a JSON object; k is <code>num_speculative_tokens</code>, the number of drafts per request per step ({{cite vllm/engine/arg_utils.py:1854-1857}}, {{cite vllm/config/speculative.py:393-395}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With async scheduling, what draft tokens does the scheduler put into the SchedulerOutput, and where are the real ones?
+    <x-a><p>A list of <code>-1</code> placeholders, k long ({{cite vllm/v1/core/sched/async_scheduler.py:28-50}}). The real drafts are in <code>req_states.draft_tokens</code> on the GPU, written by <code>sample_tokens</code> right after sampling ({{cite vllm/v1/worker/gpu/model_runner.py:2289}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With the default <code>draft_sample_method</code>, a random request (temperature 0.8) checks a draft x with target probability 0.3. What is the chance to accept it?
+    <x-a><p>0.3. Greedy drafting treats q as one-hot, so <code>q(x) = 1</code>, and the test <code>p(x) &gt; u · q(x)</code> passes with probability <code>p(x)</code> ({{cite vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:191-194}}, {{cite vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:695-697}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">k = 4. A request had 200 computed tokens before the step; the target accepts 1 draft. What are num_sampled, num_rejected (worker) and num_accepted (scheduler), and where does num_computed_tokens end?
+    <x-a><p>The query has 5 tokens and 5 logits rows. Sampled: 1 accepted draft + 1 recovered token, so <code>num_sampled = 2</code> and the worker's <code>num_rejected = 5 - 2 = 3</code> ({{cite vllm/v1/worker/gpu/input_batch.py:528-534}}). The scheduler computes <code>num_accepted = 2 - 1 = 1</code> and <code>num_rejected = 4 - 1 = 3</code> ({{cite vllm/v1/core/sched/scheduler.py:2209-2213}}). <code>num_computed_tokens</code> goes 200 → 205 at schedule time and back to 202.</p></x-a>
+  </x-q>
+  <x-q level="hard">Why can a 3-token output make the Prometheus ITL histogram look worse while TPOT improves?
+    <x-a><p>ITL adds one sample per engine-core output, the gap since the previous output, no matter how many tokens it holds ({{cite vllm/v1/metrics/stats.py:551-557}}). TPOT divides the decode time by all generated tokens minus one ({{cite vllm/v1/metrics/stats.py:612-616}}). A step with 3 tokens is a little slower than a plain step, so each ITL sample grows, but the time per token falls.</p></x-a>
+  </x-q>
+</x-quiz>

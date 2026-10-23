@@ -1,0 +1,131 @@
+---
+title: Multimodal serving: images, audio and video in vLLM
+nav_title: Multimodal serving
+level: Advanced
+prerequisites: concepts/openai-server, concepts/scheduler, concepts/model-runner
+related: concepts/renderers-and-chat-templates, concepts/prefix-caching, concepts/model-runner, concepts/kv-connectors, concepts/lora-serving, learn/openai-api
+summary: An overview of how vLLM serves a multimodal request - content parts and media loading in the API server, the per-model multimodal processor and its placeholder tokens, the processor cache between processes, the encoder cache and its budget in the scheduler, the encoder runs in Model Runner V2, and encoder-only disaggregation.
+---
+<x-sentence>The API server turns each image into placeholder tokens; the worker runs the vision encoder once per image and puts its output at those positions.</x-sentence>
+
+<h2>The idea</h2>
+<p>A vision-language model has a vision encoder next to the language model. The encoder turns an image into a sequence of vectors in the model's embedding space. The language model then reads them like token embeddings ({{deepinfer concepts/vision-encoder | The vision encoder}}). vLLM must fit this into its token-based scheduler and its KV cache.</p>
+<p>The trick is the {{term placeholder-token}}. The {{term mm-processor | multimodal processor}} of the model replaces the image marker in the prompt with N placeholder tokens, one per encoder output vector. From then on, the scheduler treats the request as a normal prompt of text plus N tokens. When a step reaches the placeholders, the worker runs the encoder and splices the N vectors into the input embeddings. The {{term encoder-cache}} keeps the output, keyed by a hash of the image. So a long prompt split over several steps needs no second encoder run, and nor does a second request with the same image.</p>
+<p><strong>An everyday comparison.</strong> Think of a book with a figure. The typesetter leaves a blank area of the right size on the page (the placeholders). A separate studio draws the figure (the encoder), and the printer pastes it into the blank area. The comparison stops being true in one place. vLLM keeps the drawn figure in a cache, and can paste it into other books with the same figure.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b7b_mm_flow" alt="Three panels. Panel 1, API server: an image_url content part goes to the MediaConnector, which accepts base64 data URLs, http URLs limited by --allowed-media-domains with a 5 second VLLM_IMAGE_FETCH_TIMEOUT, and file URLs only under --allowed-local-media-path; the model's BaseMultiModalProcessor runs the HF processor to get pixel_values, inserts N placeholder tokens, computes the mm_hash and checks --limit-mm-per-prompt; the processor cache of 4 GiB by default, type lru, sends only the hash on a hit, and falls back to a processor-only cache with more than one API server, or with data parallelism without an external load balancer. Panel 2, engine core: the request has mm_features with the hash, the placeholder offset and length N, and the data; the prefix-cache key adds mm, hash and offset; the EncoderCacheManager counts in encoder embeddings with a size of the larger of max_num_batched_tokens and the largest item, and a hit by hash skips the encoder; the SchedulerOutput carries scheduled_encoder_inputs and free_encoder_mm_hashes; the encoder compute budget equals the encoder cache size. Panel 3, worker: the EncoderRunner skips cached items and runs model.embed_multimodal per modality, storing an output of N by hidden per hash; gather_mm_embeddings takes the slice of each item inside this step's token window and builds an is_mm_embed mask; the decoder forward calls embed_input_ids with the multimodal embeddings, so placeholder rows get image embeddings and text rows get token embeddings." caption="Figure: the API server makes placeholders (panel 1), the scheduler decides when the encoder runs (panel 2), and the worker caches the encoder output and merges it into the input embeddings (panel 3)." />
+<p>Read the panels from top to bottom; each panel is one process. N depends on the model and the image size, so the figure leaves it as a symbol. The amber box is the one cache that spans two processes.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: content parts and media loading</h3>
+<p>A chat message can hold a list of content parts. The renderer has one parser per part type:</p>
+<x-code file="vllm/renderers/chat_utils/chat_message.py" lines="101-119" />
+<p><code>image_url</code>, <code>audio_url</code>, <code>input_audio</code> and <code>video_url</code> load media. The <code>image_embeds</code>, <code>audio_embeds</code> and <code>video_embeds</code> parts take precomputed embeddings and need <code>--enable-mm-embeds</code>, which the config marks as "only for trusted users" ({{cite vllm/config/multimodal.py:326-338}}; the checks at {{cite vllm/renderers/chat_utils/content_parser.py:186-190}}, {{cite vllm/renderers/chat_utils/content_parser.py:214-218}}, {{cite vllm/renderers/chat_utils/content_parser.py:296-300}}). <code>prompt_embeds</code> needs <code>--enable-prompt-embeds</code> instead ({{cite vllm/renderers/chat_utils/content_parser.py:165-168}}). The renderer gets its media loader, the media connector, from a registry; <code>VLLM_MEDIA_CONNECTOR</code> picks it, default <code>http</code> ({{cite vllm/renderers/chat_utils/content_parser.py:140-151}}, {{cite vllm/envs.py:1072-1076}}).</p>
+<x-code file="vllm/multimodal/media/connector.py" lines="381-428" highlight="388-389,393-394,424-425" />
+<ul>
+  <li><strong><code>data:</code> URLs</strong> must be base64 ({{cite vllm/multimodal/media/connector.py:328-346}}).</li>
+  <li><strong>HTTP(S)</strong>: with <code>--allowed-media-domains</code> set, other hosts raise <code>ValueError</code> ({{cite vllm/multimodal/media/connector.py:370-379}}). Timeouts are <code>VLLM_IMAGE_FETCH_TIMEOUT</code> 5 s, <code>VLLM_VIDEO_FETCH_TIMEOUT</code> 30 s and <code>VLLM_AUDIO_FETCH_TIMEOUT</code> 10 s; one download is at most <code>VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB</code> 256 MB; redirects are allowed by default ({{cite vllm/envs.py:955-994}}). The timeouts are for the first attempt. By default vLLM makes up to 3 attempts, and each new attempt has a 4 times longer timeout ({{cite vllm/connections.py:292-306}}, {{cite vllm/connections.py:30}}).</li>
+  <li><strong><code>file:</code></strong> works only with <code>--allowed-local-media-path</code>, and only for files under it ({{cite vllm/multimodal/media/connector.py:348-368}}). The config calls this "a security risk" ({{cite vllm/config/model.py:231-237}}).</li>
+</ul>
+
+<h3>Step 2: the multimodal processor and its placeholders</h3>
+<p>Each multimodal model class registers its processor on the global <code>MULTIMODAL_REGISTRY</code> with a decorator ({{cite vllm/multimodal/__init__.py:7}}, {{cite vllm/multimodal/registry.py:82-113}}); Llava is one example ({{cite vllm/model_executor/models/llava.py:487-491}}). The registry builds the processor for the served model ({{cite vllm/multimodal/registry.py:150-166}}). Its <code>apply</code> method does the work:</p>
+<x-code file="vllm/multimodal/processing/processor.py" lines="1811-1847" highlight="1816-1826,1827,1830-1833,1840-1846" />
+<p>The result holds the new prompt token ids, the processed tensors (<code>mm_kwargs</code>), one hash per item, and the placeholder ranges. A range is an offset and a length in the prompt. The count limit is <code>--limit-mm-per-prompt</code>: 999 per modality when unset, capped by what the model supports. A prompt above it gets a validation error, "At most ... may be provided in one prompt." ({{cite vllm/config/multimodal.py:695-707}}, {{cite vllm/multimodal/processing/context.py:608-626}}).</p>
+<p><code>--mm-processor-kwargs</code> passes options to the HF processor, for example <code>{"num_crops": 4}</code> for Phi-3-Vision ({{cite vllm/config/multimodal.py:343-351}}). A request can also send <code>mm_processor_kwargs</code> or <code>media_io_kwargs</code>, but the server rejects non-empty values unless it runs with <code>--trust-request-mm-kwargs</code> ({{cite vllm/entrypoints/generate/base/protocol.py:70-95}}).</p>
+
+<h3>Step 3: the processor cache between the API server and the engine core</h3>
+<p>Processing an image can cost more than the HTTP request itself. The processor cache keeps processed items by hash. Its type depends on the deployment:</p>
+<x-code file="vllm/multimodal/cache/factories.py" lines="23-46" highlight="31-32,36-43" />
+<ul>
+  <li><strong><code>lru</code></strong> (default, one API server): the API server keeps a "sender" cache and the engine core a mirrored "receiver" cache. On a hit, the API server sends the hash without the data, and the engine core fills it in ({{cite vllm/multimodal/cache/factories.py:49-87}}).</li>
+  <li><strong><code>processor_only</code></strong>: with more than one API server, or with data parallelism without an external load balancer, only the API server caches its own processing results.</li>
+  <li><strong><code>shm</code></strong>: a shared-memory FIFO that the workers read; objects up to 128 MiB each ({{cite vllm/config/multimodal.py:369-378}}).</li>
+</ul>
+<p>The size is <code>--mm-processor-cache-gb</code>, 4 GiB by default, once per API server process and once per engine core ({{cite vllm/config/multimodal.py:357-368}}). The two mirrored caches can drift. The engine core then raises <code>MultiModalCacheMissError</code>, and the API server drops the stale entries so a retry sends the data again ({{cite vllm/multimodal/cache/base.py:33-52}}).</p>
+
+<h3>Step 4: the encoder cache and its budget in the scheduler</h3>
+<p>The scheduler owns an <code>EncoderCacheManager</code>. It counts in encoder embeddings, not in bytes, and shares entries between requests with the same hash ({{cite vllm/v1/core/encoder_cache_manager.py:19-46}}). Its size and the per-step encoder budget come from <code>compute_mm_encoder_budget</code>:</p>
+<x-code file="vllm/v1/core/encoder_cache_manager.py" lines="355-362" />
+<p>Both base values are <code>max_num_batched_tokens</code>; they are not configurable ({{cite vllm/config/scheduler.py:145-157}}, {{cite vllm/config/scheduler.py:306-307}}). So by default the cache holds as many embeddings as one step holds tokens, or one largest item if that is bigger.</p>
+<p>When the scheduler gives a request new tokens, it checks the multimodal items in that token window. It schedules an encoder input only if its output is not cached, there is budget, and the cache has room. Otherwise it stops the request's chunk just before the item ({{cite vllm/v1/core/sched/scheduler.py:2007-2032}}). The <code>SchedulerOutput</code> lists the scheduled inputs per request and the hashes that workers may drop ({{cite vllm/v1/core/sched/output.py:255}}, {{cite vllm/v1/core/sched/output.py:263}}).</p>
+
+<h3>Step 5: the encoder run in Model Runner V2</h3>
+<p>The worker keeps the encoder outputs in a dict from hash to tensor ({{cite vllm/v1/worker/gpu/mm/encoder_cache.py:8-13}}). Before the forward pass, the model state runs the encoder and builds the input embeddings:</p>
+<x-code file="vllm/v1/worker/gpu/model_states/default.py" lines="98-120" highlight="108-111,118-120" />
+<ol>
+  <li><code>prepare_mm_inputs</code> skips items that are already in the cache ({{cite vllm/v1/worker/gpu/mm/encoder_runner.py:81-108}}).</li>
+  <li><code>execute_mm_encoder</code> groups the items by modality and calls the model's <code>embed_multimodal</code>, or a captured encoder CUDA graph ({{cite vllm/v1/worker/gpu/mm/encoder_runner.py:150-176}}).</li>
+  <li><code>gather_mm_embeddings</code> takes, for each request, the part of each item that falls into this step's tokens, and a boolean mask <code>is_mm_embed</code>. A step with only decodes gathers nothing (except for realtime models). A missing cache entry raises <code>RuntimeError</code> ({{cite vllm/v1/worker/gpu/mm/encoder_runner.py:207-294}}).</li>
+  <li><code>get_inputs_embeds</code> calls the model's <code>embed_input_ids</code> with the embeddings and the mask, and copies the result into the fixed buffer for CUDA graphs ({{cite vllm/v1/worker/gpu/mm/encoder_runner.py:296-308}}).</li>
+</ol>
+<p>The worker drops entries when the scheduler lists them in <code>free_encoder_mm_hashes</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1187-1190}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: one image in a chunked prompt">
+<p>Example values: a server with <code>max_num_batched_tokens = 2048</code>, a prompt of 100 text tokens, then an image, then 50 text tokens. Assume the processor gives N = 1,500 placeholder tokens for this image (the real N depends on the model and the image size).</p>
+<ol>
+  <li><strong>API server.</strong> The prompt has 100 + 1,500 + 50 = 1,650 tokens. The placeholder range is offset 100, length 1,500. The item hash is computed from the image data (default hasher <code>blake3</code>, {{cite vllm/config/multimodal.py:372-374}}).</li>
+  <li><strong>Encoder budget.</strong> <code>max(2048, largest item)</code>. With 1,500 as the largest item for this model, the cache and the per-step budget are both 2,048 embeddings.</li>
+  <li><strong>Step 1.</strong> Suppose other requests leave 600 tokens of budget. The window is tokens 0 to 599, which reaches the image at 100. The image is not cached, budget and space are free, so the encoder runs for all 1,500 embeddings. The decoder uses positions 100 to 599 of it (500 rows).</li>
+  <li><strong>Step 2.</strong> The next chunk covers tokens 600 to 1,649. The scheduler finds the item in the cache, so the encoder does not run again. The worker gathers rows 500 to 1,499 of the cached output.</li>
+  <li><strong>Prefix cache.</strong> The KV blocks that contain image positions get the extra key <code>("mm", hash, offset)</code>, with the item offset relative to the block start. So a later request with the same image and the same text can hit these blocks; a different image cannot ({{cite vllm/v1/core/kv_cache_utils.py:559-574}}).</li>
+  <li><strong>End.</strong> When no running request needs the item, its cache entry becomes freeable. It is evicted only when space is needed. Then the hash goes to the workers in <code>free_encoder_mm_hashes</code>.</li>
+</ol>
+<x-simplified><p>With <code>--disable-chunked-mm-input</code>, step 1 would stop the chunk before position 100, because a chunk may not cover only part of an item ({{cite vllm/v1/core/sched/scheduler.py:1953-1970}}). Encoder-decoder models turn this option on by themselves ({{cite vllm/config/scheduler.py:295-298}}).</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Flags and environment variables">
+<table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--limit-mm-per-prompt</code></td><td>999 per modality</td><td>Count limit, also options per modality ({{cite vllm/config/multimodal.py:307-325}}).</td></tr>
+    <tr><td><code>--language-model-only</code></td><td>false</td><td>All limits 0: a text-only server ({{cite vllm/config/multimodal.py:304-306}}).</td></tr>
+    <tr><td><code>--mm-processor-kwargs</code></td><td>none</td><td>Options for the HF processor.</td></tr>
+    <tr><td><code>--media-io-kwargs</code></td><td>{}</td><td>Media loading options per modality, for example video <code>num_frames</code> ({{cite vllm/config/multimodal.py:339-342}}).</td></tr>
+    <tr><td><code>--mm-processor-cache-gb</code> / <code>--mm-processor-cache-type</code></td><td>4 / <code>lru</code></td><td>Step 3; 0 turns the cache off. Encoder-decoder models get 0 ({{cite vllm/config/model.py:826-828}}).</td></tr>
+    <tr><td><code>--mm-encoder-tp-mode</code></td><td><code>weights</code></td><td><code>data</code> splits the image batch over TP ranks instead of the weights, if the model supports it ({{cite vllm/config/multimodal.py:385-397}}).</td></tr>
+    <tr><td><code>--allowed-local-media-path</code>, <code>--allowed-media-domains</code></td><td>"", none</td><td>Step 1.</td></tr>
+    <tr><td><code>--enable-mm-embeds</code></td><td>false</td><td>Allows <code>*_embeds</code> parts.</td></tr>
+    <tr><td><code>VLLM_MEDIA_CACHE</code></td><td>"" (off)</td><td>Disk cache for downloads, 5,120 MB and 24 h by default when on ({{cite vllm/envs.py:966-978}}).</td></tr>
+    <tr><td><code>VLLM_MEDIA_LOADING_THREAD_COUNT</code></td><td>8</td><td>Threads that decode media bytes ({{cite vllm/envs.py:998-1000}}).</td></tr>
+    <tr><td><code>VLLM_MAX_AUDIO_CLIP_FILESIZE_MB</code></td><td>25</td><td>Size limit of one audio input ({{cite vllm/envs.py:1005-1007}}).</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Encoder-only (EPD) disaggregation">
+<p>vLLM can run the vision encoder in a separate instance and send the embeddings to the language-model instance. The docs list the gains: independent scaling, lower TTFT and shared reuse of encoder outputs ({{cite docs/features/disagg_encoder.md:1-8}}). An {{term ec-connector}} moves the encoder cache entries, as a KV connector moves KV blocks ({{link concepts/kv-connectors}}). <code>--ec-transfer-config</code> sets the connector and the role (<code>ec_producer</code>, <code>ec_consumer</code>, <code>ec_both</code>) ({{cite vllm/config/ec_transfer.py:16-45}}). A producer-only instance sets <code>mm_encoder_only</code> ({{cite vllm/config/vllm.py:2863-2875}}), turns off prefix caching ({{cite vllm/config/vllm.py:1505-1516}}), and its workers build an <code>MMEncoderModelRunner</code> instead of the normal Model Runner V2 ({{cite vllm/v1/worker/gpu_worker.py:567-576}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="Local files and remote URLs are an attack surface">
+<p><code>--allowed-local-media-path</code> lets any client read files under that folder. Without <code>--allowed-media-domains</code>, the API server fetches any HTTP URL that a client sends. Set both on a public server ({{cite vllm/multimodal/media/connector.py:348-379}}).</p>
+</x-warning>
+<ul>
+  <li><strong>"At most N image(s) may be provided in one prompt."</strong> The request is above <code>--limit-mm-per-prompt</code> or the model's own limit (Step 2).</li>
+  <li><strong>"Cannot load local files without <code>--allowed-local-media-path</code>."</strong> A <code>file:</code> URL without the flag ({{cite vllm/multimodal/media/connector.py:353-357}}).</li>
+  <li><strong>Slow TTFT for large images.</strong> The encoder runs inside the step that first reaches the image. The scheduler may also cut the chunk before an item that does not fit the encoder budget (Step 4).</li>
+  <li><strong>Per-request <code>mm_processor_kwargs</code> rejected.</strong> Start the server with <code>--trust-request-mm-kwargs</code> only for trusted clients (Step 2).</li>
+  <li><strong>Host memory.</strong> The processor cache exists once per API server and once per engine core (Step 3).</li>
+</ul>
+<p><strong>Why it matters.</strong> A multimodal request costs more than its token count shows: media download, processing, an encoder run and cache space. Knowing which cache sits where helps you to size the server and to keep repeated images cheap.</p>
+
+<x-quiz>
+  <x-q level="easy">What does a placeholder token stand for, and who inserts it?
+    <x-a><p>One encoder output vector of a multimodal item. The model's multimodal processor inserts them in <code>apply()</code> ({{cite vllm/multimodal/processing/processor.py:1816-1826}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">How large is the encoder cache with <code>max_num_batched_tokens = 8192</code> and a largest item of 1,200 embeddings, and in which unit?
+    <x-a><p>8,192 encoder embeddings: <code>max(8192, 1200)</code>. The unit is embeddings, not bytes or tokens of text ({{cite vllm/v1/core/encoder_cache_manager.py:355-362}}, {{cite vllm/v1/core/encoder_cache_manager.py:19-46}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You start 4 API servers. Which processor cache type does vLLM use, and what changes?
+    <x-a><p><code>processor_only</code>: IPC caching needs exactly one API process ({{cite vllm/multimodal/cache/factories.py:36-43}}). Each API server caches only its own processing results, and the engine core gets the full data every time.</p></x-a>
+  </x-q>
+  <x-q level="hard">A prompt with one image is split over two steps. Why does the encoder run only once, and how does the worker get the second half?
+    <x-a><p>In the second step the scheduler finds the item's hash in the encoder cache and does not schedule it again ({{cite vllm/v1/core/sched/scheduler.py:2007-2010}}). The worker's <code>gather_mm_embeddings</code> slices the cached output by the step's token window ({{cite vllm/v1/worker/gpu/mm/encoder_runner.py:240-290}}).</p></x-a>
+  </x-q>
+</x-quiz>

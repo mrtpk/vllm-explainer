@@ -50,6 +50,12 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
 
+- FINAL-PASS TODO (B7b FC): concepts/model-runner ~165 'drafts never go to the CPU' wrong for structured-output batches; learn/lora-adapters + frontend-plugins: no 'adapter loads inside the step' wording; slot layouts follow activation at load.
+
+- FINAL-PASS TODO (B7b): compile-and-cuda-graphs should mention LoRA doubles CUDA graph captures by default; engine-hooks should mention custom logits processor add_request default True forces the FP32 copy.
+
+- FINAL-PASS TODO (B8a, supervisor verified): pre_register_and_update runs 5× (not 4×, not 2×) in the serve front end: fix tours/life-of-a-plugin stop 5 + counts table + diagram b5t_plugin_life ("x 4"), concepts/platform-interface (~49, ~101-102, ~118), concepts/quantization-plugins ~136, diagram b4a_platform_hooks. check_and_update_config/apply_config_platform_defaults ALSO run in every engine core (core.py:1336-1337): fix tours/life-of-a-plugin ("runs only in the front end"; table "1 each"), concepts/platform-interface and plugin-map wherever they say front end only. reference/env-vars VLLM_ENGINE_READY_TIMEOUT_S row: only with >1 API server.
+
 - FINAL-PASS TODO (B7a/B6t FC): learn/openai-api ~69, ~207 and reference/serve-flags --api-key row need the /invocations, /ping limitation; concepts/model-runner ~173 cite vllm.py:713-734 → 713-748; STE warning in learn/processes-and-ipc.
 
 - FINAL-PASS TODO (B7a): learn/openai-api tool deep dive — required/named also need --enable-auto-tool-choice; Tour 1 stop 3 template resolution incomplete (add processor + built-in fallback or link renderers page). B9 must include the --api-key / /invocations limitation in deployment/production pages.
@@ -144,8 +150,11 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-23 04:01 | B6b fact check | done ~04:30: ~330 claims, 47 defects |
 | 2026-10-23 04:31 | B6t writer (tours/forward-pass) | done ~04:55; 2 diagrams |
 | 2026-10-23 04:56 | B6t fact check | done: ~125 claims, 16 defects |
-| 2026-10-23 06:03 | B7b writer | running |
-| 2026-10-23 06:03 | B8a writer | running |
+| 2026-10-23 06:03 | B7b writer | done ~06:55; 5 diagrams, b7b.json 19 terms |
+| 2026-10-23 06:56 | B7b fact check | done ~07:20: ~190 claims, ~50 defects |
+| 2026-10-23 07:21 | B8b writer | running |
+| 2026-10-23 06:03 | B8a writer | done ~06:40; 2 diagrams, b8a.json 7 terms |
+| 2026-10-23 06:41 | B8a fact check | running |
 | 2026-10-22 22:47 | B4a writer (plugin-map, platform-plugins, platform-interface + 2 modules + plugin timeline) | done ~23:25; 3 diagrams, b4a.json 5 terms |
 | 2026-10-22 23:26 | B4a fact check | done ~23:55: ~270 claims, 24 defects; OOT quant open question answered |
 | 2026-10-22 23:56 | B4b writer | cut off ~00:05, resumed 01:01, done ~01:45; 3 diagrams, b4b.json 11 terms |

@@ -1,0 +1,130 @@
+---
+title: Serving LoRA adapters: from the model name to the wrapped layer
+nav_title: Serving LoRA adapters
+level: Advanced
+prerequisites: learn/lora-adapters, concepts/scheduler, concepts/model-runner
+related: learn/lora-adapters, concepts/frontend-plugins, concepts/compile-and-cuda-graphs, learn/prefix-caching, concepts/scheduler, concepts/openai-server
+summary: The mechanics of multi-LoRA serving in vLLM - the LoRARequest of a request, the max_loras check in the scheduler, the worker's CPU and GPU adapter caches, the wrapped layers and the Punica kernels, token_lora_mapping in Model Runner V2, CUDA graphs per LoRA count, and the limits of runtime loading.
+---
+<x-sentence>A request names an adapter, and the scheduler limits adapters per step. The worker puts each adapter into a GPU slot, and wrapped layers add its update.</x-sentence>
+
+<h2>The idea</h2>
+<p>{{link learn/lora-adapters}} explains what a {{term lora-adapter}} is, why vLLM keeps adapters unmerged, and the flags with their real defaults (<code>--enable-lora</code> off, <code>--max-loras</code> 1, <code>--max-lora-rank</code> 16). This page follows one adapter through the processes of <code>vllm serve</code>.</p>
+<p>Four parts work together. The API server turns the <code>model</code> field into a {{term lora-request}}. The scheduler admits a request only if the step does not exceed <code>max_loras</code> adapters. The worker keeps adapters in two LRU caches: one in CPU memory, and a fixed number of {{term lora-slot | GPU slots}}. At model load, vLLM replaces each supported layer with a LoRA wrapper. The wrapper runs the base layer once for the batch and then calls the {{term punica}} kernels, which add each token's own adapter update.</p>
+<p><strong>An everyday comparison.</strong> Think of a print shop with one press and a rack of three stencil holders. The front desk writes the customer's stencil name on each order. The planner never puts more than three stencils into one run. The stock room keeps stencils on shelves and moves one into a holder when a run needs it. The comparison stops being true in one place: the shop moves a stencil into a holder only when a run needs it. vLLM also activates an adapter at once when you load it through the API.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b7b_lora_slots" alt="Three panels for one step with three adapters and max_loras 3. Panel 1: the API server turns model sql into a LoRARequest with lora_name sql, lora_int_id 1 and lora_path; the base model name gives None; an unknown name gives 404 or goes to a resolver. The scheduler sees running adapters 1, 2 and 3, equal to max_loras, so a waiting request for adapter 4 is skipped, while a request for a running adapter is admitted. The worker's _apply_adapters loads adapters that are not in the CPU cache from disk or the Hugging Face Hub and activates each one into a GPU slot, with LRU eviction. Panel 2: the GPU slots hold ids 1, 3 and 2 in slots 0, 1 and 2; LoraState repeats the per-request ids 1, 2, 0, 3 by the tokens per request 3, 1, 1, 2 into the token_lora_mapping 1,1,1,2,0,3,3; Punica update_metadata maps ids to slot indices 0,0,0,2,-1,1,1, where -1 means no adapter, and recomputes only when the mapping or the slot layout changes. Panel 3: the base layer computes y equal to x W for all 7 tokens with one GEMM; add_shrink computes an FP32 buffer of shape slices by 7 by 16 from x and the A matrix of each token's slot; add_expand adds the buffer times B of the slot to y; the scale is 1.0 because alpha over r was merged into B at load time." caption="Figure: the per-request adapter choice becomes a per-token slot index (panels 1-2). One base GEMM serves all tokens; shrink and expand pick A and B per token (panel 3)." />
+<p>Read the panels from top to bottom. Panel 1 runs in three processes: the API server, the engine core and the worker. Panels 2 and 3 run in the worker in every step. The slot layout <code>[1, 3, 2]</code> is one possible order, for example after an LRU eviction; it depends on when each adapter was activated. The worked example in the deep dive gets <code>[1, 2, 3]</code> from its start-up order.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the request gets a LoRARequest</h3>
+<p>The <code>model</code> field of a request selects the base model or an adapter; <code>_maybe_get_adapters</code> looks the name up ({{cite vllm/entrypoints/serve/engine/serving.py:194-200}}). The result is a small msgspec struct:</p>
+<x-code file="vllm/lora/request.py" lines="8-29" />
+<p><code>lora_int_id</code> must be above 0 ({{cite vllm/lora/request.py:37-39}}). Two LoRA requests are equal when their names are equal; the hash also uses only the name ({{cite vllm/lora/request.py:56-69}}). An unknown name gives HTTP 404. Only with <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code> does the server first ask the {{term lora-resolver | LoRA resolvers}} ({{cite vllm/entrypoints/serve/engine/serving.py:62-66}}; {{link concepts/frontend-plugins}}, Step 4).</p>
+
+<h3>Step 2: the scheduler limits adapters per step</h3>
+<p>At the start of the waiting pass, the scheduler collects the adapter ids of all running requests. This includes requests that are not scheduled in this step ({{cite vllm/v1/core/sched/scheduler.py:945-954}}). A waiting request with a new adapter is skipped when that set already has <code>max_loras</code> entries:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="998-1008" />
+<p>The skipped request goes back to the front of the queue and tries again in the next step. The gauge <code>vllm:lora_requests_info</code> shows <code>max_lora</code> and the waiting and running adapters as labels ({{cite vllm/v1/metrics/loggers.py:1099-1112}}).</p>
+
+<h3>Step 3: the worker loads and activates adapters</h3>
+<p>The LoRA manager exists only with <code>--enable-lora</code>. <code>load_lora_model</code> checks that the model supports LoRA, builds an <code>LRUCacheWorkerLoRAManager</code>, and wraps the model ({{cite vllm/v1/worker/lora_model_runner_mixin.py:43-66}}). In each step with LoRA requests, the model runner passes the active <code>LoRARequest</code>s to the manager ({{cite vllm/v1/worker/lora_model_runner_mixin.py:68-87}}):</p>
+<x-code file="vllm/lora/worker_manager.py" lines="273-324" highlight="279-284,295-303,309-313,323" />
+<ol>
+  <li>Lines 279-284: more adapters than GPU slots in one batch raises <code>RuntimeError</code>. The scheduler check of Step 2 prevents this.</li>
+  <li>Lines 295-303: an adapter that is not in the CPU cache is loaded from disk first.</li>
+  <li>Lines 309-313: when the CPU cache is full (<code>max_cpu_loras</code>), the oldest adapter is removed.</li>
+  <li>Line 323: <code>activate_adapter</code> puts the adapter into a GPU slot.</li>
+</ol>
+<p><strong>Loading.</strong> <code>_load_adapter</code> resolves the path. An absolute path is used as is. A path that does not exist locally is a Hugging Face Hub repository, and vLLM downloads it. With <code>VLLM_USE_MODELSCOPE</code>, it is a ModelScope repository ({{cite vllm/lora/utils.py:358-385}}). Then it checks the rank against <code>max_lora_rank</code> and loads the weights to CPU memory in the LoRA dtype ({{cite vllm/lora/worker_manager.py:119-150}}). When the adapter enters the cache, <code>alpha / r</code> is merged into B, so the kernels use scale 1.0 ({{cite vllm/lora/model_manager.py:907-908}}, {{cite vllm/lora/lora_weights.py:37-42}}).</p>
+<x-warning title="Loading an adapter stalls the engine loop">
+<p>In <code>vllm serve</code>, the front end loads a new adapter with <code>add_lora</code> before a request uses it: for <code>--lora-modules</code>, the load route and the resolvers ({{cite vllm/entrypoints/openai/models/serving.py:194-197}}, {{cite vllm/entrypoints/openai/models/serving.py:333-334}}). The engine core runs this call in its loop, between two steps ({{cite vllm/v1/engine/core.py:1661-1664}}, {{cite vllm/v1/engine/core.py:1752-1765}}). An adapter that the CPU cache evicted loads again inside the step, in <code>add_adapter</code>, with a GPU sync allowed ({{cite vllm/lora/worker_manager.py:294-303}}). In both cases, a download from the Hub or a slow disk delays every running request (derived). Preload the adapters, and set <code>--max-cpu-loras</code> high enough for all the adapters that you serve.</p>
+</x-warning>
+<p><strong>Activation.</strong> <code>activate_adapter</code> takes the first free slot and copies each module's A and B into the stacked buffers at that index ({{cite vllm/lora/model_manager.py:355-412}}). The LRU manager first deactivates the oldest active adapter when all slots are used ({{cite vllm/lora/model_manager.py:1440-1452}}). A module without weights in the adapter gets its slot zeroed (<code>reset_lora</code>).</p>
+
+<h3>Step 4: the wrapped layers</h3>
+<p>At model load, the LoRA model manager walks over all modules. Without <code>--lora-target-modules</code>, it wraps every supported module ({{cite vllm/lora/model_manager.py:476-500}}). <code>from_layer</code> picks the first LoRA class whose <code>can_replace_layer</code> accepts the layer, and allocates its buffers for <code>max_loras</code> slots ({{cite vllm/lora/utils.py:113-131}}). A <code>BaseLayerWithLoRA</code> keeps the original layer as <code>base_layer</code> and forwards unknown attributes to it ({{cite vllm/lora/layers/base.py:17-34}}). The linear wrappers run the base layer, then add the LoRA output:</p>
+<x-code file="vllm/lora/layers/base_linear.py" lines="208-233" highlight="211,231-232" />
+<p>The {{term punica}} wrapper class comes from the platform: <code>PunicaWrapperGPU</code> on CUDA ({{cite vllm/platforms/cuda.py:577-578}}, {{cite vllm/lora/punica_wrapper/punica_selector.py:13-21}}). <code>add_lora_linear</code> first runs a "shrink" (<code>x @ A</code>, into an FP32 buffer of rank width) and then an "expand" (<code>buffer @ B</code>, added to the output) ({{cite vllm/lora/punica_wrapper/punica_gpu.py:218-262}}). The kernels themselves are Triton code and out of scope.</p>
+
+<h3>Step 5: token_lora_mapping in Model Runner V2</h3>
+<p><code>LoraState</code> keeps one LoRA id per request slot; 0 means no adapter ({{cite vllm/v1/worker/gpu/lora_utils.py:75-89}}). In <code>execute_model</code>, it builds the per-token map and activates the adapters:</p>
+<x-code file="vllm/v1/worker/gpu/lora_utils.py" lines="94-104" />
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1850-1857" />
+<p>Punica turns LoRA ids into slot indices; a token without an adapter gets -1 ({{cite vllm/lora/punica_wrapper/utils.py:87-111}}). <code>set_adapter_mapping</code> rebuilds the metadata only when the mapping or the slot layout changed since the last step ({{cite vllm/lora/model_manager.py:1401-1409}}).</p>
+
+<h3>Step 6: CUDA graphs with LoRA</h3>
+<p>A CUDA graph fixes the number of active adapters it was captured with. So Model Runner V2 captures every capture size once per "LoRA case" ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:305-307}}), and a graph matches a batch only with the same case ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:136}}):</p>
+<x-code file="vllm/v1/worker/gpu/lora_utils.py" lines="20-35" />
+<ul>
+  <li>Default: <code>cudagraph_specialize_lora</code> is on, <code>specialize_active_lora</code> is off ({{cite vllm/config/compilation.py:663-669}}, {{cite vllm/config/lora.py:66-72}}). So the cases are <code>[0, max_loras + 1]</code>: one graph set for batches without adapters, one for batches with any adapters. LoRA start-up captures twice as many graphs.</li>
+  <li>With <code>--specialize-active-lora</code>: the cases are 0, the powers of 2 up to <code>max_loras</code>, and <code>max_loras + 1</code> ({{cite vllm/lora/utils.py:55-69}}). A batch with 3 adapters and <code>max_loras</code> 4 uses the case 4 ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:203-227}}).</li>
+</ul>
+<p>The number of active adapters for the dispatch is the set of <code>LoRARequest</code>s in the batch ({{cite vllm/v1/worker/gpu/lora_utils.py:38-49}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: three adapters in one step">
+<p>Server (example): <code>vllm serve meta-llama/Llama-3.1-8B-Instruct --enable-lora --max-loras 3 --lora-modules sql=/adapters/sql chat-de=/adapters/de legal=/adapters/legal</code>. The front end gives the adapters the ids 1, 2 and 3 when it registers them (<code>lora_id_counter</code>, {{cite vllm/entrypoints/openai/models/serving.py:167-184}}).</p>
+<ol>
+  <li><strong>Requests.</strong> R1 <code>model: "sql"</code> with a 3-token prefill chunk, R2 <code>"chat-de"</code> in decode, R3 the base model in decode, R4 <code>"legal"</code> with 2 tokens. Each request carries its <code>LoRARequest</code> to the engine core.</li>
+  <li><strong>Scheduler.</strong> The running set is <code>{1, 2, 3}</code>, equal to <code>max_loras</code>. A new waiting request for a fourth adapter is skipped. A new request for <code>sql</code> is admitted, because id 1 is already in the set.</li>
+  <li><strong>Worker, at start-up.</strong> The front end loaded the three adapters in the order of <code>--lora-modules</code>, and each <code>add_adapter</code> activated its adapter at once (Step 3, line 323). So slot 0 holds sql, slot 1 chat-de, slot 2 legal: <code>lora_index_to_id = [1, 2, 3]</code>.</li>
+  <li><strong>Worker, in this step.</strong> <code>_apply_adapters</code> gets <code>{1, 2, 3}</code>. All are in the CPU cache and active, so each <code>add_adapter</code> only touches the LRU, and <code>activate_adapter</code> changes nothing ({{cite vllm/lora/model_manager.py:360-361}}).</li>
+  <li><strong>Mapping.</strong> Per-request ids <code>[1, 2, 0, 3]</code>, tokens per request <code>[3, 1, 1, 2]</code> → <code>token_lora_mapping = (1, 1, 1, 2, 0, 3, 3)</code>. Punica slot indices: <code>(0, 0, 0, 1, -1, 2, 2)</code>.</li>
+  <li><strong>One q_proj.</strong> Base GEMM <code>[7, 4096] × [4096, 4096]</code>. Shrink buffer FP32 <code>[1, 7, 16]</code> (one slice for q_proj). Expand adds <code>[7, 4096]</code>. Token 4 (R3) has no adapter.</li>
+  <li><strong>CUDA graph.</strong> 3 adapters are active. With the default cases <code>[0, 4]</code>, the batch uses the LoRA graphs (case 4). A batch with only base-model requests uses case 0.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Memory per slot">
+<p>Each wrapped linear layer allocates <code>lora_a_stacked [max_loras, 1, max_lora_rank, input_size]</code> and <code>lora_b_stacked [max_loras, 1, output_size, max_lora_rank]</code> per slice ({{cite vllm/lora/layers/base_linear.py:133-154}}). The size follows the configured maximum rank, not the rank of the loaded adapters.</p>
+<p>{{link learn/lora-adapters}} computes the numbers for Llama-3.1-8B at rank 16 and TP = 1. The 7 linear layers of all 32 blocks take 83.9 MB, and <code>embed_tokens</code> and <code>lm_head</code> add 8.5 MB. So one slot holds <strong>92.4 MB</strong>. With <code>--max-loras 3</code> that is 277 MB; with <code>--max-loras 4 --max-lora-rank 64</code> it is 1.48 GB. This memory is reserved before the KV cache is sized. The CPU cache holds the loaded adapters at their own rank, in the LoRA dtype.</p>
+</x-deepdive>
+
+<x-deepdive title="Runtime load and unload: what really happens">
+<p>The routes <code>/v1/load_lora_adapter</code> and <code>/v1/unload_lora_adapter</code> exist only with <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code>, and vLLM logs that this "should ONLY be used for local development" ({{cite vllm/entrypoints/serve/lora/api_router.py:30-36}}).</p>
+<ol>
+  <li><strong>Load.</strong> The API server builds a <code>LoRARequest</code> and calls <code>engine_client.add_lora()</code> ({{cite vllm/entrypoints/openai/models/serving.py:179-197}}). The call goes <code>AsyncLLM.add_lora</code> → <code>EngineCore.add_lora</code> → <code>collective_rpc("add_lora")</code> on every worker → <code>add_adapter</code> ({{cite vllm/v1/engine/async_llm.py:1231-1233}}, {{cite vllm/v1/engine/core.py:1076-1077}}, {{cite vllm/v1/executor/abstract.py:363-365}}, {{cite vllm/v1/worker/lora_model_runner_mixin.py:296-298}}). <code>add_adapter</code> also activates the adapter into a GPU slot (line 323 in Step 3), which can evict another one.</li>
+  <li><strong>Unload.</strong> The API server only deletes the name from its dict ({{cite vllm/entrypoints/openai/models/serving.py:234-247}}). No code in <code>vllm/entrypoints/</code> calls the engine's <code>remove_lora</code> ({{cite vllm/v1/engine/core.py:1079-1080}}). The worker keeps the adapter in its CPU and GPU caches until LRU eviction needs the room.</li>
+  <li><strong>Reload in place</strong> from the same path keeps the old prefix-cache blocks valid, and vLLM warns about it ({{cite vllm/entrypoints/openai/models/serving.py:215-224}}).</li>
+  <li><strong>One API server.</strong> With <code>api_server_count</code> above 1, start-up fails ({{cite vllm/entrypoints/cli/serve.py:315-318}}).</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="LoRA and the prefix cache">
+<p>An adapter changes the KV values, so the block hash of a LoRA request includes <code>("lora", lora_name, lora_path)</code> ({{cite vllm/v1/core/kv_cache_utils.py:590-607}}). The same prompt with two adapters never shares blocks. See {{link learn/prefix-caching}}.</p>
+<p>LoRA also touches the compile hash: <code>max_num_batched_tokens</code> is part of the scheduler hash, and the LoRA buffers are one of the two reasons ({{cite vllm/config/scheduler.py:271-280}}). With speculative decoding, LoRA requires <code>max_num_batched_tokens ≥ max_num_seqs × (k + 1)</code> ({{cite vllm/engine/arg_utils.py:2700-2713}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Requests wait with many adapters.</strong> More distinct adapters than <code>--max-loras</code> among running requests make new requests wait (Step 2).</li>
+  <li><strong>Latency spikes on new adapters.</strong> Loading stops the engine loop while it runs (Step 3). Preload the adapters.</li>
+  <li><strong>"LoRA rank ... is greater than max_lora_rank".</strong> Raise <code>--max-lora-rank</code> to the largest rank you serve ({{link learn/lora-adapters}}).</li>
+  <li><strong>"... does not support LoRA yet."</strong> The model class does not implement <code>SupportsLoRA</code> ({{cite vllm/v1/worker/lora_model_runner_mixin.py:49-50}}).</li>
+  <li><strong>Unloaded adapters still use memory.</strong> Unload only removes the name in the API server (deep dive).</li>
+  <li><strong>Longer start-up.</strong> LoRA doubles the CUDA graph captures by default, and <code>--specialize-active-lora</code> adds more (Step 6).</li>
+</ul>
+<p><strong>Why it matters.</strong> Multi-LoRA serving puts many fine-tuned variants on one GPU. Its limits come from three fixed sizes: <code>max_loras</code> per step, <code>max_cpu_loras</code> in memory, and slot buffers sized for <code>max_lora_rank</code>.</p>
+
+<x-quiz>
+  <x-q level="easy">Which request field selects the adapter, and what does the API server make from it?
+    <x-a><p>The <code>model</code> field. The server returns the stored <code>LoRARequest</code> for that name ({{cite vllm/entrypoints/serve/engine/serving.py:194-200}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Where are the adapter weights after <code>_load_adapter</code>, and when do they reach the GPU?
+    <x-a><p>In CPU memory: the loader uses <code>device="cpu"</code> ({{cite vllm/lora/worker_manager.py:145}}). <code>activate_adapter</code> copies them into a GPU slot of the stacked buffers ({{cite vllm/lora/model_manager.py:355-412}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With default settings and <code>--max-loras 4</code>, which LoRA cases does Model Runner V2 capture CUDA graphs for?
+    <x-a><p><code>[0, 5]</code>: <code>cudagraph_specialize_lora</code> is on and <code>specialize_active_lora</code> is off, so the cases are 0 and <code>max_loras + 1</code> ({{cite vllm/v1/worker/gpu/lora_utils.py:29-35}}, {{cite vllm/lora/utils.py:64-65}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A batch has 7 tokens: 3 for adapter id 1, 1 for id 2, 1 base, 2 for id 3. The slots hold ids <code>[1, 3, 2]</code>. What are <code>token_lora_mapping</code> and the Punica slot indices?
+    <x-a><p><code>(1, 1, 1, 2, 0, 3, 3)</code> from <code>lora_ids.repeat(num_scheduled_tokens)</code> ({{cite vllm/v1/worker/gpu/lora_utils.py:100-102}}). Slot indices <code>(0, 0, 0, 2, -1, 1, 1)</code>: id → index in <code>lora_index_to_id</code>, and 0 → -1 ({{cite vllm/lora/punica_wrapper/utils.py:94-111}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You call <code>/v1/unload_lora_adapter</code> for "legal". Is GPU memory freed, and can a new request still use "legal"?
+    <x-a><p>No memory is freed: slot buffers are fixed at start-up, and the worker keeps the adapter until LRU eviction ({{cite vllm/lora/worker_manager.py:309-313}}). New requests get 404, because the API server deleted the name ({{cite vllm/entrypoints/openai/models/serving.py:244-246}}). Requests that already carry the <code>LoRARequest</code> continue (derived).</p></x-a>
+  </x-q>
+</x-quiz>

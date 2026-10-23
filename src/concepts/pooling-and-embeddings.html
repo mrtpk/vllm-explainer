@@ -1,0 +1,157 @@
+---
+title: Pooling models and embeddings in vLLM serving
+nav_title: Pooling and embeddings
+level: Advanced
+prerequisites: concepts/openai-server, concepts/model-runner
+related: concepts/frontend-plugins, concepts/openai-server, concepts/prefix-caching, concepts/async-scheduling, learn/openai-api, concepts/model-definition
+summary: How vLLM serves models that return vectors or scores instead of text - the pooling tasks, how --runner and --convert turn a generative architecture into a pooling model, the Pooler and PoolerConfig, the endpoints per task, the Model Runner V2 pooling runner, and what is turned off for pooling models.
+---
+<x-sentence>A pooling model runs the prompt once, reduces the hidden states to a vector or a score, and finishes. Its task decides the HTTP routes.</x-sentence>
+
+<h2>The idea</h2>
+<p>A generative model ends with an LM head and a sampler, and it runs many steps per request. A {{term pooling-model}} ends with a {{term pooler}}. The pooler turns the hidden states of the prompt into one vector (an embedding), a few class scores, or one vector per token. The request then finishes after its prompt is processed: there is no decode phase.</p>
+<p>vLLM runs one runner type per instance. With <code>--runner pooling</code>, the same engine core, scheduler and KV cache serve the request, but the worker calls the pooler instead of the sampler. vLLM can also convert a generative architecture: <code>--convert embed</code> or <code>--convert classify</code> wraps the model class. So, for example, a <code>*ForCausalLM</code> checkpoint can serve embeddings from its last hidden state.</p>
+<p><strong>An everyday comparison.</strong> A generative model is a writer who adds one word at a time. A pooling model is a reader who reads the whole text once and then writes one summary number or one index card. The comparison stops being true in one place. vLLM's reader may read a long text in several chunks, but only for some pooling types (Step 4).</p>
+
+<h2>The picture</h2>
+<x-diagram name="b7b_pooling_heads" alt="Three panels. Panel 1: --runner auto chooses pooling when the registry says the architecture is a pooling model or a sentence-transformers config exists, else by name suffix, for example ForCausalLM gives generate; --convert auto gives classify for ForSequenceClassification and embed for EmbeddingModel and other names ending in Model, and embed for a causal LM run as pooling; setting convert forces runner pooling; convert embed wraps the class with as_embedding_model and DispatchPooler.for_embedding, convert classify with as_seq_cls_model, which adds a score layer. Panel 2: the generative head computes logits and samples one token per step over many steps, with logits processors, speculative decoding and async scheduling; the pooler does sequence pooling LAST, MEAN or CLS with default LAST, or token pooling ALL or STEP, then a head with an optional projector, matryoshka dimensions and normalization; the request gets one output and finishes with FINISHED_STOPPED, async scheduling is off by default, logits processors are not allowed, and MEAN, CLS and STEP pooling turn off chunked prefill and prefix caching by default. Panel 3: the generate task has /v1/chat/completions, /v1/completions and /v1/responses; the pooling task routes are /pooling for any pooling task, /classify for classify, /v1/embeddings and /v2/embed for embed, and /v1/embeddings for token_embed; the scoring routes /score, /v1/score, /rerank, /v1/rerank and /v2/rerank exist only for embed, token_embed, or classify with num_labels equal to 1." caption="Figure: --runner and --convert decide the model class (panel 1), the pooler replaces the sampler and the request ends after one output (panel 2), and the pooling task decides the routes (panel 3)." />
+<p>Read the panels from top to bottom. Amber is the generative path, teal and emerald the pooling path. A generative model never gets the pooling routes, and a pooling model never gets the chat routes.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the pooling tasks</h3>
+<p>The task names are a <code>Literal</code> type. The old names <code>score</code> and <code>encode</code> are removed and raise a validation error with a hint:</p>
+<x-code file="vllm/tasks.py" lines="10-38" highlight="10-17,20-25,34-38" />
+<table>
+  <thead><tr><th>Task</th><th>Output</th><th>Typical model</th></tr></thead>
+  <tbody>
+    <tr><td><code>embed</code></td><td>one vector per request</td><td>sentence embedding models</td></tr>
+    <tr><td><code>classify</code></td><td>class scores per request; also cross-encoder scoring</td><td><code>*ForSequenceClassification</code>, rerankers</td></tr>
+    <tr><td><code>token_embed</code></td><td>one vector per token; late-interaction scoring</td><td>ColBERT-style models</td></tr>
+    <tr><td><code>token_classify</code></td><td>scores per token</td><td><code>*ForTokenClassification</code>, process reward models</td></tr>
+    <tr><td><code>plugin</code></td><td>whatever an IO processor plugin returns</td><td>see {{link concepts/frontend-plugins}}</td></tr>
+  </tbody>
+</table>
+<p>When a model supports several tasks, <code>get_pooling_task</code> picks one. The order is: <code>--pooler-config '{"task": ...}'</code> if set, else <code>token_classify</code> for <code>*ForTokenClassification</code>. Otherwise it takes the first of <code>embed&amp;token_classify</code>, <code>embed</code>, <code>classify</code>, <code>token_embed</code>, <code>token_classify</code>, <code>plugin</code> ({{cite vllm/config/model.py:1918-1951}}). Reward models have no own task name; their default convert is <code>embed</code> ({{cite vllm/config/model.py:2353-2354}}).</p>
+
+<h3>Step 2: --runner and --convert</h3>
+<p>Both options default to <code>auto</code> ({{cite vllm/config/model.py:163-169}}). The runner types are <code>generate</code>, <code>pooling</code> and <code>draft</code>; a pooling runner allows the converts <code>embed</code> and <code>classify</code> ({{cite vllm/config/scheduler.py:20}}, {{cite vllm/config/model.py:124-128}}).</p>
+<ul>
+  <li><strong>Runner.</strong> A set <code>--convert</code> forces <code>pooling</code>. Else a sentence-transformers config means pooling; else the registry decides; else the architecture suffix decides ({{cite vllm/config/model.py:1283-1329}}).</li>
+  <li><strong>Convert.</strong> A native pooling model needs none. Else the suffix decides, and a generative architecture run as pooling becomes <code>embed</code> ({{cite vllm/config/model.py:1331-1360}}).</li>
+</ul>
+<x-code file="vllm/config/model.py" lines="2340-2357" />
+<p>The convert is applied when vLLM resolves the model class ({{cite vllm/model_executor/model_loader/utils.py:325-333}}). <code>as_embedding_model</code> subclasses the model and gives it an embedding pooler. By default, it takes the normalized hidden state of the last token ({{cite vllm/model_executor/models/adapters.py:250-281}}). <code>as_seq_cls_model</code> adds a <code>score</code> linear layer with <code>num_labels</code> outputs and a classification pooler ({{cite vllm/model_executor/models/adapters.py:307-378}}). Both return a class unchanged if it already pools.</p>
+<pre><code class="language-bash">vllm serve Qwen/Qwen3-Embedding-0.6B --runner pooling
+# LAST-token embeddings from a chat model:
+vllm serve meta-llama/Llama-3.1-8B-Instruct --convert embed</code></pre>
+
+<h3>Step 3: Pooler and PoolerConfig</h3>
+<p>Every pooler implements one small interface:</p>
+<x-code file="vllm/model_executor/layers/pooler/abstract.py" lines="16-34" />
+<p><code>DispatchPooler</code> holds one sub-pooler per task and calls the one for the request's task ({{cite vllm/model_executor/layers/pooler/special.py:25-57}}). <code>--pooler-config</code> sets <code>PoolerConfig</code>:</p>
+<ul>
+  <li><strong>Pooling types.</strong> Sequence pooling <code>CLS</code>, <code>LAST</code>, <code>MEAN</code>; token pooling <code>ALL</code>, <code>STEP</code> ({{cite vllm/config/pooler.py:16-20}}). <code>pooling_type</code> fills one of the two by its value ({{cite vllm/config/pooler.py:143-168}}).</li>
+  <li><strong>Defaults.</strong> The user's value wins. Next comes the sentence-transformers config of the checkpoint, then the model class default ({{cite vllm/config/model.py:775-803}}). The class defaults are <code>LAST</code> and <code>ALL</code> ({{cite vllm/model_executor/models/interfaces_base.py:163}}, {{cite vllm/model_executor/models/interfaces_base.py:173}}).</li>
+  <li><strong>Normalization.</strong> <code>normalize</code> was removed; <code>use_activation</code> replaces it ({{cite vllm/config/pooler.py:125-137}}). For <code>embed</code>, an unset <code>use_activation</code> means true: the embedding is L2-normalized ({{cite vllm/pooling_params.py:215-217}}).</li>
+  <li><strong>Dimensions.</strong> A request can ask for fewer <code>dimensions</code> only if the model is matryoshka; the head then cuts the vector before it normalizes ({{cite vllm/pooling_params.py:219-242}}, {{cite vllm/model_executor/layers/pooler/seqwise/heads.py:84-115}}).</li>
+  <li><strong>Long inputs.</strong> <code>enable_chunked_processing</code> and <code>max_embed_len</code> let an embedding model accept inputs above its position limit, by weighted averaging of chunks; not for multimodal inputs ({{cite vllm/config/pooler.py:80-96}}).</li>
+</ul>
+
+<h3>Step 4: what is turned off for pooling models</h3>
+<ul>
+  <li><strong>Async scheduling</strong> is off by default for pooling models. The code says it "negatively impacts performance of pooling models" ({{cite vllm/config/vllm.py:1664-1675}}). An explicit <code>--async-scheduling</code> is not rejected.</li>
+  <li><strong>Chunked prefill and prefix caching.</strong> Encoder-only (bidirectional) pooling models support neither. Decoder pooling models support both only with <code>LAST</code> or <code>ALL</code> pooling; <code>MEAN</code>, <code>CLS</code> and <code>STEP</code> turn them off ({{cite vllm/config/model.py:2193-2228}}, {{cite vllm/config/model.py:2239-2270}}). These properties set only the defaults. An explicit <code>--enable-chunked-prefill</code> or <code>--enable-prefix-caching</code> only logs a warning that the model does not officially support it ({{cite vllm/engine/arg_utils.py:3031-3035}}, {{cite vllm/engine/arg_utils.py:3051-3060}}, {{cite vllm/engine/arg_utils.py:3069-3078}}).</li>
+  <li><strong>Logits processors.</strong> <code>--logits-processors</code> on a pooling model raises <code>ValueError</code>; entry-point processors are skipped ({{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:172-179}}).</li>
+  <li><strong>The sampler.</strong> The model runner builds a <code>PoolingRunner</code> instead of a sampler ({{cite vllm/v1/worker/gpu/model_runner.py:467}}, {{cite vllm/v1/worker/gpu/model_runner.py:534-535}}).</li>
+</ul>
+
+<h3>Step 5: the endpoints</h3>
+<p>The API server adds the pooling routes only when the model has a pooling task ({{cite vllm/entrypoints/launchers/api_server/routers.py:80-83}}). Which routes it adds depends on the task:</p>
+<x-code file="vllm/entrypoints/pooling/factories.py" lines="110-143" highlight="120-123,125-130,132-139,141-143" />
+<table>
+  <thead><tr><th>Route</th><th>When</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td><code>POST /pooling</code></td><td>any pooling task</td><td>{{cite vllm/entrypoints/pooling/pooling/api_router.py:27-28}}</td></tr>
+    <tr><td><code>POST /classify</code></td><td><code>classify</code> supported</td><td>{{cite vllm/entrypoints/pooling/classify/api_router.py:26}}</td></tr>
+    <tr><td><code>POST /v1/embeddings</code>, <code>/v2/embed</code></td><td><code>embed</code> supported and the selected task is not <code>token_embed</code> (the {{term embedding-endpoint}})</td><td>{{cite vllm/entrypoints/pooling/embed/api_router.py:28-29}}, {{cite vllm/entrypoints/pooling/embed/api_router.py:46-47}}</td></tr>
+    <tr><td><code>POST /v1/embeddings</code></td><td>task <code>token_embed</code>: per-token vectors</td><td>{{cite vllm/entrypoints/pooling/token_embed/api_router.py:25-26}}</td></tr>
+    <tr><td><code>/score</code>, <code>/v1/score</code>, <code>/rerank</code>, <code>/v1/rerank</code>, <code>/v2/rerank</code></td><td>selected task <code>embed</code> or <code>token_embed</code>, or <code>classify</code> with <code>num_labels == 1</code></td><td>{{cite vllm/entrypoints/pooling/utils.py:220-238}}</td></tr>
+  </tbody>
+</table>
+<p>The serving classes send the prompt with <code>PoolingParams</code> through <code>AsyncLLM.encode</code> ({{cite vllm/v1/engine/async_llm.py:1034-1037}}). An IO processor plugin turns custom input into pooling input, and the result into a custom response. Only the pooling entry points use it ({{link concepts/frontend-plugins}}, Step 2).</p>
+
+<h3>Step 6: the pooling runner in Model Runner V2</h3>
+<p>In a pooling model, the worker calls <code>model_runner.pool()</code> right after <code>execute_model</code>, not <code>sample_tokens</code> ({{cite vllm/v1/worker/gpu_worker.py:1355-1359}}). <code>pool()</code> calls the <code>PoolingRunner</code> and returns an <code>AsyncPoolingOutput</code>, which copies the result to the CPU on a side stream ({{cite vllm/v1/worker/gpu/model_runner.py:2318-2358}}):</p>
+<x-code file="vllm/v1/worker/gpu/pool/pooling_runner.py" lines="139-166" />
+<p>The pooling cursor knows, per request, which rows of this step belong to it and whether the prompt is complete (<code>finished_mask</code>). The scheduler then finishes a request as soon as its pooler output arrives:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="2263-2266" />
+<p>Model Runner V2 supports the tasks <code>embed</code>, <code>classify</code>, <code>token_embed</code>, <code>token_classify</code> and <code>embed&amp;token_classify</code>. A model whose selected task is not in this list fails at start-up with a hint to use <code>VLLM_USE_V2_MODEL_RUNNER=0</code> ({{cite vllm/v1/worker/gpu/pool/pooling_runner.py:20-50}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: one /v1/embeddings request with LAST pooling">
+<p>Server (example): <code>vllm serve meta-llama/Llama-3.1-8B-Instruct --convert embed</code> on one GPU. Hidden size 4,096.</p>
+<ol>
+  <li><strong>Start-up.</strong> <code>--convert embed</code> forces <code>--runner pooling</code>. The class becomes <code>LlamaForCausalLM</code> wrapped by <code>as_embedding_model</code>, named with the suffix <code>ForEmbedding</code> ({{cite vllm/model_executor/models/adapters.py:279}}). There is no sentence-transformers config, so <code>seq_pooling_type</code> is the class default <code>LAST</code>. Pooling task: <code>embed</code>. Async scheduling: off. Chunked prefill and prefix caching: allowed, because LAST pooling on a decoder model supports them.</li>
+  <li><strong>Routes.</strong> <code>/pooling</code>, <code>/v1/embeddings</code>, <code>/v2/embed</code>, and the score and rerank routes (embed enables scoring). No <code>/v1/chat/completions</code>.</li>
+  <li><strong>Request.</strong> <code>{"model": "...", "input": "vLLM is fast", "dimensions": 256}</code> → a validation error, because Llama-3.1 is not a matryoshka model (<code>is_matryoshka</code> reads the HF config, {{cite vllm/config/model.py:2083-2091}}). Without <code>dimensions</code>, the request goes through.</li>
+  <li><strong>Step.</strong> Say the prompt has 6 tokens. The scheduler schedules all 6; the forward pass gives <code>hidden_states [6, 4096]</code> for this request.</li>
+  <li><strong>Pool.</strong> LAST takes row 5: <code>[4096]</code>. The head casts it to the head dtype, applies no projector, keeps all 4,096 dimensions, and L2-normalizes it (<code>use_activation</code> true by default for embed).</li>
+  <li><strong>Finish.</strong> The output reaches the scheduler, the request becomes <code>FINISHED_STOPPED</code> in this same update, and the API server returns one vector of 4,096 floats.</li>
+</ol>
+<x-simplified><p>The prompt length, the route list and the matryoshka check follow the cited code; the client JSON is an example.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="PoolerConfig fields">
+<table>
+  <thead><tr><th>Field</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>task</code></td><td>none (auto)</td><td>Pick one of the model's tasks ({{cite vllm/config/pooler.py:33-36}}).</td></tr>
+    <tr><td><code>pooling_type</code> / <code>seq_pooling_type</code> / <code>tok_pooling_type</code></td><td>none → ST config → model default</td><td>Step 3.</td></tr>
+    <tr><td><code>use_activation</code></td><td>none (pooler default, mostly true)</td><td>Normalize (embed) or activation (classify) ({{cite vllm/config/pooler.py:60-64}}).</td></tr>
+    <tr><td><code>dimensions</code></td><td>none</td><td>Matryoshka truncation ({{cite vllm/config/pooler.py:75-79}}).</td></tr>
+    <tr><td><code>enable_chunked_processing</code>, <code>max_embed_len</code></td><td>false, none</td><td>Long-input embeddings ({{cite vllm/config/pooler.py:80-96}}).</td></tr>
+    <tr><td><code>logit_mean</code>, <code>logit_sigma</code></td><td>none</td><td>Score calibration: <code>activation((logit - mean) / sigma)</code> ({{cite vllm/config/pooler.py:98-111}}).</td></tr>
+    <tr><td><code>step_tag_id</code>, <code>returned_token_ids</code></td><td>none</td><td>Process reward models ({{cite vllm/config/pooler.py:113-121}}).</td></tr>
+  </tbody>
+</table>
+<p><code>PoolerConfig.compute_hash</code> has no factors: the pooler settings do not change the compiled graph ({{cite vllm/config/pooler.py:186-201}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Why some pooling types turn off chunked prefill and prefix caching">
+<p>The code does not state the reasons for the rule in <code>ModelConfig</code> (Step 4, {{cite vllm/config/model.py:2193-2228}}). The pooling methods show them:</p>
+<ul>
+  <li><strong>LAST</strong> takes the row of the last token in the step ({{cite vllm/model_executor/layers/pooler/seqwise/methods.py:50-57}}). Earlier chunks and cached prefix blocks only have to provide KV, which they do.</li>
+  <li><strong>MEAN</strong> and <strong>CLS</strong> raise <code>RuntimeError</code> for a partial prefill. MEAN divides the sum of the step's rows by the full prompt length ({{cite vllm/model_executor/layers/pooler/seqwise/methods.py:37-47}}, {{cite vllm/model_executor/layers/pooler/seqwise/methods.py:60-106}}). Only token pooling (ALL) keeps the rows of earlier chunks ({{cite vllm/v1/pool/metadata.py:48-54}}). A cached prefix block has KV but no hidden states, so a prefix-cache hit would also lose rows (derived).</li>
+  <li><strong>Bidirectional</strong> (encoder-only) models: every token attends to every other token, so a chunk cannot be computed before the rest of the prompt exists (derived).</li>
+</ul>
+<p>So a BERT-style embedding model processes each prompt in one step. Without chunked prefill, vLLM raises an unset <code>max_num_batched_tokens</code> to at least <code>max_model_len</code> ({{cite vllm/engine/arg_utils.py:3177-3186}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>404 on <code>/v1/chat/completions</code>.</strong> The model runs as a pooling model, so the generate routes do not exist ({{cite vllm/entrypoints/launchers/api_server/routers.py:55-60}}).</li>
+  <li><strong>No <code>/score</code> or <code>/rerank</code> for a classifier.</strong> Scoring needs <code>num_labels == 1</code> for <code>classify</code> ({{cite vllm/entrypoints/pooling/utils.py:231-236}}).</li>
+  <li><strong>"<code>score</code> task was removed".</strong> Use <code>classify</code>; <code>encode</code> became <code>token_embed</code> or <code>token_classify</code> ({{cite vllm/tasks.py:20-30}}).</li>
+  <li><strong>"Parameter <code>normalize</code> was removed".</strong> Use <code>use_activation</code> ({{cite vllm/config/pooler.py:125-135}}).</li>
+  <li><strong>"does not support Matryoshka embeddings".</strong> The request sent <code>dimensions</code> to a model without matryoshka support ({{cite vllm/pooling_params.py:225-230}}).</li>
+  <li><strong>Start-up error with a hint to <code>VLLM_USE_V2_MODEL_RUNNER=0</code>.</strong> The selected task is not one that Model Runner V2 supports (Step 6).</li>
+</ul>
+<p><strong>Why it matters.</strong> Embedding and reranking servers depend on settings that differ from chat serving. The pooling type decides whether chunked prefill and prefix caching work. The task decides which routes a client can call.</p>
+
+<x-quiz>
+  <x-q level="easy">Which option turns a <code>*ForCausalLM</code> checkpoint into an embedding model, and what does it do to the class?
+    <x-a><p><code>--convert embed</code>. vLLM wraps the class with <code>as_embedding_model</code>, which adds an embedding pooler ({{cite vllm/model_executor/model_loader/utils.py:328-330}}, {{cite vllm/model_executor/models/adapters.py:250-281}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A model is served with task <code>classify</code> and 3 labels. Which routes exist?
+    <x-a><p><code>/pooling</code> and <code>/classify</code>. No scoring routes, because <code>classify</code> enables them only with <code>num_labels == 1</code> ({{cite vllm/entrypoints/pooling/factories.py:120-130}}, {{cite vllm/entrypoints/pooling/utils.py:231-236}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does a decoder embedding model with MEAN pooling not use prefix caching?
+    <x-a><p><code>is_prefix_caching_supported</code> returns false for MEAN, CLS and STEP pooling on decoder models ({{cite vllm/config/model.py:2239-2270}}). MEAN needs the hidden states of all prompt tokens in one step, and it raises <code>RuntimeError</code> for a partial prefill ({{cite vllm/model_executor/layers/pooler/seqwise/methods.py:66-68}}). Cached KV blocks give no hidden states (derived).</p></x-a>
+  </x-q>
+  <x-q level="hard">In Model Runner V2, which call produces the pooler output, and when does the scheduler finish the request?
+    <x-a><p>The worker calls <code>model_runner.pool()</code> right after <code>execute_model</code> ({{cite vllm/v1/worker/gpu_worker.py:1355-1359}}); it runs the <code>PoolingRunner</code> and returns an <code>AsyncPoolingOutput</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2338-2357}}). The scheduler sets <code>FINISHED_STOPPED</code> in the update that receives the pooler output ({{cite vllm/v1/core/sched/scheduler.py:2263-2266}}).</p></x-a>
+  </x-q>
+</x-quiz>
