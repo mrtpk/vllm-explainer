@@ -1,7 +1,7 @@
 # vLLM Explainer — Progress
 
 Last update: 2026-10-22 19:10
-Current phase: **Full build** (plan §12; max 2 agents). Phase 1 samples done except the r1 fact check. — plan approved ("go", 2026-10-22 19:13). Running (4/4): foundation agent, reference-generators agent, 1b basics samples (learn/ml-basics-recap, learn/serving-metrics), 1b Tour 1 (tours/life-of-a-chat-request + request_stepper visual). The two 1b writers started early, in parallel with 1a (they may need small fixes after STYLE.md lands).
+Current phase: **Final pass** — all batches B1a–B9 written + fact-checked + committed; B10 writer and F1 consistency pass running. Then: B10 fact check, F2 site check, README. — plan approved ("go", 2026-10-22 19:13). Running (4/4): foundation agent, reference-generators agent, 1b basics samples (learn/ml-basics-recap, learn/serving-metrics), 1b Tour 1 (tours/life-of-a-chat-request + request_stepper visual). The two 1b writers started early, in parallel with 1a (they may need small fixes after STYLE.md lands).
 
 This file is the memory of the project. A new session must be able to continue from it alone.
 
@@ -105,7 +105,7 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 - FACT-CHECK FOCUS (all batches): b0 defect rate was ~41% (39/95). Brief every writer: check arg_utils overrides for defaults; FlashInfer sampler default; async scheduling default.
 
 - DECISION 1a questions: site/ is committed (as DeepInfer) at stage ends; code/v1-attention-backend merges backend.py + selector.py (OK); nav titles OK.
-- QUEUE (max 2 running): B7b FC, B8a FC, then B8b, B9, B10, F (final pass: consistency + site check + README). Pattern: one writer + one fact checker at a time.
+- QUEUE (max 2 running): B10 FC (after B10 writer), F2 site check (after F1 and B10 FC), README (supervisor), final commit, delete hourly cron. Pattern: one writer + one fact checker at a time.
 
 - FAQ material from b0: docs/design/metrics.md queue-time wording, arrival_time wording, TPOT formula differ from code (see notes/facts.md Conflicts).
 
@@ -163,6 +163,7 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-23 07:21 | B8b writer | done ~08:15; 6 diagrams, b8b.json 16 terms |
 | 2026-10-23 08:16 | B8b fact check | done ~08:40: ~260 ranges + ~60 claims, ~36 defects; traced /scale_elastic_ep |
 | 2026-10-23 08:41 | B10 writer | running |
+| 2026-10-23 08:52 | F1 final consistency pass (notes/final-pass-todo.md, 22 items) | running |
 | 2026-10-22 22:47 | B4a writer (plugin-map, platform-plugins, platform-interface + 2 modules + plugin timeline) | done ~23:25; 3 diagrams, b4a.json 5 terms |
 | 2026-10-22 23:26 | B4a fact check | done ~23:55: ~270 claims, 24 defects; OOT quant open question answered |
 | 2026-10-22 23:56 | B4b writer | cut off ~00:05, resumed 01:01, done ~01:45; 3 diagrams, b4b.json 11 terms |
