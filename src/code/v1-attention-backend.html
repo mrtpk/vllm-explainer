@@ -1,0 +1,148 @@
+---
+title: "v1/attention/backend.py and selector.py: the backend interfaces and the selector"
+nav_title: v1/attention/backend.py
+level: Advanced
+prerequisites: concepts/attention-backends, concepts/attention-backend-selection
+related: concepts/attention-backends, concepts/attention-backend-selection, code/model-executor-layers-attention-attention, concepts/compile-and-cuda-graphs, concepts/platform-interface, concepts/hybrid-kv-cache
+summary: vllm/v1/attention/backend.py defines the abstract classes of every attention backend (AttentionBackend, AttentionMetadataBuilder, AttentionImpl, MLAAttentionImpl), CommonAttentionMetadata and AttentionCGSupport. vllm/v1/attention/selector.py turns a layer's facts into one backend class through the platform, with a cache.
+---
+<h2>Purpose</h2>
+<p>These two files define what an attention backend must provide (<code>backend.py</code>) and how a layer gets one (<code>selector.py</code>).</p>
+
+<table>
+  <tbody>
+    <tr><th>Files</th><td><code>vllm/v1/attention/backend.py</code>, 1,150 lines; <code>vllm/v1/attention/selector.py</code>, 250 lines.</td></tr>
+    <tr><th>Main classes</th><td><code>AttentionBackend</code> ({{cite vllm/v1/attention/backend.py:59-379}}), <code>CommonAttentionMetadata</code> ({{cite vllm/v1/attention/backend.py:389-554}}), <code>AttentionMetadataBuilder</code> ({{cite vllm/v1/attention/backend.py:592-761}}), <code>AttentionImpl</code> ({{cite vllm/v1/attention/backend.py:890-1031}}), <code>MLAAttentionImpl</code> ({{cite vllm/v1/attention/backend.py:1034-1128}}); <code>get_attn_backend</code> ({{cite vllm/v1/attention/selector.py:109-203}}).</td></tr>
+    <tr><th>Runs in</th><td>Each worker: the selector while the model is built; the builders at KV cache init and in every step; the impls in every step.</td></tr>
+    <tr><th>Called by</th><td><code>Attention</code> and <code>MLAAttention</code> constructors (selector), <code>attn_utils.py</code> of Model Runner V2 (builders), the unified attention ops (impls).</td></tr>
+    <tr><th>Implemented by</th><td>The backend modules in <code>vllm/v1/attention/backends/</code>, for example <code>flash_attn.py</code>, and out-of-tree backends.</td></tr>
+    <tr><th>Not in this file</th><td>The backend enum and its registry (<code>backends/registry.py</code>), the platform priority lists ({{link concepts/attention-backend-selection}}), the KV cache layout resolver (<code>backends/utils.py</code>), kernels.</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b6b_attn_triad" alt="The backend class names an impl class and a builder class. At start-up each Attention layer makes an impl and the runner makes one builder per attention group. Each step the builder turns CommonAttentionMetadata into backend metadata, stored under every layer name of the group. Each layer's custom ops call the impl with the KV cache view and the metadata." caption="Figure: how the abstract classes of backend.py are used at start-up, per step and per layer." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Selector.</strong> <code>Attention.__init__</code> calls <code>get_attn_backend</code> ({{cite vllm/model_executor/layers/attention/attention.py:349-360}}). The MLA layer does the same with <code>use_mla=True</code>.</li>
+  <li><strong>Builders.</strong> <code>AttentionGroup.create_metadata_builders</code> instantiates them ({{cite vllm/v1/worker/utils.py:330-339}}); <code>build_attn_metadata</code> calls <code>build</code> ({{cite vllm/v1/worker/gpu/attn_utils.py:574-576}}).</li>
+  <li><strong>Impls.</strong> The unified ops call <code>impl.forward</code> and <code>impl.do_kv_cache_update</code> ({{link code/model-executor-layers-attention-attention}}).</li>
+  <li><strong>Platforms.</strong> CUDA calls <code>validate_configuration</code> on each candidate ({{cite vllm/platforms/cuda.py:389-417}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>current_platform.get_attn_backend_cls</code> and <code>resolve_obj_by_qualname</code> (selector, {{cite vllm/v1/attention/selector.py:218-228}}).</li>
+  <li><code>get_kv_quant_mode</code> for the impl's KV quantization mode ({{cite vllm/v1/attention/backend.py:895-898}}).</li>
+  <li><code>ops.concat_and_cache_mla</code> in the MLA cache write ({{cite vllm/v1/attention/backend.py:1118-1128}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Lines</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>AttentionType</code></td><td>{{cite vllm/v1/attention/backend.py:36-49}}</td><td>decoder, encoder, encoder_only, encoder_decoder; strings for <code>torch.compile</code>.</td></tr>
+    <tr><td><code>MultipleOf</code></td><td>{{cite vllm/v1/attention/backend.py:52-56}}</td><td>Kernel block sizes "any multiple of N".</td></tr>
+    <tr><td><code>AttentionBackend</code></td><td>{{cite vllm/v1/attention/backend.py:59-379}}</td><td>Static description: names, classes, <code>supports_*</code>, <code>validate_configuration</code>, layouts.</td></tr>
+    <tr><td><code>CommonAttentionMetadata</code></td><td>{{cite vllm/v1/attention/backend.py:389-554}}</td><td>Backend-neutral batch description per KV cache group.</td></tr>
+    <tr><td><code>AttentionCGSupport</code></td><td>{{cite vllm/v1/attention/backend.py:557-569}}</td><td>ALWAYS, UNIFORM_BATCH, UNIFORM_SINGLE_TOKEN_DECODE, NEVER.</td></tr>
+    <tr><td><code>max_decode_query_len</code></td><td>{{cite vllm/v1/attention/backend.py:572-589}}</td><td>Widest query that counts as a decode: <code>1 + num_speculative_tokens</code>.</td></tr>
+    <tr><td><code>AttentionMetadataBuilder</code></td><td>{{cite vllm/v1/attention/backend.py:592-761}}</td><td><code>build</code>, capture and drafting variants, CUDA graph support.</td></tr>
+    <tr><td><code>AttentionLayer</code></td><td>{{cite vllm/v1/attention/backend.py:764-782}}</td><td>Protocol: the scales and <code>forward</code> that an impl may read from its layer.</td></tr>
+    <tr><td><code>AttentionImplBase</code></td><td>{{cite vllm/v1/attention/backend.py:785-887}}</td><td>Shared attributes; DCP/PCP ranks set in <code>__new__</code>.</td></tr>
+    <tr><td><code>AttentionImpl</code></td><td>{{cite vllm/v1/attention/backend.py:890-1031}}</td><td><code>forward</code> plus optional fused-op hooks.</td></tr>
+    <tr><td><code>MLAAttentionImpl</code></td><td>{{cite vllm/v1/attention/backend.py:1034-1128}}</td><td><code>forward_mha</code> (prefill), <code>forward_mqa</code> (decode), shared cache write.</td></tr>
+    <tr><td><code>subclass_attention_backend(_with_overrides)</code></td><td>{{cite vllm/v1/attention/backend.py:1131-1150}}</td><td>Make a backend subclass with another builder or other members.</td></tr>
+    <tr><td><code>AttentionSelectorConfig</code></td><td>{{cite vllm/v1/attention/selector.py:25-65}}</td><td>The hashable set of facts that the platform sees.</td></tr>
+    <tr><td><code>get_attn_spec_kind</code></td><td>{{cite vllm/v1/attention/selector.py:68-106}}</td><td>Map a layer to a <code>KVCacheSpecKind</code> for per-kind overrides.</td></tr>
+    <tr><td><code>get_attn_backend</code>, <code>_cached_get_attn_backend</code></td><td>{{cite vllm/v1/attention/selector.py:109-228}}</td><td>Collect facts, pick the requested backend, ask the platform once per fact set.</td></tr>
+    <tr><td><code>get_mamba_attn_backend</code></td><td>{{cite vllm/v1/attention/selector.py:231-250}}</td><td>The same for Mamba-style layers, from their own enum.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>AttentionBackend.validate_configuration</code></h3>
+<x-code file="vllm/v1/attention/backend.py" lines="300-331" highlight="301-308,314-318,329-331" />
+<p>Each failed check adds a human-readable reason; an empty list means "valid". The rest of the method checks sliding window, R-SWA, non-causal attention, batch invariance, the KV connector, PCP, DCP and adaptive verification, then the backend's own <code>supports_combination</code> ({{cite vllm/v1/attention/backend.py:332-369}}). The page {{link concepts/attention-backend-selection}} shows how CUDA uses the reasons.</p>
+
+<h3><code>AttentionMetadataBuilder.__init__</code> and <code>build</code></h3>
+<x-code file="vllm/v1/attention/backend.py" lines="592-624" highlight="595,599,602,604,610,613-624" />
+<ol>
+  <li><strong>Line 595.</strong> CUDA graph support defaults to <code>NEVER</code>; read it through <code>get_cudagraph_support()</code> (line 594).</li>
+  <li><strong>Line 599.</strong> <code>reorder_batch_threshold</code>: the query length up to which the builder treats a request as a decode.</li>
+  <li><strong>Lines 602, 604, 610.</strong> Feature flags: block-table update, block-table width, capture-safe draft updates.</li>
+  <li><strong>Lines 613-624.</strong> The constructor gets the KV cache spec, the layer names of the group, the config and the device.</li>
+</ol>
+<p><code>build(common_prefix_len, common_attn_metadata, fast_build=False)</code> is abstract ({{cite vllm/v1/attention/backend.py:686-704}}). <code>build_for_cudagraph_capture</code> and <code>build_for_drafting</code> call it by default (lines 720-751).</p>
+
+<h3><code>AttentionImpl.forward</code></h3>
+<x-code file="vllm/v1/attention/backend.py" lines="900-929" />
+<p>The constructor takes the same ten arguments that <code>Attention.__init__</code> passes. <code>forward</code> gets the layer (for its scales), the tensors, the KV cache view, the metadata and the output buffer. The fused hooks (<code>do_rope_and_kv_cache_update</code> and others, lines 973-1031) are used only by Inductor fusion passes when the impl says it supports them.</p>
+
+<h3><code>get_attn_backend</code> (selector.py)</h3>
+<x-code file="vllm/v1/attention/selector.py" lines="157-203" highlight="158-180,184-192,196-203" />
+<ol>
+  <li><strong>Lines 158-180.</strong> The selector config mixes the layer's facts with run-wide facts: KV connector, PCP, DCP, batch invariance, adaptive verification and R-SWA.</li>
+  <li><strong>Lines 184-192.</strong> A per-kind override wins over the global backend.</li>
+  <li><strong>Lines 196-203.</strong> The cached call. The run-wide KV cache dtype is part of the cache key.</li>
+</ol>
+<p>The block size goes into the config only when the user set <code>--block-size</code> ({{cite vllm/v1/attention/selector.py:134-138}}). <code>_cached_get_attn_backend</code> is decorated with <code>@cache</code>, so each set of facts asks the platform once per process ({{cite vllm/v1/attention/selector.py:206-228}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="CommonAttentionMetadata helpers">
+<ul>
+  <li><code>naive_query_lens()</code>: <code>query_start_loc[1:] - query_start_loc[:-1]</code>, "naive" because it assumes that one query ends where the next starts ({{cite vllm/v1/attention/backend.py:482-484}}).</li>
+  <li><code>compute_num_computed_tokens()</code>: <code>seq_lens - query_lens</code> on the device, cached ({{cite vllm/v1/attention/backend.py:489-494}}).</li>
+  <li><code>token_to_req_indices(buffer)</code>: the request index of each token, built from the device <code>query_start_loc</code>, cached ({{cite vllm/v1/attention/backend.py:496-518}}).</li>
+  <li><code>unpadded(num_actual_tokens, num_actual_reqs)</code>: slice every field back to the real sizes, marked "remove once we have FULL-CG spec-decode support" ({{cite vllm/v1/attention/backend.py:520-554}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="AttentionImplBase.__new__ and context parallelism">
+<p>Every impl gets its DCP and PCP rank and world size in <code>__new__</code>, so subclasses need not call a base constructor ({{cite vllm/v1/attention/backend.py:853-878}}). <code>need_to_return_lse_for_decode</code> is true only with DCP &gt; 1 and an impl that can return the softmax LSE. The comment on <code>lse_base_on_e</code> warns that a wrong base "silently corrupts the cross-shard softmax denominator" ({{cite vllm/v1/attention/backend.py:808-818}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Writing a backend: the minimum">
+<ol>
+  <li>A subclass of <code>AttentionBackend</code> with <code>get_name</code>, <code>get_impl_cls</code> and <code>get_builder_cls</code> ({{cite vllm/v1/attention/backend.py:81-94}}), plus the <code>supports_*</code> answers that differ from the defaults.</li>
+  <li>A metadata dataclass and a builder with <code>__init__</code> and <code>build</code>; set <code>_cudagraph_support</code> if graphs are safe.</li>
+  <li>An impl with <code>__init__</code> and <code>forward</code>; if <code>forward_includes_kv_cache_update = False</code>, also <code>do_kv_cache_update</code>.</li>
+  <li>Registration through <code>register_backend</code> and selection by the platform or <code>--attention-backend</code> ({{link concepts/attention-backend-selection}}).</li>
+</ol>
+<p>(Derived from the abstract members of this file.)</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>unknown KV cache dtype string</td><td><code>AssertionError</code> "Invalid kv_cache_dtype"</td><td>{{cite vllm/v1/attention/selector.py:123-127}}</td></tr>
+    <tr><td>the platform returns no class name</td><td><code>ValueError</code> "Invalid attention backend for ..."</td><td>{{cite vllm/v1/attention/selector.py:223-226}}</td></tr>
+    <tr><td>Mamba backend without batch invariance under <code>VLLM_BATCH_INVARIANT</code></td><td><code>RuntimeError</code></td><td>{{cite vllm/v1/attention/selector.py:245-249}}</td></tr>
+    <tr><td>a builder without <code>update_block_table</code> asked to update</td><td><code>NotImplementedError</code></td><td>{{cite vllm/v1/attention/backend.py:706-718}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/attention-backends}}: the three classes in action, with the KV cache layout.</li>
+  <li>{{link concepts/attention-backend-selection}}: the platform side of the selector.</li>
+  <li>{{link concepts/compile-and-cuda-graphs}}: how <code>AttentionCGSupport</code> lowers the CUDA graph mode.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which three static methods must every backend implement?
+    <x-a><p><code>get_name</code>, <code>get_impl_cls</code> and <code>get_builder_cls</code> ({{cite vllm/v1/attention/backend.py:81-94}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does the selector pass <code>_run_kv_cache_dtype</code> to the cached function although the platform can read the config?
+    <x-a><p>So the cache key changes when the run-wide KV cache dtype changes. The comment says some platform selectors inspect it ({{cite vllm/v1/attention/selector.py:214-215}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">What does <code>max_decode_query_len</code> return with 4 speculative tokens on Model Runner V2, and who uses it?
+    <x-a><p>5 (<code>1 + 4</code>); the extra term for parallel drafting applies only to Model Runner V1 ({{cite vllm/v1/attention/backend.py:584-589}}). Builders that run spec decoding as decodes raise their <code>reorder_batch_threshold</code> to it ({{cite vllm/v1/attention/backend.py:666-678}}).</p></x-a>
+  </x-q>
+</x-quiz>

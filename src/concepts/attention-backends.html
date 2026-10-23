@@ -1,0 +1,176 @@
+---
+title: Attention backends: backend, metadata builder and implementation
+nav_title: Attention backends
+level: Advanced
+prerequisites: concepts/attention-backend-selection, concepts/forward-context, concepts/hybrid-kv-cache
+related: code/v1-attention-backend, concepts/attention-backend-selection, concepts/forward-context, concepts/compile-and-cuda-graphs, concepts/model-runner, concepts/hybrid-kv-cache, code/model-executor-layers-attention-attention, tours/forward-pass
+summary: An attention backend is three classes. The backend class describes what it supports, the metadata builder turns the common batch description of a KV cache group into backend metadata once per step, and the implementation writes the KV cache and runs the kernel for one layer. The builders also report how much CUDA graph capture they allow.
+---
+<x-sentence>An attention backend is three classes: a description, a metadata builder that runs once per step and group, and an implementation that runs per layer.</x-sentence>
+
+<h2>The idea</h2>
+<p>Attention computes softmax(QK<sup>T</sup>)V over the cached keys and values of each request ({{deepinfer learn/attention | Attention basics}}). vLLM has many {{term attention-backend | attention backends}}: FlashAttention, FlashInfer, Triton, FlashMLA and more. Which one a layer gets is decided when the model is built ({{link concepts/attention-backend-selection}}). This page explains what a backend is made of, and how vLLM calls it each step. Kernel code is out of scope.</p>
+<p>Each backend has three classes, with three lifetimes:</p>
+<ul>
+  <li><strong><code>AttentionBackend</code></strong>, a class with only static and class methods. It names the other two classes and answers questions: which head sizes, data types, block sizes and features it supports.</li>
+  <li><strong><code>AttentionMetadataBuilder</code></strong>, the {{term metadata-builder}}. The runner makes one per group of layers at start-up. Each step it turns the {{term common-attention-metadata}} into the backend's own {{term attention-metadata}}.</li>
+  <li><strong><code>AttentionImpl</code></strong>, one object per attention layer, made in the layer's constructor. Each step it writes the new keys and values into the KV cache and runs the kernel.</li>
+</ul>
+<p>The split saves work. Metadata depends on the batch, not on the layer. So a 32-layer model builds it once per group and step, and all 32 layers use the same object.</p>
+<p><strong>An everyday comparison.</strong> Think of a train line. The timetable office (the builder) prints one timetable for all trains each day. Each driver (the impl) reads the same timetable and drives one train. The rule book (the backend class) says which trains and tracks the line can use. The comparison stops here: a builder can also say that a CUDA graph cannot replay some batches. Then vLLM changes the whole run plan at start-up.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b6b_attn_triad" alt="Panel 1, at start-up: the Attention constructor gets a backend class from the selector and calls backend.get_impl_cls() to make one impl per layer. init_attn_backend groups the layers of each KV cache group by backend, KV cache spec and head count into attention groups, calls get_builder_cls() and makes the builders; it asks each builder for its AttentionCGSupport, takes the minimum, and resolve_cudagraph_mode_and_sizes may lower the CUDA graph mode. Panel 2, every step, for KV cache group 0 of Llama-3-8B: build_attn_metadata makes one CommonAttentionMetadata with query_start_loc, seq_lens, block_table_tensor, slot_mapping, num_reqs, num_actual_tokens and max_query_len; the FlashAttention builder.build turns it into FlashAttentionMetadata; the same object goes into the attn_metadata dict for all 32 layer names. Panel 3, every layer: the unified ops get the metadata from the forward context and call impl.do_kv_cache_update with the slot mapping, then impl.forward with q, k, v, the KV cache view [num_blocks, 8, 16, 256] and the metadata." caption="Figure: the three classes of an attention backend and when each one runs. The example is Llama-3-8B with FlashAttention, BF16, block size 16 and TP = 1." />
+<p>Read the diagram from top to bottom. Panel 1 runs once at start-up. Panel 2 runs once per KV cache group in every step. Panel 3 runs once per layer in every step, inside the forward pass.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the backend class names the two other classes</h3>
+<p>Every backend implements three abstract static methods ({{cite vllm/v1/attention/backend.py:81-94}}). FlashAttention, for example:</p>
+<x-code file="vllm/v1/attention/backends/flash_attn.py" lines="379-381" />
+<x-code file="vllm/v1/attention/backends/flash_attn.py" lines="414-420" />
+<p>The rest of the class answers questions. The <code>supports_*</code> class methods and <code>validate_configuration</code> are used during selection ({{link concepts/attention-backend-selection}}, {{cite vllm/v1/attention/backend.py:279-370}}). Four more members matter at run time:</p>
+<table>
+  <thead><tr><th>Member</th><th>Default</th><th>Used for</th></tr></thead>
+  <tbody>
+    <tr><td><code>forward_includes_kv_cache_update</code></td><td><code>True</code> ({{cite vllm/v1/attention/backend.py:69-70}})</td><td><code>False</code> means the layer calls the separate KV cache update op first ({{link concepts/forward-context}}). FlashAttention, FlashInfer and Triton set <code>False</code>.</td></tr>
+    <tr><td><code>get_supported_kernel_block_sizes()</code></td><td><code>[MultipleOf(1)]</code> ({{cite vllm/v1/attention/backend.py:75-80}})</td><td>Block sizes the kernel can use; the default block size and the kernel block size come from it ({{cite vllm/v1/attention/backend.py:155-163}}).</td></tr>
+    <tr><td><code>customize_spec()</code></td><td>no change ({{cite vllm/v1/attention/backend.py:140-152}})</td><td>Lets a backend pack its KV cache in another way. The comment calls it a "temporary compatibility API".</td></tr>
+    <tr><td><code>supported_kv_cache_layouts()</code></td><td><code>None</code> ({{cite vllm/v1/attention/backend.py:371-375}})</td><td>Physical memory layouts the kernels can read, most preferred first (Deep dive).</td></tr>
+  </tbody>
+</table>
+
+<h3>Step 2: one impl per layer</h3>
+<p>The <code>Attention</code> constructor makes the impl right after the backend is selected ({{cite vllm/model_executor/layers/attention/attention.py:419-432}}). The impl gets the per-rank head counts, the head size, the scale, the sliding window and the KV cache data type. The abstract forward has this signature:</p>
+<x-code file="vllm/v1/attention/backend.py" lines="916-929" />
+<p><code>query</code> is <code>[num_tokens, num_heads, head_size]</code>; the layer reshapes q, k and v before the op ({{cite vllm/model_executor/layers/attention/attention.py:533-540}}). The impl writes into <code>output</code>; it does not return a new tensor. Some backends set <code>forward_includes_kv_cache_update = False</code>. They also implement <code>do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)</code>, which writes the keys and values of the new tokens into their slots. For FlashAttention it is a scatter by slot ({{cite vllm/v1/attention/backends/flash_attn.py:1430-1464}}).</p>
+<p>In the profile run there is no metadata. FlashAttention then only fills the output with zeros ({{cite vllm/v1/attention/backends/flash_attn.py:1224-1226}}).</p>
+
+<h3>Step 3: attention groups and builders, at start-up</h3>
+<p>When the KV cache is initialized, <code>init_attn_backend</code> groups the layers. Inside each {{term kv-cache-group}}, layers with the same backend class, the same KV cache spec and the same number of query heads form one <code>AttentionGroup</code>:</p>
+<x-code file="vllm/v1/worker/gpu/attn_utils.py" lines="248-265" highlight="255-256,257-263" />
+<p>Then each group makes its builders. It passes the KV cache spec (with the kernel block size), the layer names, the config and the device ({{cite vllm/v1/worker/gpu/attn_utils.py:291-300}}, {{cite vllm/v1/worker/utils.py:330-339}}). Normally there is one builder per group; with dual-batch overlap there is one per micro-batch, because "some builders keep the prepared metadata on themselves" ({{cite vllm/v1/worker/gpu/attn_utils.py:296-299}}).</p>
+
+<h3>Step 4: CommonAttentionMetadata, once per KV cache group and step</h3>
+<p><code>build_attn_metadata</code> loops over the KV cache groups. For each group it makes one {{term common-attention-metadata}} from the step's input tensors ({{link concepts/model-runner}}):</p>
+<x-code file="vllm/v1/worker/gpu/attn_utils.py" lines="527-548" highlight="528-537" />
+<p>Mainly the block table and the slot mapping differ between groups: each group has its own block table and its own row of slot mappings ({{cite vllm/v1/worker/gpu/attn_utils.py:504-505}}). A hybrid drafter can also set a causal flag per group, and a model state can add its own fields ({{cite vllm/v1/worker/gpu/attn_utils.py:506-520}}). The main fields:</p>
+<table>
+  <thead><tr><th>Field</th><th>Type, shape</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>query_start_loc</code>, <code>query_start_loc_cpu</code></td><td>int32 <code>[num_reqs + 1]</code>, GPU and CPU</td><td>where each request's tokens start in the flat batch</td></tr>
+    <tr><td><code>seq_lens</code></td><td>int32 <code>[num_reqs]</code></td><td>computed tokens plus this step's tokens (see the warning below)</td></tr>
+    <tr><td><code>num_reqs</code>, <code>num_actual_tokens</code></td><td><code>int</code></td><td>batch size; token count, which may be padded</td></tr>
+    <tr><td><code>max_query_len</code>, <code>max_seq_len</code></td><td><code>int</code></td><td>longest query; longest context, maybe an upper bound</td></tr>
+    <tr><td><code>block_table_tensor</code></td><td>int32 <code>[num_reqs, max_num_blocks]</code></td><td>this group's block ids per request, in batch order</td></tr>
+    <tr><td><code>slot_mapping</code></td><td>int64 <code>[num_tokens]</code></td><td>KV cache slot of each new token; -1 for padding</td></tr>
+    <tr><td><code>causal</code></td><td><code>bool</code> or tensor</td><td>causal mask; per request for some models</td></tr>
+    <tr><td><code>is_prefilling</code>, <code>positions</code>, <code>seq_lens_cpu_upper_bound</code></td><td>optional</td><td>extras that some backends read</td></tr>
+  </tbody>
+</table>
+<p>Definitions: {{cite vllm/v1/attention/backend.py:389-475}}.</p>
+<x-warning title="The seq_lens docstring is misleading"><p>The docstring says <code>seq_lens</code> is "the number of computed tokens for each request" ({{cite vllm/v1/attention/backend.py:401-402}}). Model Runner V2 writes <code>num_computed_tokens + query_len</code> ({{cite vllm/v1/worker/gpu/input_batch.py:375-376}}), and <code>compute_num_computed_tokens()</code> subtracts the query lengths again to get the computed count ({{cite vllm/v1/attention/backend.py:489-494}}).</p></x-warning>
+
+<h3>Step 5: builder.build, and one metadata object for many layers</h3>
+<p>For each attention group of the KV cache group, the runner calls the builder and stores the result under every layer name of the group:</p>
+<x-code file="vllm/v1/worker/gpu/attn_utils.py" lines="550-580" highlight="561-564,574-576,579-580" />
+<ol>
+  <li><strong>Lines 553-560.</strong> Mamba groups with the same spec and builder reuse the first metadata and only swap the block table, through <code>update_block_table</code>.</li>
+  <li><strong>Lines 561-564.</strong> During CUDA graph capture, <code>build_for_cudagraph_capture</code> is called instead. Its default just calls <code>build</code> ({{cite vllm/v1/attention/backend.py:720-729}}).</li>
+  <li><strong>Lines 574-576.</strong> The normal path: <code>AttentionGroup.build_metadata</code> calls <code>build(common_prefix_len=0, common_attn_metadata)</code> ({{cite vllm/v1/worker/utils.py:341-352}}). The <code>common_prefix_len</code> argument is "Deprecated and always 0" ({{cite vllm/v1/attention/backend.py:686-704}}).</li>
+  <li><strong>Lines 579-580.</strong> The same object goes under every layer name of the group.</li>
+</ol>
+<p>If the backend's kernel uses smaller blocks than the KV cache manager, the attention group first rewrites the block table into kernel blocks ({{cite vllm/v1/worker/utils.py:368-378}}).</p>
+
+<h3>Step 6: CUDA graph support, and how it lowers the mode</h3>
+<p>A builder reports how much {{term cuda-graph}} capture it allows, with {{term cudagraph-support | AttentionCGSupport}}:</p>
+<x-code file="vllm/v1/attention/backend.py" lines="557-569" />
+<p>The default is <code>NEVER</code> ({{cite vllm/v1/attention/backend.py:593-595}}). The runner asks every group and keeps the weakest answer ({{cite vllm/v1/worker/gpu/attn_utils.py:314-341}}). Then <code>resolve_cudagraph_mode_and_sizes</code> may lower the configured mode ({{cite vllm/v1/worker/gpu/model_runner.py:754-763}}):</p>
+<ol>
+  <li><strong>FULL for mixed batches, but support below <code>ALWAYS</code>.</strong> <code>NEVER</code> raises <code>ValueError</code>. Otherwise the mode becomes <code>FULL_AND_PIECEWISE</code> if attention is a splitting op, else <code>FULL_DECODE_ONLY</code> ({{cite vllm/config/compilation.py:1394-1418}}).</li>
+  <li><strong>FULL decode graphs, but support <code>NEVER</code>.</strong> The mode becomes <code>PIECEWISE</code> if attention is compiled piecewise, else <code>NONE</code> ({{cite vllm/config/compilation.py:1421-1445}}).</li>
+  <li><strong>FULL decode graphs with speculative decoding</strong> (decode query length above 1), but support below <code>UNIFORM_BATCH</code>. The mode becomes <code>PIECEWISE</code> or <code>NONE</code> in the same way ({{cite vllm/config/compilation.py:1448-1465}}).</li>
+  <li>Last check: a mode with FULL graphs and support <code>NEVER</code> raises ({{cite vllm/config/compilation.py:1482-1493}}).</li>
+</ol>
+<p>Each change logs a warning that names the backend. {{link concepts/compile-and-cuda-graphs}} explains the modes.</p>
+
+<h3>Step 7: the MLA variant</h3>
+<p>Models with multi-head latent attention, such as DeepSeek-V3, use the layer <code>MLAAttention</code> and an impl based on <code>MLAAttentionImpl</code>. Its constructor gets the MLA dimensions and the <code>kv_b_proj</code> layer ({{cite vllm/v1/attention/backend.py:1034-1064}}). The impl has two paths instead of one <code>forward</code>:</p>
+<ul>
+  <li><code>forward_mqa</code> for decode tokens, over the compressed latent cache ({{cite vllm/v1/attention/backend.py:1080-1089}});</li>
+  <li><code>forward_mha</code> for prefill tokens, "MHA-style" ({{cite vllm/v1/attention/backend.py:1066-1079}}).</li>
+</ul>
+<p>The layer sends the first <code>num_decode_tokens</code> rows to <code>forward_mqa</code> and the rest to <code>forward_mha</code> ({{cite vllm/model_executor/layers/attention/mla_attention.py:984-985}}, {{cite vllm/model_executor/layers/attention/mla_attention.py:1017-1020}}). The MLA builder finds the split with <code>split_decodes_and_prefills</code> ({{cite vllm/model_executor/layers/attention/mla_attention.py:2605-2612}}). This is why Model Runner V2 puts the decodes first in the batch ({{cite vllm/v1/worker/gpu/model_runner.py:2476-2483}}). The cache write is one shared method, <code>do_kv_cache_update</code>, which calls the <code>concat_and_cache_mla</code> op ({{cite vllm/v1/attention/backend.py:1108-1128}}). The custom ops are <code>unified_mla_kv_cache_update</code> and <code>unified_mla_attention_with_output</code> ({{cite vllm/model_executor/layers/attention/mla_attention.py:1475-1479}}, {{cite vllm/model_executor/layers/attention/mla_attention.py:1524-1530}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Where get_kv_cache_shape went: the KV cache layout">
+<p>Older code and many guides use <code>AttentionBackend.get_kv_cache_shape()</code>. At this commit the base class has no such method; only one MLA backend still defines it (<code>git grep</code>, {{cite vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py:227}}). The shape now comes from the KV cache spec and a layout descriptor:</p>
+<ol>
+  <li><strong>Logical shape per layer.</strong> <code>[B, H, N, C]</code>: blocks, head slots, states (tokens) per block, and C bytes of content ({{cite vllm/v1/kv_cache_interface.py:345-361}}). For normal attention, C is <code>(head_size + head_size_v) × dtype bytes</code>: key and value of one token and head ({{cite vllm/v1/kv_cache_interface.py:570-575}}).</li>
+  <li><strong>Physical order.</strong> A <code>KVCacheLayout</code> member is a permutation of <code>[L, B, H, N, C]</code>, where L is the layer inside a shared allocation ({{cite vllm/v1/kv_cache_layout.py:11-28}}).</li>
+  <li><strong>Choice.</strong> The engine core resolves one layout for the whole model. A backend lists the layouts it can read with <code>supported_kv_cache_layouts()</code>; with no list from any backend, the default preference starts with <code>LBNHC</code> ({{cite vllm/v1/attention/backends/utils.py:228-235}}, {{cite vllm/v1/attention/backends/utils.py:240-276}}). <code>VLLM_KV_CACHE_LAYOUT</code> can force a layout that every backend supports ({{cite vllm/v1/attention/backends/utils.py:361-367}}).</li>
+  <li><strong>Views.</strong> <code>allocate_kv_cache</code> allocates one int8 buffer and makes a strided view per layer, then casts it to the KV dtype ({{cite vllm/v1/worker/utils.py:564-625}}, {{cite vllm/v1/kv_cache_interface.py:461-466}}).</li>
+</ol>
+<p><strong>FlashAttention, traced.</strong> FlashAttention declares no layout list (it does not override the method), so a model with only FlashAttention layers gets <code>LBNHC</code>. Its forward docstring gives the view: <code>[num_blocks, num_kv_heads, block_size, 2 * head_size]</code> ({{cite vllm/v1/attention/backends/flash_attn.py:1199-1200}}). The cache write transposes it to <code>(B, N, H, 2D)</code> and splits the last dimension into a key half and a value half ({{cite vllm/v1/attention/backends/flash_attn.py:1445-1446}}). With <code>LBNHC</code>, the N axis is outside the H axis in memory (derived). <strong>FlashInfer</strong> on compute capability 10 lists <code>LBHNC</code> first, because "the trtllm-gen kernels consume head-major block interiors" ({{cite vllm/v1/attention/backends/flashinfer.py:700-706}}).</p>
+<p>Worked example: Llama-3-8B with TP = 1, BF16 and block size 16. The view of one layer is <code>[num_blocks, 8, 16, 256]</code> bfloat16. So one block of one layer is 8 × 16 × 256 × 2 = 65,536 bytes (derived from the formula above). {{link concepts/hybrid-kv-cache}} explains page sizes across groups.</p>
+</x-deepdive>
+
+<x-deepdive title="FlashAttention metadata, field by field">
+<x-code file="vllm/v1/attention/backends/flash_attn.py" lines="516-548" />
+<p>The builder copies most fields straight from the common metadata ({{cite vllm/v1/attention/backends/flash_attn.py:821-829}}). It adds backend-only fields, for example <code>scheduler_metadata</code> for ahead-of-time scheduling and the DCP context lengths. The <code>fast_build</code> flag "disables AOT scheduling, used when there will be few iterations i.e. spec-decode" ({{cite vllm/v1/attention/backends/flash_attn.py:818-820}}). Its CUDA graph support is <code>ALWAYS</code> with FlashAttention 3 or 4 (or on XPU), else <code>UNIFORM_BATCH</code> ({{cite vllm/v1/attention/backends/flash_attn.py:612-621}}).</p>
+</x-deepdive>
+
+<x-deepdive title="AttentionCGSupport of common backends">
+<table>
+  <thead><tr><th>Builder</th><th>Support</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>FlashAttention</td><td><code>ALWAYS</code> with FA3/FA4 or XPU, else <code>UNIFORM_BATCH</code></td><td>{{cite vllm/v1/attention/backends/flash_attn.py:617-621}}</td></tr>
+    <tr><td>FlashInfer</td><td><code>UNIFORM_BATCH</code> when every layer can use the TRT-LLM decode path (with extra rules on SM90 and SM12x), else <code>UNIFORM_SINGLE_TOKEN_DECODE</code>; always the latter with DCP</td><td>{{cite vllm/v1/attention/backends/flashinfer.py:1145-1189}}</td></tr>
+    <tr><td>Triton</td><td><code>ALWAYS</code></td><td>{{cite vllm/v1/attention/backends/triton_attn.py:96}}</td></tr>
+    <tr><td>FlashAttention MLA</td><td><code>UNIFORM_BATCH</code></td><td>{{cite vllm/v1/attention/backends/mla/flashattn_mla.py:127}}</td></tr>
+    <tr><td>FlashMLA</td><td><code>UNIFORM_BATCH</code></td><td>{{cite vllm/v1/attention/backends/mla/flashmla.py:110}}</td></tr>
+    <tr><td>base class</td><td><code>NEVER</code></td><td>{{cite vllm/v1/attention/backend.py:593-595}}</td></tr>
+  </tbody>
+</table>
+<p>Example: Llama-3-8B on an H100 with FlashAttention 3 reports <code>ALWAYS</code>, so the default <code>FULL_AND_PIECEWISE</code> stays. With FlashInfer at <code>UNIFORM_SINGLE_TOKEN_DECODE</code> and EAGLE drafts (decode query length 1 + k), rule 3 of Step 6 lowers the mode to <code>PIECEWISE</code> (derived). The design document has a similar table ({{cite docs/design/cuda_graphs.md:173-187}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Other builder hooks">
+<ul>
+  <li><code>reorder_batch_threshold</code>: the query length up to which the builder treats a request as a decode. <code>_init_reorder_batch_threshold</code> raises it to <code>1 + num_speculative_tokens</code> for backends that run speculative verification as decodes ({{cite vllm/v1/attention/backend.py:658-684}}, {{cite vllm/v1/attention/backend.py:572-589}}).</li>
+  <li><code>update_block_table</code>: reuse metadata with another block table; only when <code>supports_update_block_table</code> is true ({{cite vllm/v1/attention/backend.py:706-718}}).</li>
+  <li><code>build_for_drafting</code>: metadata for a draft model, with <code>fast_build=True</code> ({{cite vllm/v1/attention/backend.py:731-751}}).</li>
+  <li><code>update_draft_decode_metadata</code>: capture-safe update between draft steps, for the fused multi-step draft graph ({{cite vllm/v1/attention/backend.py:753-761}}, {{cite docs/design/model_runner_v2.md:194-200}}).</li>
+  <li><code>get_varlen_cudagraph_max_query_len</code>: the largest per-request query length that a FULL graph of this builder can replay in a variable-length decode batch ({{cite vllm/v1/attention/backend.py:635-656}}).</li>
+</ul>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A backend with no CUDA graph support and <code>-cc.cudagraph_mode=FULL</code>.</strong> Start-up stops with "CUDAGraphMode.FULL is not supported with ... backend (support: NEVER); please try cudagraph_mode=PIECEWISE" ({{cite vllm/config/compilation.py:1400-1410}}).</li>
+  <li><strong>Silent mode changes.</strong> A weaker backend lowers <code>FULL_AND_PIECEWISE</code> to <code>PIECEWISE</code> or <code>NONE</code> with only a warning. Decode then loses its full graph and gets slower. Look for "is not supported with" in the log.</li>
+  <li><strong>Batch invariance.</strong> With <code>VLLM_BATCH_INVARIANT=1</code>, a backend without <code>supports_batch_invariance()</code> raises <code>RuntimeError</code> in <code>init_attn_backend</code> ({{cite vllm/v1/worker/gpu/attn_utils.py:235-242}}).</li>
+  <li><strong>A layout that some backend cannot read.</strong> <code>VLLM_KV_CACHE_LAYOUT</code> outside the supported set raises <code>ValueError</code>; backends with no common layout raise too ({{cite vllm/v1/attention/backends/utils.py:361-367}}, {{cite vllm/v1/attention/backends/utils.py:271-276}}).</li>
+  <li><strong>Fused output quantization on FlashAttention.</strong> Its forward raises <code>NotImplementedError</code> when it gets an output scale ({{cite vllm/v1/attention/backends/flash_attn.py:1219-1222}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> A backend plugin implements these three classes. The builder decides the CPU cost of each step and whether decode can use a FULL CUDA graph; the impl decides the GPU cost. When a deployment is slower than expected, check which backend each layer got and which CUDA graph mode survived start-up.</p>
+
+<x-quiz>
+  <x-q level="easy">How many FlashAttention metadata objects does Llama-3-8B build per step, and how many impl objects exist?
+    <x-a><p>One metadata object per step: one KV cache group, one attention group, stored under all 32 layer names ({{cite vllm/v1/worker/gpu/attn_utils.py:579-580}}). There are 32 impl objects, one per <code>Attention</code> layer ({{cite vllm/model_executor/layers/attention/attention.py:419-432}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Which class decides which CUDA graph modes are possible, and through which method?
+    <x-a><p>The metadata builder, through <code>get_cudagraph_support()</code>, which returns an <code>AttentionCGSupport</code> ({{cite vllm/v1/attention/backend.py:626-633}}). The runner takes the minimum over all groups and passes it to <code>resolve_cudagraph_mode_and_sizes</code> ({{cite vllm/v1/worker/gpu/model_runner.py:754-763}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">What is in <code>seq_lens</code> of <code>CommonAttentionMetadata</code> for a decode request with 40 computed tokens?
+    <x-a><p>41: computed tokens plus the 1 new query token. Model Runner V2 writes <code>num_computed_tokens + query_len</code> ({{cite vllm/v1/worker/gpu/input_batch.py:375-376}}), although the docstring says "computed tokens" ({{cite vllm/v1/attention/backend.py:401-402}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A model runs FlashInfer with support <code>UNIFORM_SINGLE_TOKEN_DECODE</code>, with EAGLE and 3 speculative tokens, at the default O2. Which CUDA graph mode does it get, and why?
+    <x-a><p><code>PIECEWISE</code>. O2 sets <code>FULL_AND_PIECEWISE</code>, whose decode mode is FULL. The decode query length is 1 + 3 = 4 &gt; 1, and the support is below <code>UNIFORM_BATCH</code>. Attention is a splitting op by default, so the mode becomes <code>PIECEWISE</code> ({{cite vllm/config/compilation.py:1448-1465}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Where does FlashAttention write the new keys, and what memory layout does it see?
+    <x-a><p>In <code>do_kv_cache_update</code>, called by the separate update op because <code>forward_includes_kv_cache_update = False</code>. It views the cache <code>[B, H, N, 2D]</code> as <code>(B, N, H, 2D)</code> and splits it into a key half and a value half. Then it scatters the new rows by slot mapping ({{cite vllm/v1/attention/backends/flash_attn.py:1430-1464}}).</p></x-a>
+  </x-q>
+</x-quiz>

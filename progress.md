@@ -50,6 +50,8 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
 
+- FINAL-PASS TODO (B6b FC): reference/env-vars VLLM_LOG_BATCHSIZE_INTERVAL text ('after every forward' wrong); any page saying an mp worker always uses WorkerAsyncOutputCopy.
+
 - FINAL-PASS TODO (B5t FC, supervisor verified): pre_register_and_update runs 4× in the vllm serve front end, not twice: fix concepts/platform-interface ~49, ~101-102, ~118; concepts/quantization-plugins ~136; diagram b4a_platform_hooks (used on platform-interface and code/platforms-interface ~25); also facts docstring note.
 
 - FINAL-PASS TODO (B6a FC): learn/tp-pp-in-practice ~47 '64 all-reduces per step' → align with 65 (64 + embedding) on model-definition; any page saying the completeness check catches missing linear weights in BF16 models; TeleChat2 mapper-only; SupportsQuant remapping Llama names.
@@ -133,7 +135,9 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-23 03:57 | B7a writer | running |
 | 2026-10-23 02:11 | B6a writer | done ~02:50; 3 diagrams, b6a.json 13 terms |
 | 2026-10-23 02:51 | B6a fact check | done ~03:15: ~175 claims, 26 defects |
-| 2026-10-23 03:16 | B6b writer | running |
+| 2026-10-23 03:16 | B6b writer | done ~04:00; 6 diagrams, b6b.json 18 terms |
+| 2026-10-23 04:01 | B6b fact check | done ~04:30: ~330 claims, 47 defects |
+| 2026-10-23 04:31 | B6t writer (tours/forward-pass) | running |
 | 2026-10-22 22:47 | B4a writer (plugin-map, platform-plugins, platform-interface + 2 modules + plugin timeline) | done ~23:25; 3 diagrams, b4a.json 5 terms |
 | 2026-10-22 23:26 | B4a fact check | done ~23:55: ~270 claims, 24 defects; OOT quant open question answered |
 | 2026-10-22 23:56 | B4b writer | cut off ~00:05, resumed 01:01, done ~01:45; 3 diagrams, b4b.json 11 terms |

@@ -1,0 +1,214 @@
+---
+title: "v1/worker/gpu/model_runner.py: Model Runner V2"
+nav_title: worker/gpu/model_runner.py
+level: Advanced
+prerequisites: concepts/model-runner, concepts/executors-and-workers
+related: concepts/model-runner, concepts/forward-context, concepts/attention-backends, concepts/compile-and-cuda-graphs, concepts/async-scheduling, code/v1-worker-gpu-worker, code/forward-context, tours/engine-step
+summary: vllm/v1/worker/gpu/model_runner.py holds GPUModelRunner, the default model runner (MRV2). It loads the model, sets up the KV cache, attention backends and CUDA graphs, and per step turns a SchedulerOutput into GPU inputs, runs the forward pass and samples into an AsyncOutput.
+---
+<h2>Purpose</h2>
+<p><code>vllm/v1/worker/gpu/model_runner.py</code> is the GPU half of an engine step: it keeps the request states on the GPU, builds each step's inputs, runs the model and samples the next tokens.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/v1/worker/gpu/model_runner.py</code>, 2,483 lines. The header asks contributors to keep the file "minimal" and to put model-specific code elsewhere ({{cite vllm/v1/worker/gpu/model_runner.py:3-17}}).</td></tr>
+    <tr><th>Main class</th><td><code>GPUModelRunner(LoRAModelRunnerMixin)</code> ({{cite vllm/v1/worker/gpu/model_runner.py:199}}).</td></tr>
+    <tr><th>Runs in</th><td>Each {{term worker}} process, or the engine core process with the {{term uni-executor}}. The Python code runs on the CPU and only queues GPU work; one extra CUDA stream copies outputs back.</td></tr>
+    <tr><th>Called by</th><td><code>Worker</code> in <code>v1/worker/gpu_worker.py</code>, which builds it when <code>use_v2_model_runner</code> is true ({{cite vllm/v1/worker/gpu_worker.py:567-580}}).</td></tr>
+    <tr><th>Calls</th><td><code>states.py</code>, <code>input_batch.py</code>, <code>block_table.py</code>, <code>attn_utils.py</code>, <code>cudagraph_utils.py</code>, <code>async_utils.py</code>, the model states, the sampler, the speculators and the model itself ({{cite vllm/v1/worker/gpu/model_runner.py:90-190}}).</td></tr>
+    <tr><th>Not in this file</th><td>Kernels for input preparation (in <code>input_batch.py</code> and <code>block_table.py</code>), CUDA graph capture details ({{link concepts/compile-and-cuda-graphs}}), attention ({{link concepts/attention-backends}}), the sampler (<code>gpu/sample/</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/model-runner}} explains the design. This page is a map of the file and a walk through its main methods.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b6b_mr_timeline" alt="Three lanes over time: the caller thread, the GPU main stream and the copy stream. execute_model queues the forward pass, sample_tokens queues the sampler and starts a copy on the copy stream, and get_output() later waits for the copy event. A second panel shows who calls get_output: the engine core main thread with the uni executor, or the WorkerAsyncOutputCopy thread on the output rank with the multiproc executor and async scheduling." caption="Figure: one step of this file over time, and who waits for its output." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Start-up, through the worker.</strong> <code>load_model</code> ({{cite vllm/v1/worker/gpu_worker.py:591-598}}), <code>profile_run</code> during memory profiling ({{cite vllm/v1/worker/gpu_worker.py:697}}), <code>initialize_kv_cache</code> ({{cite vllm/v1/worker/gpu_worker.py:898}}), warm-up <code>_dummy_run</code> calls and <code>capture_model</code> ({{cite vllm/v1/worker/gpu_worker.py:961-985}}).</li>
+  <li><strong>Every step.</strong> <code>Worker.execute_model</code> and <code>Worker.sample_tokens</code> forward the engine core's calls ({{cite vllm/v1/worker/gpu_worker.py:1318-1321}}, {{cite vllm/v1/worker/gpu_worker.py:1350-1353}}).</li>
+  <li><strong>Subclasses.</strong> The CPU runner subclasses this class ({{cite vllm/v1/worker/cpu/model_runner.py:10}}). An out-of-tree runner can pick its own PCP manager through <code>pcp_manager_cls</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2433-2437}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>RequestState</code> for the {{term persistent-batch}} ({{cite vllm/v1/worker/gpu/model_runner.py:286-295}}), <code>InputBuffers</code> and <code>InputBatch</code> for the per-step tensors, <code>BlockTables</code> for block tables and slot mappings.</li>
+  <li><code>init_attn_backend</code>, <code>init_kv_cache</code> and <code>build_slot_mappings_by_layer</code> from <code>attn_utils.py</code>.</li>
+  <li><code>ModelCudaGraphManager</code> and <code>dispatch_cg_and_sync_dp</code> for CUDA graphs.</li>
+  <li><code>set_forward_context</code> around the model call ({{link code/forward-context}}).</li>
+  <li><code>Sampler</code>, <code>RejectionSampler</code>, <code>StructuredOutputsWorker</code>, the speculator, <code>AsyncOutput</code>.</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Lines</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>__init__</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:200-368}}</td><td>Configs, the copy stream, <code>RequestState</code>, speculator, input buffers, LoRA state.</td></tr>
+    <tr><td><code>load_model</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:385-555}}</td><td>Load the model, pick the model state, build the samplers.</td></tr>
+    <tr><td><code>initialize_kv_cache</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:622-823}}</td><td>Attention groups, block tables, CUDA graph mode and manager, KV cache tensors.</td></tr>
+    <tr><td><code>_dummy_run</code>, <code>profile_run</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:835-1040}}</td><td>Fake batches through <code>execute_model</code> for profiling and warm-up.</td></tr>
+    <tr><td><code>capture_model</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1073-1153}}</td><td>Capture the encoder and decoder CUDA graphs; log time and memory.</td></tr>
+    <tr><td><code>finish_requests</code>, <code>add_requests</code>, <code>update_requests</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1173-1291}}</td><td>Apply the scheduler's plan to the persistent state.</td></tr>
+    <tr><td><code>gather_batch_req_state</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1293-1373}}</td><td>Sort the batch, map to slots, find prefills and the uniform decode count.</td></tr>
+    <tr><td><code>prepare_inputs</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1375-1575}}</td><td>Build the <code>InputBatch</code> with GPU kernels.</td></tr>
+    <tr><td><code>prepare_attn</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1577-1597}}</td><td>Gather block tables, compute slot mappings.</td></tr>
+    <tr><td><code>sample</code>, <code>postprocess_sampled</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1615-1730}}</td><td>Logits, bitmask, sampler; then write the new tokens into the state.</td></tr>
+    <tr><td><code>execute_model</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1741-2110}}</td><td>The forward half of a step.</td></tr>
+    <tr><td><code>sample_tokens</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:2112-2311}}</td><td>The sampling half; returns an <code>AsyncOutput</code>.</td></tr>
+    <tr><td><code>pool</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:2316-2358}}</td><td>The pooling replacement of <code>sample_tokens</code>.</td></tr>
+    <tr><td><code>shutdown</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:2368-2407}}</td><td>Free weights, KV caches and graphs.</td></tr>
+    <tr><td><code>ExecuteModelState</code>, <code>BatchReqState</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:2439-2468}}</td><td>Hand-over from <code>execute_model</code> to <code>sample_tokens</code>; sorted batch state.</td></tr>
+    <tr><td><code>sort_batch_req_ids</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:2471-2483}}</td><td>Batch order: drafts, decodes, then by token count.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>load_model</code></h3>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="397-410" highlight="398,402-406,407-410" />
+<ol>
+  <li><strong>Line 398.</strong> <code>get_model_loader</code> picks the loader for <code>--load-format</code> ({{link concepts/weight-loading}}).</li>
+  <li><strong>Lines 402-406.</strong> The loader builds the model and loads the weights. JIT warm-up providers chosen during the build are recorded.</li>
+  <li><strong>Lines 407-410.</strong> With LoRA, the model's layers are wrapped.</li>
+</ol>
+<p>After loading, it builds the model state and <code>decode_query_len</code> ({{cite vllm/v1/worker/gpu/model_runner.py:438-445}}). On the last PP rank of a generative model it builds the <code>Sampler</code>, a <code>RejectionSampler</code> with speculative decoding, the prompt-logprobs worker and the structured-output worker ({{cite vllm/v1/worker/gpu/model_runner.py:464-532}}). A pooling model gets a <code>PoolingRunner</code> instead (lines 534-535). In <code>STOCK_TORCH_COMPILE</code> mode the whole model is compiled here (lines 554-555).</p>
+
+<h3><code>initialize_kv_cache</code></h3>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="684-699" highlight="692-697,698-699" />
+<p><code>init_attn_backend</code> returns the attention groups, the weakest CUDA graph support and the kernel block sizes. Then the method builds <code>BlockTables</code> (lines 716-728), resolves the CUDA graph mode with the backend support, and builds the CUDA graph manager:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="754-772" highlight="754-763,764-772" />
+<p>Last, it allocates the KV cache and binds each view to its layer through <code>static_forward_context</code> ({{cite vllm/v1/worker/gpu/model_runner.py:792-808}}), and creates the KV connector unless this is a profiling call ({{cite vllm/v1/worker/gpu/model_runner.py:813-823}}).</p>
+
+<h3><code>execute_model</code></h3>
+<p>The state updates (lines 1753-1771) and the input steps are on {{link concepts/model-runner}}. The core of the method:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1806-1838" highlight="1806-1821,1823-1826,1835-1838" />
+<ol>
+  <li><strong>Lines 1806-1821.</strong> Pick the CUDA graph descriptor; with DP &gt; 1 the ranks agree on one padded size.</li>
+  <li><strong>Lines 1823-1826.</strong> If every DP rank has zero tokens, return an empty output.</li>
+  <li><strong>Lines 1835-1838.</strong> Build the step tensors, then the block tables and slot mappings.</li>
+</ol>
+<p>Then the method builds the attention metadata (lines 1924-1951), the model inputs (lines 1984-2010), and runs the model in FULL, PIECEWISE or eager mode (lines 2024-2070). It stores an <code>ExecuteModelState</code> and returns <code>None</code>, or <code>IntermediateTensors</code> on a non-last PP rank ({{cite vllm/v1/worker/gpu/model_runner.py:2090-2110}}).</p>
+
+<h3><code>sample_tokens</code></h3>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="2117-2134" highlight="2117-2119,2131,2133" />
+<ol>
+  <li><strong>Lines 2117-2119.</strong> No stored state means <code>execute_model</code> failed; return <code>None</code>.</li>
+  <li><strong>Line 2131.</strong> The state is used once and cleared.</li>
+  <li><strong>Line 2133.</strong> A non-last PP rank only receives the sampled tokens from the last rank and updates its counters (lines 2134-2153).</li>
+</ol>
+<p>On the last rank: <code>sample()</code> (line 2163), prompt logprobs (lines 2176-2192), the <code>ModelRunnerOutput</code> shell with <code>sampled_token_ids=None</code> (lines 2195-2204), the <code>AsyncOutput</code> that starts the copy (lines 2210-2218), <code>postprocess_sampled</code> (lines 2249-2255), and the speculator (lines 2257-2293). It returns the <code>AsyncOutput</code> (line 2311).</p>
+
+<h3><code>prepare_inputs</code></h3>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1481-1504" highlight="1482-1488,1493-1504" />
+<p>Two of the four GPU steps: positions and sequence lengths, then the input tokens from the last sampled tokens and the drafts. The returned <code>logits_indices</code> select the rows for the sampler. The method ends with an <code>InputBatch</code> of more than 30 fields ({{cite vllm/v1/worker/gpu/model_runner.py:1532-1574}}).</p>
+
+<h3><code>capture_model</code></h3>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1091-1127" highlight="1092,1097-1098,1104-1118,1119-1127" />
+<ol>
+  <li><strong>Line 1092.</strong> Garbage collection is frozen during capture.</li>
+  <li><strong>Lines 1097-1098.</strong> A multimodal model can capture its encoder too.</li>
+  <li><strong>Lines 1104-1118.</strong> The decoder graphs: PIECEWISE and FULL descriptors ({{link concepts/compile-and-cuda-graphs}}).</li>
+  <li><strong>Lines 1119-1127.</strong> Model-state graphs and the speculator's graphs.</li>
+</ol>
+<p>The method returns the graph memory and logs "Graph capturing finished in ... secs, took ... GiB" ({{cite vllm/v1/worker/gpu/model_runner.py:1144-1153}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="A map of the file by line ranges">
+<table>
+  <thead><tr><th>Lines</th><th>Section</th></tr></thead>
+  <tbody>
+    <tr><td>1-17</td><td>Style note: keep this file minimal ({{cite vllm/v1/worker/gpu/model_runner.py:3-17}})</td></tr>
+    <tr><td>19-197</td><td>Imports</td></tr>
+    <tr><td>199-383</td><td><code>__init__</code>, <code>update_max_model_len</code>, <code>get_supported_tasks</code></td></tr>
+    <tr><td>385-620</td><td>Model loading, small accessors, weight reload, <code>get_kv_cache_spec</code></td></tr>
+    <tr><td>622-833</td><td><code>initialize_kv_cache</code>, <code>_init_kv_zero_meta</code></td></tr>
+    <tr><td>835-1071</td><td>Dummy runs, profiling, CUDA graph memory profile</td></tr>
+    <tr><td>1073-1153</td><td><code>capture_model</code></td></tr>
+    <tr><td>1155-1291</td><td>Request state updates</td></tr>
+    <tr><td>1293-1613</td><td>Batch gathering, <code>prepare_inputs</code>, <code>prepare_attn</code>, dummy attention inputs</td></tr>
+    <tr><td>1615-1739</td><td><code>sample</code>, <code>postprocess_sampled</code>, EC connector helper</td></tr>
+    <tr><td>1741-2110</td><td><code>execute_model</code></td></tr>
+    <tr><td>2112-2366</td><td><code>sample_tokens</code>, <code>take_draft_token_ids</code>, <code>pool</code>, <code>postprocess_num_computed_tokens</code></td></tr>
+    <tr><td>2368-2437</td><td><code>shutdown</code>, EPLB properties, <code>pcp_manager_cls</code></td></tr>
+    <tr><td>2439-2483</td><td><code>ExecuteModelState</code>, <code>BatchReqState</code>, <code>sort_batch_req_ids</code></td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Data flow: types and shapes">
+<table>
+  <thead><tr><th>Value</th><th>Type, shape</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>scheduler_output</code></td><td><code>SchedulerOutput</code>, from the engine core</td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1742-1745}}</td></tr>
+    <tr><td><code>idx_mapping</code></td><td>int64 <code>[num_reqs]</code>, GPU</td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1392-1395}}</td></tr>
+    <tr><td><code>query_start_loc</code></td><td>int32 <code>[num_reqs_padded + 1]</code>, persistent GPU buffer</td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1455-1467}}</td></tr>
+    <tr><td><code>input_ids</code>, <code>positions</code></td><td>int32 / int64 <code>[num_tokens_after_padding]</code></td><td>{{cite vllm/v1/worker/gpu/input_batch.py:25-26}}</td></tr>
+    <tr><td><code>logits_indices</code></td><td>int64 <code>[total_num_logits]</code></td><td>{{cite vllm/v1/worker/gpu/input_batch.py:486}}</td></tr>
+    <tr><td>block tables</td><td>tuple of int32 <code>[num_reqs_padded, max_num_blocks]</code>, one per KV cache group</td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1584-1588}}</td></tr>
+    <tr><td>slot mappings</td><td>int64 <code>[num_groups, num_tokens_padded]</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1589-1596}}</td></tr>
+    <tr><td><code>attn_metadata</code></td><td><code>dict[layer name, metadata]</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1940-1951}}</td></tr>
+    <tr><td><code>hidden_states</code></td><td><code>[num_tokens_after_padding, hidden_size]</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:2074-2081}}</td></tr>
+    <tr><td>result of <code>sample_tokens</code></td><td><code>AsyncOutput</code>; after <code>get_output()</code>, <code>ModelRunnerOutput</code> with <code>sampled_token_ids: list[list[int]]</code></td><td>{{cite vllm/v1/worker/gpu/async_utils.py:173-184}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Processes, threads and streams">
+<ul>
+  <li><strong>One thread calls the runner</strong>: the engine core main thread (uni executor) or the worker main thread (multiproc executor). The runner has no threads of its own.</li>
+  <li><strong>Two CUDA streams.</strong> The main stream, cached as <code>main_stream</code> ({{cite vllm/v1/worker/gpu/model_runner.py:601-604}}), and <code>output_copy_stream</code> for the copy to the CPU (line 235). The structured-output worker uses its own stream for the bitmask copy ({{cite vllm/v1/worker/gpu/structured_outputs.py:67}}).</li>
+  <li><strong>The waiter.</strong> <code>AsyncOutput.get_output()</code> is called later, outside this file ({{link concepts/model-runner}}, Step 9).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>skip_attn</code> outside a profile run</td><td><code>ValueError</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:850-853}}</td></tr>
+    <tr><td>a dummy run above <code>max_num_batched_tokens</code></td><td><code>AssertionError</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:878-881}}</td></tr>
+    <tr><td><code>sample_tokens</code> after a failed <code>execute_model</code></td><td>returns <code>None</code></td><td>{{cite vllm/v1/worker/gpu/model_runner.py:2117-2119}}</td></tr>
+    <tr><td>capture with mode <code>NONE</code> and no encoder graph</td><td>WARNING "Skipping encoder and decoder CUDA graph capture", returns 0</td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1081-1087}}</td></tr>
+    <tr><td>FULL capture with <code>skip_attn</code></td><td><code>AssertionError</code>: metadata needed</td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1877-1881}}</td></tr>
+    <tr><td>batch-sharded sampling without <code>compute_logits_local</code></td><td>WARNING, feature off</td><td>{{cite vllm/v1/worker/gpu/model_runner.py:447-461}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_MOE_SKIP_PADDING</code></td><td><code>1</code> ({{cite vllm/envs.py:1640}})</td><td>{{cite vllm/v1/worker/gpu/model_runner.py:1386}}</td><td>Marks padding rows in <code>is_padding</code>.</td></tr>
+    <tr><td><code>VLLM_USE_BREAKABLE_CUDAGRAPH</code></td><td>off unless set or auto-enabled ({{cite vllm/envs.py:777-779}})</td><td>{{cite vllm/v1/worker/gpu/model_runner.py:746-748}}</td><td>Piecewise capture without a compiled submodule.</td></tr>
+    <tr><td><code>VLLM_USE_V2_MODEL_RUNNER</code></td><td>unset ({{cite vllm/envs.py:2147-2149}})</td><td>{{cite vllm/config/vllm.py:730-732}}</td><td>Selects this file (or the V1 fallback).</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/model-runner}}: the design of MRV2, with a worked example.</li>
+  <li>{{link concepts/forward-context}}: how the layers get the metadata set in <code>execute_model</code>.</li>
+  <li>{{link concepts/attention-backends}}: the builders called from the model state.</li>
+  <li>{{link concepts/compile-and-cuda-graphs}}: the modes and the dispatch rule.</li>
+  <li>{{link concepts/async-scheduling}}: why the two calls never wait.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which method returns the <code>AsyncOutput</code>, and what does <code>execute_model</code> return on the last PP rank?
+    <x-a><p><code>sample_tokens</code> returns it ({{cite vllm/v1/worker/gpu/model_runner.py:2311}}). <code>execute_model</code> returns <code>None</code> and keeps its results in <code>execute_model_state</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2090-2110}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Where is the CUDA graph mode of the run finally decided, and with which inputs?
+    <x-a><p>In <code>initialize_kv_cache</code>, by <code>resolve_cudagraph_mode_and_sizes</code> with the weakest attention support, its backend name, <code>decode_query_len</code>, the KV cache config and <code>piecewise_capture_available</code> ({{cite vllm/v1/worker/gpu/model_runner.py:754-763}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>sample_tokens</code> create the <code>AsyncOutput</code> before <code>postprocess_sampled</code>?
+    <x-a><p>So the copy event is recorded first and the copy to the CPU does not wait for the post-processing kernels ({{cite vllm/v1/worker/gpu/model_runner.py:2244-2248}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A dummy run for the profile uses <code>skip_attn=True</code>. Why can a FULL capture not do the same?
+    <x-a><p>A FULL graph records the attention kernels too, so it needs real attention metadata at capture; the code asserts this ({{cite vllm/v1/worker/gpu/model_runner.py:1877-1881}}). The profile run only measures memory and may skip attention ({{cite vllm/v1/worker/gpu/model_runner.py:1022-1027}}).</p></x-a>
+  </x-q>
+</x-quiz>

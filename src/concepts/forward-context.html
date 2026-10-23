@@ -1,0 +1,159 @@
+---
+title: The forward context: how layers find per-step data
+nav_title: Forward context
+level: Advanced
+prerequisites: concepts/model-definition, learn/pytorch-for-serving, concepts/model-runner
+related: code/forward-context, code/model-executor-layers-attention-attention, concepts/attention-backends, concepts/compile-and-cuda-graphs, concepts/model-runner, concepts/model-definition, tours/forward-pass
+summary: Attention layers register themselves by name when the model is built, get their KV cache tensor bound at start-up, and read the per-step metadata from a global forward context that the model runner sets around each forward pass. The attention custom ops take only the layer name, so torch.compile sees them as opaque.
+---
+<x-sentence>An attention layer gets no KV cache or metadata arguments. It looks them up by its own name in a context that the runner sets.</x-sentence>
+
+<h2>The idea</h2>
+<p>A model file calls <code>self.attn(q, k, v)</code> and nothing else ({{link concepts/model-definition}}). But attention needs more: the {{term kv-cache-block | KV cache}} tensor of this layer, where to write the new keys and values, and the shape of the batch. vLLM passes these through two dictionaries keyed by the layer name, the {{term model-prefix}} such as <code>model.layers.0.self_attn.attn</code>:</p>
+<ul>
+  <li><strong>The {{term static-forward-context}}</strong> maps each name to its layer object. A layer adds itself when it is built. At start-up, the runner binds each layer's KV cache tensor to the object, as <code>layer.kv_cache</code>.</li>
+  <li><strong>The {{term forward-context}}</strong> exists only during one forward pass. The model runner sets it with the {{term attention-metadata}} per layer name, the {{term slot-mapping}} per layer name, the CUDA graph mode and a {{term batch-descriptor}}.</li>
+</ul>
+<p>The attention custom op gets the tensors q, k, v and output, plus the layer name. Inside, it looks up the layer, the KV cache, the metadata and the slot mapping. Why so indirect? For <code>torch.compile</code>, the op is one opaque node with plain inputs ({{link learn/pytorch-for-serving}}). The graph does not depend on Python objects that change every step, so vLLM can compile it once and split it at these ops.</p>
+<p><strong>An everyday comparison.</strong> Think of a theater with a prop table. Each actor has a spot on the table, labeled with the actor's name. Before each show, the stage manager puts that night's props on each labeled spot. During the show, an actor walks to the table and takes the props under the label. The script never lists the props. The comparison stops here: in vLLM, the label also leads to the actor's own permanent locker, the KV cache, which nobody refills between shows.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b6b_fwd_ctx" alt="Panel 1, built once at start-up: the Attention constructor registers itself in compilation_config.static_forward_context under its prefix, for example model.layers.0.self_attn.attn; later init_kv_cache allocates the KV cache and bind_kv_cache_to_layers sets layer.kv_cache. Panel 2, set each step: execute_model calls set_forward_context with attn_metadata (a dict from layer name to metadata), slot_mapping (a dict from layer name to slot tensor), cudagraph_runtime_mode and batch_descriptor; the ForwardContext also points to the static dict as no_compile_layers. Panel 3, the call chain inside the forward pass: LlamaAttention.forward calls self.attn(q, k, v); Attention.forward calls torch.ops.vllm.unified_kv_cache_update(k, v, name) and torch.ops.vllm.unified_attention_with_output(q, k, v, output, name); both call get_attention_context(name), which returns the metadata, the layer, layer.kv_cache and the slot mapping; then impl.do_kv_cache_update and impl.forward run the backend kernels." caption="Figure: the two dictionaries behind the attention call. One is filled at start-up (panel 1), one is set around each forward pass (panel 2), and the attention ops read both by layer name (panel 3)." />
+<p>Follow the name <code>model.layers.0.self_attn.attn</code> through the three panels. It is a key in every dictionary. The violet parts happen once at start-up; the blue parts happen in every step.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the layer registers itself by name</h3>
+<x-code file="vllm/model_executor/layers/attention/attention.py" lines="436-445" highlight="440,443-445" />
+<ol>
+  <li><strong>Line 440.</strong> <code>use_direct_call</code> is false on platforms that want "one giant opaque custom op" for attention. CUDA, ROCm, CPU and XPU return true from <code>opaque_attention_op()</code> ({{cite vllm/platforms/cuda.py:595-596}}, {{cite vllm/platforms/rocm.py:1231-1232}}, {{cite vllm/platforms/cpu.py:640-641}}, {{cite vllm/platforms/xpu.py:609-610}}); the base <code>Platform</code> returns false ({{cite vllm/platforms/interface.py:1286-1290}}).</li>
+  <li><strong>Lines 443-445.</strong> The prefix is the key. A second layer with the same prefix raises <code>ValueError: Duplicate layer name</code>.</li>
+</ol>
+<p>The dict is a field of the compilation config. Its docstring says: "Map from layer name to layer objects that need to be accessed outside model code" ({{cite vllm/config/compilation.py:757-760}}). Attention is not the only user. MLA attention ({{cite vllm/model_executor/layers/attention/mla_attention.py:620}}), the MoE runner ({{cite vllm/model_executor/layers/fused_moe/runner/moe_runner.py:68}}), Mamba layers ({{cite vllm/model_executor/layers/mamba/mamba_mixer2.py:528}}) and LoRA linear layers ({{cite vllm/lora/layers/base_linear.py:102}}) also register.</p>
+<p>The runner reads this dict to find all attention layers. <code>get_layers_from_vllm_config</code> filters it by type ({{cite vllm/config/vllm.py:3596-3617}}), and the KV cache spec of the model comes from these layers ({{cite vllm/v1/worker/gpu/attn_utils.py:138-155}}).</p>
+
+<h3>Step 2: the runner binds the KV cache tensor</h3>
+<p>When the KV cache is allocated, <code>init_kv_cache</code> gets <code>compilation_config.static_forward_context</code> as its first argument ({{cite vllm/v1/worker/gpu/model_runner.py:794-797}}). It allocates one backing buffer and makes a view per layer, then binds each view to its layer:</p>
+<x-code file="vllm/v1/worker/utils.py" lines="868-880" highlight="879-880" />
+<p>The default <code>bind_kv_cache</code> just stores the view: <code>self.kv_cache = kv_cache</code> ({{cite vllm/model_executor/layers/attention_layer_base.py:27-33}}). Until then, the layer holds an empty placeholder tensor ({{cite vllm/model_executor/layers/attention/attention.py:461-464}}). The binding happens once; the tensor stays the same for the whole life of the server. How the views are laid out is on {{link concepts/attention-backends}}.</p>
+
+<h3>Step 3: the runner sets the forward context each step</h3>
+<p>For PIECEWISE and eager steps, Model Runner V2 wraps the model call:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="2034-2053" highlight="2035-2039,2041-2053" />
+<p><code>set_forward_context</code> builds a <code>ForwardContext</code> and installs it in a module-level variable for the duration of the <code>with</code> block:</p>
+<x-code file="vllm/forward_context.py" lines="140-158" highlight="143-145,157-158" />
+<ul>
+  <li><code>no_compile_layers</code> is the static dict itself, not a copy: <code>create_forward_context</code> passes the same object ({{cite vllm/forward_context.py:247-248}}).</li>
+  <li><code>attn_metadata</code> and <code>slot_mapping</code> are dicts from layer name to value. They are built fresh each step ({{link concepts/model-runner}}, Step 6).</li>
+  <li><code>cudagraph_runtime_mode</code> and <code>batch_descriptor</code> tell the CUDA graph wrappers inside the compiled model what to do ({{link concepts/compile-and-cuda-graphs}}).</li>
+</ul>
+<p>The context manager restores the previous context on exit ({{cite vllm/forward_context.py:262-274}}). Any code inside the forward pass reads it with <code>get_forward_context()</code> ({{cite vllm/forward_context.py:208-214}}).</p>
+
+<h3>Step 4: the attention layer calls a custom op with its name</h3>
+<x-code file="vllm/model_executor/layers/attention/attention.py" lines="561-581" highlight="563,564-572,573-580" />
+<ol>
+  <li><strong>Line 563.</strong> The name is wrapped by <code>_encode_layer_name</code>. On PyTorch 2.11 or newer with <code>VLLM_USE_LAYERNAME=1</code> (the default), it becomes a <code>LayerName</code> object; else it stays a <code>str</code> ({{cite vllm/utils/torch_utils.py:990-995}}, {{cite vllm/utils/torch_utils.py:1045-1047}}).</li>
+  <li><strong>Lines 564-572.</strong> Only when the backend does not write the KV cache inside its own forward, a first op writes k and v into the cache. It returns an empty tensor, the "dummy dependency".</li>
+  <li><strong>Lines 573-580.</strong> The attention op takes the dummy as an argument, so the compiler cannot move it before the cache write ({{cite vllm/model_executor/layers/attention/attention.py:779-782}}). It returns nothing and writes into <code>output</code>.</li>
+</ol>
+<p>At this commit, the FlashAttention, FlashInfer and Triton backends set <code>forward_includes_kv_cache_update = False</code>, so they use the separate update op ({{cite vllm/v1/attention/backends/flash_attn.py:367}}, {{cite vllm/v1/attention/backends/flashinfer.py:708}}, {{cite vllm/v1/attention/backends/triton_attn.py:347}}). The base class default is <code>True</code> ({{cite vllm/v1/attention/backend.py:69-70}}).</p>
+
+<h3>Step 5: get_attention_context resolves the name</h3>
+<x-code file="vllm/model_executor/layers/attention/attention.py" lines="705-723" highlight="709,713,716-717,722" />
+<ol>
+  <li><strong>Line 709.</strong> The normal case: <code>attn_metadata</code> is a dict, and the layer's entry is taken.</li>
+  <li><strong>Line 713.</strong> A list of dicts: the comment says index 0 holds the base model's metadata in speculative decoding.</li>
+  <li><strong>Lines 716-717.</strong> The layer object comes from <code>no_compile_layers</code>, and the KV cache from the attribute bound in Step 2.</li>
+  <li><strong>Line 722.</strong> The slot mapping may be <code>None</code>; then <code>unified_kv_cache_update</code> writes nothing ({{cite vllm/model_executor/layers/attention/attention.py:736}}).</li>
+</ol>
+<p>Then the two ops call the backend: <code>impl.do_kv_cache_update(...)</code> ({{cite vllm/model_executor/layers/attention/attention.py:740-746}}) and <code>impl.forward(self, query, key, value, kv_cache, attn_metadata, output=...)</code> ({{cite vllm/model_executor/layers/attention/attention.py:786-796}}). The backend classes are on {{link concepts/attention-backends}}.</p>
+
+<h3>Step 6: why a name and not the tensors</h3>
+<p>The two ops are registered once, at import, in the <code>vllm</code> library ({{cite vllm/model_executor/layers/attention/attention.py:759-764}}, {{cite vllm/model_executor/layers/attention/attention.py:799-803}}). For the compiler, three facts follow:</p>
+<ul>
+  <li><strong>Opaque.</strong> Dynamo records one node per call and does not trace into the backend code. The node has only tensors and a name as inputs.</li>
+  <li><strong>A splitting point.</strong> The op names are in the default {{term splitting-op | splitting ops}}, so vLLM cuts the graph here. Attention then runs eagerly between piecewise CUDA graphs and can use any batch shape ({{cite vllm/config/compilation.py:768-770}}, {{cite vllm/config/compilation.py:1184}}).</li>
+  <li><strong>One graph for 32 layers.</strong> A <code>str</code> argument is a constant in the graph. The <code>LayerName</code> class is an opaque type. <code>torch.compile</code> "lifts [it] as a graph input instead of baking it as a constant", which avoids "per-layer recompilation" ({{cite vllm/utils/torch_utils.py:1003-1010}}).</li>
+</ul>
+<p>The code also says that the string in <code>unified_kv_cache_update</code> "prevents Inductor from reusing piecewise graphs"; this is why that op is a splitting op too ({{cite vllm/config/compilation.py:1186-1213}}).</p>
+
+<h3>Step 7: FULL CUDA graph steps do not read the context</h3>
+<p>In FULL mode the runner replays one graph and does not call <code>set_forward_context</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2024-2032}}). No Python code of the model runs, so no layer looks anything up. The comment says the inputs "are already copied to the CUDA graph input buffers" (lines 2026-2027). The context was used at capture time: the capture runs the model inside <code>set_forward_context</code>, with the dummy metadata of that batch shape ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:754-771}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: Llama-3-8B, one step">
+<p>Llama-3-8B has 32 decoder layers. So the static dict has 32 attention entries, from <code>model.layers.0.self_attn.attn</code> to <code>model.layers.31.self_attn.attn</code> (prefix rules on {{link concepts/model-definition}}). All 32 layers use full attention and one backend, so there is one {{term kv-cache-group}} and one attention group (derived).</p>
+<ol>
+  <li><strong>Metadata dict.</strong> <code>build_attn_metadata</code> builds one metadata object for the group and stores the same object under all 32 names ({{cite vllm/v1/worker/gpu/attn_utils.py:574-580}}).</li>
+  <li><strong>Slot mapping dict.</strong> <code>build_slot_mappings_by_layer</code> stores the same row tensor of group 0 under all 32 names ({{cite vllm/v1/worker/gpu/attn_utils.py:447-455}}).</li>
+  <li><strong>Lookups.</strong> Each layer does three dict lookups and one attribute read per op call. With two ops per layer, a step does 64 calls of <code>get_attention_context</code> (derived, eager or PIECEWISE mode).</li>
+</ol>
+<p>A model with several KV cache groups, for example sliding-window and full layers, gets one metadata object per group. Each layer name points to the object of its group ({{link concepts/hybrid-kv-cache}}).</p>
+</x-deepdive>
+
+<x-deepdive title="All fields of ForwardContext">
+<table>
+  <thead><tr><th>Field</th><th>Type</th><th>Set by</th></tr></thead>
+  <tbody>
+    <tr><td><code>no_compile_layers</code></td><td><code>dict[str, Any]</code></td><td>the static dict ({{cite vllm/forward_context.py:142-143}})</td></tr>
+    <tr><td><code>attn_metadata</code></td><td>dict by layer name, or a list of two dicts for dual-batch overlap</td><td>the runner ({{cite vllm/forward_context.py:144-152}})</td></tr>
+    <tr><td><code>slot_mapping</code></td><td>dict by layer name (or list)</td><td>the runner; an empty dict if not given ({{cite vllm/forward_context.py:251}})</td></tr>
+    <tr><td><code>dp_metadata</code></td><td><code>DPMetadata</code> or <code>None</code></td><td>only for MoE models with DP &gt; 1 or sequence-parallel MoE ({{cite vllm/forward_context.py:299-328}})</td></tr>
+    <tr><td><code>cudagraph_runtime_mode</code></td><td><code>NONE</code>, <code>PIECEWISE</code> or <code>FULL</code></td><td>the runner; checked in <code>__post_init__</code> ({{cite vllm/forward_context.py:199-202}})</td></tr>
+    <tr><td><code>batch_descriptor</code></td><td><code>BatchDescriptor</code></td><td>the runner, or made from <code>num_tokens</code> ({{cite vllm/forward_context.py:331-332}})</td></tr>
+    <tr><td><code>ubatch_slices</code></td><td>micro-batch slices or <code>None</code></td><td>dual-batch overlap only</td></tr>
+    <tr><td><code>is_padding</code></td><td>bool tensor <code>[num_tokens_padded]</code></td><td>the runner ({{cite vllm/forward_context.py:162-165}})</td></tr>
+    <tr><td><code>skip_compiled</code></td><td><code>bool</code></td><td>true when the compiled model must be bypassed, for example an encoder-decoder step with encoder inputs ({{cite vllm/forward_context.py:167-168}})</td></tr>
+    <tr><td><code>all_moe_layers</code>, <code>moe_layer_index</code></td><td>list of names, counter</td><td>only with <code>fast_moe_cold_start</code> ({{cite vllm/forward_context.py:242-245}})</td></tr>
+    <tr><td><code>additional_kwargs</code></td><td>dict</td><td>the platform hook <code>set_additional_forward_context</code> ({{cite vllm/forward_context.py:334-343}})</td></tr>
+  </tbody>
+</table>
+<p>The comment on <code>all_moe_layers</code> explains a second way around strings in the graph. MoE custom ops pop the next layer name from this list instead of taking it as a constant ({{cite vllm/forward_context.py:170-195}}). On PyTorch 2.11 or newer, vLLM turns <code>fast_moe_cold_start</code> off, because the <code>LayerName</code> approach replaces it ({{cite vllm/config/vllm.py:1913-1918}}).</p>
+</x-deepdive>
+
+<x-deepdive title="set_forward_context, step by step">
+<ol>
+  <li>If batch-size logging is on and <code>attn_metadata</code> is not <code>None</code>, take the start time ({{cite vllm/forward_context.py:295-297}}).</li>
+  <li>For an MoE model with DP &gt; 1 (or sequence-parallel MoE), make <code>DPMetadata</code>. If the caller gave no token counts across ranks, they are computed with a collective here, and padding across ranks is off ({{cite vllm/forward_context.py:308-322}}).</li>
+  <li>If <code>num_tokens</code> is given and no descriptor, make <code>BatchDescriptor(num_tokens=num_tokens)</code> (lines 331-332).</li>
+  <li>Ask the platform for extra fields (lines 334-343).</li>
+  <li>Build the context and install it with <code>override_forward_context</code> (lines 345-360).</li>
+  <li>On exit, in the same case, synchronize the device and record the forward time per batch size. Every <code>VLLM_LOG_BATCHSIZE_INTERVAL</code> seconds, log the median time per size ({{cite vllm/forward_context.py:362-392}}).</li>
+</ol>
+<p><code>VLLM_LOG_BATCHSIZE_INTERVAL</code> defaults to <code>-1</code>, which turns the logging off ({{cite vllm/envs.py:1445-1447}}). The module reads it once, at import ({{cite vllm/forward_context.py:22-25}}).</p>
+</x-deepdive>
+
+<x-deepdive title="KV sharing and the KV connector hooks">
+<p><strong>KV sharing.</strong> A layer built with <code>kv_sharing_target_layer_name</code> reuses the cache of an earlier layer. The constructor checks the target in the static dict: it must exist, come before this layer and have the same attention type ({{cite vllm/model_executor/layers/attention/attention.py:61-91}}). Such a layer skips the cache write (line 566), and its KV cache entry points to the target's tensor ({{cite vllm/v1/worker/gpu/attn_utils.py:427-428}}).</p>
+<p><strong>KV connector.</strong> <code>unified_attention_with_output</code> has the decorator <code>@maybe_transfer_kv_layer</code>. With a KV connector, it waits for the layer's KV to load before the attention and saves it after ({{cite vllm/model_executor/layers/attention/kv_transfer_utils.py:15-55}}). It finds the layer data through the same <code>get_attention_context</code>. See {{link concepts/kv-connectors}}.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A model call outside a context.</strong> <code>get_forward_context()</code> asserts "Forward context is not set. Please use `set_forward_context` to set the forward context." ({{cite vllm/forward_context.py:210-213}}). This happens when you call the model directly in a test or a script.</li>
+  <li><strong>Two layers with one prefix.</strong> <code>ValueError: Duplicate layer name</code> at model build time ({{cite vllm/model_executor/layers/attention/attention.py:443-444}}).</li>
+  <li><strong>A wrong KV sharing target.</strong> <code>ValueError</code> "must come before the current layer", "is not a valid Attention layer in the model" or "must be the same type" ({{cite vllm/model_executor/layers/attention/attention.py:80-91}}).</li>
+  <li><strong>Batch-size logging slows the server.</strong> With <code>VLLM_LOG_BATCHSIZE_INTERVAL</code> &gt;= 0, every forward pass that runs inside <code>set_forward_context</code> with metadata ends with a device synchronize ({{cite vllm/forward_context.py:295}}, {{cite vllm/forward_context.py:363-370}}). In Model Runner V2 these are the eager and PIECEWISE steps; FULL replays have no context. That removes the CPU/GPU overlap of {{link concepts/async-scheduling}}. The comment above it still says "we use synchronous scheduling right now" (line 365); with the default async scheduling this is no longer true.</li>
+  <li><strong>A backend without a separate cache write.</strong> If a backend says <code>forward_includes_kv_cache_update = False</code> but has no <code>do_kv_cache_update</code>, the update op fails its assertion ({{cite vllm/model_executor/layers/attention/attention.py:737-739}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> The forward context is the contract between the model runner, the model code and the attention backends. A model file stays free of serving details, the compiler sees a clean graph, and a new backend only needs to read its metadata. When you write a model or a backend plugin, keep the layer name unique, and read per-step data from the context, never from arguments.</p>
+
+<x-quiz>
+  <x-q level="easy">Which key does the first Llama attention layer use in <code>static_forward_context</code>?
+    <x-a><p>Its prefix, <code>model.layers.0.self_attn.attn</code>. The constructor stores <code>static_forward_context[prefix] = self</code> ({{cite vllm/model_executor/layers/attention/attention.py:445}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Where does <code>unified_attention_with_output</code> get the KV cache tensor from?
+    <x-a><p>From <code>get_attention_context</code>: it takes the layer object from <code>forward_context.no_compile_layers[layer_name]</code> and reads <code>layer.kv_cache</code> ({{cite vllm/model_executor/layers/attention/attention.py:716-717}}). The runner set that attribute once, in <code>bind_kv_cache_to_layers</code> ({{cite vllm/v1/worker/utils.py:879-880}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>unified_kv_cache_update</code> return an empty tensor?
+    <x-a><p>As a data dependency. The attention op takes it as <code>kv_cache_dummy_dep</code>, so <code>torch.compile</code> keeps the cache write before the attention ({{cite vllm/model_executor/layers/attention/attention.py:731-733}}, {{cite vllm/model_executor/layers/attention/attention.py:779-782}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">In a FULL CUDA graph step, how many times is <code>get_attention_context</code> called in Python, and why?
+    <x-a><p>Zero. The runner replays the captured graph without <code>set_forward_context</code> and without Python model code ({{cite vllm/v1/worker/gpu/model_runner.py:2024-2032}}). The lookups ran once, at capture time, inside <code>set_forward_context</code> ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:754-771}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">On PyTorch 2.14, how does the layer name reach the attention op, and what would go wrong with a plain string?
+    <x-a><p>As a <code>LayerName</code> object, because PyTorch is 2.11 or newer and <code>VLLM_USE_LAYERNAME</code> defaults to 1 ({{cite vllm/utils/torch_utils.py:990-995}}, {{cite vllm/envs.py:1451}}). It is a hoisted opaque type that becomes a graph input. A plain string is baked in as a constant, which the code says causes per-layer recompilation ({{cite vllm/utils/torch_utils.py:1003-1010}}).</p></x-a>
+  </x-q>
+</x-quiz>

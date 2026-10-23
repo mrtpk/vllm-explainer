@@ -1,0 +1,145 @@
+---
+title: "forward_context.py: the per-step context of the forward pass"
+nav_title: forward_context.py
+level: Advanced
+prerequisites: concepts/forward-context
+related: concepts/forward-context, code/model-executor-layers-attention-attention, code/v1-worker-gpu-model-runner, concepts/compile-and-cuda-graphs, concepts/data-parallel-serving
+summary: vllm/forward_context.py defines ForwardContext, BatchDescriptor and DPMetadata, and the context manager set_forward_context that the model runner wraps around each model call. Code inside the forward pass reads it with get_forward_context().
+---
+<h2>Purpose</h2>
+<p><code>vllm/forward_context.py</code> holds one global object during each forward pass, so that layers and CUDA graph wrappers can read per-step data without function arguments.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/forward_context.py</code>, 392 lines.</td></tr>
+    <tr><th>Main class</th><td><code>ForwardContext</code> ({{cite vllm/forward_context.py:140-202}}); the entry point is <code>set_forward_context</code> ({{cite vllm/forward_context.py:277-392}}).</td></tr>
+    <tr><th>Runs in</th><td>Each worker process (or the engine core with the uni executor), in the thread that calls the model. The context is a module-level variable, not a thread-local ({{cite vllm/forward_context.py:205}}).</td></tr>
+    <tr><th>Called by</th><td>Model Runner V2 for eager and PIECEWISE steps ({{cite vllm/v1/worker/gpu/model_runner.py:2041-2053}}) and for CUDA graph capture ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:762-771}}); the speculators ({{cite vllm/v1/worker/gpu/spec_decode/standalone_ar/speculator.py:140}}) and the KV connector ({{cite vllm/v1/worker/gpu/kv_connector.py:126}}) too.</td></tr>
+    <tr><th>Read by</th><td>The attention ops through <code>get_attention_context</code> ({{cite vllm/model_executor/layers/attention/attention.py:705}}), <code>CUDAGraphWrapper</code> ({{cite vllm/compilation/cuda_graph.py:242-244}}), MoE layers and others.</td></tr>
+    <tr><th>Not in this file</th><td>The static dict of layers (in <code>CompilationConfig</code>, {{cite vllm/config/compilation.py:757-760}}); building the attention metadata ({{link concepts/attention-backends}}).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/forward-context}} explains the idea with the attention layer as the example.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b6b_fwd_ctx" alt="Panel 1: Attention layers register in static_forward_context at build time and get layer.kv_cache bound at KV cache init. Panel 2: execute_model calls set_forward_context with attn_metadata, slot mappings, the CUDA graph mode and the batch descriptor; the ForwardContext also points to the static dict as no_compile_layers. Panel 3: the attention custom ops call get_attention_context(name), which reads the metadata, the layer, its KV cache and the slot mapping." caption="Figure: where this module's ForwardContext comes from and who reads it." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><code>GPUModelRunner.execute_model</code>, around the model call in PIECEWISE and eager mode (FULL mode replays a graph without a context) ({{cite vllm/v1/worker/gpu/model_runner.py:2024-2053}}).</li>
+  <li><code>ModelCudaGraphManager.capture</code>, around each capture run ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:754-771}}).</li>
+  <li>Any code inside the forward pass that needs step data: <code>get_forward_context()</code>.</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>coordinate_batch_across_dp</code> when an MoE model with DP &gt; 1 has no token counts yet ({{cite vllm/forward_context.py:311-322}}).</li>
+  <li>The platform hook <code>set_additional_forward_context</code> ({{cite vllm/forward_context.py:334-343}}).</li>
+  <li><code>current_platform.synchronize</code>, only when batch-size logging is on ({{cite vllm/forward_context.py:368-370}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Lines</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td>module globals</td><td>{{cite vllm/forward_context.py:22-26}}</td><td>Batch-size logging settings, read from env at import.</td></tr>
+    <tr><td><code>BatchDescriptor</code></td><td>{{cite vllm/forward_context.py:29-57}}</td><td>Frozen key of a piecewise CUDA graph: tokens, requests, uniform, LoRA.</td></tr>
+    <tr><td><code>_compute_sp_num_tokens</code></td><td>{{cite vllm/forward_context.py:60-77}}</td><td>Tokens per rank for sequence-parallel MoE.</td></tr>
+    <tr><td><code>DPMetadata</code></td><td>{{cite vllm/forward_context.py:80-137}}</td><td>Token counts across DP ranks for MoE dispatch.</td></tr>
+    <tr><td><code>ForwardContext</code></td><td>{{cite vllm/forward_context.py:140-202}}</td><td>All per-step fields; checks the CUDA graph mode.</td></tr>
+    <tr><td><code>get_forward_context</code></td><td>{{cite vllm/forward_context.py:208-214}}</td><td>Return the current context; assert that one is set.</td></tr>
+    <tr><td><code>is_forward_context_available</code>, <code>in_piecewise_cudagraph</code></td><td>{{cite vllm/forward_context.py:217-227}}</td><td>Safe checks for code that may run outside a forward pass.</td></tr>
+    <tr><td><code>create_forward_context</code></td><td>{{cite vllm/forward_context.py:230-259}}</td><td>Build the dataclass; attach the static dict.</td></tr>
+    <tr><td><code>override_forward_context</code></td><td>{{cite vllm/forward_context.py:262-274}}</td><td>Swap the global, restore it on exit.</td></tr>
+    <tr><td><code>set_forward_context</code></td><td>{{cite vllm/forward_context.py:277-392}}</td><td>DP metadata, descriptor, platform extras, install, timing log.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>ForwardContext</code></h3>
+<x-code file="vllm/forward_context.py" lines="140-168" highlight="143,144-145,157-158,165,168" />
+<ol>
+  <li><strong>Line 143.</strong> <code>no_compile_layers</code>: the comment says "copy", but <code>create_forward_context</code> passes the same dict object ({{cite vllm/forward_context.py:248}}).</li>
+  <li><strong>Lines 144-145.</strong> <code>attn_metadata</code> and <code>slot_mapping</code>: dicts by layer name, or a list of two dicts for dual-batch overlap.</li>
+  <li><strong>Lines 157-158.</strong> The CUDA graph mode and the descriptor for the wrappers.</li>
+  <li><strong>Line 165.</strong> <code>is_padding</code>: which token rows are padding.</li>
+  <li><strong>Line 168.</strong> <code>skip_compiled</code>: call <code>forward()</code> directly, bypassing the compiled model ({{cite vllm/compilation/decorators.py:540-544}}).</li>
+</ol>
+
+<h3><code>set_forward_context</code></h3>
+<x-code file="vllm/forward_context.py" lines="299-360" highlight="300-307,311-322,331-332,345-356,359" />
+<ol>
+  <li><strong>Lines 300-307.</strong> DP metadata only for MoE models with DP &gt; 1 or sequence-parallel MoE.</li>
+  <li><strong>Lines 311-322.</strong> Without counts from the caller, a collective computes them; the assert says micro-batching must be off.</li>
+  <li><strong>Lines 331-332.</strong> A default descriptor with only <code>num_tokens</code>.</li>
+  <li><strong>Lines 345-356.</strong> Build the context.</li>
+  <li><strong>Line 359.</strong> Install it; the <code>finally</code> block of <code>override_forward_context</code> restores the previous one.</li>
+</ol>
+
+<h3><code>get_forward_context</code></h3>
+<x-code file="vllm/forward_context.py" lines="208-214" />
+<p>An <code>assert</code>, not an exception class: with <code>python -O</code> the check disappears and the function returns <code>None</code>. Code that may run outside a forward pass uses <code>is_forward_context_available()</code> first, like <code>CUDAGraphWrapper</code> ({{cite vllm/compilation/cuda_graph.py:236-240}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: what the runner passes in one PIECEWISE step">
+<table>
+  <thead><tr><th>Argument</th><th>Value from Model Runner V2</th></tr></thead>
+  <tbody>
+    <tr><td><code>attn_metadata</code></td><td>dict of layer name to backend metadata ({{cite vllm/v1/worker/gpu/model_runner.py:1940-1951}})</td></tr>
+    <tr><td><code>num_tokens</code></td><td><code>input_batch.num_tokens_after_padding</code>, the padded size</td></tr>
+    <tr><td><code>cudagraph_runtime_mode</code></td><td><code>batch_desc.cg_mode</code>: <code>PIECEWISE</code> or <code>NONE</code></td></tr>
+    <tr><td><code>num_tokens_across_dp</code></td><td>from the DP sync, or <code>None</code> with DP = 1</td></tr>
+    <tr><td><code>batch_descriptor</code></td><td><code>BatchDescriptor(num_tokens=padded, has_lora, num_active_loras)</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2035-2039}})</td></tr>
+    <tr><td><code>slot_mapping</code></td><td>dict of layer name to the slot row of its KV cache group</td></tr>
+    <tr><td><code>is_padding</code></td><td>bool tensor <code>[padded tokens]</code></td></tr>
+  </tbody>
+</table>
+<p>Example: a batch of 300 tokens runs as PIECEWISE with 304 padded tokens. The descriptor is <code>BatchDescriptor(num_tokens=304, has_lora=False, num_active_loras=0)</code>, which is also the key that each piece wrapper captured at start-up (derived from {{link concepts/compile-and-cuda-graphs}}).</p>
+</x-deepdive>
+
+<x-deepdive title="BatchDescriptor fields and the uniform flag">
+<p>The descriptor has five fields ({{cite vllm/forward_context.py:36-56}}). Model Runner V2 sets only <code>num_tokens</code>, <code>has_lora</code> and <code>num_active_loras</code>; <code>num_reqs</code> stays <code>None</code> and <code>uniform</code> stays <code>False</code>, because PIECEWISE graphs do not depend on them. The FULL graph choice uses a separate class, <code>BatchExecutionDescriptor</code>, in <code>gpu/cudagraph_utils.py</code> ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:70-85}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Threads and processes">
+<p><code>_forward_context</code> is one module-level variable ({{cite vllm/forward_context.py:205}}). Each worker process has its own copy. Inside a process, the model runs in one thread at a time. Dual-batch overlap uses threads that hand off one compute stream ({{cite vllm/v1/worker/gpu/attn_utils.py:301-303}}); it passes the list form of <code>attn_metadata</code> and <code>slot_mapping</code>, one dict per micro-batch ({{cite vllm/forward_context.py:146-150}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths and environment variables">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>no context is set</td><td><code>AssertionError</code> "Forward context is not set."</td><td>{{cite vllm/forward_context.py:210-213}}</td></tr>
+    <tr><td>a mode that is not NONE, PIECEWISE or FULL</td><td><code>AssertionError</code> "Invalid cudagraph runtime mode"</td><td>{{cite vllm/forward_context.py:199-202}}</td></tr>
+    <tr><td>DP counts that do not match this rank</td><td><code>AssertionError</code> in <code>DPMetadata.make</code></td><td>{{cite vllm/forward_context.py:104-106}}</td></tr>
+  </tbody>
+</table>
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_LOG_BATCHSIZE_INTERVAL</code></td><td><code>-1</code> (off) ({{cite vllm/envs.py:1445-1447}})</td><td>import, {{cite vllm/forward_context.py:22-25}}</td><td>&gt;= 0: synchronize after each forward pass that has attention metadata, and log the median time per batch size at this interval in seconds ({{cite vllm/forward_context.py:295}}).</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/forward-context}}: the idea, with the attention lookup step by step.</li>
+  <li>{{link concepts/compile-and-cuda-graphs}}: how the wrappers use the mode and the descriptor.</li>
+  <li>{{link concepts/model-runner}}: where the metadata comes from.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which function do layers call to read the current step data?
+    <x-a><p><code>get_forward_context()</code>, which returns the module-level <code>_forward_context</code> ({{cite vllm/forward_context.py:208-214}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Is <code>no_compile_layers</code> a copy of <code>static_forward_context</code>?
+    <x-a><p>No. The field comment says "copy", but <code>create_forward_context</code> passes the dict object itself ({{cite vllm/forward_context.py:142-143}}, {{cite vllm/forward_context.py:248}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Why can <code>VLLM_LOG_BATCHSIZE_INTERVAL=0</code> make a server slower, and when is the setting read?
+    <x-a><p>When it is 0 or more, every forward pass inside <code>set_forward_context</code> with attention metadata ends with <code>current_platform.synchronize()</code> ({{cite vllm/forward_context.py:295}}, {{cite vllm/forward_context.py:363-370}}), which removes the CPU/GPU overlap. In Model Runner V2 these are the eager and PIECEWISE steps. The module reads the variable once, at import ({{cite vllm/forward_context.py:22-25}}).</p></x-a>
+  </x-q>
+</x-quiz>

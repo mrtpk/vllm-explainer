@@ -1,0 +1,238 @@
+---
+title: torch.compile and CUDA graphs in vLLM
+nav_title: Compile and CUDA graphs
+level: Advanced
+prerequisites: learn/pytorch-for-serving, concepts/forward-context, concepts/model-runner
+related: concepts/model-runner, concepts/forward-context, concepts/attention-backends, concepts/custom-ops, learn/pytorch-for-serving, concepts/tuning, concepts/troubleshooting, tours/serve-startup
+summary: vLLM compiles the inner model once with torch.compile and its own Inductor backend, splits the graph at the attention ops, caches the result on disk, and captures CUDA graphs at start-up. Each step, Model Runner V2 replays a FULL graph for uniform decode batches, PIECEWISE graphs for other batches up to the largest capture size, and runs eagerly above it.
+---
+<x-sentence>vLLM compiles the model once, cuts it at attention, records CUDA graphs at start-up, and picks FULL, PIECEWISE or eager per step.</x-sentence>
+
+<h2>The idea</h2>
+<p>A decoder step launches hundreds of small kernels. Two tools cut this cost ({{link learn/pytorch-for-serving}} has the PyTorch basics):</p>
+<ul>
+  <li><strong>{{term torch-compile}}</strong> captures the model's Python code as one graph and lets {{term inductor}} fuse the small ops into fewer kernels. vLLM does it once per process, with no guards, and keeps the token count as a dynamic dimension.</li>
+  <li><strong>{{term cuda-graph | CUDA graphs}}</strong> record the kernel launches of one batch shape at start-up and replay them later with one call ({{deepinfer concepts/cuda-graphs | CUDA graph capture and replay}}).</li>
+</ul>
+<p>Attention is the hard part. Its kernels depend on the batch layout, and some backends cannot run inside a graph for every layout. So vLLM cuts the compiled graph at the attention ops, the {{term splitting-op | splitting ops}}. Each piece between two attention ops gets its own {{term piecewise-cuda-graph}}, and attention runs eagerly between them. For pure decode batches, it also captures a {{term full-cuda-graph}} of the whole forward pass, attention included.</p>
+<p>The {{term optimization-level}} sets the defaults. At the default <code>-O2</code>, the {{term compilation-mode}} is <code>VLLM_COMPILE</code> and the CUDA graph mode is <code>FULL_AND_PIECEWISE</code>. Each step, Model Runner V2 looks at the batch and picks FULL, PIECEWISE or NONE (eager).</p>
+<p><strong>An everyday comparison.</strong> Think of a factory line with fixed robot programs. The engineers write one program per standard product size. They leave a manual station in the middle, for the step that changes with every order. Small standard orders run one complete program with no stop (FULL). Other orders run the programs with a stop at the manual station (PIECEWISE). A giant order runs fully by hand (eager). The comparison stops here: the programs are recorded once at start-up, for a fixed list of sizes. An order is padded up to the next size.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b6b_piecewise" alt="Panel 1, compile: LlamaModel.forward with @support_torch_compile is traced once by Dynamo into one FX graph with fullgraph=True and the token dimension dynamic. VllmBackend computes the cache hash, then split_graph cuts the graph at the splitting ops unified_kv_cache_update and unified_attention_with_output. The result is a chain: piece 0 (embedding, layer 0 norm, QKV, RoPE), attention 0 (kept as a splitting submodule, eager), piece 1 (o_proj, MLP of layer 0, norm and QKV of layer 1), attention 1, and so on to piece 32 (o_proj, MLP of layer 31, final norm). Panel 2, wrap: each compiled piece becomes a PiecewiseBackend (Inductor code for the compile range 1 to max_num_batched_tokens) inside a CUDAGraphWrapper with runtime mode PIECEWISE that keeps one graph per BatchDescriptor; attention pieces have no wrapper. Panel 3, capture: at start-up CudaGraphManager.capture runs PIECEWISE captures first (the wrappers record one graph per piece and size) and then FULL captures (torch.cuda.graph around the whole forward with the runtime mode NONE inside, so the piece wrappers do not record)." caption="Figure: how one Llama model becomes compiled pieces with CUDA graph wrappers (panels 1 and 2), and how the two kinds of graphs are captured at start-up (panel 3)." />
+<p>Panel 1 is the one-time compile. Panel 2 shows what runs in a PIECEWISE step: blue pieces replay graphs, amber attention pieces run Python and the backend kernel. Panel 3 shows why FULL and PIECEWISE graphs do not interfere: a wrapper replays only when the forward context says PIECEWISE.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: optimization levels and their defaults</h3>
+<p>The <code>OptimizationLevel</code> enum has four values; O2 is the default ({{cite vllm/config/vllm.py:131-143}}, {{cite vllm/config/vllm.py:434}}). The CLI accepts <code>-O2</code>, <code>-O 2</code>, <code>-O=2</code> and <code>--optimization-level 2</code> ({{cite vllm/utils/argparse_utils.py:395-406}}).</p>
+<table>
+  <thead><tr><th>Level</th><th>Compile mode (if unset)</th><th>CUDA graph mode (if unset)</th><th>Fusion passes</th></tr></thead>
+  <tbody>
+    <tr><td><code>-O0</code></td><td><code>NONE</code></td><td><code>NONE</code> ({{cite vllm/config/vllm.py:268}})</td><td>all off</td></tr>
+    <tr><td><code>-O1</code></td><td><code>VLLM_COMPILE</code></td><td><code>PIECEWISE</code> ({{cite vllm/config/vllm.py:289}})</td><td>norm+quant and act+quant when their conditions hold; no all-reduce fusion</td></tr>
+    <tr><td><code>-O2</code> (default)</td><td><code>VLLM_COMPILE</code></td><td><code>FULL_AND_PIECEWISE</code> ({{cite vllm/config/vllm.py:310}})</td><td>as O1, plus all-reduce+RMSNorm and some RoPE/KV-cache fusions when their conditions hold</td></tr>
+    <tr><td><code>-O3</code></td><td><code>VLLM_COMPILE</code></td><td><code>FULL_AND_PIECEWISE</code> ({{cite vllm/config/vllm.py:331}})</td><td>same as O2: "Currently the same as -O2"</td></tr>
+  </tbody>
+</table>
+<p>The compile mode is not in the level tables. <code>VllmConfig.__post_init__</code> sets it: above O0, an unset mode becomes <code>VLLM_COMPILE</code> ({{cite vllm/config/vllm.py:1806-1810}}). Then the level's table fills only the fields that are still <code>None</code>, so your own settings win ({{cite vllm/config/vllm.py:1005-1019}}, {{cite vllm/config/vllm.py:1833-1834}}).</p>
+<x-warning title="Three cases turn compilation off before the default applies">
+<ul>
+  <li><code>--enforce-eager</code> sets the compile mode and the CUDA graph mode to <code>NONE</code> ({{cite vllm/config/vllm.py:1745-1747}}).</li>
+  <li><code>TORCH_COMPILE_DISABLE=1</code> sets the compile mode to <code>NONE</code> ({{cite vllm/config/vllm.py:1765-1770}}). The CUDA graph mode then loses its piecewise part: <code>FULL_AND_PIECEWISE</code> becomes <code>FULL_DECODE_ONLY</code> ({{cite vllm/config/vllm.py:1111-1129}}).</li>
+  <li><strong>Breakable CUDA graphs</strong> set the compile mode to <code>NONE</code> too ({{cite vllm/config/vllm.py:849-852}}). vLLM turns them on by default for 30 architectures, for example <code>DeepseekV4ForCausalLM</code>, unless <code>VLLM_USE_BREAKABLE_CUDAGRAPH</code> is set ({{cite vllm/config/vllm.py:75-107}}, {{cite vllm/config/vllm.py:824-836}}). With <code>VLLM_BATCH_INVARIANT=1</code>, some BF16 models on CUDA also get them ({{cite vllm/config/vllm.py:834-843}}). On ROCm the list is only <code>DeepseekV41ForCausalLM</code> ({{cite vllm/config/vllm.py:111-128}}).</li>
+</ul>
+</x-warning>
+<p>Later checks can lower the CUDA graph mode again. A pooling model gets <code>PIECEWISE</code> instead of FULL graphs; an encoder-decoder model gets <code>FULL_DECODE_ONLY</code> ({{cite vllm/config/vllm.py:1932-1954}}). A KV connector can ask for <code>PIECEWISE</code> ({{cite vllm/config/vllm.py:1957-1980}}). At KV cache init, the attention backends can lower it once more ({{link concepts/attention-backends}}).</p>
+
+<h3>Step 2: @support_torch_compile marks what to compile</h3>
+<p>A model class opts in with the decorator; in Llama it sits on <code>LlamaModel</code> ({{link concepts/model-definition}}). Without explicit <code>dynamic_arg_dims</code>, dimension 0 of every argument annotated as a tensor or <code>IntermediateTensors</code> is dynamic: the token count ({{cite vllm/compilation/decorators.py:214-232}}). The decorator adds <code>TorchCompileWithNoGuardsWrapper</code> as a base class ({{cite vllm/compilation/decorators.py:360-367}}). It skips compilation when the mode is <code>NONE</code> or <code>STOCK_TORCH_COMPILE</code>, when the class is marked with <code>ignore_torch_compile</code>, or when <code>enable_if</code> says no ({{cite vllm/compilation/decorators.py:409-418}}).</p>
+<p>The wrapper builds the compiled callable once:</p>
+<x-code file="vllm/compilation/wrapper.py" lines="168-175" highlight="169-174" />
+<p><code>fullgraph=True</code> forbids graph breaks; <code>dynamic=False</code> plus the marked dimensions give one graph with a symbolic token count. Outside <code>STOCK_TORCH_COMPILE</code> all guards are dropped, so Dynamo never traces again after the first call ({{cite vllm/compilation/wrapper.py:65-70}}, {{cite vllm/compilation/wrapper.py:126-146}}). The backend comes from <code>init_backend</code>: a <code>VllmBackend</code> in <code>VLLM_COMPILE</code> mode ({{cite vllm/config/compilation.py:1083-1134}}).</p>
+<p>The first call happens in the first forward pass of the worker, the {{term profile-run}} with <code>max_num_batched_tokens</code> dummy tokens ({{cite vllm/v1/worker/gpu/model_runner.py:1022-1027}}). The worker runs it inside its memory profiling, and a comment says that this run "compiles the model" ({{cite vllm/v1/worker/gpu_worker.py:654-655}}, {{cite vllm/v1/worker/gpu_worker.py:681-697}}). So on a start without a cache, the compile time is part of the memory profiling time.</p>
+
+<h3>Step 3: VllmBackend hashes and caches</h3>
+<p>Dynamo calls <code>VllmBackend</code> with the traced graph. First it decides the {{term compile-cache}} folder:</p>
+<x-code file="vllm/compilation/backends.py" lines="1059-1098" highlight="1059-1060,1062-1063,1083,1091-1098" />
+<ol>
+  <li><strong>Env factors.</strong> Every known vLLM environment variable, minus a list of ignored ones such as <code>VLLM_PORT</code> and <code>VLLM_CACHE_ROOT</code> ({{cite vllm/envs.py:2351-2381}}).</li>
+  <li><strong>Config hash.</strong> <code>VllmConfig.compute_hash()</code>: the vLLM version and the hashes of the model, cache, parallel, scheduler, compilation and other configs, cut to 10 hex digits ({{cite vllm/config/vllm.py:459-501}}, {{cite vllm/config/vllm.py:571-574}}). The scheduler part holds <code>max_num_batched_tokens</code>, because LoRA buffers and Inductor's index width depend on it, and <code>max_num_seqs</code>, because some static per-request buffers depend on it ({{cite vllm/config/scheduler.py:271-284}}).</li>
+  <li><strong>Code hash.</strong> The source of every file that Dynamo traced (lines 1064-1083).</li>
+  <li><strong>Compiler hash.</strong> From the Inductor adaptor ({{cite vllm/compilation/backends.py:159-160}}).</li>
+</ol>
+<p>The folder is <code>$VLLM_CACHE_ROOT/torch_compile_cache/&lt;10 hex digits&gt;/rank_&lt;rank&gt;_&lt;dp&gt;/&lt;prefix&gt;</code>, where the prefix is <code>backbone</code> for the main model ({{cite vllm/compilation/backends.py:1103-1107}}, {{cite vllm/compilation/backends.py:804}}). <code>VLLM_CACHE_ROOT</code> defaults to <code>~/.cache/vllm</code> when <code>XDG_CACHE_HOME</code> is not set ({{cite vllm/envs.py:710-718}}). vLLM computes the hash folder only when <code>compilation_config.cache_dir</code> is empty ({{cite vllm/compilation/backends.py:1086-1098}}). <code>VLLM_DISABLE_COMPILE_CACHE=1</code> turns the cache off ({{cite vllm/compilation/compiler_interface.py:204-219}}).</p>
+<p>On PyTorch 2.10 or newer, vLLM also uses ahead-of-time (AOT) compilation by default: <code>VLLM_USE_AOT_COMPILE</code> is 1 unless the compile cache is off ({{cite vllm/envs.py:378-387}}). The decorator then first tries to load a saved compiled function from <code>torch_compile_cache/torch_aot_compile/&lt;hash&gt;/rank_&lt;rank&gt;_&lt;dp&gt;/model</code>. After a fresh compile it saves one there ({{cite vllm/compilation/decorators.py:556-605}}, {{cite vllm/compilation/decorators.py:731-756}}).</p>
+<p>So both folders can exist side by side. On a start without a cache, Dynamo traces the model, and <code>VllmBackend</code> compiles the pieces into its hash folder. Then the decorator saves the AOT file. On the next start, a loaded AOT file skips the Dynamo trace ({{cite vllm/compilation/decorators.py:595-605}}). From the saved graph, <code>VllmBackend</code> runs again and finds its compiled pieces in its own folder ({{cite vllm/compilation/caching.py:351-380}}). With <code>VLLM_USE_MEGA_AOT_ARTIFACT</code> (default on with AOT on PyTorch 2.12 or newer), the AOT file holds the Inductor code too ({{cite vllm/envs.py:390-397}}, {{cite vllm/compilation/caching.py:326-349}}).</p>
+
+<h3>Step 4: split_graph cuts at the splitting ops</h3>
+<p>Without Inductor graph partition (the default at every level, {{cite vllm/config/vllm.py:311}}), the backend splits the FX graph itself:</p>
+<x-code file="vllm/compilation/backends.py" lines="1206-1212" />
+<p>The default list is the attention ops plus the two KV cache update ops ({{cite vllm/config/compilation.py:1175-1213}}):</p>
+<ul>
+  <li><code>vllm::unified_attention_with_output</code>, <code>vllm::unified_mla_attention_with_output</code>, the Mamba and linear-attention ops and some model-specific ops: 17 names in <code>_attention_ops</code> ({{cite vllm/config/compilation.py:768-788}});</li>
+  <li><code>vllm::unified_kv_cache_update</code> and <code>vllm::unified_mla_kv_cache_update</code>, because the string argument "prevents Inductor from reusing piecewise graphs" ({{cite vllm/config/compilation.py:1186-1187}}).</li>
+</ul>
+<p><code>split_graph</code> walks the nodes in order. A splitting op starts a new subgraph, and consecutive splitting ops stay in one subgraph ({{cite vllm/compilation/backends.py:589-617}}). Only the pieces that are not splitting graphs are compiled ({{cite vllm/compilation/backends.py:1235-1239}}). The attention subgraphs stay plain FX code that calls the custom ops, so they run eagerly.</p>
+<p>If attention-quant fusion is on (Inductor graph partition off), vLLM must keep attention inside the graph. If you did not set <code>splitting_ops</code>, it sets <code>[]</code>, and a mode with piecewise graphs becomes <code>FULL</code> ({{cite vllm/config/compilation.py:1260-1278}}).</p>
+
+<h3>Step 5: PiecewiseBackend and CUDAGraphWrapper</h3>
+<p><code>PiecewiseCompileInterpreter</code> runs the split graph with fake tensors. For each piece to compile it makes a <code>PiecewiseBackend</code>, wraps it, and puts the wrapper in place of the piece ({{cite vllm/compilation/backends.py:765-795}}). The backend compiles the piece with Inductor once per compile range. The default range list has one range, from 1 to <code>max_num_batched_tokens</code>; all-reduce and RoPE/KV-cache fusions can add an extra endpoint ({{cite vllm/config/vllm.py:2637-2645}}, {{cite vllm/compilation/piecewise_backend.py:244-276}}). At run time it picks the compiled code of the range that holds the token count ({{cite vllm/compilation/piecewise_backend.py:357-379}}).</p>
+<p>The wrapper is added only when the CUDA graph mode has a piecewise part and Inductor graph partition is off ({{cite vllm/compilation/backends.py:656-707}}):</p>
+<x-code file="vllm/compilation/cuda_graph.py" lines="235-256" highlight="242-243,245-256" />
+<p>The wrapper reads the forward context. It replays only when the run-time mode equals its own mode, PIECEWISE. Then it looks up a graph by the <code>BatchDescriptor</code>: the padded token count and the LoRA flags ({{cite vllm/forward_context.py:29-57}}). A missing entry is captured on the spot, which is allowed only during the capture phase ({{cite vllm/compilation/cuda_graph.py:258-279}}).</p>
+
+<h3>Step 6: Inductor post-grad passes</h3>
+<p><code>VllmBackend</code> adds vLLM's own passes to Inductor. <code>PostGradPassManager.configure</code> picks them from <code>PassConfig</code> ({{cite vllm/compilation/passes/pass_manager.py:139-223}}). The flags start as <code>None</code> and get their values from the level table, as functions of the config ({{cite vllm/config/vllm.py:296-315}}):</p>
+<table>
+  <thead><tr><th>Flag</th><th>On at O2 when</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td><code>eliminate_noops</code></td><td>always (field default <code>True</code>)</td><td>{{cite vllm/config/compilation.py:133-134}}</td></tr>
+    <tr><td><code>fuse_norm_quant</code></td><td>the <code>rms_norm</code> or <code>quant_fp8</code> CustomOp is enabled, or the IR <code>rms_norm</code> provider is not <code>native</code></td><td>{{cite vllm/config/vllm.py:156-163}}</td></tr>
+    <tr><td><code>fuse_act_quant</code></td><td>the <code>silu_and_mul</code> or <code>quant_fp8</code> CustomOp is enabled, or the model is NVFP4-quantized</td><td>{{cite vllm/config/vllm.py:166-175}}</td></tr>
+    <tr><td><code>fuse_allreduce_rms</code></td><td>TP &gt; 1 on CUDA with FlashInfer installed and compute capability 9.0 or the 10.x family; on ROCm, AITER on and TP &gt; 1; never with <code>VLLM_BATCH_INVARIANT</code></td><td>{{cite vllm/config/vllm.py:178-202}}</td></tr>
+    <tr><td><code>fuse_attn_quant</code></td><td>never by default (<code>IS_QUANTIZED = False</code>)</td><td>{{cite vllm/config/vllm.py:148-153}}, {{cite vllm/config/vllm.py:302}}</td></tr>
+    <tr><td><code>fuse_rope_kvcache</code>, <code>fuse_qk_norm_rope_kvcache</code>, <code>fuse_act_padding</code>, <code>fuse_mla_dual_rms_norm</code></td><td>ROCm with AITER, with extra conditions</td><td>{{cite vllm/config/vllm.py:205-251}}</td></tr>
+    <tr><td><code>fuse_rope_kvcache_cat_mla</code></td><td>Inductor graph partition on, or the KV cache update ops are not splitting ops</td><td>{{cite vllm/config/vllm.py:221-226}}</td></tr>
+    <tr><td><code>enable_qk_norm_rope_fusion</code></td><td>off at every level</td><td>{{cite vllm/config/vllm.py:307}}</td></tr>
+  </tbody>
+</table>
+<p>Take a BF16 Llama with TP = 1 on CUDA, at O2. The CustomOps are off by default ({{link concepts/custom-ops}}), and the CUDA IR priority of <code>rms_norm</code> starts with <code>native</code> when Inductor compiles ({{cite vllm/platforms/cuda.py:716-731}}). So of these flags only <code>eliminate_noops</code> is on (derived from the table). The pass manager always adds its IR lowering and clean-up passes ({{cite vllm/compilation/passes/pass_manager.py:119-134}}). With TP = 2 on an H100 and FlashInfer installed, <code>fuse_allreduce_rms</code> joins it. vLLM logs the list as "Enabled custom fusions: ..." ({{cite vllm/config/compilation.py:301-320}}).</p>
+
+<h3>Step 7: CUDA graph modes and capture sizes</h3>
+<p><code>CUDAGraphMode</code> has three run-time modes and two pairs ({{cite vllm/config/compilation.py:53-63}}). A pair has one mode for uniform decode batches and one for mixed batches ({{cite vllm/config/compilation.py:65-69}}):</p>
+<table>
+  <thead><tr><th>Mode</th><th>Uniform decode batch</th><th>Other batches</th></tr></thead>
+  <tbody>
+    <tr><td><code>NONE</code></td><td>eager</td><td>eager</td></tr>
+    <tr><td><code>PIECEWISE</code></td><td>PIECEWISE</td><td>PIECEWISE</td></tr>
+    <tr><td><code>FULL</code></td><td>FULL</td><td>FULL</td></tr>
+    <tr><td><code>FULL_DECODE_ONLY</code></td><td>FULL</td><td>eager</td></tr>
+    <tr><td><code>FULL_AND_PIECEWISE</code> (O2)</td><td>FULL</td><td>PIECEWISE</td></tr>
+  </tbody>
+</table>
+<p>The {{term capture-size | capture sizes}} are padded token counts. When you do not set <code>max_cudagraph_capture_size</code>, the maximum is <code>min(max_num_seqs × decode_query_len × 2, 512)</code>, or 1024 on data-center Blackwell (compute capability 10.x) ({{cite vllm/config/vllm.py:2440-2449}}). It is also capped at <code>max_num_batched_tokens</code> ({{cite vllm/config/vllm.py:2530-2531}}). The list is 1, 2, 4, then steps of 8 below 256, then steps of 16 ({{cite vllm/config/vllm.py:2557-2570}}). <code>max_num_batched_tokens</code> joins the list if it is below the maximum (lines 2571-2576).</p>
+
+<h3>Step 8: Model Runner V2 captures the graphs</h3>
+<p>The runner makes a <code>ModelCudaGraphManager</code> at KV cache init ({{cite vllm/v1/worker/gpu/model_runner.py:764-772}}). Its <code>_init_candidates</code> turns the mode and the sizes into a list of <code>BatchExecutionDescriptor</code>s to capture ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:256-394}}). After warm-up, the worker calls <code>capture_model()</code>, unless <code>--enforce-eager</code> is set ({{cite vllm/v1/worker/gpu_worker.py:983-985}}). The manager captures all PIECEWISE descriptors first, then all FULL ones, the largest size first in each mode ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:447-449}}, {{cite vllm/v1/worker/gpu/cudagraph_utils.py:376-378}}):</p>
+<ul>
+  <li><strong>PIECEWISE.</strong> A warm-up run, then a run in the forward context with mode PIECEWISE. Each piece's wrapper records its graph ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:464-479}}).</li>
+  <li><strong>FULL.</strong> A warm-up run, fresh inputs, then <code>torch.cuda.graph(...)</code> around the whole forward with the mode <code>NONE</code> inside. The piece wrappers pass through, so the outer graph records everything ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:480-512}}).</li>
+</ul>
+<p>The comment gives the order's reason: "PIECEWISE has larger activations so FULL activations should fit in already allocated buffers in the graph pool" ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:444-446}}).</p>
+
+<h3>Step 9: the dispatch rule for each step</h3>
+<x-diagram name="b6b_cg_dispatch" alt="A decision flow for one batch under FULL_AND_PIECEWISE. Inputs: number of requests, number of tokens, whether the batch is a uniform decode, max query length, active LoRA count. Check 1: profile run or an encoder-decoder step with encoder inputs: NONE. Check 2: no captured descriptor for this token count, because it is above the largest capture size or capture has not happened: NONE, eager. Check 3: the candidate list has FULL descriptors first, then PIECEWISE. A FULL decode descriptor matches only if every request has decode_query_len tokens (1 without speculative decoding, 1 + k with k drafts), the batch has no real prefill, and the descriptor has enough request slots: replay the FULL graph padded to its size. Otherwise the PIECEWISE descriptor of the next capture size matches any batch: run the compiled pieces padded to that size. Examples on an H100 with max_num_seqs 1024: 3 decodes become FULL with 4 tokens and 4 requests; 6 prompt tokens plus 2 decodes become PIECEWISE with 8 tokens; 300 tokens become PIECEWISE with 304; 8192 tokens run eagerly." caption="Figure: how Model Runner V2 picks the CUDA graph for one batch, with four example batches on an H100 (largest capture size 512)." />
+<p><code>execute_model</code> calls <code>dispatch_cg_and_sync_dp</code> before it prepares the inputs ({{cite vllm/v1/worker/gpu/model_runner.py:1806-1819}}). It passes the uniform decode token count. This count is set only when every request has the same query length and the batch has no real prefill ({{cite vllm/v1/worker/utils.py:958-976}}, {{cite vllm/v1/worker/gpu/model_runner.py:1335-1372}}). The manager then takes the candidates for this token count and returns the first compatible one, else <code>NONE</code>:</p>
+<x-code file="vllm/v1/worker/gpu/cudagraph_utils.py" lines="523-553" highlight="535-546,547-553" />
+<p>The compatibility test:</p>
+<x-code file="vllm/v1/worker/gpu/cudagraph_utils.py" lines="111-138" highlight="125-128,131-134" />
+<ol>
+  <li><strong>FULL decode graph.</strong> Its <code>uniform_token_count</code> is <code>decode_query_len</code>: 1 without speculative decoding, <code>1 + k</code> with <code>k</code> drafts ({{cite vllm/v1/worker/gpu/model_runner.py:442-445}}). The batch must have the same count, and the graph enough request slots.</li>
+  <li><strong>Varlen decode FULL variant.</strong> Only with adaptive verification: a FULL graph for decode batches whose requests have 1 to <code>decode_query_len</code> tokens ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:302-318}}). A batch with a prefill passes <code>max_query_len=None</code> and cannot use it ({{cite vllm/v1/worker/gpu/model_runner.py:1780-1785}}).</li>
+  <li><strong>PIECEWISE.</strong> No request count and no uniform count, so any batch up to its token count fits ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:352-370}}).</li>
+  <li><strong>Above the largest size.</strong> The token count has no candidates, so the result is <code>NONE</code> (line 553).</li>
+</ol>
+<p>With DP &gt; 1, the ranks agree on one padded size with a collective ({{cite vllm/v1/worker/gpu/dp_utils.py:278-312}}).</p>
+
+<h3>Step 10: breakable CUDA graphs</h3>
+<p>A {{term breakable-cuda-graph}} gives piecewise graphs without <code>torch.compile</code>. Instead of cutting an FX graph, one capture context runs the whole forward. Each attention op ends the current graph segment, runs eagerly, and a new segment starts ({{cite vllm/compilation/breakable_cudagraph.py:3-20}}). The ops that break are marked with <code>@eager_break_during_capture</code>, for example <code>unified_attention_with_output</code> ({{cite vllm/model_executor/layers/attention/attention.py:767-769}}). The decorator does nothing outside a capture, and nothing during a FULL capture ({{cite vllm/compilation/breakable_cudagraph.py:99-118}}). In MRV2, <code>run_pw_graph</code> uses the <code>BreakableCUDAGraphWrapper</code> instead of the compiled model when this mode is on ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:578-583}}). The environment variable is described as experimental ({{cite vllm/envs.py:776-779}}).</p>
+
+<h3>Step 11: the start-up cost, and how to reduce it</h3>
+<p>Compilation and capture are the slow part of <code>vllm serve</code> start-up. The logs show each part: "Dynamo bytecode transform time" ({{cite vllm/compilation/backends.py:1186-1190}}), "Compiling a graph for compile range ... takes ... s", once per compile range after its last piece ({{cite vllm/compilation/backends.py:415-422}}), and "Graph capturing finished in ... secs, took ... GiB" ({{cite vllm/v1/worker/gpu/model_runner.py:1146-1152}}). The comment there says capture "usually takes 5~20 seconds".</p>
+<ul>
+  <li><strong>Keep the compile cache.</strong> The second start with the same config, code and env loads the compiled pieces. Mount <code>~/.cache/vllm</code> (or <code>VLLM_CACHE_ROOT</code>) as a volume in containers. Changing <code>--max-num-batched-tokens</code> or <code>--max-num-seqs</code> changes the hash.</li>
+  <li><strong><code>-O0</code></strong>: no compile, no CUDA graphs, fastest start, slowest steps. <code>--enforce-eager</code> has the same effect on compile and graphs.</li>
+  <li><strong><code>-O1</code></strong>: compile with PIECEWISE graphs only, so no FULL capture.</li>
+  <li><strong>Fewer sizes.</strong> Set <code>-cc.max_cudagraph_capture_size</code> or <code>-cc.cudagraph_capture_sizes</code>. Fewer sizes mean shorter capture and less memory, but more padding or eager steps.</li>
+  <li><strong><code>-cc.cudagraph_mode=FULL_DECODE_ONLY</code></strong>: no piecewise graphs; the docstring suggests it for decode instances in prefill/decode disaggregation ({{cite vllm/config/compilation.py:628-631}}).</li>
+</ul>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: capture sizes and four batches on one H100">
+<p><code>vllm serve meta-llama/Llama-3.1-8B-Instruct</code> on one H100: <code>max_num_seqs = 1024</code>, <code>max_num_batched_tokens = 8192</code> ({{link concepts/scheduler}}), no speculative decoding, so <code>decode_query_len = 1</code>.</p>
+<ol>
+  <li><strong>Maximum.</strong> <code>min(1024 × 1 × 2, 512) = 512</code>. 8192 is larger, so it is not added.</li>
+  <li><strong>Sizes.</strong> <code>[1, 2, 4]</code> + 31 sizes <code>8, 16, ..., 248</code> + 17 sizes <code>256, 272, ..., 512</code> = 51 sizes. No uniform decode sizes are added: <code>max_num_seqs</code> 1024 is above the maximum ({{cite vllm/config/vllm.py:2528-2529}}).</li>
+  <li><strong>Descriptors.</strong> 51 PIECEWISE descriptors and 51 FULL decode descriptors, one per size, each FULL one with <code>num_reqs = num_tokens</code> (derived from {{cite vllm/v1/worker/gpu/cudagraph_utils.py:321-343}}).</li>
+</ol>
+<table>
+  <thead><tr><th>Batch</th><th>Uniform count</th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td>3 decodes</td><td>1</td><td>FULL, 4 tokens, 4 requests (one padding request)</td></tr>
+    <tr><td>2 decodes + a 6-token prompt</td><td>none (a prefill)</td><td>PIECEWISE, 8 tokens</td></tr>
+    <tr><td>a 300-token prompt chunk</td><td>none</td><td>PIECEWISE, 304 tokens</td></tr>
+    <tr><td>8192 tokens</td><td>none</td><td>NONE (eager): no size at or above 8192</td></tr>
+  </tbody>
+</table>
+<p>With EAGLE and 3 drafts, <code>decode_query_len = 4</code>. Uniform decode sizes are added as 4 × request counts up to 512 tokens ({{cite vllm/config/vllm.py:2454-2526}}). A batch of 3 verifying requests has 12 tokens. No FULL graph has 12 tokens: the capture sizes go from 8 to 16. So the batch replays the FULL graph of 16 tokens and 4 request slots, with one padding request (derived from {{cite vllm/v1/worker/gpu/cudagraph_utils.py:321-343}}).</p>
+</x-deepdive>
+
+<x-deepdive title="CompilationMode in detail">
+<table>
+  <thead><tr><th>Mode</th><th>Value</th><th>What happens</th></tr></thead>
+  <tbody>
+    <tr><td><code>NONE</code></td><td>0</td><td>Eager PyTorch. <code>@support_torch_compile</code> does nothing. Piecewise graphs are possible only with breakable CUDA graphs.</td></tr>
+    <tr><td><code>STOCK_TORCH_COMPILE</code></td><td>1</td><td>Plain <code>torch.compile</code> with guards. The decorator skips; Model Runner V2 compiles the whole model after loading ({{cite vllm/v1/worker/gpu/model_runner.py:554-555}}).</td></tr>
+    <tr><td><code>DYNAMO_TRACE_ONCE</code></td><td>2</td><td>One Dynamo trace, guards dropped, the configured backend sees the whole graph ({{cite vllm/config/compilation.py:1114-1121}}).</td></tr>
+    <tr><td><code>VLLM_COMPILE</code></td><td>3</td><td><code>VllmBackend</code>: splitting, caching, passes, piecewise graphs ({{cite vllm/config/compilation.py:1123-1134}}).</td></tr>
+  </tbody>
+</table>
+<p>Source: {{cite vllm/config/compilation.py:37-50}}. Piecewise CUDA graphs need <code>VLLM_COMPILE</code> or breakable graphs; a final assert checks it on CUDA-like platforms ({{cite vllm/config/vllm.py:2146-2156}}).</p>
+</x-deepdive>
+
+<x-deepdive title="What the compiled pieces look like for Llama">
+<p>The default splitting ops cut Llama at the KV cache write and the attention of each layer. The order inside <code>Attention.forward</code> is: reshape q/k/v, the cache update op, then the attention op ({{cite vllm/model_executor/layers/attention/attention.py:535-540}}, {{cite vllm/model_executor/layers/attention/attention.py:561-580}}). No other op sits between the two op calls, so Dynamo records them as neighbours in the FX graph. <code>split_graph</code> keeps consecutive splitting ops in one subgraph ({{cite vllm/compilation/backends.py:605-613}}). So each layer gives one eager attention subgraph, and N layers give N + 1 compiled pieces: 33 for the 32 layers of Llama-3-8B (derived). To see the real split, open <code>computation_graph.py</code> in the cache folder ({{cite vllm/compilation/backends.py:1292-1306}}).</p>
+<p>Each compiled piece covers the end of one layer and the start of the next. It holds <code>o_proj</code>, the MLP, the norms, the next QKV projection and RoPE. Inductor can fuse inside a piece, but never across an attention op.</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables and config fields">
+<table>
+  <thead><tr><th>Name</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>-O</code> / <code>--optimization-level</code></td><td><code>2</code></td><td>Level defaults of Step 1.</td></tr>
+    <tr><td><code>-cc.mode</code></td><td>unset → <code>VLLM_COMPILE</code> above O0</td><td>{{cite vllm/config/compilation.py:432-445}}</td></tr>
+    <tr><td><code>-cc.cudagraph_mode</code></td><td>unset → level default</td><td>{{cite vllm/config/compilation.py:610-645}}</td></tr>
+    <tr><td><code>-cc.cudagraph_capture_sizes</code>, <code>-cc.max_cudagraph_capture_size</code></td><td>unset → Step 7 formula</td><td>{{cite vllm/config/compilation.py:651-711}}</td></tr>
+    <tr><td><code>-cc.splitting_ops</code></td><td>unset → attention and KV cache update ops</td><td>{{cite vllm/config/compilation.py:502-518}}</td></tr>
+    <tr><td><code>-cc.use_inductor_graph_partition</code></td><td><code>False</code> at all levels</td><td>{{cite vllm/config/compilation.py:672-690}}</td></tr>
+    <tr><td><code>VLLM_DISABLE_COMPILE_CACHE</code></td><td><code>0</code></td><td>no cache read or write ({{cite vllm/envs.py:374-375}})</td></tr>
+    <tr><td><code>VLLM_USE_AOT_COMPILE</code></td><td><code>1</code> on PyTorch 2.10+ with the cache on</td><td>{{cite vllm/envs.py:378-387}}</td></tr>
+    <tr><td><code>VLLM_CACHE_ROOT</code></td><td><code>~/.cache/vllm</code></td><td>root of the compile cache ({{cite vllm/envs.py:710-718}})</td></tr>
+    <tr><td><code>VLLM_COMPILE_CACHE_SAVE_FORMAT</code></td><td><code>binary</code></td><td><code>unpacked</code> writes readable files ({{cite vllm/envs.py:2143-2145}})</td></tr>
+    <tr><td><code>VLLM_USE_BREAKABLE_CUDAGRAPH</code></td><td>unset → on for the default architectures only</td><td>{{cite vllm/envs.py:776-779}}</td></tr>
+    <tr><td><code>TORCH_COMPILE_DISABLE</code></td><td>unset</td><td><code>1</code> → compile mode <code>NONE</code></td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Slow first start, fast second start.</strong> This is the compile cache at work. If every start is slow, something in the hash changes: a different <code>--max-num-batched-tokens</code>, another environment variable, or a lost cache volume.</li>
+  <li><strong>Large steps run eagerly.</strong> Batches above the largest capture size get no CUDA graph (Step 9). This is normal for long prefill chunks, where launch overhead is small.</li>
+  <li><strong>A mode quietly lowered.</strong> A backend, a pooling model, an encoder-decoder model or a KV connector can change <code>FULL_AND_PIECEWISE</code> with only a log line (Step 1, {{link concepts/attention-backends}}).</li>
+  <li><strong>A model without a compiled part.</strong> If the model has no compiled submodule and breakable graphs are off, piecewise capture is not possible. At KV cache init the runner then lowers the mode to its non-piecewise form, with a warning ({{cite vllm/config/compilation.py:1467-1480}}). The capture code checks the same condition and raises "piecewise CUDA graphs ... unavailable" ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:633-641}}).</li>
+  <li><strong>FULL with a weak backend.</strong> <code>-cc.cudagraph_mode=FULL</code> with a <code>NEVER</code> backend stops start-up with <code>ValueError</code> ({{cite vllm/config/compilation.py:1394-1410}}).</li>
+  <li><strong>Docs that do not match.</strong> <code>docs/design/torch_compile.md</code> shows a cache folder <code>torch_compile_cache/1517964802/rank_0_0</code> ({{cite docs/design/torch_compile.md:15}}); the code uses 10 hex digits and adds the prefix folder. <code>docs/design/cuda_graphs.md</code> describes the dispatcher of Model Runner V1 ({{cite docs/design/cuda_graphs.md:98-118}}); Model Runner V2 uses <code>CudaGraphManager.dispatch</code>.</li>
+</ul>
+<p><strong>Why it matters.</strong> These settings decide both the start-up time and the speed of every decode step. For a latency-sensitive deployment, keep O2, keep the compile cache on disk, and check in the log that FULL decode graphs survived start-up. For fast restarts during development, use <code>-O0</code> or <code>--enforce-eager</code>.</p>
+
+<x-quiz>
+  <x-q level="easy">What are the default compile mode and CUDA graph mode of <code>vllm serve</code>?
+    <x-a><p><code>VLLM_COMPILE</code> and <code>FULL_AND_PIECEWISE</code>: the default level is O2 ({{cite vllm/config/vllm.py:434}}), an unset mode above O0 becomes <code>VLLM_COMPILE</code> ({{cite vllm/config/vllm.py:1806-1808}}), and O2 sets <code>FULL_AND_PIECEWISE</code> ({{cite vllm/config/vllm.py:310}}). Exceptions: <code>--enforce-eager</code>, <code>TORCH_COMPILE_DISABLE=1</code> and breakable-graph architectures.</p></x-a>
+  </x-q>
+  <x-q level="medium">Which ops are splitting ops by default, and why is the KV cache write one of them?
+    <x-a><p>The 17 attention-like ops in <code>_attention_ops</code>, plus <code>unified_kv_cache_update</code> and <code>unified_mla_kv_cache_update</code> when Inductor graph partition is off ({{cite vllm/config/compilation.py:1184-1213}}). The update op takes a string argument that "prevents Inductor from reusing piecewise graphs" ({{cite vllm/config/compilation.py:1186-1187}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">On one H100 with <code>max_num_seqs = 1024</code>, what is the largest capture size, and what happens to a 600-token batch?
+    <x-a><p>512: <code>min(1024 × 1 × 2, 512)</code> ({{cite vllm/config/vllm.py:2440-2449}}). A 600-token batch has no candidate descriptor, so <code>dispatch</code> returns <code>NONE</code> and the model runs eagerly ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:547-553}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">During a FULL capture, why do the PIECEWISE <code>CUDAGraphWrapper</code>s inside the compiled model not record their own graphs?
+    <x-a><p>The capture runs the forward with run-time mode <code>NONE</code> inside <code>torch.cuda.graph</code> ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:496-502}}). A wrapper replays or captures only when the forward context mode equals its own mode, PIECEWISE; otherwise it just calls the piece ({{cite vllm/compilation/cuda_graph.py:245-256}}). So the outer graph records all kernels.</p></x-a>
+  </x-q>
+  <x-q level="hard">You change <code>--max-num-batched-tokens</code> from 8192 to 16384. Why does the next start compile again?
+    <x-a><p>The cache folder name hashes the config. The scheduler config hash contains <code>max_num_batched_tokens</code>, because LoRA buffers and Inductor's 32/64-bit index choice depend on it ({{cite vllm/config/scheduler.py:271-280}}, {{cite vllm/compilation/backends.py:1086-1098}}). A new hash gives a new, empty folder.</p></x-a>
+  </x-q>
+</x-quiz>

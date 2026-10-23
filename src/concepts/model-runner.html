@@ -1,0 +1,207 @@
+---
+title: The model runner (Model Runner V2)
+nav_title: The model runner (MRV2)
+level: Advanced
+prerequisites: concepts/executors-and-workers, concepts/async-scheduling, concepts/kv-cache-manager
+related: code/v1-worker-gpu-model-runner, concepts/forward-context, concepts/attention-backends, concepts/compile-and-cuda-graphs, concepts/async-scheduling, concepts/kv-cache-manager, concepts/hybrid-kv-cache, tours/engine-step, tours/forward-pass
+summary: Model Runner V2 keeps every running request in a fixed row of GPU tensors, gathers each step's inputs from those rows with GPU kernels, runs the model (CUDA graph or eager), and samples in a second call that returns an AsyncOutput without a GPU wait.
+---
+<x-sentence>Model Runner V2 keeps each request in a fixed GPU row, builds every step's inputs on the GPU, runs the model, and samples without waiting.</x-sentence>
+
+<h2>The idea</h2>
+<p>The {{term worker}} owns one GPU, and the {{term model-runner}} does the GPU work of each {{term engine-step | engine step}}. It gets a {{term scheduler-output | SchedulerOutput}} that says which requests run and how many tokens each one adds. It must turn this plan into tensors, run the model, and sample the next tokens. The default runner is Model Runner V2 (MRV2) in <code>vllm/v1/worker/gpu/</code>.</p>
+<p>MRV2 is built on three ideas:</p>
+<ul>
+  <li><strong>A {{term persistent-batch}}.</strong> Each running request gets a fixed row, its {{term request-slot}}, in a set of tensors with <code>max_num_seqs</code> rows. The rows hold the token ids, the lengths and the last sampled token. They stay on the GPU between steps.</li>
+  <li><strong>Inputs built on the GPU.</strong> Each step sorts the requests into a batch order. A small tensor, {{term idx-mapping}}, maps each batch row to its slot. GPU kernels use it to gather the input ids, positions and lengths from the rows.</li>
+  <li><strong>No wait for the GPU.</strong> <code>execute_model</code> only queues the forward pass. <code>sample_tokens</code> queues the sampler and a copy to the CPU, and returns an <code>AsyncOutput</code>. Somebody waits for the copy later, in <code>get_output()</code>. This is what makes {{term async-scheduling}} work ({{link concepts/async-scheduling}}).</li>
+</ul>
+<p><strong>An everyday comparison.</strong> Think of a hotel with numbered rooms. A guest keeps one room for the whole stay, and the luggage stays in that room. Each morning the front desk writes a short list: "visit rooms 1023, 1022 and 1021, in this order". The staff use the list to find the luggage; nobody carries it to the desk. The comparison stops here. In MRV2, a guest who is moved out (preempted) gives the room back and starts again as a new guest later.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b6b_mr_state" alt="Panel 1: the persistent state on the GPU. RequestState has max_num_reqs = 1024 rows; the example shows slots 1021, 1022 and 1023 with all_token_ids (UVA), num_computed_tokens, last_sampled_tokens and prefill_len. BlockTables has one int32 table per KV cache group, also indexed by slot. Panel 2: one step with three requests. The SchedulerOutput gives R1 1 token, R2 1 token and R3 6 prompt tokens. gather_batch_req_state sorts the decodes first and builds idx_mapping = [1023, 1022, 1021]. GPU kernels then build query_start_loc [0, 1, 2, 8], positions [40, 17, 0..5], seq_lens [41, 18, 6], input_ids (R1 and R2 from last_sampled_tokens, R3 from all_token_ids), logits_indices [0, 1, 7] and the slot mapping. Panel 3: the outputs of prepare_attn and the model state: block tables gathered into batch order, slot mappings per KV cache group, CommonAttentionMetadata per group and attention metadata per layer name." caption="Figure: what MRV2 keeps on the GPU between steps (panel 1), how one step turns the scheduler plan into input tensors (panel 2), and what goes to the attention layers (panel 3). Values are a worked example with block size 16." />
+<p>Read panel 1 as the long-lived memory, and panels 2 and 3 as the work of one call of <code>execute_model</code>. The amber arrow is the only input copy from the CPU in each step: <code>idx_mapping</code> and <code>query_start_loc</code>. Speculative decoding adds a few more small arrays. The staged writes of new requests and new blocks (Step 3) also go to the GPU. Everything else is read on the GPU, through the slot numbers.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: why V2, and when V1 runs</h3>
+<p>The design document lists the problems of the first runner. V1 used its persistent tensors directly as model inputs, so a finished request forced a reorder of whole tensors. It also kept a second copy of every request state ({{cite docs/design/model_runner_v2.md:21-27}}). MRV2 keeps the state apart from the per-step inputs and gathers the inputs on the GPU ({{cite docs/design/model_runner_v2.md:31-39}}). It assumes that the execution loop is "a CUDA stream with no CPU synchronization points" ({{cite docs/design/model_runner_v2.md:47}}).</p>
+<p>The worker builds MRV2 when <code>use_v2_model_runner</code> is true, and Model Runner V1 (<code>vllm/v1/worker/gpu_model_runner.py</code>) only as the fallback ({{cite vllm/v1/worker/gpu_worker.py:567-583}}). The fallback runs without Triton or with an unsupported feature: PP with <code>external_launcher</code>, <code>suffix</code> or <code>custom_class</code> drafts, parallel EAGLE drafts, mixed-vocabulary drafts, some dual-batch-overlap cases ({{cite vllm/config/vllm.py:734-746}}, {{cite vllm/config/vllm.py:2999-3033}}). The rest of this site explains MRV2 only.</p>
+<x-note title="Docs and code"><p>The folder README still says "[Experimental]" ({{cite vllm/v1/worker/gpu/README.md:1}}), and the design document says MRV2 "is not yet feature-complete" ({{cite docs/design/model_runner_v2.md:7}}). At this commit it is the default for <code>vllm serve</code>. The design document also says that the state has 1024 rows "by default on most platforms" ({{cite docs/design/model_runner_v2.md:35}}). It says that large state tensors "are mostly stored on GPU memory" ({{cite docs/design/model_runner_v2.md:39}}). In the code, the default <code>max_num_seqs</code> is 1024 only on GPUs with 70 GB or more (not A100 or GB10), else 256 on GPUs ({{cite vllm/engine/arg_utils.py:2960-2993}}). The largest state tensor, <code>all_token_ids</code>, is in pinned CPU memory (Deep dive).</p></x-note>
+
+<h3>Step 2: the persistent state and the request slots</h3>
+<p>The runner makes one <code>RequestState</code> with <code>max_num_reqs = max_num_seqs</code> rows ({{cite vllm/v1/worker/gpu/model_runner.py:286-295}}). A new request takes a free row:</p>
+<x-code file="vllm/v1/worker/gpu/states.py" lines="91-118" highlight="99-102,110-115" />
+<ol>
+  <li><strong>Lines 99-102.</strong> <code>free_indices</code> starts as <code>[0, 1, ..., max_num_reqs - 1]</code> and <code>pop()</code> takes the last one ({{cite vllm/v1/worker/gpu/states.py:30}}). So the first request gets slot 1023 when <code>max_num_seqs = 1024</code>.</li>
+  <li><strong>Lines 110-115.</strong> The writes are staged on the CPU. <code>apply_staged_writes()</code> later copies them to GPU-visible memory: a UVA copy for the small arrays, one kernel for each staged tensor ({{cite vllm/v1/worker/gpu/states.py:120-125}}).</li>
+</ol>
+<p><code>remove_request</code> appends the slot to <code>free_indices</code> again, so the slot freed last is used next ({{cite vllm/v1/worker/gpu/states.py:127-134}}). The runner treats a preempted request like a finished one: <code>finish_requests</code> removes both kinds in sorted order, so every TP rank frees the same slots ({{cite vllm/v1/worker/gpu/model_runner.py:1173-1185}}).</p>
+
+<h3>Step 3: apply the plan to the state</h3>
+<p>Each <code>execute_model</code> call starts with the state changes of the plan:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1753-1771" highlight="1756,1758,1759,1760,1766" />
+<ul>
+  <li><code>add_requests</code> fills the slot of each new request, overwrites its block table row, and registers its sampling parameters ({{cite vllm/v1/worker/gpu/model_runner.py:1202-1255}}).</li>
+  <li><code>update_requests</code> writes the scheduler's <code>num_computed_tokens</code> of running requests into the CPU mirror, and appends their new block ids ({{cite vllm/v1/worker/gpu/model_runner.py:1257-1271}}).</li>
+  <li><code>block_tables.apply_staged_writes()</code> applies all staged block-table rows. With more than one {{term kv-cache-group}}, one fused kernel writes all groups ({{cite vllm/v1/worker/gpu/block_table.py:146-158}}).</li>
+  <li>A step with zero scheduled tokens returns after these updates, without a forward pass (lines 1766-1771).</li>
+</ul>
+<p>The block ids come from the scheduler's {{term block-pool}}; {{link concepts/kv-cache-manager}} explains how they are chosen. The runner only mirrors them on the GPU.</p>
+
+<h3>Step 4: the batch order</h3>
+<p><code>gather_batch_req_state</code> sorts the scheduled request ids:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="2471-2483" />
+<p>The key puts requests with draft tokens first (speculative verification). Then come the requests whose token count equals <code>decode_query_len</code>, the decodes. All others follow, sorted by token count, so short extends come before long prefill chunks. The comment says why: <code>split_decodes_and_prefills</code> in the attention backends expects the decode-like rows at the front. For a request without speculative decoding, <code>decode_query_len</code> is 1 ({{cite vllm/v1/worker/gpu/model_runner.py:442-445}}, {{cite vllm/v1/worker/gpu/model_states/interface.py:254-256}}).</p>
+<p>The same function computes <code>idx_mapping_np</code>, the slot of each sorted request, and decides whether the batch has a prefill ({{cite vllm/v1/worker/gpu/model_runner.py:1310-1326}}). It returns a uniform decode token count only for a batch that may use a decode CUDA graph ({{cite vllm/v1/worker/gpu/model_runner.py:1370-1372}}).</p>
+
+<h3>Step 5: prepare_inputs builds the step tensors on the GPU</h3>
+<p>Only small arrays go from the CPU to the GPU: <code>idx_mapping</code> and <code>query_start_loc</code>. The rest is computed on the GPU:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1446-1504" highlight="1449-1456,1470-1479,1482-1488,1493-1504" />
+<ol>
+  <li><strong>Lines 1449-1456.</strong> <code>query_start_loc</code> is the cumulative sum of the token counts, in a persistent buffer of <code>max_num_reqs + 1</code> entries. Unused entries repeat the total, because "some attention backends like FA3 require query_start_loc to be non-decreasing".</li>
+  <li><strong>Lines 1470-1479.</strong> Only when the batch has a prefill: a kernel copies the prompt tokens from <code>all_token_ids</code> of each slot into <code>input_ids</code>.</li>
+  <li><strong>Lines 1482-1488.</strong> A kernel writes <code>positions</code> and <code>seq_lens</code>. For each request, <code>seq_len = num_computed_tokens + query_len</code> ({{cite vllm/v1/worker/gpu/input_batch.py:375-376}}).</li>
+  <li><strong>Lines 1493-1504.</strong> A kernel writes the last sampled token (and the drafts) of each decode into <code>input_ids</code>, and returns <code>logits_indices</code>: the rows that get logits. Without drafts, this is the last token of each request.</li>
+</ol>
+<p>The varlen layout itself is the one of {{deepinfer concepts/input-metadata | Input metadata}}. The result is an <code>InputBatch</code> dataclass with these tensors and their CPU twins ({{cite vllm/v1/worker/gpu/input_batch.py:38-125}}).</p>
+
+<h3>Step 6: block tables, slot mappings and attention metadata</h3>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1577-1597" highlight="1584-1588,1591-1596" />
+<p><code>gather_block_tables</code> copies the rows of the batch's slots into a second set of tensors in batch order. <code>compute_slot_mappings</code> computes the {{term slot-mapping}}: one row per KV cache group, one entry per token. The entry is <code>block_number × block_size + offset</code> ({{cite vllm/v1/worker/gpu/block_table.py:409}}), and padding tokens get <code>PAD_SLOT_ID = -1</code> ({{cite vllm/v1/attention/backends/utils.py:53}}).</p>
+<p>Then the runner builds a dict from layer name to slot mapping ({{cite vllm/v1/worker/gpu/attn_utils.py:447-455}}), and the model state builds the {{term attention-metadata}} per layer ({{cite vllm/v1/worker/gpu/model_runner.py:1940-1951}}). {{link concepts/attention-backends}} explains the builders.</p>
+
+<h3>Step 7: pick a CUDA graph mode and run the model</h3>
+<p>Before <code>prepare_inputs</code>, the runner asks the CUDA graph manager for a descriptor of this batch shape ({{cite vllm/v1/worker/gpu/model_runner.py:1806-1819}}). The answer is FULL, PIECEWISE or NONE, plus the padded token count. The rule is on {{link concepts/compile-and-cuda-graphs}}. Then the forward pass runs in one of three ways:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="2025-2070" highlight="2032,2041-2052,2065-2067,2070" />
+<p>FULL mode replays the whole captured graph; the inputs are already in its buffers. The other modes run inside <code>set_forward_context</code>, which gives the attention layers their metadata ({{link concepts/forward-context}}). The output is not returned. The runner stores it in <code>execute_model_state</code> and returns <code>None</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2090-2110}}).</p>
+
+<h3>Step 8: sample_tokens</h3>
+<x-diagram name="b6b_mr_timeline" alt="Three lanes over time: the CPU thread that calls the runner, the GPU main stream, and the GPU copy stream. execute_model on the CPU updates the states, dispatches the CUDA graph mode, prepares inputs and launches the forward pass; the forward pass then runs on the main stream. Between the calls, the engine core may compute a grammar bitmask. sample_tokens on the CPU launches compute_logits, the bitmask, the sampler, starts AsyncOutput (the copy stream waits for the main stream and copies sampled ids and counts to pinned CPU memory, then records copy_event), runs postprocess_sampled (post_update writes last_sampled_tokens on the GPU) and the speculator, and returns the AsyncOutput. Later get_output() calls copy_event.synchronize(), converts to lists and trims each row. A box below says who calls get_output: the engine core main thread through AsyncOutputFuture with the uni executor, or the WorkerAsyncOutputCopy thread on the output rank with the multiproc executor and async scheduling." caption="Figure: one step of MRV2 over time. The CPU only queues work in execute_model and sample_tokens; the only wait is copy_event.synchronize() in get_output()." />
+<p>The engine core calls <code>sample_tokens</code> after <code>execute_model</code>, with the grammar bitmask or <code>None</code> ({{link concepts/async-scheduling}} explains why these are two calls). On the last PP rank it does five things:</p>
+<ol>
+  <li><strong>Logits.</strong> <code>compute_logits</code> runs only on <code>hidden_states[logits_indices]</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1637-1638}}).</li>
+  <li><strong>Grammar bitmask.</strong> If there is a grammar output, the structured-output worker copies the bitmask to the GPU on a side stream and masks the logits in place ({{cite vllm/v1/worker/gpu/model_runner.py:1643-1657}}). The mask is <code>int32 [rows, ceil(vocab_size / 32)]</code> ({{cite vllm/v1/worker/gpu/structured_outputs.py:63-65}}). Token masks are explained in {{deepinfer concepts/structured-outputs | Structured outputs}}.</li>
+  <li><strong>Sampler.</strong> Without drafts, the <code>Sampler</code> draws the tokens; with drafts, the <code>RejectionSampler</code> verifies them ({{cite vllm/v1/worker/gpu/model_runner.py:1659-1677}}).</li>
+  <li><strong>AsyncOutput.</strong> The runner starts the copy to the CPU before it updates its own state, so the copy can start early ({{cite vllm/v1/worker/gpu/model_runner.py:2209-2218}}, {{cite vllm/v1/worker/gpu/model_runner.py:2244-2255}}). <code>postprocess_sampled</code> then writes the new token into <code>last_sampled_tokens</code> on the GPU.</li>
+  <li><strong>Speculator.</strong> With speculative decoding, <code>speculator.propose(...)</code> drafts the next tokens on the GPU, and the runner stores them in <code>req_states.draft_tokens</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2257-2289}}). The method is on {{link concepts/speculative-decoding}}.</li>
+</ol>
+
+<h3>Step 9: AsyncOutput and get_output</h3>
+<x-code file="vllm/v1/worker/gpu/async_utils.py" lines="133-140" highlight="134,137-140" />
+<p>The copy runs on <code>output_copy_stream</code>, a second CUDA stream of the runner ({{cite vllm/v1/worker/gpu/model_runner.py:235}}). The copy stream first waits for the main stream, then copies into CPU memory, then records <code>copy_event</code> ({{cite vllm/v1/worker/gpu/async_utils.py:171}}). <code>get_output()</code> is the only place that waits:</p>
+<x-code file="vllm/v1/worker/gpu/async_utils.py" lines="173-184" highlight="174,182-183" />
+<p>Who calls it depends on the {{term executor}}:</p>
+<ul>
+  <li><strong>uni executor (TP = PP = DP = 1).</strong> <code>collective_rpc</code> wraps the result in an <code>AsyncOutputFuture</code> ({{cite vllm/v1/executor/uniproc_executor.py:108-111}}). The engine core's main thread calls <code>future.result()</code> when it pops the step from its {{term batch-queue}}, and that calls <code>get_output()</code> ({{cite vllm/v1/executor/uniproc_executor.py:38-48}}, {{cite vllm/v1/engine/core.py:767-773}}).</li>
+  <li><strong>multiproc executor.</strong> Only the output rank sends a reply. With async scheduling, its worker puts the output into a queue, and the thread <code>WorkerAsyncOutputCopy</code> calls <code>get_output()</code> before it writes the reply ({{cite vllm/v1/executor/multiproc_executor.py:690-699}}, {{cite vllm/v1/executor/multiproc_executor.py:1000-1039}}). Without async scheduling, the worker's main thread calls it ({{cite vllm/v1/executor/multiproc_executor.py:1014-1022}}). See {{link concepts/executors-and-workers}}.</li>
+</ul>
+
+<h3>Step 10: model states and the pooling runner</h3>
+<p>Model-specific input work lives in a <code>ModelState</code>, chosen once after the model loads ({{cite vllm/v1/worker/gpu/model_runner.py:438-440}}):</p>
+<x-code file="vllm/v1/worker/gpu/model_states/__init__.py" lines="28-59" highlight="32-33,36,44-48,52,57-59" />
+<p>A model can bring its own class with <code>get_model_state_cls()</code>. Otherwise cross-attention models get <code>EncoderDecoderModelState</code>, encoder-only attention gets <code>EncoderOnlyModelState</code>, hybrid and attention-free models get <code>MambaHybridModelState</code>, and everything else, Llama included, gets <code>DefaultModelState</code>. The default state adds M-RoPE positions when the model needs them ({{cite vllm/v1/worker/gpu/model_states/default.py:144-157}}) and builds the attention metadata ({{cite vllm/v1/worker/gpu/model_states/default.py:167-242}}).</p>
+<p>A pooling model gets a <code>PoolingRunner</code> on the last PP rank ({{cite vllm/v1/worker/gpu/model_runner.py:534-535}}); its <code>pool()</code> replaces <code>sample_tokens</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2316-2358}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The persistent tensors: shapes, types, where they live">
+<p>All tensors have <code>max_num_reqs</code> rows, indexed by slot. Values for <code>vllm serve meta-llama/Llama-3.1-8B-Instruct</code> on one H100: <code>max_num_seqs = 1024</code> ({{link concepts/scheduler}}) and <code>max_model_len = 131072</code> (from the model's <code>config.json</code>, inferred).</p>
+<table>
+  <thead><tr><th>Tensor</th><th>Type, shape</th><th>Memory</th><th>Line</th></tr></thead>
+  <tbody>
+    <tr><td><code>all_token_ids</code></td><td>int32 <code>[1024, 131072]</code> = 512 MiB</td><td>UVA (pinned CPU memory that kernels read), unless n-gram drafting is on ({{cite vllm/v1/worker/gpu/model_runner.py:281-283}})</td><td>{{cite vllm/v1/worker/gpu/states.py:37-42}}</td></tr>
+    <tr><td><code>prompt_len</code>, <code>prefill_len</code></td><td>int32 <code>[1024]</code></td><td>CPU source of truth, copied to UVA buffers</td><td>{{cite vllm/v1/worker/gpu/states.py:52-53}}</td></tr>
+    <tr><td><code>total_len</code>, <code>num_computed_tokens</code></td><td>int32 <code>[1024]</code></td><td>GPU, with staged writes</td><td>{{cite vllm/v1/worker/gpu/states.py:55-63}}</td></tr>
+    <tr><td><code>num_computed_tokens_np</code></td><td>int32 <code>[1024]</code></td><td>CPU; an upper bound of the GPU value</td><td>{{cite vllm/v1/worker/gpu/states.py:64-65}}</td></tr>
+    <tr><td><code>last_sampled_tokens</code></td><td>int64 <code>[1024, 1]</code></td><td>GPU</td><td>{{cite vllm/v1/worker/gpu/states.py:67-70}}</td></tr>
+    <tr><td><code>draft_tokens</code></td><td>int64 <code>[1024, num_speculative_steps]</code></td><td>GPU</td><td>{{cite vllm/v1/worker/gpu/states.py:75-81}}</td></tr>
+    <tr><td>block table, per KV cache group</td><td>int32 <code>[1024, max_num_blocks]</code></td><td>GPU, with staged writes</td><td>{{cite vllm/v1/worker/gpu/block_table.py:66-72}}</td></tr>
+    <tr><td>slot mappings</td><td>int64 <code>[num_groups, max_num_batched_tokens]</code></td><td>GPU, rewritten every step</td><td>{{cite vllm/v1/worker/gpu/block_table.py:91-96}}</td></tr>
+  </tbody>
+</table>
+<p>The comment on <code>all_token_ids</code> warns that it "can be extremely large (e.g., several GBs)" and gives this as the reason for UVA ({{cite vllm/v1/worker/gpu/states.py:32-36}}). A <code>StagedWriteTensor</code> keeps its base tensor on the GPU (or UVA) and collects writes on the CPU. <code>apply_write()</code> packs them and applies them with one kernel ({{cite vllm/v1/worker/gpu/buffer_utils.py:132-175}}, {{cite docs/design/model_runner_v2.md:104-130}}).</p>
+<p>The per-step input buffers are separate: <code>input_ids</code> int32, <code>positions</code> int64 and <code>is_padding</code> bool, each <code>[max_num_batched_tokens]</code>, plus <code>query_start_loc</code> <code>[max_num_reqs + 1]</code> and <code>seq_lens</code> <code>[max_num_reqs]</code> ({{cite vllm/v1/worker/gpu/input_batch.py:19-35}}). CUDA graphs need these fixed addresses.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: three requests in one step">
+<p>Block size 16, no speculative decoding, one KV cache group. Three requests are running:</p>
+<ul>
+  <li>R1 arrived first, so it has slot 1023. It decodes; 40 tokens are computed.</li>
+  <li>R2 has slot 1022. It decodes; 17 tokens are computed.</li>
+  <li>R3 is new, with a 6-token prompt. It gets slot 1021.</li>
+</ul>
+<p>The scheduler sends <code>num_scheduled_tokens = {"R3": 6, "R1": 1, "R2": 1}</code>. (Derived from the rules above; the dict order is only an example.)</p>
+<ol>
+  <li><strong>Sort.</strong> Keys: R1 and R2 are <code>(True, False, 1)</code>, R3 is <code>(True, True, 6)</code>. <code>sorted</code> keeps the dict order for equal keys, so the batch is <code>[R1, R2, R3]</code>.</li>
+  <li><strong>idx_mapping.</strong> <code>[1023, 1022, 1021]</code>, int64 on the GPU.</li>
+  <li><strong>query_start_loc.</strong> cumsum of <code>[1, 1, 6]</code>: <code>[0, 1, 2, 8]</code>. Entries 4 to 1024 are 8.</li>
+  <li><strong>positions.</strong> <code>[40, 17, 0, 1, 2, 3, 4, 5]</code>; <strong>seq_lens</strong> <code>[41, 18, 6]</code>.</li>
+  <li><strong>input_ids.</strong> Row 0 is <code>last_sampled_tokens[1023]</code>; row 1 is <code>last_sampled_tokens[1022]</code>; rows 2-7 are <code>all_token_ids[1021, 0:6]</code>.</li>
+  <li><strong>logits_indices.</strong> The last row of each request: <code>[0, 1, 7]</code>. R3 samples its first token in this step, because its whole prompt fits.</li>
+  <li><strong>slot mapping.</strong> R1's token at position 40 is in block index 2 of its table, offset 8, so its slot is <code>table[1023][2] × 16 + 8</code>. R3's tokens go to <code>table[1021][0] × 16 + 0 .. 5</code>.</li>
+  <li><strong>CUDA graph mode.</strong> The batch has a prefill, so it is not a uniform decode. With the default mode it runs as a PIECEWISE graph of 8 tokens, which is a capture size.</li>
+</ol>
+<p>In the next step, all three decode: 3 tokens, one per request. That batch is a uniform decode, so it replays a FULL graph padded to 4 tokens and 4 requests. The fourth request is padding with <code>seq_len = 0</code> ({{cite vllm/v1/worker/gpu/input_batch.py:360-366}}).</p>
+</x-deepdive>
+
+<x-deepdive title="execute_model, end to end">
+<ol>
+  <li>Apply the plan: finish, free, add, update, apply block-table writes (lines 1755-1760).</li>
+  <li><code>gather_batch_req_state</code>: sort, <code>idx_mapping_np</code>, prefill flags, uniform decode count ({{cite vllm/v1/worker/gpu/model_runner.py:1777-1780}}).</li>
+  <li>Count active LoRA adapters, and force eager mode for an encoder-decoder step with encoder inputs ({{cite vllm/v1/worker/gpu/model_runner.py:1791-1804}}).</li>
+  <li><code>dispatch_cg_and_sync_dp</code>: pick the descriptor; with DP &gt; 1, agree on one padded size across ranks ({{cite vllm/v1/worker/gpu/model_runner.py:1806-1819}}, {{cite vllm/v1/worker/gpu/dp_utils.py:201-255}}).</li>
+  <li><code>prepare_inputs</code>, <code>prepare_attn</code>, <code>model_state.preprocess_state</code>, LoRA activation ({{cite vllm/v1/worker/gpu/model_runner.py:1831-1859}}).</li>
+  <li>Slot mappings by layer and attention metadata ({{cite vllm/v1/worker/gpu/model_runner.py:1924-1951}}).</li>
+  <li>Inputs embeddings for multimodal or prompt-embeds models, on the first PP rank only ({{cite vllm/v1/worker/gpu/model_runner.py:1953-1984}}).</li>
+  <li>Build <code>model_inputs</code>; on a later PP stage, copy the received intermediate tensors into the persistent buffer ({{cite vllm/v1/worker/gpu/model_runner.py:1986-2012}}).</li>
+  <li>Run the model (FULL, PIECEWISE or eager), store <code>ExecuteModelState</code>, return <code>None</code>, or <code>IntermediateTensors</code> on a non-last PP rank ({{cite vllm/v1/worker/gpu/model_runner.py:2103-2110}}).</li>
+</ol>
+<p>A dummy run takes the same function with <code>dummy_run=True</code>: the profile run, warm-up and empty DP steps all use it. Only CUDA graph capture has its own path ({{cite docs/design/model_runner_v2.md:171-186}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Speculative decoding and structured outputs inside the runner">
+<p><strong>Drafts.</strong> <code>init_speculator</code> picks the speculator class from the method: EAGLE, MTP, DFlash, DSpark, draft model and others ({{cite vllm/v1/worker/gpu/spec_decode/__init__.py:13-80}}). Only the last PP rank builds one ({{cite vllm/v1/worker/gpu/model_runner.py:300-304}}). The drafts never go to the CPU before the next step. <code>combine_sampled_and_draft_tokens</code> writes them from <code>req_states.draft_tokens</code> into <code>input_ids</code> (line 1500 above). With <code>k</code> drafts, a decode has <code>1 + k</code> query tokens, which is <code>decode_query_len</code> (lines 442-445 above).</p>
+<p><strong>Bitmask.</strong> Each structured-output request owns <code>decode_query_len</code> rows of the bitmask. <code>apply_grammar_bitmask</code> maps them to logits rows and launches one masking kernel; rows beyond the device <code>cu_num_logits</code> are skipped ({{cite vllm/v1/worker/gpu/structured_outputs.py:70-128}}). With drafts, <code>grammar_invalid_drafts</code> marks draft positions that the grammar cannot accept, and the rejection sampler gets that mask ({{cite vllm/v1/worker/gpu/model_runner.py:1653-1657}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Settings and environment variables">
+<table>
+  <thead><tr><th>Name</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_USE_V2_MODEL_RUNNER</code></td><td>unset ({{cite vllm/envs.py:2147-2149}})</td><td>Unset: MRV2 when Triton is present and no unsupported feature is set. <code>0</code>/<code>1</code> force a runner, except that HiSparse and watermarking need MRV2 ({{cite vllm/config/vllm.py:713-734}}).</td></tr>
+    <tr><td><code>--max-num-seqs</code></td><td>by GPU memory ({{link concepts/scheduler}})</td><td>The number of request slots, <code>max_num_reqs</code> ({{cite vllm/v1/worker/gpu/model_runner.py:232}}).</td></tr>
+    <tr><td><code>--max-num-batched-tokens</code></td><td>by GPU memory</td><td>The size of the per-step input buffers ({{cite vllm/v1/worker/gpu/model_runner.py:327-331}}).</td></tr>
+    <tr><td><code>VLLM_MOE_SKIP_PADDING</code></td><td><code>1</code> ({{cite vllm/envs.py:1640}})</td><td>Marks the padding rows in <code>is_padding</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1385-1388}}), so the MoE routers can skip them ({{cite vllm/model_executor/layers/fused_moe/router/fused_topk_router.py:20}}).</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A feature that MRV2 does not support.</strong> vLLM logs "Model Runner V2 does not yet support ...; using the V1 model runner instead." and runs the fallback ({{cite vllm/config/vllm.py:740-746}}). The pages of this site then do not match the code that runs.</li>
+  <li><strong>A new GPU-to-CPU wait.</strong> A <code>.item()</code> or <code>.cpu()</code> in <code>execute_model</code> or <code>sample_tokens</code> blocks the CPU and breaks the overlap; {{link concepts/async-scheduling}} shows the check.</li>
+  <li><strong>A block table too narrow.</strong> <code>append_block_ids</code> raises <code>RuntimeError</code> "Block table write ... exceeds row capacity" when a request gets more blocks than the row holds ({{cite vllm/v1/worker/gpu/block_table.py:136-142}}).</li>
+  <li><strong>No free slot.</strong> <code>add_request</code> asserts "No free indices" ({{cite vllm/v1/worker/gpu/states.py:99}}). The scheduler keeps at most <code>max_num_seqs</code> requests running, so this means a bug.</li>
+  <li><strong>A failed execute_model.</strong> <code>sample_tokens</code> then finds no stored state and returns <code>None</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2117-2119}}). The engine core turns this into the original exception ({{cite vllm/v1/engine/core.py:773-778}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Every token of every request passes through this file. Its design explains two numbers you tune. <code>max_num_seqs</code> sets the slots and the size of the persistent tensors. <code>max_num_batched_tokens</code> sets the input buffers and the largest step. If you add code here, keep the rule of the design document: queue GPU work, never wait for it.</p>
+
+<x-quiz>
+  <x-q level="easy">Which slot does the first request get when <code>max_num_seqs = 1024</code>, and why?
+    <x-a><p>Slot 1023. <code>free_indices</code> is <code>list(range(1024))</code> and <code>add_request</code> takes <code>free_indices.pop()</code>, the last element ({{cite vllm/v1/worker/gpu/states.py:30}}, {{cite vllm/v1/worker/gpu/states.py:100}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A batch has a 300-token prefill chunk, a 1-token decode and a 12-token chunk. In which order does MRV2 put them, and why?
+    <x-a><p>Decode, then the 12-token chunk, then the 300-token chunk. The sort key is (no drafts, token count ≠ <code>decode_query_len</code>, token count), so the decode comes first and the others follow by size ({{cite vllm/v1/worker/gpu/model_runner.py:2477-2483}}). Attention backends expect the decode-like rows at the front.</p></x-a>
+  </x-q>
+  <x-q level="medium">Where does a decode's input token come from, if the CPU has not received the previous token yet?
+    <x-a><p>From <code>req_states.last_sampled_tokens</code> on the GPU. <code>postprocess_sampled</code> writes it in <code>sample_tokens</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1702-1726}}), and <code>combine_sampled_and_draft_tokens</code> copies it into <code>input_ids</code> in the next <code>prepare_inputs</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1493-1504}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With TP = 2, which thread calls <code>AsyncOutput.get_output()</code>, and on which workers?
+    <x-a><p>Only on the output rank, because only that rank sends a reply. With async scheduling, its <code>WorkerAsyncOutputCopy</code> thread takes the output from <code>async_output_queue</code> and calls <code>enqueue_output</code>, which calls <code>get_output()</code> ({{cite vllm/v1/executor/multiproc_executor.py:1000-1039}}, {{cite vllm/v1/executor/multiproc_executor.py:1070-1071}}). With TP = 1 and the uni executor, the engine core's main thread calls it through <code>AsyncOutputFuture.result()</code> ({{cite vllm/v1/executor/uniproc_executor.py:38-48}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">How much host memory does <code>all_token_ids</code> take for <code>max_num_seqs = 1024</code> and <code>max_model_len = 131072</code>, and why is it not on the GPU?
+    <x-a><p>1024 × 131072 × 4 bytes = 512 MiB of int32. It is a UVA tensor: pinned CPU memory that GPU kernels can read. The comment gives the reason: the tensor "can be extremely large". Only n-gram drafting keeps it on the GPU ({{cite vllm/v1/worker/gpu/states.py:32-42}}, {{cite vllm/v1/worker/gpu/model_runner.py:281-283}}).</p></x-a>
+  </x-q>
+</x-quiz>

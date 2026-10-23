@@ -1,0 +1,161 @@
+---
+title: "model_executor/layers/attention/attention.py: the Attention layer and its custom ops"
+nav_title: layers/attention/attention.py
+level: Advanced
+prerequisites: concepts/forward-context, concepts/attention-backends
+related: concepts/forward-context, concepts/attention-backends, concepts/attention-backend-selection, code/forward-context, code/v1-attention-backend, concepts/model-definition, concepts/hybrid-kv-cache
+summary: vllm/model_executor/layers/attention/attention.py defines the Attention layer that model files use for standard attention, the two custom ops unified_kv_cache_update and unified_attention_with_output, and get_attention_context, which resolves a layer name to its metadata, layer object, KV cache and slot mapping.
+---
+<h2>Purpose</h2>
+<p><code>vllm/model_executor/layers/attention/attention.py</code> is the bridge between a model file and an attention backend: the model calls <code>Attention</code>, and this file finds the per-step data and calls the backend's impl.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/model_executor/layers/attention/attention.py</code>, 803 lines.</td></tr>
+    <tr><th>Main class</th><td><code>Attention(nn.Module, AttentionLayerBase)</code> ({{cite vllm/model_executor/layers/attention/attention.py:229-239}}).</td></tr>
+    <tr><th>Runs in</th><td>Each worker. The constructor runs once at model build; <code>forward</code> and the ops run in every eager or PIECEWISE step, between the compiled pieces.</td></tr>
+    <tr><th>Called by</th><td>Model files, for example <code>LlamaAttention</code> ({{cite vllm/model_executor/models/llama.py:212-222}}); subclasses such as <code>EncoderOnlyAttention</code>; Model Runner V2 for the KV cache spec through <code>get_kv_cache_spec</code> ({{cite vllm/v1/worker/gpu/attn_utils.py:138-155}}).</td></tr>
+    <tr><th>Calls</th><td>The selector <code>get_attn_backend</code>, the backend's impl class, the quantization config, and the forward context.</td></tr>
+    <tr><th>Not in this file</th><td>MLA attention (<code>mla_attention.py</code>), backend classes ({{link code/v1-attention-backend}}), kernels.</td></tr>
+  </tbody>
+</table>
+
+<h2>Where it sits</h2>
+<x-diagram name="b6b_attn_triad" alt="The three classes of a backend. At start-up the Attention constructor makes one impl per layer, and the runner makes one metadata builder per attention group. Each step the builder makes metadata from CommonAttentionMetadata. Each layer's custom ops call impl.do_kv_cache_update and impl.forward with the KV cache view and the metadata." caption="Figure: the Attention layer makes the impl (panel 1) and calls it through the custom ops (panel 3)." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Model files</strong> build one <code>Attention</code> per decoder layer and call <code>self.attn(q, k, v)</code> ({{link concepts/model-definition}}).</li>
+  <li><strong>The runner</strong> reads the layers from the static dict to build the KV cache spec and the attention groups ({{cite vllm/v1/worker/gpu/attn_utils.py:228-234}}).</li>
+  <li><strong>The compiled graph</strong> calls <code>torch.ops.vllm.unified_kv_cache_update</code> and <code>torch.ops.vllm.unified_attention_with_output</code> as opaque nodes.</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>get_attn_backend</code> in its constructor ({{cite vllm/model_executor/layers/attention/attention.py:349-360}}); see {{link concepts/attention-backend-selection}}.</li>
+  <li><code>impl_cls(...)</code> of the backend ({{cite vllm/model_executor/layers/attention/attention.py:419-432}}).</li>
+  <li><code>resolve_quant_method</code> for KV cache scales ({{cite vllm/model_executor/layers/attention/attention.py:194-198}}).</li>
+  <li><code>get_forward_context()</code> inside <code>get_attention_context</code> ({{cite vllm/model_executor/layers/attention/attention.py:705}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Lines</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>validate_kv_sharing_target</code></td><td>{{cite vllm/model_executor/layers/attention/attention.py:61-91}}</td><td>Check a KV sharing target: earlier layer, same type.</td></tr>
+    <tr><td><code>should_load_quant_weights</code>, <code>set_default_quant_scales</code>, <code>_init_kv_cache_quant</code></td><td>{{cite vllm/model_executor/layers/attention/attention.py:94-226}}</td><td>KV cache scales q/k/v/prob; FP8 checkpoint scales.</td></tr>
+    <tr><td><code>_largest_kernel_block_within</code></td><td>{{cite vllm/model_executor/layers/attention/attention.py:101-130}}</td><td>Block size for sliding-window layers that share a padded page.</td></tr>
+    <tr><td><code>Attention.__init__</code></td><td>{{cite vllm/model_executor/layers/attention/attention.py:241-488}}</td><td>KV dtype, backend, impl, registration, quantization.</td></tr>
+    <tr><td><code>Attention.forward</code></td><td>{{cite vllm/model_executor/layers/attention/attention.py:490-581}}</td><td>Reshape q/k/v, allocate output, call the two ops.</td></tr>
+    <tr><td><code>Attention.get_kv_cache_spec</code></td><td>{{cite vllm/model_executor/layers/attention/attention.py:608-679}}</td><td><code>FullAttentionSpec</code>, <code>SlidingWindowSpec</code> or <code>None</code> for encoder attention.</td></tr>
+    <tr><td><code>get_attention_context</code></td><td>{{cite vllm/model_executor/layers/attention/attention.py:682-723}}</td><td>Layer name → metadata, layer, KV cache, slot mapping.</td></tr>
+    <tr><td><code>unified_kv_cache_update</code> (+ fake, registration)</td><td>{{cite vllm/model_executor/layers/attention/attention.py:726-764}}</td><td>Write k/v into the cache; return a dummy for ordering.</td></tr>
+    <tr><td><code>unified_attention_with_output</code> (+ registration)</td><td>{{cite vllm/model_executor/layers/attention/attention.py:767-803}}</td><td>Call <code>impl.forward</code> with the cache and metadata.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>Attention.__init__</code>: data type and backend</h3>
+<x-code file="vllm/model_executor/layers/attention/attention.py" lines="275-297" highlight="276-279,287-291,294-297" />
+<ol>
+  <li><strong>Lines 276-279.</strong> The KV cache dtype comes from <code>--kv-cache-dtype</code>, else <code>"auto"</code>.</li>
+  <li><strong>Lines 287-291.</strong> A checkpoint with an FP8 <code>kv_cache_scheme</code> turns <code>"auto"</code> into <code>"fp8"</code>. The comment says this case "is normally resolved upstream".</li>
+  <li><strong>Lines 294-297.</strong> A scheme with <code>strategy == "attn_head"</code> needs per-head scales; the selector checks backend support for it.</li>
+</ol>
+<p>Then the constructor stores the head counts and asserts that <code>num_heads</code> divides by <code>num_kv_heads</code> ({{cite vllm/model_executor/layers/attention/attention.py:327-338}}). It selects the backend unless the caller passed one (lines 349-362). It rejects options the backend cannot do, for example <code>use_alibi_sqrt</code> ({{cite vllm/model_executor/layers/attention/attention.py:363-370}}).</p>
+
+<h3><code>Attention.__init__</code>: impl, registration, placeholder</h3>
+<x-code file="vllm/model_executor/layers/attention/attention.py" lines="419-467" highlight="419-432,440,443-445,448-453,464,467" />
+<ol>
+  <li><strong>Lines 419-432.</strong> The impl gets ten positional arguments plus backend extras.</li>
+  <li><strong>Line 440.</strong> <code>use_direct_call</code> is false on CUDA, ROCm, CPU and XPU, which want the opaque op.</li>
+  <li><strong>Lines 443-445.</strong> Register in <code>static_forward_context</code> by prefix; a duplicate raises.</li>
+  <li><strong>Lines 448-453.</strong> Validate a KV sharing target.</li>
+  <li><strong>Line 464.</strong> An empty placeholder until the runner binds the real cache view. The comment says the attribute is not read with direct calls; in this file the direct path also reads it, through <code>get_attention_context</code> (lines 553, 716-717).</li>
+  <li><strong>Line 467.</strong> KV cache quantization scales.</li>
+</ol>
+
+<h3><code>Attention.forward</code></h3>
+<x-code file="vllm/model_executor/layers/attention/attention.py" lines="525-560" highlight="525-530,533-540,542-552,553-560" />
+<ol>
+  <li><strong>Lines 525-530.</strong> Allocate the output: <code>[num_tokens, num_heads × head_size_v]</code> unless the model gives a shape.</li>
+  <li><strong>Lines 533-540.</strong> Reshape q, k and v to <code>[tokens, heads, head_size]</code> outside the op, "to minimize the CPU overheads from the non-CUDA-graph regions".</li>
+  <li><strong>Lines 542-552.</strong> The direct-call path; the cache write runs only if the backend does not write in its forward and the layer does not share another layer's cache.</li>
+  <li><strong>Lines 553-560.</strong> The attention call. The opaque path (lines 561-580) is the same with <code>torch.ops.vllm.*</code> and an encoded name.</li>
+</ol>
+
+<h3><code>get_kv_cache_spec</code></h3>
+<x-code file="vllm/model_executor/layers/attention/attention.py" lines="671-679" />
+<p>A normal decoder layer returns a <code>FullAttentionSpec</code> with the current block size, per-rank KV heads, head sizes and the KV dtype. Encoder and encoder-only layers return <code>None</code>: they keep no KV cache ({{cite vllm/model_executor/layers/attention/attention.py:616-617}}). A sliding-window layer returns a <code>SlidingWindowSpec</code> and may choose its own block size ({{cite vllm/model_executor/layers/attention/attention.py:620-670}}); see {{link concepts/hybrid-kv-cache}}.</p>
+
+<h3><code>get_attention_context</code> and the two ops</h3>
+<x-code file="vllm/model_executor/layers/attention/attention.py" lines="767-803" highlight="767-768,782,784,786-796,799-803" />
+<ol>
+  <li><strong>Lines 767-768.</strong> Two decorators: <code>@eager_break_during_capture</code> makes the op a break point of breakable CUDA graphs; <code>@maybe_transfer_kv_layer</code> adds the KV connector's per-layer load and save. The breakable decorator must be outermost ({{cite vllm/compilation/breakable_cudagraph.py:82-96}}).</li>
+  <li><strong>Line 782.</strong> The dummy dependency is dropped; it only ordered the ops.</li>
+  <li><strong>Line 784.</strong> One lookup gives metadata, layer, KV cache (the slot mapping is not needed here).</li>
+  <li><strong>Lines 786-796.</strong> The impl call; the result lands in <code>output</code>.</li>
+  <li><strong>Lines 799-803.</strong> Registration: <code>mutates_args=["output", "output_block_scale"]</code> tells the compiler which inputs change.</li>
+</ol>
+<p><code>get_attention_context</code> itself is explained line by line on {{link concepts/forward-context}} (Step 5).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: shapes for Llama-3-8B, TP = 2">
+<p>Per rank: 16 query heads, 4 KV heads, head size 128 (from {{link concepts/model-definition}}). A step with T tokens:</p>
+<table>
+  <thead><tr><th>Tensor</th><th>Shape</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>q in, k in, v in</td><td><code>[T, 2048]</code>, <code>[T, 512]</code>, <code>[T, 512]</code></td><td>from the QKV split in the model</td></tr>
+    <tr><td>q, k, v to the ops</td><td><code>[T, 16, 128]</code>, <code>[T, 4, 128]</code>, <code>[T, 4, 128]</code></td><td>lines 535-540</td></tr>
+    <tr><td>output</td><td><code>[T, 16, 128]</code> inside, <code>[T, 2048]</code> returned</td><td>lines 527-536, 581</td></tr>
+    <tr><td>KV cache view</td><td><code>[num_blocks, 4, 16, 256]</code> BF16 with FlashAttention</td><td>{{link concepts/attention-backends}}</td></tr>
+    <tr><td>slot mapping</td><td>int64 <code>[T (padded)]</code></td><td>from the forward context</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>two layers with one prefix</td><td><code>ValueError: Duplicate layer name</code></td><td>{{cite vllm/model_executor/layers/attention/attention.py:443-444}}</td></tr>
+    <tr><td>heads do not divide by KV heads</td><td><code>AssertionError</code></td><td>{{cite vllm/model_executor/layers/attention/attention.py:329-331}}</td></tr>
+    <tr><td>KV sharing target is wrong</td><td><code>ValueError</code> with the reason</td><td>{{cite vllm/model_executor/layers/attention/attention.py:69-91}}</td></tr>
+    <tr><td><code>use_alibi_sqrt</code> on a backend without it</td><td><code>ValueError</code></td><td>{{cite vllm/model_executor/layers/attention/attention.py:365-369}}</td></tr>
+    <tr><td><code>fp8_e5m2</code> KV cache with an FP8 checkpoint that has KV scales</td><td><code>ValueError</code></td><td>{{cite vllm/model_executor/layers/attention/attention.py:205-220}}</td></tr>
+    <tr><td>impl without <code>do_kv_cache_update</code> on the update path</td><td><code>AssertionError</code></td><td>{{cite vllm/model_executor/layers/attention/attention.py:737-739}}</td></tr>
+    <tr><td>FlexAttention block size above the cache block size with batch invariance</td><td><code>ValueError</code></td><td>{{cite vllm/model_executor/layers/attention/attention.py:398-410}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Interaction with prefix caching, compile and KV transfer">
+<ul>
+  <li><strong>Prefix caching.</strong> With <code>VLLM_BATCH_INVARIANT</code> and the FlashInfer or Triton MLA backend, the constructor turns prefix caching off and logs a warning ({{cite vllm/model_executor/layers/attention/attention.py:373-388}}).</li>
+  <li><strong>torch.compile.</strong> The ops are splitting ops ({{link concepts/compile-and-cuda-graphs}}). The query quantization in <code>forward</code> uses a plain torch op so that the compiler can fuse it ({{cite vllm/model_executor/layers/attention/attention.py:512-517}}).</li>
+  <li><strong>KV transfer.</strong> <code>@maybe_transfer_kv_layer</code> calls <code>wait_for_layer_load</code> before and saves after the attention, only with an active KV connector and connector metadata ({{cite vllm/model_executor/layers/attention/kv_transfer_utils.py:37-55}}).</li>
+</ul>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/forward-context}}: the name lookup in detail.</li>
+  <li>{{link concepts/attention-backends}}: what the impl and the metadata are.</li>
+  <li>{{link concepts/attention-backend-selection}}: how the constructor's backend is chosen.</li>
+  <li>{{link concepts/hybrid-kv-cache}}: the specs that <code>get_kv_cache_spec</code> returns.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">What does <code>Attention.forward</code> return, and where is the attention result written first?
+    <x-a><p>It returns <code>output.view(-1, hidden_size)</code> ({{cite vllm/model_executor/layers/attention/attention.py:581}}). The impl writes into the <code>output</code> tensor that <code>forward</code> allocated, because the op mutates <code>output</code> ({{cite vllm/model_executor/layers/attention/attention.py:799-803}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">When does <code>Attention.forward</code> skip the cache write op?
+    <x-a><p>When the backend writes the cache inside its own forward (<code>forward_includes_kv_cache_update</code>), when the layer shares another layer's cache, or when key or value is <code>None</code> ({{cite vllm/model_executor/layers/attention/attention.py:564-572}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Which decorator must be outermost on <code>unified_attention_with_output</code>, and why?
+    <x-a><p><code>@eager_break_during_capture</code>. The KV connector's wait and save calls in <code>@maybe_transfer_kv_layer</code> must run in the eager segment; inside a captured graph they would hang on replay ({{cite vllm/compilation/breakable_cudagraph.py:82-96}}).</p></x-a>
+  </x-q>
+</x-quiz>
