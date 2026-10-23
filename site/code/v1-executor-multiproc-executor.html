@@ -1,0 +1,871 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>v1/executor/multiproc_executor.py: MultiprocExecutor and WorkerProc · vLLM Explained</title>
+<meta name="description" content="vllm/v1/executor/multiproc_executor.py starts one worker process per local GPU, broadcasts every call to them through a shared-memory MessageQueue, reads the reply of one output rank, and watches the processes for failures.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="code/v1-executor-multiproc-executor">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a class="current" aria-current="page" href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>Code map</span><span class="sep">›</span><span>Executor and worker</span><span class="sep">›</span><span aria-current="page">v1/executor/multiproc_executor.py</span></nav>
+<h1 class="page-title">v1/executor/multiproc_executor.py: MultiprocExecutor and WorkerProc</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">Code map</span><span class="meta-time">about 8 min read + 3 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../concepts/executors-and-workers.html">Executors and workers: from the engine core to the GPUs</a> <span class="level level-intermediate level-sm">Intermediate</span></li></ul></aside>
+<h2 id="purpose">Purpose<a class="h-anchor" href="#purpose" aria-label="Link to this section">#</a></h2>
+<p><code>vllm/v1/executor/multiproc_executor.py</code> implements the <a class="term" href="../reference/glossary.html#term-multiproc-executor" data-term="multiproc executor" data-def="The executor backend &quot;mp&quot; (MultiprocExecutor). It starts one worker process per local rank and sends every call to all of them through one shared-memory message queue.">multiproc executor</a>: the default executor when an engine core needs more than one worker on a node, or when DP &gt; 1. It also defines <a class="term" href="../reference/glossary.html#term-worker-proc" data-term="WorkerProc" data-def="The wrapper that runs one worker in its own process (named VllmWorker-0, VllmWorker-1, ...). Its busy loop reads calls from the broadcast message queue and writes the results into its own reply queue.">WorkerProc</a>, the code that runs inside each worker process.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/v1/executor/multiproc_executor.py</code>, 1,147 lines of Python.</td></tr>
+    <tr><th>Main classes</th><td><code>MultiprocExecutor(Executor)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L112" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:112 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:112</code></a>), <code>WorkerProc</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L608" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:608 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:608</code></a>), <code>FutureWrapper(Future)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L79" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:79 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:79</code></a>).</td></tr>
+    <tr><th>Runs in</th><td><code>MultiprocExecutor</code>: the engine core process (main thread, plus the thread <code>MultiprocWorkerMonitor</code>). <code>WorkerProc</code>: each worker process (main thread, <code>WorkerAsyncOutputCopy</code>, <code>DeathPipeMonitor</code>).</td></tr>
+    <tr><th>Called by</th><td><code>EngineCore.__init__</code> makes it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L147" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:147 at 3e44c0d"><code>vllm/v1/engine/core.py:147</code></a>); the busy loop calls <code>execute_model</code> and <code>sample_tokens</code>; utility calls reach <code>collective_rpc</code>.</td></tr>
+    <tr><th>Calls</th><td><code>MessageQueue</code> (shared memory), <code>multiprocessing</code> processes and pipes, <code>WorkerWrapperBase</code> and through it the GPU <code>Worker</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The ring buffer itself (<code>distributed/device_communicators/shm_broadcast.py</code>), the worker methods (<code>v1/worker/gpu_worker.py</code>), the uni executor (<code>uniproc_executor.py</code>), the base interface (<code>abstract.py</code>), Ray (<code>ray_executor_v2.py</code>, which subclasses this file's classes).</td></tr>
+  </tbody>
+</table>
+<p>The page <a href="../concepts/executors-and-workers.html">Executors and workers: from the engine core to the GPUs</a> explains the ideas. This page reads the file method by method.</p>
+
+<h2 id="where-it-sits">Where it sits<a class="h-anchor" href="#where-it-sits" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b2b_executor_workers"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: the uni, mp and ray executor backends. Panel 2: with TP = 2, the engine core&#x27;s MultiprocExecutor enqueues the call into the shared-memory rpc_broadcast_mq; both worker processes dequeue it; worker 0, the output rank, writes its result into its response queue, which the executor reads. Panel 3: the main thread, WorkerAsyncOutputCopy and DeathPipeMonitor threads of a worker process."><svg role="img" aria-label="Panel 1: the uni, mp and ray executor backends. Panel 2: with TP = 2, the engine core&#x27;s MultiprocExecutor enqueues the call into the shared-memory rpc_broadcast_mq; both worker processes dequeue it; worker 0, the output rank, writes its result into its response queue, which the executor reads. Panel 3: the main thread, WorkerAsyncOutputCopy and DeathPipeMonitor threads of a worker process." xmlns="http://www.w3.org/2000/svg" width="1100" height="1004" viewBox="0 0 1100 1004">
+<defs><marker id="dg-b2b_executor_workers-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker><marker id="dg-b2b_executor_workers-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker><marker id="dg-b2b_executor_workers-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker></defs>
+<rect width="1100" height="1004" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Executors and workers: how the engine core reaches the GPUs</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">vllm serve on one node  ·  Model Runner V2  ·  async scheduling on (default)</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rpc_broadcast_mq: 10 chunks x 16 MiB shared memory  ·  reply queue per worker: MessageQueue(1, 1)</text>
+<rect x="20.0" y="118.0" width="1060.0" height="214.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="144.0" r="13" fill="#111827"/>
+<text x="46.0" y="148.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="149.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Which executor runs the workers?</text>
+<text x="68.0" y="168.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ParallelConfig picks the backend; Executor.get_class() maps the name to a class.</text>
+<rect x="46.0" y="190.0" width="280.0" height="118.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="58.0" y="210.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">uni: UniProcExecutor</text>
+<text x="58.0" y="228.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">default only if TP=PP=DP=1</text>
+<text x="58.0" y="243.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">worker object in the engine</text>
+<text x="58.0" y="258.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  core process</text>
+<text x="58.0" y="273.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">collective_rpc = direct call</text>
+<text x="58.0" y="288.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">no extra process, no queue</text>
+<rect x="410.0" y="190.0" width="280.0" height="118.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="422.0" y="210.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">mp: MultiprocExecutor</text>
+<text x="422.0" y="228.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">default when world_size_across_dp</text>
+<text x="422.0" y="243.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  &gt; 1 on one node</text>
+<text x="422.0" y="258.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">one VllmWorker-&lt;rank&gt; process</text>
+<text x="422.0" y="273.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  per local rank (spawn)</text>
+<text x="422.0" y="288.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">shared-memory MessageQueue</text>
+<rect x="774.0" y="190.0" width="280.0" height="118.0" rx="8" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.5"/>
+<text x="786.0" y="210.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#db2777" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">ray: RayExecutorV2</text>
+<text x="786.0" y="228.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">subclass of MultiprocExecutor</text>
+<text x="786.0" y="243.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">workers are Ray actors</text>
+<text x="786.0" y="258.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">same MessageQueue control path</text>
+<text x="786.0" y="273.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">picked: DP backend ray, or a</text>
+<text x="786.0" y="288.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  Ray placement group</text>
+<rect x="20.0" y="354.0" width="1060.0" height="300.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="380.0" r="13" fill="#111827"/>
+<text x="46.0" y="384.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="385.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">How does one execute_model call travel with TP = 2 (mp)?</text>
+<text x="68.0" y="404.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The executor writes the call once into shared memory. Every worker reads it; only output_rank replies.</text>
+<rect x="46.0" y="430.0" width="280.0" height="196.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="58.0" y="450.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Engine core process</text>
+<text x="58.0" y="468.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">busy loop (main thread)</text>
+<text x="58.0" y="483.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  executor.execute_model(</text>
+<text x="58.0" y="498.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">    scheduler_output,</text>
+<text x="58.0" y="513.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">    non_block=True)</text>
+<text x="58.0" y="528.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">MultiprocExecutor.collective_rpc</text>
+<text x="58.0" y="543.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  rpc_broadcast_mq.enqueue(</text>
+<text x="58.0" y="558.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   (method, args, kwargs, 0))</text>
+<text x="58.0" y="573.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  FutureWrapper -&gt; futures_queue</text>
+<text x="58.0" y="588.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">thread MultiprocWorkerMonitor</text>
+<text x="58.0" y="603.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  waits on process sentinels</text>
+<rect x="410.0" y="430.0" width="280.0" height="92.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="422.0" y="450.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">rpc_broadcast_mq (1 writer)</text>
+<text x="422.0" y="468.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ShmRingBuffer, 2 local readers</text>
+<text x="422.0" y="483.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">pickle; &gt;= 16 MiB -&gt; ZMQ XPUB</text>
+<text x="422.0" y="498.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">readers: rank 0 and rank 1</text>
+<rect x="410.0" y="542.0" width="280.0" height="84.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="422.0" y="562.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">response MQ of rank 0</text>
+<text x="422.0" y="580.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">MessageQueue(1, 1)</text>
+<text x="422.0" y="595.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">(SUCCESS, ModelRunnerOutput)</text>
+<text x="422.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">read by FutureWrapper.result()</text>
+<rect x="774.0" y="430.0" width="280.0" height="92.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="786.0" y="450.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">VllmWorker-1  (GPU 1)</text>
+<text x="786.0" y="468.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">TP rank 1</text>
+<text x="786.0" y="483.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">same call, same inputs</text>
+<text x="786.0" y="498.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">no reply (rank != output_rank)</text>
+<rect x="774.0" y="542.0" width="280.0" height="84.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="786.0" y="562.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">VllmWorker-0  (GPU 0)</text>
+<text x="786.0" y="580.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">TP rank 0 = output_rank</text>
+<text x="786.0" y="595.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">worker_busy_loop: dequeue</text>
+<text x="786.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  -&gt; Worker.execute_model</text>
+<line x1="326.0" y1="476.0" x2="408.0" y2="476.0" stroke="#7c3aed" stroke-width="2" marker-end="url(#dg-b2b_executor_workers-m0)"/>
+<text x="368.0" y="466.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">enqueue</text>
+<line x1="690.0" y1="476.0" x2="772.0" y2="476.0" stroke="#d97706" stroke-width="2" marker-end="url(#dg-b2b_executor_workers-m1)"/>
+<path d="M 720,476 L 720,562 L 772,562" fill="none" stroke="#d97706" stroke-width="1.6" marker-end="url(#dg-b2b_executor_workers-m1)"/>
+<text x="732.0" y="466.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">dequeue</text>
+<line x1="774.0" y1="606.0" x2="692.0" y2="606.0" stroke="#059669" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#dg-b2b_executor_workers-m2)"/>
+<text x="732.0" y="598.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">reply</text>
+<line x1="410.0" y1="590.0" x2="328.0" y2="590.0" stroke="#059669" stroke-width="1.6" marker-end="url(#dg-b2b_executor_workers-m2)"/>
+<text x="368.0" y="580.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">result</text>
+<text x="1048.0" y="536.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="end" xml:space="preserve" style="white-space:pre" font-style="italic">NCCL all-reduce in forward</text>
+<rect x="20.0" y="676.0" width="1060.0" height="214.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="702.0" r="13" fill="#111827"/>
+<text x="46.0" y="706.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="707.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Which threads run inside one worker process?</text>
+<text x="68.0" y="726.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The main thread runs the calls. Two helper threads move results and watch the parent.</text>
+<rect x="46.0" y="748.0" width="280.0" height="118.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="58.0" y="768.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Main thread</text>
+<text x="58.0" y="786.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">worker_busy_loop()</text>
+<text x="58.0" y="801.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rpc_broadcast_mq.dequeue()</text>
+<text x="58.0" y="816.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">getattr(worker, method)(...)</text>
+<text x="58.0" y="831.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">if output_rank is None or</text>
+<text x="58.0" y="846.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  rank == output_rank: reply</text>
+<rect x="410.0" y="748.0" width="280.0" height="118.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="422.0" y="768.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">WorkerAsyncOutputCopy</text>
+<text x="422.0" y="786.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">only with async scheduling</text>
+<text x="422.0" y="801.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">async_output_queue.get()</text>
+<text x="422.0" y="816.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">AsyncOutput.get_output()</text>
+<text x="422.0" y="831.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  (waits for the D2H copy)</text>
+<text x="422.0" y="846.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">worker_response_mq.enqueue()</text>
+<rect x="774.0" y="748.0" width="280.0" height="118.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="786.0" y="768.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">DeathPipeMonitor</text>
+<text x="786.0" y="786.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">death_pipe.recv() blocks</text>
+<text x="786.0" y="801.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">EOFError = parent exited</text>
+<text x="786.0" y="816.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">shut down both queues</text>
+<text x="786.0" y="831.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Parent side: the executor&#x27;s</text>
+<text x="786.0" y="846.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  MultiprocWorkerMonitor</text>
+<text x="30.0" y="925.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="914.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="118.3" y="925.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">engine core</text>
+<rect x="208.8" y="914.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="229.8" y="925.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">shared-memory queue</text>
+<rect x="381.5" y="914.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="402.5" y="925.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">worker</text>
+<rect x="470.5" y="914.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="491.5" y="925.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">mp backend</text>
+<rect x="582.2" y="914.0" width="14.0" height="14.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="603.2" y="925.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Ray backend</text>
+<text x="30.0" y="954.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">With a KV or EC connector, every worker replies and an aggregator merges the outputs (multiproc_executor.py:405-419).</text>
+<text x="30.0" y="972.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Not shown: multi-node (remote readers over ZMQ), PP stages, the ready and death pipes at start-up.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: where MultiprocExecutor and WorkerProc sit, and the path of one call.</figcaption><a class="diagram-open" href="../diagrams/b2b_executor_workers.svg" target="_blank">Open full size ↗</a></div></figure>
+
+<h3 id="who-calls-it">Who calls it<a class="h-anchor" href="#who-calls-it" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><code>Executor.get_class</code> returns <code>MultiprocExecutor</code> for the backend <code>"mp"</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/abstract.py#L80-L83" target="_blank" rel="noopener" title="vllm/v1/executor/abstract.py:80-83 at 3e44c0d"><code>vllm/v1/executor/abstract.py:80-83</code></a>). When you do not set a backend, the config picks <code>"mp"</code> when <code>world_size_across_dp &gt; 1</code>, unless a Ray case applies (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L1055-L1096" target="_blank" rel="noopener" title="vllm/config/parallel.py:1055-1096 at 3e44c0d"><code>vllm/config/parallel.py:1055-1096</code></a>).</li>
+  <li><code>EngineCore</code> builds it and registers the failure callback (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L147-L150" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:147-150 at 3e44c0d"><code>vllm/v1/engine/core.py:147-150</code></a>).</li>
+  <li><code>RayExecutorV2</code> and <code>RayWorkerProc</code> subclass the two main classes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/ray_executor_v2.py#L79" target="_blank" rel="noopener" title="vllm/v1/executor/ray_executor_v2.py:79 at 3e44c0d"><code>vllm/v1/executor/ray_executor_v2.py:79</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/ray_executor_v2.py#L239" target="_blank" rel="noopener" title="vllm/v1/executor/ray_executor_v2.py:239 at 3e44c0d"><code>vllm/v1/executor/ray_executor_v2.py:239</code></a>).</li>
+  <li>The spawned child process runs <code>WorkerProc.worker_main</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L745-L750" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:745-750 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:745-750</code></a>).</li>
+</ul>
+
+<h3 id="what-it-calls">What it calls<a class="h-anchor" href="#what-it-calls" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><code>MessageQueue(...)</code>, <code>export_handle</code>, <code>create_from_handle</code>, <code>enqueue</code>, <code>dequeue</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L165-L172" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:165-172 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:165-172</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L615-L625" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:615-625 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:615-625</code></a>).</li>
+  <li><code>get_mp_context()</code> for processes, locks and pipes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L174-L175" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:174-175 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:174-175</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L723-L727" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:723-727 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:723-727</code></a>).</li>
+  <li><code>WorkerWrapperBase.init_worker</code>, then <code>init_device</code> and <code>load_model</code> in the worker (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L659-L688" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:659-688 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:659-688</code></a>).</li>
+  <li><code>set_multiprocessing_worker_envs</code>, which forces spawn when needed and sets <code>OMP_NUM_THREADS</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1119-L1147" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1119-1147 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1119-1147</code></a>).</li>
+</ul>
+
+<h2 id="key-classes-and-functions">Key classes and functions<a class="h-anchor" href="#key-classes-and-functions" aria-label="Link to this section">#</a></h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>FutureWrapper</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L79-L110" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:79-110 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:79-110</code></a></td><td>A future that reads replies in call order from a shared deque.</td></tr>
+    <tr><td><code>MultiprocExecutor._init_executor</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L119-L268" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:119-268 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:119-268</code></a></td><td>Broadcast queue, worker processes, ready wait, monitor, reply queues, output rank.</td></tr>
+    <tr><td><code>start_worker_monitor</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L300-L334" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:300-334 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:300-334</code></a></td><td>Thread that waits for any worker to exit.</td></tr>
+    <tr><td><code>execute_model</code> / <code>sample_tokens</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L342-L366" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:342-366 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:342-366</code></a></td><td>One-reply RPCs with the step timeout and the KV/EC aggregators.</td></tr>
+    <tr><td><code>collective_rpc</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L383-L456" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:383-456 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:383-456</code></a></td><td>Enqueue once, build the reply reader, return a future or the result.</td></tr>
+    <tr><td><code>_ensure_worker_termination</code> / <code>shutdown</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L458-L543" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:458-543 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:458-543</code></a></td><td>Close the death pipes, wait, SIGTERM, SIGKILL; close the queues.</td></tr>
+    <tr><td><code>_get_output_rank</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L549-L563" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:549-563 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:549-563</code></a></td><td><code>world_size - TP × PCP</code>: first TP rank of the last PP stage.</td></tr>
+    <tr><td><code>UnreadyWorkerProcHandle</code> / <code>WorkerProcHandle</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L570-L605" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:570-605 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:570-605</code></a></td><td>The parent's view of a worker before and after <code>READY</code>.</td></tr>
+    <tr><td><code>WorkerProc.__init__</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L647-L710" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:647-710 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:647-710</code></a></td><td>Build the worker, device, model, async copy thread, queues.</td></tr>
+    <tr><td><code>make_worker_process</code> / <code>wait_for_ready</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L712-L822" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:712-822 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:712-822</code></a></td><td>Start the child with a ready pipe and a death pipe; collect <code>READY</code>.</td></tr>
+    <tr><td><code>worker_main</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L861-L989" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:861-989 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:861-989</code></a></td><td>Process entry point of a worker.</td></tr>
+    <tr><td><code>enqueue_output</code> / <code>handle_output</code> / <code>async_output_busy_loop</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L995-L1039" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:995-1039 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:995-1039</code></a></td><td>Turn a result into <code>(status, value)</code>; wait for async outputs in a thread.</td></tr>
+    <tr><td><code>worker_busy_loop</code> / <code>_execute_worker_rpc</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1041-L1080" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1041-1080 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1041-1080</code></a></td><td>Dequeue a call, run it, reply if this rank must.</td></tr>
+    <tr><td><code>setup_proc_title_and_log_prefix</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1082-L1116" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1082-1116 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1082-1116</code></a></td><td>Process titles such as <code>Worker_TP0</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="walk-through-the-main-methods">Walk through the main methods<a class="h-anchor" href="#walk-through-the-main-methods" aria-label="Link to this section">#</a></h2>
+
+<h3 id="init-executor-start-the-workers"><code>_init_executor</code>: start the workers<a class="h-anchor" href="#init-executor-start-the-workers" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L174-L216" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/executor/multiproc_executor.py:174-216</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L174-L216" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">174</span><span class="ln hl">175</span><span class="ln">176</span><span class="ln">177</span><span class="ln">178</span><span class="ln">179</span><span class="ln">180</span><span class="ln">181</span><span class="ln">182</span><span class="ln">183</span><span class="ln">184</span><span class="ln">185</span><span class="ln">186</span><span class="ln">187</span><span class="ln">188</span><span class="ln">189</span><span class="ln">190</span><span class="ln hl">191</span><span class="ln hl">192</span><span class="ln hl">193</span><span class="ln">194</span><span class="ln">195</span><span class="ln">196</span><span class="ln hl">197</span><span class="ln hl">198</span><span class="ln hl">199</span><span class="ln hl">200</span><span class="ln hl">201</span><span class="ln hl">202</span><span class="ln hl">203</span><span class="ln hl">204</span><span class="ln hl">205</span><span class="ln hl">206</span><span class="ln">207</span><span class="ln">208</span><span class="ln">209</span><span class="ln">210</span><span class="ln">211</span><span class="ln">212</span><span class="ln">213</span><span class="ln">214</span><span class="ln">215</span><span class="ln hl">216</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(42 * var(--code-lh))"></span><pre><code class="language-python">        context = get_mp_context()
+        shared_worker_lock = context.Lock()
+        unready_workers: list[UnreadyWorkerProcHandle] = []
+        success = False
+        try:
+            global_start_rank = (
+                self.local_world_size * self.parallel_config.node_rank_within_dp
+            )
+            # When using fork, keep track of socket file descriptors that are
+            # inherited by the worker, so that we can close them in subsequent
+            # workers
+            inherited_fds: list[int] | None = (
+                [] if context.get_start_method() == &quot;fork&quot; else None
+            )
+
+            # For CPU backend only, to setup OpenMP threads affinity
+            cpu_omp_manager = OMPProcessManager(self.vllm_config)
+            for local_rank in range(self.local_world_size):
+                global_rank = global_start_rank + local_rank
+                is_driver_worker = self._is_driver_worker(global_rank)
+                with cpu_omp_manager.configure_omp_envs(
+                    rank=global_rank, local_rank=local_rank
+                ):
+                    unready_worker_handle = WorkerProc.make_worker_process(
+                        vllm_config=self.vllm_config,
+                        local_rank=local_rank,
+                        rank=global_rank,
+                        distributed_init_method=distributed_init_method,
+                        input_shm_handle=scheduler_output_handle,
+                        shared_worker_lock=shared_worker_lock,
+                        is_driver_worker=is_driver_worker,
+                        inherited_fds=inherited_fds,
+                    )
+                unready_workers.append(unready_worker_handle)
+                if inherited_fds is not None:
+                    inherited_fds.append(unready_worker_handle.death_writer.fileno())
+                    inherited_fds.append(unready_worker_handle.ready_pipe.fileno())
+
+            # Workers must be created before wait_for_ready to avoid
+            # deadlock, since worker.init_device() does a device sync.
+
+            # Wait for all local workers to be ready.
+            self.workers = WorkerProc.wait_for_ready(unready_workers)</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 174-175.</strong> One lock is shared by all workers of this executor; the worker uses it for the multimodal receiver cache (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/worker_base.py#L339-L343" target="_blank" rel="noopener" title="vllm/v1/worker/worker_base.py:339-343 at 3e44c0d"><code>vllm/v1/worker/worker_base.py:339-343</code></a>).</li>
+  <li><strong>Lines 191-193.</strong> One process per <em>local</em> rank. <code>is_driver_worker</code> is true when <code>rank % TP == 0</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L297-L298" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:297-298 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:297-298</code></a>).</li>
+  <li><strong>Lines 197-206.</strong> Each child gets the handle of the broadcast queue, not the queue object.</li>
+  <li><strong>Line 216.</strong> The executor blocks until every worker has loaded its model. The comment at lines 212-213 explains the order: all workers must exist first, because <code>init_device</code> synchronizes the devices.</li>
+</ol>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L222-L268" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/executor/multiproc_executor.py:222-268</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L222-L268" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">222</span><span class="ln">223</span><span class="ln">224</span><span class="ln hl">225</span><span class="ln hl">226</span><span class="ln">227</span><span class="ln">228</span><span class="ln hl">229</span><span class="ln hl">230</span><span class="ln hl">231</span><span class="ln hl">232</span><span class="ln hl">233</span><span class="ln hl">234</span><span class="ln hl">235</span><span class="ln hl">236</span><span class="ln hl">237</span><span class="ln hl">238</span><span class="ln hl">239</span><span class="ln hl">240</span><span class="ln hl">241</span><span class="ln">242</span><span class="ln">243</span><span class="ln">244</span><span class="ln">245</span><span class="ln">246</span><span class="ln hl">247</span><span class="ln hl">248</span><span class="ln hl">249</span><span class="ln hl">250</span><span class="ln hl">251</span><span class="ln">252</span><span class="ln hl">253</span><span class="ln">254</span><span class="ln">255</span><span class="ln">256</span><span class="ln">257</span><span class="ln">258</span><span class="ln">259</span><span class="ln">260</span><span class="ln">261</span><span class="ln">262</span><span class="ln">263</span><span class="ln">264</span><span class="ln">265</span><span class="ln">266</span><span class="ln">267</span><span class="ln hl">268</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(46 * var(--code-lh))"></span><pre><code class="language-python">            set_torch_threads_for_runtime()
+
+            # Start background thread to monitor worker health if not in headless mode.
+            if self.monitor_workers:
+                self.start_worker_monitor()
+
+            self.response_mqs = []
+            # Only leader node have remote response mqs
+            if self.parallel_config.node_rank_within_dp == 0:
+                for rank in range(self.world_size):
+                    if rank &lt; self.local_world_size:
+                        local_message_queue = self.workers[rank].worker_response_mq
+                        assert local_message_queue is not None
+                        self.response_mqs.append(local_message_queue)
+                    else:
+                        remote_message_queue = self.workers[0].peer_worker_response_mqs[
+                            rank
+                        ]
+                        assert remote_message_queue is not None
+                        self.response_mqs.append(remote_message_queue)
+
+            # Ensure message queues are ready. Will deadlock if re-ordered
+            # Must be kept consistent with the WorkerProc.
+
+            # Wait for all input mqs to be ready.
+            if self.rpc_broadcast_mq is not None:
+                self.rpc_broadcast_mq.wait_until_ready()
+            # Wait for all remote response mqs to be ready.
+            for response_mq in self.response_mqs:
+                response_mq.wait_until_ready()
+
+            self.futures_queue = deque[FutureWrapper]()
+
+            self._post_init_executor()
+
+            success = True
+        finally:
+            if not success:
+                # Clean up the worker procs if there was a failure.
+                # Close death_writers first to signal workers to exit
+                for uw in unready_workers:
+                    if uw.death_writer is not None:
+                        uw.death_writer.close()
+                        uw.death_writer = None
+                self._ensure_worker_termination([uw.proc for uw in unready_workers])
+
+        self.output_rank = self._get_output_rank()</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 222.</strong> The engine core process sets its torch thread count for run time. The comment gives the reason: this process only schedules, and more threads only compete with the workers for the CPU.</li>
+  <li><strong>Lines 229-241.</strong> One reply queue per rank. Local workers write to their own <code>MessageQueue(1, 1)</code>; remote ranks reach the leader node through worker 0.</li>
+  <li><strong>Lines 247-251.</strong> Both sides must call <code>wait_until_ready()</code> in the same order. The comment warns that another order deadlocks.</li>
+  <li><strong>Lines 258-266.</strong> On any failure, the executor closes the death pipes and terminates the processes it started.</li>
+</ol>
+
+<h3 id="collective-rpc-one-call-to-all-workers"><code>collective_rpc</code>: one call to all workers<a class="h-anchor" href="#collective-rpc-one-call-to-all-workers" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L383-L423" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/executor/multiproc_executor.py:383-423</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L383-L423" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">383</span><span class="ln">384</span><span class="ln">385</span><span class="ln">386</span><span class="ln">387</span><span class="ln">388</span><span class="ln">389</span><span class="ln">390</span><span class="ln">391</span><span class="ln">392</span><span class="ln">393</span><span class="ln">394</span><span class="ln">395</span><span class="ln hl">396</span><span class="ln hl">397</span><span class="ln hl">398</span><span class="ln hl">399</span><span class="ln hl">400</span><span class="ln">401</span><span class="ln hl">402</span><span class="ln">403</span><span class="ln">404</span><span class="ln hl">405</span><span class="ln hl">406</span><span class="ln hl">407</span><span class="ln hl">408</span><span class="ln hl">409</span><span class="ln hl">410</span><span class="ln hl">411</span><span class="ln hl">412</span><span class="ln hl">413</span><span class="ln hl">414</span><span class="ln hl">415</span><span class="ln hl">416</span><span class="ln hl">417</span><span class="ln hl">418</span><span class="ln hl">419</span><span class="ln hl">420</span><span class="ln hl">421</span><span class="ln hl">422</span><span class="ln">423</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(37 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(38 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><pre><code class="language-python">    def collective_rpc(  # type: ignore[override]
+        self,
+        method: str | Callable,
+        timeout: float | None = None,
+        args: tuple = (),
+        kwargs: dict | None = None,
+        non_block: bool = False,
+        unique_reply_rank: int | None = None,
+        kv_output_aggregator: KVOutputAggregator | None = None,
+        ec_output_aggregator: ECOutputAggregator | None = None,
+    ) -&gt; Any:
+        &quot;&quot;&quot;Returns single result if unique_reply_rank and/or an output
+        aggregator is provided, otherwise list.&quot;&quot;&quot;
+        assert self.rpc_broadcast_mq is not None, (
+            &quot;collective_rpc should not be called on follower node&quot;
+        )
+        if self.is_failed:
+            raise RuntimeError(&quot;Executor failed.&quot;)
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        kwargs = kwargs or {}
+
+        aggregators = [a for a in (kv_output_aggregator, ec_output_aggregator) if a]
+        aggregate: Callable[[Any], Any]
+        if aggregators:
+            output_rank = None
+
+            def _aggregate(outputs: Any) -&gt; Any:
+                # Each aggregator merges its own connector&#x27;s output onto
+                # outputs[output_rank] in place and returns it, so chaining is safe.
+                rank = unique_reply_rank or 0
+                result = outputs[rank]
+                for a in aggregators:
+                    result = a.aggregate(outputs, output_rank=rank)
+                return result
+
+            aggregate = _aggregate
+        else:
+            output_rank = unique_reply_rank
+            aggregate = lambda x: x
+</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 396-398.</strong> Only the leader node of a DP rank owns the broadcast queue.</li>
+  <li><strong>Lines 399-400.</strong> After a worker death, every call fails at once.</li>
+  <li><strong>Line 402.</strong> One deadline for the whole call; each reply read gets the time that is left.</li>
+  <li><strong>Lines 405-422.</strong> With a KV or EC connector aggregator, <code>output_rank</code> becomes <code>None</code>: all workers reply, and the aggregator merges their outputs onto the reply of <code>unique_reply_rank</code>.</li>
+</ol>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L424-L456" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/executor/multiproc_executor.py:424-456</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L424-L456" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">424</span><span class="ln hl">425</span><span class="ln hl">426</span><span class="ln hl">427</span><span class="ln hl">428</span><span class="ln">429</span><span class="ln">430</span><span class="ln hl">431</span><span class="ln hl">432</span><span class="ln">433</span><span class="ln">434</span><span class="ln">435</span><span class="ln">436</span><span class="ln hl">437</span><span class="ln hl">438</span><span class="ln hl">439</span><span class="ln hl">440</span><span class="ln hl">441</span><span class="ln hl">442</span><span class="ln hl">443</span><span class="ln hl">444</span><span class="ln hl">445</span><span class="ln hl">446</span><span class="ln hl">447</span><span class="ln hl">448</span><span class="ln">449</span><span class="ln">450</span><span class="ln">451</span><span class="ln hl">452</span><span class="ln hl">453</span><span class="ln hl">454</span><span class="ln hl">455</span><span class="ln hl">456</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><pre><code class="language-python">        if isinstance(method, str):
+            send_method = method
+        else:
+            send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
+        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
+
+        response_mqs: Sequence[MessageQueue] = self.response_mqs
+        if output_rank is not None:
+            response_mqs = (response_mqs[output_rank],)
+
+        def get_response():
+            responses = []
+            for mq in response_mqs:
+                dequeue_timeout = (
+                    None if deadline is None else max(0.0, deadline - time.monotonic())
+                )
+                try:
+                    status, result = mq.dequeue(timeout=dequeue_timeout)
+                except TimeoutError as e:
+                    raise TimeoutError(f&quot;RPC call to {method} timed out.&quot;) from e
+                if status != WorkerProc.ResponseStatus.SUCCESS:
+                    raise RuntimeError(
+                        f&quot;Worker failed with error &#x27;{result}&#x27;, please check the&quot;
+                        &quot; stack trace above for the root cause&quot;
+                    )
+                responses.append(result)
+            return responses[0] if output_rank is not None else responses
+
+        future = FutureWrapper(
+            self.futures_queue, get_response=get_response, aggregate=aggregate
+        )
+
+        return future if non_block else future.result()</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 425-427.</strong> A callable is sent as cloudpickle bytes; the worker calls it with the worker object as the first argument (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1059-L1060" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1059-1060 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1059-1060</code></a>).</li>
+  <li><strong>Line 428.</strong> The single write into shared memory.</li>
+  <li><strong>Lines 437-443.</strong> A reply that does not come in time becomes <code>TimeoutError</code>.</li>
+  <li><strong>Lines 452-456.</strong> <code>non_block</code> returns the <code>FutureWrapper</code>; else the method waits at once.</li>
+</ol>
+
+<h3 id="futurewrapper-replies-in-order"><code>FutureWrapper</code>: replies in order<a class="h-anchor" href="#futurewrapper-replies-in-order" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L79-L110" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/executor/multiproc_executor.py:79-110</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L79-L110" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">79</span><span class="ln">80</span><span class="ln">81</span><span class="ln">82</span><span class="ln">83</span><span class="ln">84</span><span class="ln">85</span><span class="ln">86</span><span class="ln">87</span><span class="ln">88</span><span class="ln">89</span><span class="ln hl">90</span><span class="ln">91</span><span class="ln">92</span><span class="ln">93</span><span class="ln">94</span><span class="ln">95</span><span class="ln">96</span><span class="ln hl">97</span><span class="ln hl">98</span><span class="ln hl">99</span><span class="ln">100</span><span class="ln">101</span><span class="ln">102</span><span class="ln">103</span><span class="ln hl">104</span><span class="ln hl">105</span><span class="ln hl">106</span><span class="ln">107</span><span class="ln">108</span><span class="ln">109</span><span class="ln">110</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><pre><code class="language-python">class FutureWrapper(Future):
+    def __init__(
+        self,
+        futures_queue: deque[&quot;FutureWrapper&quot;],
+        get_response: Callable[[], Any],
+        aggregate: Callable = lambda x: x,
+    ):
+        self.futures_queue = futures_queue
+        self.get_response = get_response
+        self.aggregate = aggregate
+        super().__init__()
+        self.futures_queue.appendleft(self)
+
+    def result(self, timeout=None):
+        if timeout is not None:
+            raise RuntimeError(&quot;timeout not implemented&quot;)
+
+        # Drain any futures ahead of us in the queue.
+        while not self.done():
+            future = self.futures_queue.pop()
+            future._wait_for_response()
+        return super().result()
+
+    def _wait_for_response(self):
+        try:
+            response = self.aggregate(self.get_response())
+            with suppress(InvalidStateError):
+                self.set_result(response)
+        except Exception as e:
+            with suppress(InvalidStateError):
+                self.set_exception(e)
+</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 90.</strong> Each new future goes to the left end of the shared deque.</li>
+  <li><strong>Lines 97-99.</strong> <code>result()</code> pops from the right end, the oldest future, and reads its reply, until its own future is done. The reply queues are FIFO, so the reply of the oldest call always comes first.</li>
+  <li><strong>Lines 104-109.</strong> An error goes into the future that owns it, not into the caller's future.</li>
+</ol>
+
+<h3 id="workerproc-init-inside-the-worker-process"><code>WorkerProc.__init__</code>: inside the worker process<a class="h-anchor" href="#workerproc-init-inside-the-worker-process" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L658-L710" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/executor/multiproc_executor.py:658-710</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L658-L710" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">658</span><span class="ln hl">659</span><span class="ln">660</span><span class="ln">661</span><span class="ln">662</span><span class="ln">663</span><span class="ln">664</span><span class="ln">665</span><span class="ln">666</span><span class="ln">667</span><span class="ln">668</span><span class="ln">669</span><span class="ln">670</span><span class="ln">671</span><span class="ln hl">672</span><span class="ln">673</span><span class="ln">674</span><span class="ln">675</span><span class="ln">676</span><span class="ln">677</span><span class="ln">678</span><span class="ln">679</span><span class="ln hl">680</span><span class="ln">681</span><span class="ln">682</span><span class="ln">683</span><span class="ln">684</span><span class="ln">685</span><span class="ln">686</span><span class="ln">687</span><span class="ln hl">688</span><span class="ln">689</span><span class="ln">690</span><span class="ln hl">691</span><span class="ln hl">692</span><span class="ln hl">693</span><span class="ln hl">694</span><span class="ln hl">695</span><span class="ln hl">696</span><span class="ln hl">697</span><span class="ln hl">698</span><span class="ln hl">699</span><span class="ln">700</span><span class="ln">701</span><span class="ln hl">702</span><span class="ln">703</span><span class="ln">704</span><span class="ln">705</span><span class="ln hl">706</span><span class="ln">707</span><span class="ln">708</span><span class="ln">709</span><span class="ln hl">710</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(37 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(38 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(40 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(41 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(44 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(48 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(52 * var(--code-lh))"></span><pre><code class="language-python">        self.rank = rank
+        wrapper = WorkerWrapperBase(rpc_rank=local_rank, global_rank=rank)
+        # TODO: move `init_worker` to executor level as a collective rpc call
+        all_kwargs: list[dict] = [
+            {} for _ in range(vllm_config.parallel_config.world_size)
+        ]
+        all_kwargs[local_rank] = {
+            &quot;vllm_config&quot;: vllm_config,
+            &quot;local_rank&quot;: local_rank,
+            &quot;rank&quot;: rank,
+            &quot;distributed_init_method&quot;: distributed_init_method,
+            &quot;is_driver_worker&quot;: is_driver_worker,
+            &quot;shared_worker_lock&quot;: shared_worker_lock,
+        }
+        wrapper.init_worker(all_kwargs)
+        self.worker = wrapper
+
+        self.setup_proc_title_and_log_prefix(
+            enable_ep=vllm_config.parallel_config.enable_expert_parallel
+        )
+
+        # Load model
+        self.worker.init_device()
+        # Update process title now that parallel groups are initialized
+        self.setup_proc_title_and_log_prefix(
+            enable_ep=vllm_config.parallel_config.enable_expert_parallel
+        )
+        if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
+            self.worker.elastic_ep_execute(&quot;load_model&quot;)
+        else:
+            self.worker.load_model()
+
+        scheduler_config = vllm_config.scheduler_config
+        self.use_async_scheduling = scheduler_config.async_scheduling
+        if self.use_async_scheduling:
+            self.async_output_queue: queue.Queue = queue.Queue()
+            self.async_output_copy_thread = Thread(
+                target=self.async_output_busy_loop,
+                daemon=True,
+                name=&quot;WorkerAsyncOutputCopy&quot;,
+            )
+            self.async_output_copy_thread.start()
+
+        # Set block size based on the attention backends
+        current_platform.update_block_size_for_backend(vllm_config)
+
+        # Initialize message queues after init_device() since multi-node setups
+        # (nnodes_within_dp &gt; 1) require distributed groups to be initialized
+        self._init_message_queues(input_shm_handle, vllm_config)
+
+        # Enable environment variable cache (e.g. assume no more
+        # environment variable overrides after this point)
+        enable_envs_cache()</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 659-672.</strong> <code>WorkerWrapperBase.init_worker</code> loads the general plugins and makes the worker class. Only this rank's kwargs are filled in.</li>
+  <li><strong>Line 680.</strong> <code>init_device</code>: CUDA device, NCCL groups, memory snapshot, model runner.</li>
+  <li><strong>Line 688.</strong> The weights load here, before the worker reports <code>READY</code>.</li>
+  <li><strong>Lines 691-699.</strong> With async scheduling, a second thread will wait for the GPU results.</li>
+  <li><strong>Line 702.</strong> The platform may change the block size for the chosen attention backend.</li>
+  <li><strong>Line 706.</strong> The queues come last, because a multi-node setup needs the process groups.</li>
+</ol>
+
+<h3 id="worker-busy-loop-and-execute-worker-rpc"><code>worker_busy_loop</code> and <code>_execute_worker_rpc</code><a class="h-anchor" href="#worker-busy-loop-and-execute-worker-rpc" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1041-L1080" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/executor/multiproc_executor.py:1041-1080</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1041-L1080" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1041</span><span class="ln">1042</span><span class="ln">1043</span><span class="ln">1044</span><span class="ln hl">1045</span><span class="ln hl">1046</span><span class="ln">1047</span><span class="ln">1048</span><span class="ln">1049</span><span class="ln">1050</span><span class="ln">1051</span><span class="ln">1052</span><span class="ln">1053</span><span class="ln">1054</span><span class="ln">1055</span><span class="ln">1056</span><span class="ln hl">1057</span><span class="ln hl">1058</span><span class="ln hl">1059</span><span class="ln hl">1060</span><span class="ln">1061</span><span class="ln">1062</span><span class="ln hl">1063</span><span class="ln hl">1064</span><span class="ln hl">1065</span><span class="ln hl">1066</span><span class="ln hl">1067</span><span class="ln hl">1068</span><span class="ln">1069</span><span class="ln hl">1070</span><span class="ln hl">1071</span><span class="ln">1072</span><span class="ln">1073</span><span class="ln">1074</span><span class="ln">1075</span><span class="ln hl">1076</span><span class="ln">1077</span><span class="ln">1078</span><span class="ln hl">1079</span><span class="ln hl">1080</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(38 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><pre><code class="language-python">    def worker_busy_loop(self):
+        &quot;&quot;&quot;Main busy loop for Multiprocessing Workers.&quot;&quot;&quot;
+        assert self.rpc_broadcast_mq is not None
+        while True:
+            with get_watch_dog().disable():
+                rpc_request = self.rpc_broadcast_mq.dequeue(indefinite=True)
+            self._execute_worker_rpc(rpc_request)
+            del rpc_request
+
+    def _execute_worker_rpc(
+        self,
+        rpc_request: tuple[str | bytes, tuple[Any, ...], dict[str, Any], int | None],
+    ) -&gt; None:
+        &quot;&quot;&quot;Execute one RPC in a separate frame from the dequeue loop.&quot;&quot;&quot;
+        method, args, kwargs, output_rank = rpc_request
+        try:
+            if isinstance(method, str):
+                func = getattr(self.worker, method)
+            elif isinstance(method, bytes):
+                func = partial(cloudpickle.loads(method), self.worker)
+
+            watchdog = get_watch_dog()
+            watchdog.feed()
+            output = func(*args, **kwargs)
+            # Feed again: the RPC itself may run close to the watchdog
+            # timeout, so the pre-call feed can go stale while the result
+            # is serialized/enqueued in handle_output().
+            watchdog.feed()
+
+            if output_rank is None or self.rank == output_rank:
+                self.handle_output(output)
+        except Exception as e:
+            # Notes have been introduced in python 3.11
+            if hasattr(e, &quot;add_note&quot;):
+                e.add_note(traceback.format_exc())
+            logger.exception(&quot;WorkerProc hit an exception.&quot;)
+            # enqueue_output converts the exception to a FAILURE response
+            # containing its string representation before transport.
+            if output_rank is None or self.rank == output_rank:
+                self.handle_output(e)</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 1045-1046.</strong> Wait for the next call without a timeout. The stack-dump watchdog is off during this wait, so an idle worker does not look stuck.</li>
+  <li><strong>Lines 1057-1060.</strong> A name is looked up on the worker wrapper; bytes are a pickled function.</li>
+  <li><strong>Lines 1070-1071.</strong> Only the reply rank (or every rank when <code>output_rank</code> is <code>None</code>) sends the result.</li>
+  <li><strong>Lines 1076-1080.</strong> An exception is logged with its traceback and sent as a <code>FAILURE</code> reply. The loop goes on.</li>
+</ol>
+
+<h3 id="handle-output-the-async-copy-thread"><code>handle_output</code>: the async copy thread<a class="h-anchor" href="#handle-output-the-async-copy-thread" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L995-L1039" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/executor/multiproc_executor.py:995-1039</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L995-L1039" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">995</span><span class="ln">996</span><span class="ln">997</span><span class="ln">998</span><span class="ln">999</span><span class="ln hl">1000</span><span class="ln hl">1001</span><span class="ln hl">1002</span><span class="ln hl">1003</span><span class="ln hl">1004</span><span class="ln hl">1005</span><span class="ln">1006</span><span class="ln hl">1007</span><span class="ln hl">1008</span><span class="ln hl">1009</span><span class="ln hl">1010</span><span class="ln">1011</span><span class="ln">1012</span><span class="ln">1013</span><span class="ln">1014</span><span class="ln">1015</span><span class="ln">1016</span><span class="ln">1017</span><span class="ln">1018</span><span class="ln hl">1019</span><span class="ln hl">1020</span><span class="ln hl">1021</span><span class="ln hl">1022</span><span class="ln">1023</span><span class="ln">1024</span><span class="ln">1025</span><span class="ln">1026</span><span class="ln">1027</span><span class="ln">1028</span><span class="ln">1029</span><span class="ln">1030</span><span class="ln">1031</span><span class="ln">1032</span><span class="ln">1033</span><span class="ln hl">1034</span><span class="ln hl">1035</span><span class="ln">1036</span><span class="ln hl">1037</span><span class="ln hl">1038</span><span class="ln hl">1039</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(40 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(42 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(43 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(44 * var(--code-lh))"></span><pre><code class="language-python">    def enqueue_output(self, output: Any):
+        &quot;&quot;&quot;Prepares output from the worker and enqueues it to the
+        worker_response_mq. If the output is an Exception, it is
+        converted to a FAILURE response.
+        &quot;&quot;&quot;
+        if isinstance(output, AsyncModelRunnerOutput):
+            try:
+                output = output.get_output()
+            except Exception as e:
+                logger.exception(&quot;Error getting async model runner output&quot;)
+                output = e
+
+        if isinstance(output, Exception):
+            result = (WorkerProc.ResponseStatus.FAILURE, str(output))
+        else:
+            result = (WorkerProc.ResponseStatus.SUCCESS, output)
+        if (response_mq := self.worker_response_mq) is not None:
+            response_mq.enqueue(result)
+
+    def handle_output(self, output: Any):
+        &quot;&quot;&quot;Handles output from the worker. If async scheduling is enabled,
+        it is passed to the async_output_busy_loop thread. Otherwise, it is
+        enqueued directly to the worker_response_mq.
+        &quot;&quot;&quot;
+        if self.use_async_scheduling:
+            self.async_output_queue.put(output)
+        else:
+            self.enqueue_output(output)
+
+    def async_output_busy_loop(self):
+        &quot;&quot;&quot;Entrypoint for the thread which handles outputs asynchronously.&quot;&quot;&quot;
+        # set device to the worker device for the thread.
+        # a thread will not inherit the context of the main thread.
+        # when calling any cuda runtime functions, it will implicitly
+        # create a new cuda context on device 0, consuming extra memory.
+        # here we set the device to the worker device for the thread,
+        # enforcing the context to be the same as the main thread.
+        from vllm.platforms import current_platform
+
+        if hasattr(self.worker, &quot;device&quot;):
+            current_platform.set_device(self.worker.device)
+
+        while True:
+            output = self.async_output_queue.get()
+            self.enqueue_output(output)</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 1000-1005.</strong> An <code>AsyncModelRunnerOutput</code> is resolved with <code>get_output()</code>, which waits for the copy to the CPU.</li>
+  <li><strong>Lines 1019-1022.</strong> With async scheduling, this wait happens in the extra thread, not in the main thread.</li>
+  <li><strong>Lines 1034-1035.</strong> The thread sets its CUDA device first. A new thread does not inherit it, and a CUDA call on device 0 would make a second CUDA context.</li>
+</ol>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="data-flow-types-in-and-out" class="dd-title">Data flow: types in and out</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Value</th><th>Type</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>broadcast message</td><td><code>(method: str | bytes, args: tuple, kwargs: dict, output_rank: int | None)</code>, pickled</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L428" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:428 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:428</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1050-L1055" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1050-1055 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1050-1055</code></a></td></tr>
+    <tr><td><code>execute_model</code> args</td><td><code>(SchedulerOutput,)</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L345-L347" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:345-347 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:345-347</code></a></td></tr>
+    <tr><td><code>sample_tokens</code> args</td><td><code>(GrammarOutput | None,)</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L358-L360" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:358-360 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:358-360</code></a></td></tr>
+    <tr><td>reply message</td><td><code>(ResponseStatus.SUCCESS, result)</code> or <code>(ResponseStatus.FAILURE, str(exception))</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1007-L1012" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1007-1012 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1007-1012</code></a></td></tr>
+    <tr><td><code>execute_model</code> reply (MRV2, last PP rank)</td><td><code>None</code>: sampling follows in <code>sample_tokens</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2103-L2110" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2103-2110 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2103-2110</code></a></td></tr>
+    <tr><td><code>sample_tokens</code> reply</td><td><code>ModelRunnerOutput</code> (after <code>get_output()</code> in the worker)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1000-L1002" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1000-1002 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1000-1002</code></a></td></tr>
+    <tr><td>ready pipe message</td><td><code>{"status": "READY", "handle": Handle, "peer_response_handles": [...]}</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L931-L937" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:931-937 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:931-937</code></a></td></tr>
+  </tbody>
+</table></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="processes-and-threads" class="dd-title">Processes and threads</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Process</th><th>Thread</th><th>Code</th><th>Blocks in</th></tr></thead>
+  <tbody>
+    <tr><td>engine core</td><td>main</td><td><code>collective_rpc</code>, <code>FutureWrapper.result</code></td><td><code>mq.dequeue</code> of a reply queue</td></tr>
+    <tr><td>engine core</td><td><code>MultiprocWorkerMonitor</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L307-L331" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:307-331 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:307-331</code></a></td><td><code>multiprocessing.connection.wait(sentinels)</code></td></tr>
+    <tr><td>worker</td><td>main</td><td><code>worker_busy_loop</code></td><td><code>rpc_broadcast_mq.dequeue(indefinite=True)</code></td></tr>
+    <tr><td>worker</td><td><code>WorkerAsyncOutputCopy</code> (async scheduling only)</td><td><code>async_output_busy_loop</code></td><td><code>async_output_queue.get()</code>, then <code>copy_event.synchronize()</code></td></tr>
+    <tr><td>worker</td><td><code>DeathPipeMonitor</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L835-L859" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:835-859 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:835-859</code></a></td><td><code>death_pipe.recv()</code></td></tr>
+  </tbody>
+</table>
+<p>The process name is <code>VllmWorker-&lt;rank&gt;</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L748" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:748 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:748</code></a>). After <code>init_device</code>, the worker renames itself by its parallel ranks, for example <code>Worker_TP1</code> or, for an MoE model with DP = 2 and TP = 2, <code>Worker_DP1_TP0</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1101-L1116" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1101-1116 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1101-1116</code></a>). A dense model's DP rank runs as DP = 1 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L1192-L1199" target="_blank" rel="noopener" title="vllm/config/parallel.py:1192-1199 at 3e44c0d"><code>vllm/config/parallel.py:1192-1199</code></a>), so its name has no DP part.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-tp-2-one-step" class="dd-title">Worked example: TP = 2, one step</h3></summary><div class="dd-body"><ol>
+  <li>The busy loop calls <code>execute_model(so, non_block=True)</code>. <code>collective_rpc</code> enqueues <code>("execute_model", (so,), {}, 0)</code> and returns future F1 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L342-L353" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:342-353 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:342-353</code></a>).</li>
+  <li>Both workers dequeue the same message. Both run <code>Worker.execute_model</code>; their forward passes meet in the NCCL all-reduces of the TP layers.</li>
+  <li>Worker 0 is the output rank (<code>2 - 2 × 1 = 0</code>). It replies <code>(SUCCESS, None)</code> through its copy thread. Worker 1 replies nothing.</li>
+  <li>The busy loop computes the grammar bitmask, then calls <code>sample_tokens(grammar, non_block=True)</code>: message <code>("sample_tokens", (grammar,), {}, 0)</code>, future F2.</li>
+  <li>Both workers sample. Worker 0 gives its <code>AsyncOutput</code> to the copy thread, which waits for the copy and replies <code>(SUCCESS, ModelRunnerOutput)</code>.</li>
+  <li>One call later, the busy loop pops this step and calls <code>F2.result()</code>. <code>FutureWrapper</code> first reads the reply of F1 (<code>None</code>), then the reply of F2.</li>
+</ol>
+<p>(Derived from the methods above and <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L724-L773" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:724-773 at 3e44c0d"><code>vllm/v1/engine/core.py:724-773</code></a>.)</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="error-paths-what-raises-what-only-logs" class="dd-title">Error paths: what raises, what only logs</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>world size is not TP × PP × PCP</td><td><code>AssertionError</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L126-L132" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:126-132 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:126-132</code></a></td></tr>
+    <tr><td>a worker sends a status other than <code>READY</code>, or its pipe closes</td><td><code>Exception("WorkerProc initialization failed ...")</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L790-L816" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:790-816 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:790-816</code></a></td></tr>
+    <tr><td>a worker process exits</td><td>ERROR log, <code>is_failed = True</code>, shutdown, failure callback</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L314-L326" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:314-326 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:314-326</code></a></td></tr>
+    <tr><td>call after a failure</td><td><code>RuntimeError("Executor failed.")</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L399-L400" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:399-400 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:399-400</code></a></td></tr>
+    <tr><td>worker method raises</td><td>worker logs it. Only a replying rank sends <code>FAILURE</code>, and then the executor raises <code>RuntimeError("Worker failed with error ...")</code>. A failure on another rank is only logged</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1072-L1080" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1072-1080 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1072-1080</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L444-L448" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:444-448 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:444-448</code></a></td></tr>
+    <tr><td>reply timeout</td><td><code>TimeoutError("RPC call to ... timed out.")</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L440-L443" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:440-443 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:440-443</code></a></td></tr>
+    <tr><td><code>get_output()</code> fails in the copy thread</td><td>logged; sent as a <code>FAILURE</code> reply</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1000-L1005" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1000-1005 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1000-1005</code></a></td></tr>
+    <tr><td>parent process exits</td><td>worker logs "Parent process exited, terminating worker queues"</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L841-L849" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:841-849 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:841-849</code></a></td></tr>
+    <tr><td>SIGTERM / SIGINT in a worker</td><td><code>SystemExit</code>, raised once</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L873-L884" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:873-884 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:873-884</code></a></td></tr>
+  </tbody>
+</table></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="environment-variables" class="dd-title">Environment variables</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_MQ_MAX_CHUNK_BYTES_MB</code></td><td>16 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L1856-L1858" target="_blank" rel="noopener" title="vllm/envs.py:1856-1858 at 3e44c0d"><code>vllm/envs.py:1856-1858</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L152" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:152 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:152</code></a></td><td>Chunk size of the broadcast queue; larger messages go over ZMQ.</td></tr>
+    <tr><td><code>VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS</code></td><td>300 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L1861-L1863" target="_blank" rel="noopener" title="vllm/envs.py:1861-1863 at 3e44c0d"><code>vllm/envs.py:1861-1863</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L350" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:350 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:350</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L363" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:363 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:363</code></a></td><td>Timeout of <code>execute_model</code>, <code>sample_tokens</code>, dummy batches and draft tokens.</td></tr>
+    <tr><td><code>VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS</code></td><td>5 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L1865-L1867" target="_blank" rel="noopener" title="vllm/envs.py:1865-1867 at 3e44c0d"><code>vllm/envs.py:1865-1867</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L484-L486" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:484-486 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:484-486</code></a></td><td>Grace period before SIGTERM; SIGKILL follows after 4 s more.</td></tr>
+    <tr><td><code>VLLM_WORKER_MULTIPROC_METHOD</code></td><td><code>fork</code>; <code>vllm serve</code> sets <code>spawn</code></td><td>through <code>get_mp_context()</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L723" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:723 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:723</code></a>)</td><td>Start method of the worker processes.</td></tr>
+    <tr><td><code>OMP_NUM_THREADS</code></td><td>set by vLLM if unset</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1125-L1135" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1125-1135 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1125-1135</code></a></td><td>CPU threads per worker.</td></tr>
+  </tbody>
+</table></div></details>
+
+<h2 id="related-concepts">Related concepts<a class="h-anchor" href="#related-concepts" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><a href="../concepts/executors-and-workers.html">Executors and workers: from the engine core to the GPUs</a>: the backends, the call path and the worker start-up.</li>
+  <li><a href="../concepts/async-scheduling.html">Async scheduling: overlap the CPU and the GPU</a>: why the worker has a copy thread.</li>
+  <li><a href="../concepts/engine-core-loop.html">The engine core loop: threads, queues and the busy loop</a>: what happens after <code>EXECUTOR_FAILED</code>.</li>
+  <li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py: the GPU Worker</a>: the methods that the RPCs run.</li>
+  <li><a href="../code/distributed-device-communicators-shm-broadcast.html">distributed/device_communicators/shm_broadcast.py: MessageQueue</a>: the <code>MessageQueue</code> ring buffer.</li>
+</ul>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>What is the name of a worker process before it renames itself, and which method is its target?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>VllmWorker-&lt;rank&gt;</code>, with the target <code>WorkerProc.worker_main</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L745-L750" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:745-750 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:745-750</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>With TP = 8 and PP = 4, which rank replies to <code>execute_model</code>?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Rank <code>world_size - TP × PCP = 32 - 8 = 24</code>, the first TP rank of the last PP stage. The comment in <code>_get_output_rank</code> uses this example (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L549-L563" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:549-563 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:549-563</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>A worker method raises <code>ValueError("bad")</code>. What does the engine core see, and where is the traceback?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The worker logs "WorkerProc hit an exception." with the traceback. If it is the reply rank (or the call has no <code>output_rank</code>), it replies <code>(FAILURE, "bad")</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1072-L1080" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1072-1080 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1072-1080</code></a>). The executor raises <code>RuntimeError("Worker failed with error 'bad', ...")</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L444-L448" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:444-448 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:444-448</code></a>). The traceback is only in the worker's log.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>Why does <code>async_output_busy_loop</code> call <code>current_platform.set_device</code> before its loop, and what goes wrong without it?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>A new thread does not inherit the current CUDA device of the main thread. The first CUDA call in the thread, here the event synchronize in <code>get_output()</code>, would then make a new CUDA context on device 0, which costs extra memory. The comment says this (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1026-L1035" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1026-1035 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1026-1035</code></a>).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/executors-and-workers.html">Executors and workers: from the engine core to the GPUs</a><span class="rel-sum">The executor starts the workers and runs each call on all of them. The uni executor calls one worker in the engine core process; the multiproc executor sends calls to one worker process per GPU through a shared-memory queue.</span></li><li><a href="../concepts/async-scheduling.html">Async scheduling: overlap the CPU and the GPU</a><span class="rel-sum">With async scheduling, the engine core schedules and starts step N+1 before it waits for the token of step N. Placeholders in the scheduler and a GPU-side token buffer in Model Runner V2 make this possible.</span></li><li><a href="../concepts/engine-core-loop.html">The engine core loop: threads, queues and the busy loop</a><span class="rel-sum">The engine core process runs three threads. An input thread decodes requests, the main thread runs the busy loop with the scheduler and the executor, and an output thread sends the results back.</span></li><li><a href="../code/v1-engine-core.html">v1/engine/core.py: EngineCore and the engine core process</a><span class="rel-sum">vllm/v1/engine/core.py defines EngineCore (scheduler + executor + step functions), EngineCoreProc (the process with its ZMQ threads and busy loop) and DPEngineCoreProc (the lock-step variant for MoE data parallelism).</span></li><li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py: the GPU Worker</a><span class="rel-sum">vllm/v1/worker/gpu_worker.py defines Worker, the object that owns one GPU. It sets up the device and NCCL, builds Model Runner V2, profiles memory to size the KV cache, warms up the model, and forwards each step to the model runner.</span></li><li><a href="../code/distributed-device-communicators-shm-broadcast.html">distributed/device_communicators/shm_broadcast.py: MessageQueue</a><span class="rel-sum">vllm/distributed/device_communicators/shm_broadcast.py implements MessageQueue, a one-writer, many-reader queue. Local readers share a lock-free ring of chunks in /dev/shm with one flag byte per reader; large messages and remote readers use ZMQ XPUB sockets. The executor uses it to send every call to its workers, and each worker uses one to reply.</span></li><li><a href="../tours/multi-gpu-step.html">Tour: One step across GPUs</a><span class="rel-sum">Follow two requests through vllm serve -tp 2 -dp 2 in 13 stops: the API servers pick an engine each, two independent engine cores schedule, each broadcasts the step to its two workers through shared memory, the workers meet in 65 all-reduces on their TP group, only rank 0 replies, and the coordinator publishes the new load.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../code/v1-core-kv-cache-utils.html"><span class="pn-dir">← Previous</span><span class="pn-title">v1/core/kv_cache_utils.py: block hashes, KVCacheBlock and the free queue</span></a><a class="pn pn-next" href="../code/v1-worker-gpu-worker.html"><span class="pn-dir">Next →</span><span class="pn-title">v1/worker/gpu_worker.py: the GPU Worker</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#purpose">Purpose</a></li><li class="toc-l2"><a href="#where-it-sits">Where it sits</a></li><li class="toc-l3"><a href="#who-calls-it">Who calls it</a></li><li class="toc-l3"><a href="#what-it-calls">What it calls</a></li><li class="toc-l2"><a href="#key-classes-and-functions">Key classes and functions</a></li><li class="toc-l2"><a href="#walk-through-the-main-methods">Walk through the main methods</a></li><li class="toc-l3"><a href="#init-executor-start-the-workers">_init_executor: start the workers</a></li><li class="toc-l3"><a href="#collective-rpc-one-call-to-all-workers">collective_rpc: one call to all workers</a></li><li class="toc-l3"><a href="#futurewrapper-replies-in-order">FutureWrapper: replies in order</a></li><li class="toc-l3"><a href="#workerproc-init-inside-the-worker-process">WorkerProc.__init__: inside the worker process</a></li><li class="toc-l3"><a href="#worker-busy-loop-and-execute-worker-rpc">worker_busy_loop and _execute_worker_rpc</a></li><li class="toc-l3"><a href="#handle-output-the-async-copy-thread">handle_output: the async copy thread</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#data-flow-types-in-and-out">Data flow: types in and out</a></li><li class="toc-l3"><a href="#processes-and-threads">Processes and threads</a></li><li class="toc-l3"><a href="#worked-example-tp-2-one-step">Worked example: TP = 2, one step</a></li><li class="toc-l3"><a href="#error-paths-what-raises-what-only-logs">Error paths: what raises, what only logs</a></li><li class="toc-l3"><a href="#environment-variables">Environment variables</a></li><li class="toc-l2"><a href="#related-concepts">Related concepts</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

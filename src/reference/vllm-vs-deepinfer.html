@@ -1,0 +1,96 @@
+---
+title: vLLM and DeepInfer compared
+nav_title: vLLM vs DeepInfer
+related: learn/what-is-vllm, learn/ml-basics-recap, concepts/architecture-overview, concepts/scheduler, concepts/kv-cache-manager, concepts/model-runner, concepts/compile-and-cuda-graphs, concepts/speculative-decoding, concepts/distributed-groups, reference/extension-points
+summary: A side-by-side reference of vLLM (this site, the pinned commit) and DeepInfer (the sister site, an engine that was first built on vLLM) - process model, scheduler, KV cache, model runner, CUDA graphs and compile, sampling, speculative decoding, parallelism, platforms, plugins, serving front end and configuration. Each vLLM cell cites vLLM code; each DeepInfer cell links the DeepInfer page that states it.
+---
+<x-sentence>DeepInfer is a small, offline, one-model engine with a C++ scheduler; vLLM is a general online serving engine with a Python scheduler and many extension points.</x-sentence>
+
+<p>DeepInfer "was originally built primarily on vLLM" ({{deepinfer index | DeepInfer Explained}}). So most ideas have the same name on both sites. This page lists where the two engines differ. Use it when a DeepInfer page gives a number or a rule, and you want to know if it holds in vLLM.</p>
+<ul>
+  <li>Each <strong>vLLM</strong> cell cites the vLLM code at the pinned commit, or links the page of this site that explains it.</li>
+  <li>Each <strong>DeepInfer</strong> cell links the DeepInfer Explained page that states it. This site does not cite DeepInfer code.</li>
+</ul>
+<p>The short table on {{link learn/what-is-vllm}} has the main rows. The page {{link learn/ml-basics-recap}} gives the differences for each of the 12 basics.</p>
+
+<h2 id="process-model">Use and process model</h2>
+<table>
+  <thead><tr><th>Topic</th><th>DeepInfer</th><th>vLLM</th></tr></thead>
+  <tbody>
+    <tr><td>How you use it</td><td>Offline only. Your script calls <code>LLM.generate()</code>, which calls <code>step()</code> until no request is left ({{deepinfer concepts/engine-step-loop | Offline API and the step loop}}). The release has no online-serving wrapper ({{deepinfer reference/faq | DeepInfer FAQ}}, "What is not in this release?").</td><td>Online first. <code>vllm serve</code> starts an OpenAI-compatible HTTP server ({{cite vllm/entrypoints/cli/serve.py:39-40}}). The offline <code>LLM</code> class also exists and uses its own usage context ({{cite vllm/entrypoints/llm.py:341-343}}). See {{link concepts/openai-server}}.</td></tr>
+    <tr><td>Processes</td><td>The engine and the driver worker run in your script process; context-parallel followers run in their own processes ({{deepinfer code/worker | Worker}}). Each data-parallel replica is its own process with its own engine, started by the example launcher ({{deepinfer concepts/dp-step-votes | Data parallelism and step votes}}).</td><td>The API server process and an engine core process, joined by ZMQ sockets ({{cite vllm/v1/engine/core_client.py:672-682}}). <code>AsyncLLM</code> always starts the engine core in a background process ({{cite vllm/v1/engine/async_llm.py:188-193}}). With TP = PP = DP = 1 the worker runs inside the engine core ({{cite vllm/config/parallel.py:1099-1100}}); otherwise one worker process per GPU. See {{link concepts/architecture-overview}}.</td></tr>
+    <tr><td>Data-parallel replicas</td><td>Replicas vote with all-reduces, so that all run a prefill step or all run a decode step ({{deepinfer concepts/dp-step-votes | Data parallelism and step votes}}).</td><td>One engine core per DP rank. Dense models get independent engines; MoE models use <code>DPEngineCoreProc</code> ({{cite vllm/v1/engine/core.py:1534-1543}}). The API server balances requests over the engines ({{cite vllm/v1/engine/core_client.py:1776-1789}}). See {{link concepts/data-parallel-serving}}.</td></tr>
+    <tr><td>Models</td><td>One model family, DeepSeek-V4.1-Flash ({{deepinfer concepts/model-map | Model map}}).</td><td>A registry of hundreds of architecture names ({{cite vllm/model_executor/models/registry.py:806-817}}), plus out-of-tree models ({{link concepts/oot-models}}).</td></tr>
+  </tbody>
+</table>
+
+<h2 id="scheduler">Scheduler and KV cache</h2>
+<table>
+  <thead><tr><th>Topic</th><th>DeepInfer</th><th>vLLM</th></tr></thead>
+  <tbody>
+    <tr><td>Language</td><td>C++ scheduler ({{deepinfer concepts/scheduler | The scheduler}}).</td><td>Python (<code>vllm/v1/core/sched/</code>). See {{link concepts/scheduler}}.</td></tr>
+    <tr><td>Step kinds</td><td>A step is a prefill step or a decode step, never both. A prefill starts only at attempt points: every 70 or 100 decode steps ({{deepinfer concepts/scheduler | The scheduler}}).</td><td>No prefill phase and no decode phase. Each request catches up from <code>num_computed_tokens</code> to its token count, so one step can mix prompt chunks and decode tokens ({{cite vllm/v1/core/sched/scheduler.py:624-633}}).</td></tr>
+    <tr><td>Order and preemption</td><td>Decode serves the fewest output tokens first; it preempts the sequence with the most output tokens. A preempted sequence stops or is recomputed (<code>stop_preempted_request</code>) ({{deepinfer concepts/scheduler | The scheduler}}).</td><td>Running requests first, then waiting ones ({{cite vllm/v1/core/sched/scheduler.py:713-715}}, {{cite vllm/v1/core/sched/scheduler.py:956}}). With the default FCFS policy the victim is the last running request ({{cite vllm/v1/core/sched/scheduler.py:852-858}}). Preemption always recomputes: blocks freed, computed tokens set to 0, request back at the front of the queue ({{cite vllm/v1/core/sched/scheduler.py:1676-1700}}).</td></tr>
+    <tr><td>Overlap of CPU and GPU</td><td>Zero-overhead scheduling: the CPU prepares step N+1 while the device runs step N, and <code>step()</code> returns tokens one step late ({{deepinfer concepts/zero-overhead-scheduling | Zero-overhead scheduling}}).</td><td>Async scheduling is on by default when the configuration allows it ({{cite vllm/config/vllm.py:1664-1698}}). The engine core then runs <code>step_with_batch_queue</code> ({{cite vllm/v1/engine/core.py:227-229}}). See {{link concepts/async-scheduling}}.</td></tr>
+    <tr><td>Block size</td><td>128 tokens ({{deepinfer concepts/paged-kv-cache | Paged KV cache}}).</td><td>16 tokens by default ({{cite vllm/config/cache.py:182}}). When you do not set <code>--block-size</code>, the platform picks a size that all attention backends accept ({{cite vllm/platforms/interface.py:771-781}}).</td></tr>
+    <tr><td>Prefix caching</td><td>None in the release ({{deepinfer concepts/paged-kv-cache | Paged KV cache}}).</td><td>On by default when the model supports it ({{cite vllm/engine/arg_utils.py:3062-3063}}, {{cite vllm/config/model.py:2275-2291}}). See {{link concepts/prefix-caching}}.</td></tr>
+    <tr><td>Cache layout for mixed layer types</td><td>One paged byte buffer for the compressed KV and the indexer keys; the sliding-window cache is a ring per sequence in a separate state buffer, with a second block manager for state slots ({{deepinfer concepts/paged-kv-cache | Paged KV cache}}, {{deepinfer concepts/sliding-window-attention | Sliding-window attention}}).</td><td>KV cache groups, one per kind of layer, with one shared block pool. The coordinator is <code>NoPrefixCache</code>, <code>Unitary</code> (one group) or <code>Hybrid</code> ({{cite vllm/v1/core/kv_cache_coordinator.py:995-1024}}). See {{link concepts/hybrid-kv-cache}}.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="execution">Model execution</h2>
+<table>
+  <thead><tr><th>Topic</th><th>DeepInfer</th><th>vLLM</th></tr></thead>
+  <tbody>
+    <tr><td>Model runner</td><td><code>ModelRunner</code> builds the input metadata, runs the forward eager or as a CUDA graph replay, and prepares the sampler inputs ({{deepinfer code/model-runner | ModelRunner}}).</td><td>Model Runner V2 (<code>vllm/v1/worker/gpu/</code>) is the default ({{cite vllm/config/vllm.py:713-749}}, {{cite vllm/v1/worker/gpu_worker.py:567-583}}). See {{link concepts/model-runner}}.</td></tr>
+    <tr><td>CUDA graphs</td><td>Decode steps only. Prefill steps run eager. A decode batch is padded to the next captured size ({{deepinfer concepts/cuda-graphs | CUDA graphs}}).</td><td>Mode <code>FULL_AND_PIECEWISE</code> at the default level O2 ({{cite vllm/config/vllm.py:310}}, {{cite vllm/config/vllm.py:434}}): FULL graphs for uniform decode batches, PIECEWISE graphs for mixed batches. See {{link concepts/compile-and-cuda-graphs}}.</td></tr>
+    <tr><td><code>torch.compile</code></td><td>Not used. DeepInfer Explained does not describe it, and a search of the DeepInfer repository finds no <code>torch.compile</code> call.</td><td>On above O0: the mode becomes <code>VLLM_COMPILE</code> ({{cite vllm/config/vllm.py:1806-1810}}).</td></tr>
+    <tr><td>Sampling</td><td>A fused sampler applies temperature, top-p and top-k, then draws with a seeded hash ({{deepinfer concepts/sampler | The sampler}}).</td><td>A FlashInfer (or XPU) fused top-k/top-p sampler when no request is greedy or seeded and none needs processed logprobs ({{cite vllm/v1/worker/gpu/sample/sampler.py:304-315}}); else the general path with a Gumbel draw. See {{link concepts/sampling-and-logits-processors}}.</td></tr>
+    <tr><td>Speculative decoding</td><td>Always on: the DFlash draft model makes 5 drafts per request ({{deepinfer concepts/speculative-decoding | Speculative decoding}}). DSpark, with <code>DEEPINFER_ENABLE_MTP_VARLEN=1</code>, checks only the drafts that are worth their cost ({{deepinfer concepts/dspark | DSpark}}).</td><td>Off unless you pass <code>--speculative-config</code>. Methods include <code>ngram</code>, <code>draft_model</code>, <code>suffix</code>, the EAGLE and MTP types, <code>dflash</code> and <code>dspark</code> ({{cite vllm/config/speculative.py:68-82}}). Adaptive verification from per-request confidence is opt-in and only for <code>dspark</code> ({{cite vllm/config/speculative.py:559-561}}). See {{link concepts/speculative-decoding}}.</td></tr>
+    <tr><td>Structured outputs</td><td>xgrammar, compiled on a pinned CPU thread pool ({{deepinfer concepts/structured-outputs | Structured outputs}}).</td><td>Backend <code>auto</code> tries xgrammar, then guidance, or outlines for some cases ({{cite vllm/sampling_params.py:1397-1439}}). See {{link concepts/structured-outputs}}.</td></tr>
+    <tr><td>Determinism</td><td><code>DEEPINFER_BATCH_INVARIANT=1</code> (NVIDIA only) ({{deepinfer concepts/determinism | Determinism}}).</td><td><code>VLLM_BATCH_INVARIANT</code>, default 0 ({{cite vllm/envs.py:637}}).</td></tr>
+  </tbody>
+</table>
+
+<h2 id="parallelism">Parallelism and hardware</h2>
+<table>
+  <thead><tr><th>Topic</th><th>DeepInfer</th><th>vLLM</th></tr></thead>
+  <tbody>
+    <tr><td>Parallel groups</td><td>DP for attention, CP for long prefills, EP for experts; no TP group and no PP group ({{deepinfer learn/parallelism | Parallelism basics}}).</td><td>TP, PP, DP, prefill context parallelism (PCP) and decode context parallelism (DCP), each 1 by default ({{cite vllm/config/parallel.py:140-147}}, {{cite vllm/config/parallel.py:389}}). Expert parallelism is off by default ({{cite vllm/config/parallel.py:190}}). The rank grid is <code>(-1, DP, PP, PCP, TP)</code> ({{cite vllm/distributed/parallel_state.py:2157-2163}}). See {{link concepts/distributed-groups}}.</td></tr>
+    <tr><td>MoE</td><td>Every decoder layer is MoE; DeepEP dispatch and combine, DeepGEMM grouped GEMMs ({{deepinfer concepts/expert-parallelism | Expert parallelism}}).</td><td>Without <code>--enable-expert-parallel</code>, MoE layers use tensor parallelism. See {{link concepts/expert-parallel-moe}}.</td></tr>
+    <tr><td>Platforms</td><td>NVIDIA SM100 GPUs and Huawei Ascend 950 NPUs, chosen once per process by <code>get_platform()</code> ({{deepinfer concepts/hardware-platforms | NVIDIA and Ascend}}, {{deepinfer code/platform | platform.py}}).</td><td>Five built-in detectors: TPU, CUDA, ROCm, XPU, CPU ({{cite vllm/platforms/__init__.py:231-237}}), plus out-of-tree platform plugins ({{cite vllm/platforms/__init__.py:250}}). See {{link concepts/platform-plugins}}.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="extension">Extension, configuration and monitoring</h2>
+<table>
+  <thead><tr><th>Topic</th><th>DeepInfer</th><th>vLLM</th></tr></thead>
+  <tbody>
+    <tr><td>Plugins</td><td>None. DeepInfer Explained describes no plugin system, and a search of the DeepInfer packaging files finds no entry-point groups.</td><td>Five plugin groups ({{cite vllm/plugins/__init__.py:16-30}}) plus <code>vllm.logits_processors</code> ({{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:34}}), registries and config hooks. See {{link reference/extension-points}}.</td></tr>
+    <tr><td>Configuration</td><td>One <code>EngineArgs</code> object becomes four config objects ({{deepinfer reference/config-classes | Config classes}}).</td><td><code>EngineArgs.create_engine_config</code> ({{cite vllm/engine/arg_utils.py:2234}}) makes one <code>VllmConfig</code> ({{cite vllm/config/vllm.py:348}}) with many nested config classes. See {{link reference/config-classes}}.</td></tr>
+    <tr><td>Environment variables</td><td>59 <code>DEEPINFER_*</code> variables, each read once on first use ({{deepinfer reference/env-vars | Environment variables}}).</td><td>About 300 variables in one dict of lambdas ({{cite vllm/envs.py:618}}), read again on each access until a process turns on the cache. See {{link reference/env-vars}}.</td></tr>
+    <tr><td>Metrics</td><td>A periodic <code>[stats]</code> log line ({{deepinfer code/stats-logger | stats_logger.py}}).</td><td>Prometheus metrics at <code>/metrics</code> ({{cite vllm/entrypoints/serve/instrumentator/metrics.py:76-77}}) and a log line every 10 s by default ({{cite vllm/envs.py:874-878}}). See {{link reference/metrics}}.</td></tr>
+  </tbody>
+</table>
+
+<x-simplified><p>The DeepInfer cells are summaries of DeepInfer Explained, which describes DeepInfer at its own pinned commit. The rows "<code>torch.compile</code>" and "Plugins" come from a search of the DeepInfer repository, because no DeepInfer page states them. The vLLM cells give the default for <code>vllm serve</code>; many of them change with flags.</p></x-simplified>
+
+<h2 id="numbers">Numbers that change between the sites</h2>
+<p>Examples on DeepInfer pages use DeepInfer's settings. Recompute them with the vLLM defaults:</p>
+<ul>
+  <li><strong>Blocks per prompt.</strong> A 1,000-token prompt needs ⌈1,000 / 16⌉ = 63 blocks in vLLM and ⌈1,000 / 128⌉ = 8 blocks in DeepInfer.</li>
+  <li><strong>Tokens per decode step.</strong> DeepInfer sends 1 + 5 rows per request in a decode step by default ({{deepinfer concepts/speculative-decoding | Speculative decoding}}). vLLM sends 1 row per request when speculative decoding is off.</li>
+  <li><strong>Wait for the first prefill.</strong> A new DeepInfer request waits for the next attempt point ({{deepinfer concepts/scheduler | The scheduler}}). In vLLM, a waiting request can start in the next step when the token budget and the KV cache allow it ({{cite vllm/v1/core/sched/scheduler.py:956}}).</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">What is the default KV block size in each engine, and which one has prefix caching?
+    <x-a><p>DeepInfer uses 128 tokens and has no prefix cache in its release ({{deepinfer concepts/paged-kv-cache | Paged KV cache}}). vLLM uses 16 tokens by default ({{cite vllm/config/cache.py:182}}) and turns prefix caching on for models that support it ({{cite vllm/engine/arg_utils.py:3062-3063}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Both engines have something called DSpark. Is it on by default in vLLM?
+    <x-a><p>No. <code>dspark</code> is one value of the speculative method ({{cite vllm/config/speculative.py:70}}), and speculative decoding needs <code>--speculative-config</code>. Adaptive verification, which sizes the verification budget from per-request confidence, is a separate opt-in field ({{cite vllm/config/speculative.py:559-561}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A DeepInfer page says that a step is either a prefill step or a decode step. Why can a vLLM metrics dashboard not show separate prefill-step and decode-step times?
+    <x-a><p>The vLLM scheduler has no phases. Each request only catches up from its computed tokens to its token count, so one step holds prompt chunks and decode tokens together ({{cite vllm/v1/core/sched/scheduler.py:624-633}}). The per-request metrics measure intervals of one request instead, for example the prefill interval from the first SCHEDULED event to the first token ({{cite vllm/v1/metrics/stats.py:599-601}}).</p></x-a>
+  </x-q>
+</x-quiz>

@@ -7,10 +7,12 @@ Sources (vLLM at the pinned commit 3e44c0d):
   vllm/entrypoints/cli/main.py:67-68                         stop 2: cli_env_setup (spawn)
   vllm/platforms/__init__.py:250-279                         stop 3: detectors; one OOT winner
   vllm/engine/arg_utils.py:3243                              stop 4: general plugins, first run
-  vllm/engine/arg_utils.py:3257 (x3), :2246                  stop 5: pre_register_and_update four times
+  vllm/engine/arg_utils.py:3257 (x4), :2246                  stop 5: pre_register_and_update five times
+  vllm/entrypoints/launchers/launcher.py:368, common/startup.py:70-71  stop 5: setup_server builds the parser again
   vllm/entrypoints/cli/launch.py:39, cli/run_batch.py:62     stop 5: two more parsers call add_cli_args
   vllm/config/model.py:741                                   stop 6: registry inspection
   vllm/config/vllm.py:1804, :2046                            stop 7: platform config hooks
+  vllm/v1/engine/core.py:1336-1337                           stop 7 again: engine core re-runs __post_init__ after the handshake
   vllm/v1/engine/async_llm.py:156, :193                      stop 8: stat logger group, engine core start
   vllm/v1/engine/core.py:132, :147                           stops 9-10: general plugins, executor
   vllm/v1/executor/multiproc_executor.py:191-207, :745-750   stop 10: one spawned process per rank
@@ -18,7 +20,7 @@ Sources (vLLM at the pinned commit 3e44c0d):
   vllm/v1/attention/selector.py:218                          stop 13
   vllm/model_executor/custom_op.py:117-126, :183-205         stops 14-15
   vllm/v1/executor/multiproc_executor.py:702, :710           stop 16
-  vllm/v1/executor/uniproc_executor.py:68-75                 TP = 1 callout
+  vllm/v1/executor/uniproc_executor.py:68-75                 TP = PP = DP = 1 callout (config/parallel.py:1055, 1099-1100)
 """
 
 import os
@@ -41,7 +43,7 @@ lanes = [
         (2, "vllm serve: spawn mode", "cli/main.py:67-68", GRAY),
         (3, "dummy detector wins", "platforms/__init__.py:277", DET),
         (4, "general plugins: run 1", "arg_utils.py:3243", GEN),
-        (5, "pre_register_and_update x 4", "arg_utils.py:3257 (x 3), 2246", CONF),
+        (5, "pre_register_and_update x 5", "arg_utils.py:3257 (x 4), 2246", CONF),
         (6, "registry: MyOPTForCausalLM", "config/model.py:741", GEN),
         (7, "platform config hooks", "config/vllm.py:1804, 2046", CONF),
         (8, "start the engine core", "async_llm.py:156, 193", GRAY),
@@ -49,6 +51,7 @@ lanes = [
     ("Engine core process", ["scheduler, executor"], [
         (9, "detect + general plugins", "v1/engine/core.py:132", GEN),
         (10, "spawn 2 worker processes", "multiproc_executor.py:197", GRAY),
+        (7, "config hooks again", "core.py:1336-1337 (after 16)", CONF),
     ]),
     ("Worker process (x 2)", ["one per rank"], [
         (11, "detect + plugins + Triton", "worker_base.py:284-290", GEN),
@@ -66,7 +69,7 @@ lane_h = HEAD + 14 + n_max * (ITEM_H + GAP) + 6
 INSTALL_H = 50
 P1_H = 72 + INSTALL_H + 22 + lane_h + 16
 d.panel(y0, P1_H, 1, "Which process runs which stop?",
-        "Stops 2-8 run in the front end. Stops 9-10 run in the engine core. Stops 11-16 run in each worker.")
+        "Stops 2-8 run in the front end. Stops 9-10 (and stop 7 again) run in the engine core. Stops 11-16 run in each worker.")
 
 # Stop 1: before any process exists.
 iy = y0 + 70
@@ -95,7 +98,7 @@ for i in range(2):
 d.arrow(550, iy + INSTALL_H + 2, 550, ly - 2, GEN, dash="5 4")
 
 y = y0 + P1_H + 16
-d.callout(30, y, 1040, "TP = 1:", "the uni executor runs stops 11-16 inside the engine core process; "
+d.callout(30, y, 1040, "TP = PP = DP = 1:", "the uni executor runs stops 11-16 inside the engine core process; "
           "the second load_general_plugins() call there returns at once.", AMBER, h=36)
 y += 52
 d.legend(30, y, [(DET, "platform detection"), (GEN, "install / general plugin / registry"),

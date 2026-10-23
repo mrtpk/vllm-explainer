@@ -1,0 +1,710 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Structured outputs: JSON schemas, grammars and token bitmasks in vLLM · vLLM Explained</title>
+<meta name="description" content="How a JSON schema, regex, choice list or grammar in a request becomes a per-step token bitmask - the request fields, the backend choice, grammar compilation in the engine core, the bitmask on the worker, and the interplay with async scheduling, speculative decoding and reasoning.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="concepts/structured-outputs">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a class="current" aria-current="page" href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>vLLM concepts</span><span class="sep">›</span><span>Serving features</span><span class="sep">›</span><span aria-current="page">Structured outputs</span></nav>
+<h1 class="page-title">Structured outputs: JSON schemas, grammars and token bitmasks in vLLM</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">vLLM concepts</span><span class="meta-time">about 13 min read + 4 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../concepts/openai-server.html">The OpenAI-compatible server: launch modes, app, serving classes and streaming</a> <span class="level level-intermediate level-sm">Intermediate</span></li><li><a href="../concepts/engine-core-loop.html">The engine core loop: threads, queues and the busy loop</a> <span class="level level-intermediate level-sm">Intermediate</span></li><li><a href="../concepts/async-scheduling.html">Async scheduling: overlap the CPU and the GPU</a> <span class="level level-advanced level-sm">Advanced</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">vLLM compiles a request's constraint into a grammar in the engine core. Every step then masks the logits, so only allowed tokens can be sampled.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>Structured outputs force the answer into a format. Examples are valid JSON for a schema, a string that matches a regex, one of a list of choices, or text of a grammar. The method is a token mask. At each step, a grammar state machine says which tokens may come next, and the sampler sees <code>-inf</code> for all others (<a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/concepts/structured-outputs.html" target="_blank" rel="noopener" title="DeepInfer Explained: Structured outputs">Structured outputs: token masks<span class="ext-mark" aria-hidden="true">↗</span></a>). This page shows how vLLM splits that work between its processes.</p>
+<p>The API server turns the request fields into one constraint and picks a <a class="term" href="../reference/glossary.html#term-structured-output-backend" data-term="structured output backend" data-def="The library that compiles a constraint into a grammar and fills the token bitmask: xgrammar, guidance, outlines or lm-format-enforcer. The default auto picks per request.">structured output backend</a> for it. The engine core compiles the constraint into a grammar matcher, in a thread pool, while the request waits. In every step, the engine core fills a <a class="term" href="../reference/glossary.html#term-grammar-bitmask" data-term="grammar bitmask" data-def="One bit per vocabulary token, packed in int32 words, for each structured request in a step. A 0 bit means the grammar forbids the token; its logit becomes -inf.">grammar bitmask</a> row for each constrained request; the worker applies it to the logits on the GPU. After the step, the engine core feeds the sampled token to the matcher.</p>
+<p><strong>An everyday comparison.</strong> Think of a form with boxes that accept only digits. Before the clerk starts, someone prints the form (compile). For every character, the form shows which keys still work (the bitmask), and the clerk can press only those. The comparison stops being true in one place: vLLM's clerk may write freely for a while first. While a reasoning model thinks, the mask allows every token; the form starts only after the thinking ends.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b7a_structured_flow"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1, API server: request fields (response_format json_schema or json_object, structured_outputs with json, regex, choice, grammar or structural_tag, tool_choice required or named set by the tool parser) become StructuredOutputsParams with exactly one constraint, validated in the InputProcessor; the backend choice with auto tries xgrammar, else guidance, else outlines, and stores the result in params._backend. Panel 2, engine core once: the input thread runs grammar_init and sets the status WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR; the first request builds the one backend of the engine; a ThreadPoolExecutor with (CPUs + 1) // 2 workers compiles with the xgrammar GrammarCompiler and its 512 MB cache into a GrammarMatcher; the scheduler&#x27;s waiting pass skips the request until the future is done, then sets WAITING, or finishes it with an error. Panel 3, every decode step: get_grammar_bitmask in the engine core fills one row per structured request, a full row while reasoning; sample_tokens on the worker copies the bitmask to the GPU and a kernel writes -inf where the bit is 0 before the sampler; update_from_output calls accept_tokens to advance the matcher, latches reasoning_ended at the end of thinking, and stops masking when the matcher is terminated."><svg role="img" aria-label="Panel 1, API server: request fields (response_format json_schema or json_object, structured_outputs with json, regex, choice, grammar or structural_tag, tool_choice required or named set by the tool parser) become StructuredOutputsParams with exactly one constraint, validated in the InputProcessor; the backend choice with auto tries xgrammar, else guidance, else outlines, and stores the result in params._backend. Panel 2, engine core once: the input thread runs grammar_init and sets the status WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR; the first request builds the one backend of the engine; a ThreadPoolExecutor with (CPUs + 1) // 2 workers compiles with the xgrammar GrammarCompiler and its 512 MB cache into a GrammarMatcher; the scheduler&#x27;s waiting pass skips the request until the future is done, then sets WAITING, or finishes it with an error. Panel 3, every decode step: get_grammar_bitmask in the engine core fills one row per structured request, a full row while reasoning; sample_tokens on the worker copies the bitmask to the GPU and a kernel writes -inf where the bit is 0 before the sampler; update_from_output calls accept_tokens to advance the matcher, latches reasoning_ended at the end of thinking, and stops masking when the matcher is terminated." xmlns="http://www.w3.org/2000/svg" width="1100" height="1008" viewBox="0 0 1100 1008">
+<defs><marker id="dg-b7a_structured_flow-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b7a_structured_flow-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker><marker id="dg-b7a_structured_flow-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0d9488"/></marker><marker id="dg-b7a_structured_flow-m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker></defs>
+<rect width="1100" height="1008" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Structured outputs: from a JSON schema to masked logits</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">vllm serve  ·  backend auto → xgrammar  ·  one GPU  ·  no speculative decoding  ·  async scheduling on</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">bitmask: int32 [num_rows, ceil(vocab / 32)]  ·  vocab 151,936 → 4,748 words = 18,992 bytes per row</text>
+<rect x="20.0" y="124.0" width="1060.0" height="236.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="150.0" r="13" fill="#111827"/>
+<text x="46.0" y="154.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="155.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What does the API server do with the constraint?</text>
+<text x="68.0" y="174.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">It turns the request fields into StructuredOutputsParams and picks a backend for this request.</text>
+<rect x="46.0" y="194.0" width="300.0" height="136.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="58.0" y="214.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Request fields</text>
+<text x="58.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">response_format: json_schema</text>
+<text x="58.0" y="247.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  or json_object</text>
+<text x="58.0" y="262.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">structured_outputs: json, regex,</text>
+<text x="58.0" y="277.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  choice, grammar, structural_tag</text>
+<text x="58.0" y="292.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">tool_choice required / named</text>
+<text x="58.0" y="307.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  (set by the tool parser)</text>
+<rect x="400.0" y="194.0" width="300.0" height="136.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="412.0" y="214.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">StructuredOutputsParams</text>
+<text x="412.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">exactly one constraint</text>
+<text x="412.0" y="247.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">inside SamplingParams</text>
+<text x="412.0" y="262.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">validated in InputProcessor</text>
+<text x="412.0" y="277.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  (AsyncLLM.add_request)</text>
+<text x="412.0" y="292.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">bad schema → 400</text>
+<text x="412.0" y="307.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">sampling_params.py:102-142</text>
+<rect x="754.0" y="194.0" width="300.0" height="136.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="766.0" y="214.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Backend choice (auto)</text>
+<text x="766.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">xgrammar validates? → xgrammar</text>
+<text x="766.0" y="247.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">else guidance (default fallback)</text>
+<text x="766.0" y="262.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">else outlines (non-Tekken Mistral</text>
+<text x="766.0" y="277.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  or guidance-unsupported schema)</text>
+<text x="766.0" y="292.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">stored in params._backend</text>
+<text x="766.0" y="307.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">sampling_params.py:1390-1441</text>
+<line x1="346.0" y1="262.0" x2="398.0" y2="262.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b7a_structured_flow-m0)"/>
+<line x1="700.0" y1="262.0" x2="752.0" y2="262.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b7a_structured_flow-m0)"/>
+<rect x="20.0" y="382.0" width="1060.0" height="236.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="408.0" r="13" fill="#111827"/>
+<text x="46.0" y="412.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="413.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What happens before the first step of the request?</text>
+<text x="68.0" y="432.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The engine core compiles the grammar in a thread pool; the request waits until it is ready.</text>
+<rect x="46.0" y="452.0" width="300.0" height="136.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="58.0" y="472.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Input thread: grammar_init</text>
+<text x="58.0" y="490.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Request(...) with</text>
+<text x="58.0" y="505.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  structured_output_request</text>
+<text x="58.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">status WAITING_FOR_</text>
+<text x="58.0" y="535.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  STRUCTURED_OUTPUT_GRAMMAR</text>
+<text x="58.0" y="550.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">first request builds the backend</text>
+<text x="58.0" y="565.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  (one backend per engine)</text>
+<rect x="400.0" y="452.0" width="300.0" height="136.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="412.0" y="472.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Compile (ThreadPoolExecutor)</text>
+<text x="412.0" y="490.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">workers = (CPUs + 1) // 2</text>
+<text x="412.0" y="505.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">xgrammar GrammarCompiler</text>
+<text x="412.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  cache: VLLM_XGRAMMAR_CACHE_MB 512</text>
+<text x="412.0" y="535.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">→ GrammarMatcher (an FSM)</text>
+<text x="412.0" y="550.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Future stored on the request</text>
+<text x="412.0" y="565.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">__init__.py:95-96, 195-204</text>
+<rect x="754.0" y="452.0" width="300.0" height="136.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="766.0" y="472.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Scheduler waiting pass</text>
+<text x="766.0" y="490.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Future not done → skip request</text>
+<text x="766.0" y="505.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">done → status WAITING</text>
+<text x="766.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  → normal admission</text>
+<text x="766.0" y="535.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">exception → FINISHED_ERROR</text>
+<text x="766.0" y="550.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  (400 validation_error)</text>
+<text x="766.0" y="565.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">scheduler.py:3291-3303</text>
+<line x1="346.0" y1="520.0" x2="398.0" y2="520.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b7a_structured_flow-m1)"/>
+<line x1="700.0" y1="520.0" x2="752.0" y2="520.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b7a_structured_flow-m1)"/>
+<rect x="20.0" y="640.0" width="1060.0" height="236.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="666.0" r="13" fill="#111827"/>
+<text x="46.0" y="670.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="671.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What happens in every decode step?</text>
+<text x="68.0" y="690.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The engine core fills one bitmask row per request; the worker masks the logits before sampling.</text>
+<rect x="46.0" y="710.0" width="300.0" height="136.0" rx="8" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.5"/>
+<text x="58.0" y="730.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#0d9488" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">get_grammar_bitmask (engine core)</text>
+<text x="58.0" y="748.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">one row per structured request</text>
+<text x="58.0" y="763.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  (no prefill chunks)</text>
+<text x="58.0" y="778.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">reasoning not ended → row = all 1</text>
+<text x="58.0" y="793.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">else matcher.fill_next_token_bitmask</text>
+<text x="58.0" y="808.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">→ GrammarOutput (numpy)</text>
+<text x="58.0" y="823.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">scheduler.py:2086-2115</text>
+<rect x="400.0" y="710.0" width="300.0" height="136.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="412.0" y="730.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">sample_tokens (worker, GPU)</text>
+<text x="412.0" y="748.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">logits = compute_logits(hidden)</text>
+<text x="412.0" y="763.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">copy bitmask to GPU (side stream)</text>
+<text x="412.0" y="778.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">kernel: logit = -inf where bit 0</text>
+<text x="412.0" y="793.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">sampler → token id</text>
+<text x="412.0" y="808.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">model_runner.py:1638-1665</text>
+<text x="412.0" y="823.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">structured_outputs.py:70-171</text>
+<rect x="754.0" y="710.0" width="300.0" height="136.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="766.0" y="730.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">update_from_output (engine core)</text>
+<text x="766.0" y="748.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">accept_tokens(new ids)</text>
+<text x="766.0" y="763.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  advances the FSM</text>
+<text x="766.0" y="778.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">&lt;/think&gt; seen → reasoning_ended</text>
+<text x="766.0" y="793.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  latched, grammar starts</text>
+<text x="766.0" y="808.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">FSM terminated → full rows</text>
+<text x="766.0" y="823.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">__init__.py:533-553</text>
+<line x1="346.0" y1="778.0" x2="398.0" y2="778.0" stroke="#0d9488" stroke-width="1.6" marker-end="url(#dg-b7a_structured_flow-m2)"/>
+<line x1="700.0" y1="778.0" x2="752.0" y2="778.0" stroke="#d97706" stroke-width="1.6" marker-end="url(#dg-b7a_structured_flow-m3)"/>
+<text x="30.0" y="911.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="900.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="911.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">API server</text>
+<rect x="209.1" y="900.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="230.1" y="911.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">engine core, once</text>
+<rect x="353.2" y="900.0" width="14.0" height="14.0" rx="3" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.4"/>
+<text x="374.2" y="911.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">engine core, each step</text>
+<rect x="526.3" y="900.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="547.3" y="911.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">worker / GPU</text>
+<rect x="651.9" y="900.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="672.9" y="911.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">after the step</text>
+<text x="30.0" y="940.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Vocab 151,936 is the Qwen2.5 value (inferred from its config, not in the repo); the bitmask width follows cdiv(vocab, 32).</text>
+<text x="30.0" y="958.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Async scheduling: when a structured request in decode has its last token still in flight, sample_tokens of the whole step waits</text>
+<text x="30.0" y="976.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  until the previous step is processed (pending_structured_output_tokens, core.py:737-749, 789-810).</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the API server builds and validates the constraint (panel 1), the engine core compiles it once (panel 2), and every step masks the logits with a fresh bitmask row (panel 3).</figcaption><a class="diagram-open" href="../diagrams/b7a_structured_flow.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read the panels from top to bottom; each panel runs in a different place. Blue is the API server, violet and teal are the engine core process, amber is the worker on the GPU. The parameter strip shows the bitmask size for a 151,936-token vocabulary: 4,748 int32 words, 18,992 bytes per row.</p>
+
+<h2 id="in-the-code">In the code<a class="h-anchor" href="#in-the-code" aria-label="Link to this section">#</a></h2>
+
+<h3 id="step-1-the-request-fields">Step 1: the request fields<a class="h-anchor" href="#step-1-the-request-fields" aria-label="Link to this section">#</a></h3>
+<p>Three fields lead to a constraint. All end in one <code>StructuredOutputsParams</code> inside <code>SamplingParams</code>:</p>
+<ul>
+  <li><strong><code>response_format</code></strong> (OpenAI). <code>json_object</code> becomes <code>json_object=True</code>; <a class="term" href="../reference/glossary.html#term-json-schema-response-format" data-term="json_schema response format" data-def="The OpenAI field response_format of type json_schema. vLLM turns it into a structured outputs json constraint, so the answer must match the schema."><code>json_schema</code></a> becomes <code>json=&lt;schema&gt;</code>; <code>structural_tag</code> stays a structural tag. <code>text</code> means no constraint (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/generate/base/protocol.py#L181-L211" target="_blank" rel="noopener" title="vllm/entrypoints/generate/base/protocol.py:181-211 at 3e44c0d"><code>vllm/entrypoints/generate/base/protocol.py:181-211</code></a>). A <code>json_schema</code> without the schema gives HTTP 400 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L827-L838" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/protocol.py:827-838 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/protocol.py:827-838</code></a>).</li>
+  <li><strong><code>structured_outputs</code></strong> (vLLM extra field) with exactly one of <code>json</code>, <code>regex</code>, <code>choice</code>, <code>grammar</code>, <code>json_object</code>, <code>structural_tag</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/sampling_params.py#L102-L141" target="_blank" rel="noopener" title="vllm/sampling_params.py:102-141 at 3e44c0d"><code>vllm/sampling_params.py:102-141</code></a>). <code>response_format</code> overrides the matching fields when both are set (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/generate/base/protocol.py#L208-L211" target="_blank" rel="noopener" title="vllm/entrypoints/generate/base/protocol.py:208-211 at 3e44c0d"><code>vllm/entrypoints/generate/base/protocol.py:208-211</code></a>).</li>
+  <li><strong><code>tool_choice</code></strong> <code>"required"</code> or a named function: the tool parser writes a constraint into <code>structured_outputs</code> during rendering (<a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers: from model text to tool_calls and reasoning</a>).</li>
+</ul>
+<aside class="callout callout-warning"><p class="callout-title">The old guided_* fields are ignored</p><div class="callout-body"><p><code>guided_json</code>, <code>guided_regex</code>, <code>guided_choice</code>, <code>guided_grammar</code> and <code>guided_decoding_backend</code> are no longer request fields. A request that still sends them gets HTTP 200 and unconstrained output; the server only logs a warning once (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/engine/protocol.py#L21-L34" target="_blank" rel="noopener" title="vllm/entrypoints/serve/engine/protocol.py:21-34 at 3e44c0d"><code>vllm/entrypoints/serve/engine/protocol.py:21-34</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/engine/protocol.py#L62-L71" target="_blank" rel="noopener" title="vllm/entrypoints/serve/engine/protocol.py:62-71 at 3e44c0d"><code>vllm/entrypoints/serve/engine/protocol.py:62-71</code></a>). Use <code>structured_outputs</code> or <code>response_format</code>.</p></div></aside>
+<p>The sampling parameters are made with <code>structured_outputs=self.extract_structured_outputs()</code> for chat and for completions (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L801" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/protocol.py:801 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/protocol.py:801</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/completion/protocol.py#L427" target="_blank" rel="noopener" title="vllm/entrypoints/openai/completion/protocol.py:427 at 3e44c0d"><code>vllm/entrypoints/openai/completion/protocol.py:427</code></a>).</p>
+
+<h3 id="step-2-structuredoutputsconfig-and-the-backend-choice">Step 2: StructuredOutputsConfig and the backend choice<a class="h-anchor" href="#step-2-structuredoutputsconfig-and-the-backend-choice" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/structured_outputs.py#L11-L41" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/config/structured_outputs.py:11-41</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/structured_outputs.py#L11-L41" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">11</span><span class="ln hl">12</span><span class="ln hl">13</span><span class="ln">14</span><span class="ln">15</span><span class="ln">16</span><span class="ln">17</span><span class="ln">18</span><span class="ln">19</span><span class="ln hl">20</span><span class="ln">21</span><span class="ln">22</span><span class="ln">23</span><span class="ln">24</span><span class="ln hl">25</span><span class="ln">26</span><span class="ln">27</span><span class="ln">28</span><span class="ln">29</span><span class="ln">30</span><span class="ln">31</span><span class="ln">32</span><span class="ln">33</span><span class="ln hl">34</span><span class="ln">35</span><span class="ln">36</span><span class="ln">37</span><span class="ln">38</span><span class="ln">39</span><span class="ln hl">40</span><span class="ln">41</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><pre><code class="language-python">StructuredOutputsBackend = Literal[
+    &quot;auto&quot;, &quot;xgrammar&quot;, &quot;guidance&quot;, &quot;outlines&quot;, &quot;lm-format-enforcer&quot;
+]
+
+
+@config
+class StructuredOutputsConfig:
+    &quot;&quot;&quot;Dataclass which contains structured outputs config for the engine.&quot;&quot;&quot;
+
+    backend: StructuredOutputsBackend = &quot;auto&quot;
+    &quot;&quot;&quot;Which engine will be used for structured outputs (e.g. JSON schema,
+    regex, etc) by default. With &quot;auto&quot;, we will make opinionated choices
+    based on request contents and what the backend libraries currently support,
+    so the behavior is subject to change in each release.&quot;&quot;&quot;
+    disable_any_whitespace: bool = False
+    &quot;&quot;&quot;If `True`, json output will always be compact without any whitespace.
+    If `False`, the model may generate whitespace between JSON fields,
+    which is still valid JSON. This is only supported for xgrammar
+    and guidance backends.&quot;&quot;&quot;
+    disable_additional_properties: bool = False
+    &quot;&quot;&quot;If `True`, the `guidance` backend will not use `additionalProperties`
+    in the JSON schema. This is only supported for the `guidance` backend and
+    is used to better align its behaviour with `outlines` and `xgrammar`.&quot;&quot;&quot;
+    reasoning_parser: str = &quot;&quot;
+    &quot;&quot;&quot;Select the reasoning parser depending on the model that you&#x27;re using.
+    This is used to parse the reasoning content into OpenAI API format.&quot;&quot;&quot;
+    reasoning_parser_plugin: str = &quot;&quot;
+    &quot;&quot;&quot;Path to a dynamically reasoning parser plugin that can be dynamically
+    loaded and registered.&quot;&quot;&quot;
+    enable_in_reasoning: bool = False
+    &quot;&quot;&quot;Whether to use structured input for reasoning.&quot;&quot;&quot;</code></pre></div></div></div></figure>
+<p>The backend is set with <code>--structured-outputs-config.backend</code>; the default is <code>auto</code>. A search of <code>vllm/</code> finds no other assignment to this field; <code>EngineArgs</code> merges only the reasoning parser into this config (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L2187-L2204" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:2187-2204 at 3e44c0d"><code>vllm/engine/arg_utils.py:2187-2204</code></a>). The choice happens per request, when <code>InputProcessor</code> validates the sampling parameters inside <code>AsyncLLM.add_request</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/input_processor.py#L157-L162" target="_blank" rel="noopener" title="vllm/v1/engine/input_processor.py:157-162 at 3e44c0d"><code>vllm/v1/engine/input_processor.py:157-162</code></a>):</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/sampling_params.py#L1390-L1441" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/sampling_params.py:1390-1441</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/sampling_params.py#L1390-L1441" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1390</span><span class="ln">1391</span><span class="ln">1392</span><span class="ln">1393</span><span class="ln">1394</span><span class="ln">1395</span><span class="ln">1396</span><span class="ln hl">1397</span><span class="ln hl">1398</span><span class="ln hl">1399</span><span class="ln">1400</span><span class="ln">1401</span><span class="ln">1402</span><span class="ln">1403</span><span class="ln">1404</span><span class="ln">1405</span><span class="ln">1406</span><span class="ln">1407</span><span class="ln">1408</span><span class="ln">1409</span><span class="ln">1410</span><span class="ln">1411</span><span class="ln">1412</span><span class="ln">1413</span><span class="ln">1414</span><span class="ln">1415</span><span class="ln">1416</span><span class="ln">1417</span><span class="ln">1418</span><span class="ln">1419</span><span class="ln">1420</span><span class="ln hl">1421</span><span class="ln hl">1422</span><span class="ln hl">1423</span><span class="ln hl">1424</span><span class="ln hl">1425</span><span class="ln">1426</span><span class="ln hl">1427</span><span class="ln hl">1428</span><span class="ln hl">1429</span><span class="ln hl">1430</span><span class="ln hl">1431</span><span class="ln hl">1432</span><span class="ln hl">1433</span><span class="ln hl">1434</span><span class="ln hl">1435</span><span class="ln hl">1436</span><span class="ln hl">1437</span><span class="ln hl">1438</span><span class="ln hl">1439</span><span class="ln">1440</span><span class="ln hl">1441</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(37 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(38 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(40 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(41 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(42 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(43 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(44 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(45 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(46 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(47 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(48 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(49 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(51 * var(--code-lh))"></span><pre><code class="language-python">        else:
+            # NOTE: backend must be &quot;auto&quot; here, because we have
+            # checked supported_backends above.
+            # In this mode, we set opinionated defaults based on what we think
+            # will satisfy the most use cases without having to worry about
+            # this setting. We include fallback behavior here, but not with any
+            # other setting where a specific backend was specified.
+            try:
+                validate_xgrammar_grammar(self)
+                self.structured_outputs._backend = &quot;xgrammar&quot;
+            except VLLMValidationError:
+                # The request either failed validation
+                # or includes some jsonschema feature(s) that
+                # are not supported in xgrammar.
+
+                skip_guidance = _is_non_tekken_mistral(tokenizer)
+
+                # Check if schema has features unsupported by guidance
+                so_params = self.structured_outputs
+                if not skip_guidance and so_params.json:
+                    if isinstance(so_params.json, str):
+                        try:
+                            schema = json_mod.loads(so_params.json)
+                        except json_mod.JSONDecodeError as e:
+                            raise VLLMValidationError(
+                                &quot;Invalid JSON grammar specification.&quot;
+                            ) from e
+                    else:
+                        schema = so_params.json
+                    skip_guidance = has_guidance_unsupported_json_features(schema)
+
+                if skip_guidance:
+                    # Fall back to outlines for non-Tekken Mistral tokenizers or
+                    # schemas containing features unsupported by guidance.
+                    validate_structured_output_request_outlines(self)
+                    self.structured_outputs._backend = &quot;outlines&quot;
+                else:
+                    # Fall back to guidance by default.
+                    if not GuidanceBackend.is_tokenizer_supported(tokenizer):
+                        raise VLLMValidationError(
+                            &quot;No compatible structured output backend was found for &quot;
+                            &quot;this request. XGrammar rejected the constraint, and &quot;
+                            &quot;Guidance does not support this tokenizer. Configure a &quot;
+                            &quot;fast tokenizer or select a compatible backend explicitly.&quot;
+                        ) from None
+                    validate_guidance_grammar(
+                        self,
+                        tokenizer=_get_llg_tokenizer(tokenizer),
+                    )
+                    self.structured_outputs._backend = &quot;guidance&quot;
+            # Remember that this backend was set automatically
+            self.structured_outputs._backend_was_auto = True</code></pre></div></div></div></figure>
+<ol>
+  <li>Lines 1397-1399: <code>auto</code> tries xgrammar first. If xgrammar accepts the constraint, the request uses xgrammar.</li>
+  <li>Lines 1405-1425: else outlines, for a non-Tekken Mistral tokenizer or a JSON schema with features that guidance does not support.</li>
+  <li>Lines 1427-1439: else guidance, if the tokenizer is a fast Hugging Face tokenizer; else HTTP 400.</li>
+  <li>Line 1441: <code>_backend_was_auto</code> remembers that the choice was automatic.</li>
+</ol>
+<p>A Tekken Mistral tokenizer with a Lark grammar goes to guidance directly (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/sampling_params.py#L1374-L1389" target="_blank" rel="noopener" title="vllm/sampling_params.py:1374-1389 at 3e44c0d"><code>vllm/sampling_params.py:1374-1389</code></a>). A fixed backend (not <code>auto</code>) validates with that backend only and has no fallback (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/sampling_params.py#L1336-L1373" target="_blank" rel="noopener" title="vllm/sampling_params.py:1336-1373 at 3e44c0d"><code>vllm/sampling_params.py:1336-1373</code></a>).</p>
+<aside class="callout callout-note"><p class="callout-title">When the validation error becomes visible</p><div class="callout-body"><p>This check runs in <code>add_request</code>, so it runs when the generator starts. For a non-streaming request that is still before any HTTP byte, so the client gets a plain HTTP 400. For a stream, the HTTP 200 is already out, so the client gets an error chunk (<a href="../concepts/openai-server.html">The OpenAI-compatible server: launch modes, app, serving classes and streaming</a>, Step 6).</p></div></aside>
+
+<h3 id="step-3-compile-in-the-engine-core-wait-in-the-scheduler">Step 3: compile in the engine core, wait in the scheduler<a class="h-anchor" href="#step-3-compile-in-the-engine-core-wait-in-the-scheduler" aria-label="Link to this section">#</a></h3>
+<p>The engine core's input thread turns the <code>EngineCoreRequest</code> into a <code>Request</code> and starts the grammar at once (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1128-L1135" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1128-1135 at 3e44c0d"><code>vllm/v1/engine/core.py:1128-1135</code></a>). A request with a constraint starts in the status <code>WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR</code>, not <code>WAITING</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/request.py#L112-L117" target="_blank" rel="noopener" title="vllm/v1/request.py:112-117 at 3e44c0d"><code>vllm/v1/request.py:112-117</code></a>).</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L141-L204" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/structured_output/__init__.py:141-204</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L141-L204" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">141</span><span class="ln">142</span><span class="ln hl">143</span><span class="ln hl">144</span><span class="ln hl">145</span><span class="ln hl">146</span><span class="ln hl">147</span><span class="ln hl">148</span><span class="ln hl">149</span><span class="ln hl">150</span><span class="ln">151</span><span class="ln">152</span><span class="ln">153</span><span class="ln">154</span><span class="ln">155</span><span class="ln">156</span><span class="ln hl">157</span><span class="ln hl">158</span><span class="ln hl">159</span><span class="ln">160</span><span class="ln">161</span><span class="ln">162</span><span class="ln">163</span><span class="ln">164</span><span class="ln">165</span><span class="ln">166</span><span class="ln">167</span><span class="ln">168</span><span class="ln">169</span><span class="ln">170</span><span class="ln">171</span><span class="ln">172</span><span class="ln">173</span><span class="ln">174</span><span class="ln">175</span><span class="ln">176</span><span class="ln">177</span><span class="ln">178</span><span class="ln">179</span><span class="ln">180</span><span class="ln">181</span><span class="ln">182</span><span class="ln">183</span><span class="ln">184</span><span class="ln">185</span><span class="ln">186</span><span class="ln">187</span><span class="ln">188</span><span class="ln">189</span><span class="ln">190</span><span class="ln">191</span><span class="ln">192</span><span class="ln hl">193</span><span class="ln">194</span><span class="ln">195</span><span class="ln hl">196</span><span class="ln hl">197</span><span class="ln">198</span><span class="ln">199</span><span class="ln">200</span><span class="ln">201</span><span class="ln">202</span><span class="ln">203</span><span class="ln">204</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(52 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(55 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(56 * var(--code-lh))"></span><pre><code class="language-python">        request_backend = structured_outputs._backend
+        assert request_backend is not None
+        if self.backend_name is not None and request_backend != self.backend_name:
+            raise VLLMValidationError(
+                &quot;Structured output processing only supports one backend per engine. &quot;
+                f&quot;The engine is already using &#x27;{self.backend_name}&#x27;, but this &quot;
+                f&quot;request resolved to &#x27;{request_backend}&#x27;. Configure &quot;
+                &quot;`structured_outputs_config.backend` explicitly or use schemas &quot;
+                &quot;supported by the initialized backend.&quot;
+            )
+
+        # Initialize the backend the first time it is needed.
+        #
+        # NOTE: We only support a single backend. We do NOT support different
+        # backends on a per-request basis in V1 (for now, anyway...).
+        # _backend is set in Processor._validate_structured_output
+        if self.backend is None:
+            vocab_size = self.vllm_config.model_config.get_vocab_size()
+            if request_backend == &quot;xgrammar&quot;:
+                self.backend = XgrammarBackend(
+                    self.vllm_config,
+                    tokenizer=self.tokenizer,
+                    vocab_size=vocab_size,
+                )
+            elif request_backend == &quot;guidance&quot;:
+                self.backend = GuidanceBackend(
+                    self.vllm_config,
+                    tokenizer=self.tokenizer,
+                    vocab_size=vocab_size,
+                )
+            elif request_backend == &quot;outlines&quot;:
+                from vllm.v1.structured_output.backend_outlines import OutlinesBackend
+
+                self.backend = OutlinesBackend(
+                    self.vllm_config,
+                    tokenizer=self.tokenizer,
+                    vocab_size=vocab_size,
+                )
+            elif request_backend == &quot;lm-format-enforcer&quot;:
+                from vllm.v1.structured_output.backend_lm_format_enforcer import (  # noqa: E501
+                    LMFormatEnforcerBackend,
+                )
+
+                self.backend = LMFormatEnforcerBackend(
+                    self.vllm_config,
+                    tokenizer=self.tokenizer,
+                    vocab_size=vocab_size,
+                )
+            else:
+                raise ValueError(
+                    f&quot;Unsupported structured output backend: {request_backend}&quot;
+                )
+            self.backend_name = request_backend
+
+        grammar: Future[StructuredOutputGrammar] | StructuredOutputGrammar
+        if self._use_async_grammar_compilation:
+            grammar = self.executor.submit(self._create_grammar, request)
+        else:
+            try:
+                grammar = self._create_grammar(request)
+            except Exception as e:
+                grammar = Future()
+                grammar.set_exception(e)
+        request.structured_output_request.grammar = grammar</code></pre></div></div></div></figure>
+<ol>
+  <li>Lines 143-150: the engine has one backend. A request with another backend than the one already built gets <code>VLLMValidationError</code>. The input thread finishes the request with a validation error, which the client sees as HTTP 400, or as an error chunk in a stream (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1999-L2005" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1999-2005 at 3e44c0d"><code>vllm/v1/engine/core.py:1999-2005</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2158-L2167" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:2158-2167 at 3e44c0d"><code>vllm/v1/engine/core.py:2158-2167</code></a>).</li>
+  <li>Lines 157-193: the first constrained request builds the backend.</li>
+  <li>Lines 196-197: the compile runs in a <code>ThreadPoolExecutor</code> with <code>(CPU count + 1) // 2</code> workers (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L95-L96" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:95-96 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:95-96</code></a>); the request keeps a <code>Future</code>. With the <code>external_launcher</code> executor the compile runs at once instead, so that every rank switches state at the same time (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L65-L74" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:65-74 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:65-74</code></a>).</li>
+</ol>
+<p>The scheduler's waiting pass skips the request until the <code>Future</code> is done (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L3291-L3303" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:3291-3303 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:3291-3303</code></a>). Then the status becomes <code>WAITING</code>, and the request is scheduled like any other. A compile error finishes the request with <code>FINISHED_ERROR</code> and a <code>validation_error</code>, which the front end turns into <code>VLLMValidationError</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2399-L2425" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2399-2425 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2399-2425</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/outputs.py#L30-L35" target="_blank" rel="noopener" title="vllm/outputs.py:30-35 at 3e44c0d"><code>vllm/outputs.py:30-35</code></a>).</p>
+<p>The xgrammar backend keeps two compilers with a cache. One is for JSON, regex, choice and EBNF grammars; it never allows special tokens. The other is for structural tags and Lark grammars, which may need special tokens (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/backend_xgrammar.py#L84-L112" target="_blank" rel="noopener" title="vllm/v1/structured_output/backend_xgrammar.py:84-112 at 3e44c0d"><code>vllm/v1/structured_output/backend_xgrammar.py:84-112</code></a>). The cache is limited by <code>VLLM_XGRAMMAR_CACHE_MB</code>, 512 MB by default (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/backend_xgrammar.py#L215-L224" target="_blank" rel="noopener" title="vllm/v1/structured_output/backend_xgrammar.py:215-224 at 3e44c0d"><code>vllm/v1/structured_output/backend_xgrammar.py:215-224</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L1689" target="_blank" rel="noopener" title="vllm/envs.py:1689 at 3e44c0d"><code>vllm/envs.py:1689</code></a>). So the same schema compiles fast the second time (cache inside xgrammar; library behaviour).</p>
+
+<h3 id="step-4-the-bitmask-of-each-step">Step 4: the bitmask of each step<a class="h-anchor" href="#step-4-the-bitmask-of-each-step" aria-label="Link to this section">#</a></h3>
+<p>In the default engine loop, the engine core schedules a step, starts the forward pass, and then asks for the bitmask while the GPU runs (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L724-L745" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:724-745 at 3e44c0d"><code>vllm/v1/engine/core.py:724-745</code></a>):</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2086-L2115" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/sched/scheduler.py:2086-2115</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2086-L2115" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">2086</span><span class="ln">2087</span><span class="ln">2088</span><span class="ln">2089</span><span class="ln">2090</span><span class="ln">2091</span><span class="ln">2092</span><span class="ln">2093</span><span class="ln hl">2094</span><span class="ln hl">2095</span><span class="ln hl">2096</span><span class="ln hl">2097</span><span class="ln hl">2098</span><span class="ln hl">2099</span><span class="ln">2100</span><span class="ln">2101</span><span class="ln">2102</span><span class="ln hl">2103</span><span class="ln hl">2104</span><span class="ln hl">2105</span><span class="ln hl">2106</span><span class="ln hl">2107</span><span class="ln">2108</span><span class="ln">2109</span><span class="ln">2110</span><span class="ln">2111</span><span class="ln">2112</span><span class="ln">2113</span><span class="ln">2114</span><span class="ln">2115</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><pre><code class="language-python">    def get_grammar_bitmask(
+        self, scheduler_output: SchedulerOutput
+    ) -&gt; GrammarOutput | None:
+        # Collect list of scheduled request ids that use structured output.
+        # The corresponding rows of the bitmask will be in this order.
+        if not scheduler_output.has_structured_output_requests:
+            return None
+
+        structured_output_request_ids = [
+            req_id
+            for req_id in scheduler_output.num_scheduled_tokens
+            if (req := self.requests.get(req_id))
+            and (req.use_structured_output and not req.is_prefill_chunk)
+        ]
+        if not structured_output_request_ids:
+            return None
+
+        bitmask = self.structured_output_manager.grammar_bitmask(
+            self.requests,
+            structured_output_request_ids,
+            scheduler_output.scheduled_spec_decode_tokens,
+        )
+        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        num_acceptable_drafts = [
+            len(strip_speculative_padding(spec_tokens.get(req_id, [])))
+            for req_id in structured_output_request_ids
+        ]
+        return GrammarOutput(
+            structured_output_request_ids, bitmask, num_acceptable_drafts
+        )</code></pre></div></div></div></figure>
+<p>Only requests that sample in this step get a row. A chunk of a long prefill that is not the last one gets none (line 2098). <code>grammar_bitmask</code> fills the rows (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L382-L531" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:382-531 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:382-531</code></a>):</p>
+<ul>
+  <li>The bitmask has <code>max_num_seqs × (1 + num_speculative_tokens)</code> rows, allocated once (lines 397-406). Each structured request owns <code>mask_stride</code> rows: one per draft position plus one for the bonus token (line 395).</li>
+  <li>A request that is still thinking gets a full row of ones: no constraint (lines 241-247 and 466-469).</li>
+  <li>A request in its format gets the matcher's mask for the next token (line 242).</li>
+  <li>Above 128 structured requests and without speculative decoding, up to 8 threads fill the rows in batches of 16 (lines 79-87 and 416-448).</li>
+</ul>
+<p>The result goes to the worker as a <code>GrammarOutput</code> with a numpy array (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L523-L531" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:523-531 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:523-531</code></a>).</p>
+
+<h3 id="step-5-masking-on-the-worker">Step 5: masking on the worker<a class="h-anchor" href="#step-5-masking-on-the-worker" aria-label="Link to this section">#</a></h3>
+<p>Model Runner V2 applies the mask after <code>compute_logits</code> and before the sampler (<a href="../concepts/model-runner.html">The model runner (Model Runner V2)</a>):</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1637-L1665" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/model_runner.py:1637-1665</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1637-L1665" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1637</span><span class="ln">1638</span><span class="ln">1639</span><span class="ln">1640</span><span class="ln">1641</span><span class="ln">1642</span><span class="ln hl">1643</span><span class="ln hl">1644</span><span class="ln hl">1645</span><span class="ln hl">1646</span><span class="ln hl">1647</span><span class="ln hl">1648</span><span class="ln hl">1649</span><span class="ln hl">1650</span><span class="ln hl">1651</span><span class="ln">1652</span><span class="ln">1653</span><span class="ln">1654</span><span class="ln">1655</span><span class="ln">1656</span><span class="ln">1657</span><span class="ln">1658</span><span class="ln">1659</span><span class="ln">1660</span><span class="ln">1661</span><span class="ln">1662</span><span class="ln hl">1663</span><span class="ln hl">1664</span><span class="ln hl">1665</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><pre><code class="language-python">            sample_hidden_states = hidden_states[input_batch.logits_indices]
+            logits = self.model.compute_logits(sample_hidden_states)
+
+        invalid_drafts = None
+        # A diffusion prefill has no logit rows even when a bitmask row
+        # arrived for it.
+        if grammar_output is not None and logits.shape[0] &gt; 0:
+            # Apply grammar bitmask to the logits in-place.
+            assert self.structured_outputs_worker is not None
+            self.structured_outputs_worker.apply_grammar_bitmask(
+                logits,
+                input_batch,
+                grammar_output.structured_output_request_ids,
+                grammar_output.grammar_bitmask,
+            )
+            invalid_drafts = grammar_invalid_drafts(
+                input_batch,
+                grammar_output.structured_output_request_ids,
+                grammar_output.num_acceptable_drafts,
+            )
+
+        sampler_output: SamplerOutput | None
+        if input_batch.num_reqs == 0:
+            # This rank owns no requests this step. It contributes an
+            # all-padding block to the gather below.
+            sampler_output = None
+        elif input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
+            assert self.sampler is not None
+            sampler_output = self.sampler(logits, input_batch)</code></pre></div></div></div></figure>
+<p><code>StructuredOutputsWorker</code> keeps an <code>int32 [max_num_logits, cdiv(vocab_size, 32)]</code> buffer on the GPU (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/structured_outputs.py#L60-L68" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/structured_outputs.py:60-68 at 3e44c0d"><code>vllm/v1/worker/gpu/structured_outputs.py:60-68</code></a>). It copies the rows on a side CUDA stream, then a Triton kernel writes <code>-inf</code> into each logit whose bit is 0 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/structured_outputs.py#L80-L124" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/structured_outputs.py:80-124 at 3e44c0d"><code>vllm/v1/worker/gpu/structured_outputs.py:80-124</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/structured_outputs.py#L162-L171" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/structured_outputs.py:162-171 at 3e44c0d"><code>vllm/v1/worker/gpu/structured_outputs.py:162-171</code></a>). The sampler then sees only allowed tokens.</p>
+
+<h3 id="step-6-after-the-step">Step 6: after the step<a class="h-anchor" href="#step-6-after-the-step" aria-label="Link to this section">#</a></h3>
+<p><code>update_from_output</code> feeds the new tokens to the matcher (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2279-L2290" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2279-2290 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2279-2290</code></a>):</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L533-L553" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/structured_output/__init__.py:533-553</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L533-L553" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">533</span><span class="ln">534</span><span class="ln">535</span><span class="ln">536</span><span class="ln">537</span><span class="ln">538</span><span class="ln">539</span><span class="ln">540</span><span class="ln">541</span><span class="ln">542</span><span class="ln">543</span><span class="ln">544</span><span class="ln hl">545</span><span class="ln hl">546</span><span class="ln hl">547</span><span class="ln hl">548</span><span class="ln hl">549</span><span class="ln hl">550</span><span class="ln hl">551</span><span class="ln hl">552</span><span class="ln hl">553</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><pre><code class="language-python">    def accept_tokens(self, request: &quot;Request&quot;, new_token_ids: list[int]) -&gt; bool:
+        &quot;&quot;&quot;Advance grammar with accepted tokens. Returns False on rejection.&quot;&quot;&quot;
+        if not request.use_structured_output or not new_token_ids:
+            return True
+
+        structured_req = request.structured_output_request
+        if TYPE_CHECKING:
+            assert structured_req is not None
+        grammar = structured_req.grammar
+        if TYPE_CHECKING:
+            assert isinstance(grammar, StructuredOutputGrammar)
+
+        grammar_start, _ = self._get_constraint_bounds(
+            request, new_token_ids, spec_tokens_committed=True
+        )
+        # Early return only when no reasoning-end token is present.
+        # Otherwise, latch structured_req.reasoning_ended.
+        if grammar_start &gt; len(new_token_ids):
+            return True
+        structured_req.reasoning_ended = True
+        return grammar.accept_tokens(request.request_id, new_token_ids[grammar_start:])</code></pre></div></div></div></figure>
+<p>Tokens before the end of the thinking are not fed. When the end token is among the new tokens, <code>reasoning_ended</code> is latched, and the grammar starts after it (lines 545-552). If the matcher rejects a token, the request finishes with an error; the log says "Unexpected", because the mask should make this impossible (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2282-L2290" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2282-2290 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2282-2290</code></a>). The matcher is built with the request's stop tokens (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L216-L223" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:216-223 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:216-223</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/backend_xgrammar.py#L198-L203" target="_blank" rel="noopener" title="vllm/v1/structured_output/backend_xgrammar.py:198-203 at 3e44c0d"><code>vllm/v1/structured_output/backend_xgrammar.py:198-203</code></a>). Two parts are library behaviour of xgrammar. At the end of the format, the mask allows a stop token. After the matcher accepts a stop token, it reports <code>is_terminated()</code>. vLLM then stops feeding the matcher, and any later row would be a full row (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/backend_xgrammar.py#L271-L286" target="_blank" rel="noopener" title="vllm/v1/structured_output/backend_xgrammar.py:271-286 at 3e44c0d"><code>vllm/v1/structured_output/backend_xgrammar.py:271-286</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L241-L247" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:241-247 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:241-247</code></a>).</p>
+
+<h3 id="step-7-async-scheduling-speculative-decoding-and-reasoning">Step 7: async scheduling, speculative decoding and reasoning<a class="h-anchor" href="#step-7-async-scheduling-speculative-decoding-and-reasoning" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><strong>Async scheduling.</strong> The bitmask for step k+1 needs the token of step k, but with async scheduling that token may still be on the GPU. The scheduler sets <code>pending_structured_output_tokens</code> for such a step (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/async_scheduler.py#L37-L39" target="_blank" rel="noopener" title="vllm/v1/core/sched/async_scheduler.py:37-39 at 3e44c0d"><code>vllm/v1/core/sched/async_scheduler.py:37-39</code></a>). The engine core still starts the forward pass of step k+1. But it calls <code>sample_tokens</code> only after it has processed the output of step k (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L737-L749" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:737-749 at 3e44c0d"><code>vllm/v1/engine/core.py:737-749</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L789-L810" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:789-810 at 3e44c0d"><code>vllm/v1/engine/core.py:789-810</code></a>). The flag is for the whole batch. So one structured request in decode delays the sampling of every request in that step (derived from line 37). See <a href="../concepts/async-scheduling.html">Async scheduling: overlap the CPU and the GPU</a>.</li>
+  <li><strong>Speculative decoding.</strong> Draft tokens are checked against the grammar before they are scheduled; the longest valid prefix stays, and the rest becomes <code>-1</code> padding (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2663-L2666" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2663-2666 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2663-2666</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2691-L2699" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2691-2699 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2691-2699</code></a>). The bitmask has one row per draft position; the manager advances the matcher through the drafts to fill the rows and rolls it back afterwards (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L476-L521" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:476-521 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:476-521</code></a>). The matcher allows a rollback of <code>num_speculative_tokens</code> tokens (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/backend_xgrammar.py#L198-L203" target="_blank" rel="noopener" title="vllm/v1/structured_output/backend_xgrammar.py:198-203 at 3e44c0d"><code>vllm/v1/structured_output/backend_xgrammar.py:198-203</code></a>).</li>
+  <li><strong>Reasoning.</strong> With a reasoning parser, the grammar starts only after the thinking ends, unless <code>enable_in_reasoning</code> is set (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L300-L319" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:300-319 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:300-319</code></a>). The front end tells the engine core whether the prompt already ended the thinking. With <code>reasoning_ended</code> unset, the engine core checks the prompt with its own parser (lines 312-319). Some engine-based parsers end the thinking with a content token, for example a tool-call start. Such a token stays masked during the thinking if the grammar cannot start with it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L258-L281" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:258-281 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:258-281</code></a>).</li>
+</ul>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-one-json-schema-request-step-by-step" class="dd-title">Worked example: one JSON-schema request, step by step</h3></summary><div class="dd-body"><p>Server: <code>vllm serve Qwen/Qwen2.5-0.5B-Instruct</code> on one GPU, default flags (<code>max_num_seqs</code> from the GPU size, async scheduling on, no reasoning parser). Request (example):</p>
+<pre><code class="language-json">{"messages": [{"role": "user", "content": "Give me a city as JSON."}],
+ "response_format": {"type": "json_schema",
+   "json_schema": {"name": "city", "schema": {"type": "object",
+      "properties": {"name": {"type": "string"}}, "required": ["name"]}}}}</code></pre>
+<ol>
+  <li><strong>API server.</strong> <code>to_sampling_params</code> makes <code>StructuredOutputsParams(json={...schema...})</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/generate/base/protocol.py#L192-L195" target="_blank" rel="noopener" title="vllm/entrypoints/generate/base/protocol.py:192-195 at 3e44c0d"><code>vllm/entrypoints/generate/base/protocol.py:192-195</code></a>). In <code>add_request</code>, the input processor validates with xgrammar; it accepts, so <code>_backend = "xgrammar"</code> and <code>_backend_was_auto = True</code>.</li>
+  <li><strong>Input thread.</strong> <code>Request</code> starts as <code>WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR</code>. This is the first constrained request, so the manager builds <code>XgrammarBackend</code>: two compilers, each with <code>max_threads=8</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/backend_xgrammar.py#L215-L224" target="_blank" rel="noopener" title="vllm/v1/structured_output/backend_xgrammar.py:215-224 at 3e44c0d"><code>vllm/v1/structured_output/backend_xgrammar.py:215-224</code></a>). The compile job goes to the pool.</li>
+  <li><strong>Scheduler.</strong> While the <code>Future</code> runs, each waiting pass skips the request. When it is done, the request becomes <code>WAITING</code> and is admitted.</li>
+  <li><strong>Prefill step.</strong> The whole prompt fits into one step, so the request is not a partial prefill chunk; it gets bitmask row 0. The matcher allows only tokens that can start a JSON object of the schema; every other token gets <code>-inf</code>.</li>
+  <li><strong>Size of the mask.</strong> The Qwen2.5 vocabulary has 151,936 entries (inferred from its <code>config.json</code>). One row is <code>cdiv(151936, 32)</code> = 4,748 int32 words = 18,992 bytes. With 3 structured requests in a step, the array is <code>int32 [3, 4748]</code>, about 57 KB, copied to the GPU once per step.</li>
+  <li><strong>Decode steps.</strong> With async scheduling, the next step is scheduled while the token of this step is in flight, so <code>pending_structured_output_tokens</code> is true. The engine core starts the forward pass and processes the previous output, which feeds the token to the matcher. Only then does it fill the row and sample.</li>
+  <li><strong>End.</strong> After <code>{"name": "Paris"}</code>, the format is complete. The mask then allows a stop token of the request (here <code>&lt;|im_end|&gt;</code>), and the request finishes with <code>finish_reason: "stop"</code> when the model samples it.</li>
+</ol>
+<aside class="callout callout-simplified"><p class="callout-title">Simplified</p><div class="callout-body"><p>The order of tokens and the exact allowed set come from xgrammar (library behaviour); the steps above follow vLLM's calls. Whitespace rules depend on <code>disable_any_whitespace</code>.</p></div></aside></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="costs-where-structured-outputs-spend-time" class="dd-title">Costs: where structured outputs spend time</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Cost</th><th>Where</th><th>When</th><th>Lines</th></tr></thead>
+  <tbody>
+    <tr><td>validation of the constraint</td><td>API server, in <code>add_request</code></td><td>every request</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/sampling_params.py#L1336-L1441" target="_blank" rel="noopener" title="vllm/sampling_params.py:1336-1441 at 3e44c0d"><code>vllm/sampling_params.py:1336-1441</code></a></td></tr>
+    <tr><td>grammar compile</td><td>engine core thread pool</td><td>per request; repeat schemas hit the xgrammar cache</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L195-L204" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:195-204 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:195-204</code></a></td></tr>
+    <tr><td>wait for the compile</td><td>scheduler</td><td>until the <code>Future</code> is done: adds to TTFT</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L3291-L3295" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:3291-3295 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:3291-3295</code></a></td></tr>
+    <tr><td>fill the bitmask</td><td>engine core main thread (threads above 128 requests)</td><td>every step with constrained requests</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L416-L521" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:416-521 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:416-521</code></a></td></tr>
+    <tr><td>copy and apply the mask</td><td>worker, GPU</td><td>every step</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/structured_outputs.py#L70-L128" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/structured_outputs.py:70-128 at 3e44c0d"><code>vllm/v1/worker/gpu/structured_outputs.py:70-128</code></a></td></tr>
+    <tr><td>deferred sampling</td><td>engine core loop</td><td>async scheduling with a constrained request in decode</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L737-L749" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:737-749 at 3e44c0d"><code>vllm/v1/engine/core.py:737-749</code></a></td></tr>
+    <tr><td>advance the matcher</td><td>engine core, <code>update_from_output</code></td><td>every new token</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L533-L553" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:533-553 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:533-553</code></a></td></tr>
+  </tbody>
+</table>
+<p>The code gives no measured numbers for these costs. Measure with and without the constraint on your own workload (<code>vllm bench serve</code>, <a href="../concepts/benchmarking.html">Benchmarking vLLM: vllm bench serve, throughput, latency and startup</a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="errors-what-fails-where" class="dd-title">Errors: what fails where</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Situation</th><th>Where</th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td>two of <code>json</code>, <code>regex</code> and <code>choice</code> in one request</td><td>request validator</td><td>400 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L931-L945" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/protocol.py:931-945 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/protocol.py:931-945</code></a>)</td></tr>
+    <tr><td>a constraint and a named <code>tool_choice</code></td><td>request validator</td><td>400 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L946-L955" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/protocol.py:946-955 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/protocol.py:946-955</code></a>)</td></tr>
+    <tr><td>empty choice list, empty grammar or schema, NUL in a regex</td><td>input processor</td><td>400 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/sampling_params.py#L1266-L1308" target="_blank" rel="noopener" title="vllm/sampling_params.py:1266-1308 at 3e44c0d"><code>vllm/sampling_params.py:1266-1308</code></a>)</td></tr>
+    <tr><td>no backend accepts the constraint (auto)</td><td>input processor</td><td>400 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/sampling_params.py#L1428-L1434" target="_blank" rel="noopener" title="vllm/sampling_params.py:1428-1434 at 3e44c0d"><code>vllm/sampling_params.py:1428-1434</code></a>)</td></tr>
+    <tr><td>a model loaded without a tokenizer (<code>--skip-tokenizer-init</code>)</td><td>input processor</td><td>400 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/sampling_params.py#L1242-L1245" target="_blank" rel="noopener" title="vllm/sampling_params.py:1242-1245 at 3e44c0d"><code>vllm/sampling_params.py:1242-1245</code></a>)</td></tr>
+    <tr><td>request resolves to another backend than the engine's</td><td>engine core input thread</td><td>validation error: 400, or an error chunk in a stream (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L143-L150" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:143-150 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:143-150</code></a>)</td></tr>
+    <tr><td>compile fails</td><td>engine core thread pool</td><td>request finished with a validation error (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L3296-L3301" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:3296-3301 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:3296-3301</code></a>)</td></tr>
+    <tr><td>the matcher rejects a sampled token</td><td><code>update_from_output</code></td><td>request finished with an error, logged as unexpected (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2279-L2290" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2279-2290 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2279-2290</code></a>)</td></tr>
+    <tr><td>old <code>guided_*</code> field</td><td>pydantic model</td><td>no error, no constraint, a warning in the log</td></tr>
+  </tbody>
+</table></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="flags-and-environment-variables" class="dd-title">Flags and environment variables</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--structured-outputs-config.backend</code></td><td><code>auto</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/structured_outputs.py#L20" target="_blank" rel="noopener" title="vllm/config/structured_outputs.py:20 at 3e44c0d"><code>vllm/config/structured_outputs.py:20</code></a>)</td><td>Fix one backend; no fallback then.</td></tr>
+    <tr><td><code>--structured-outputs-config.disable_any_whitespace</code></td><td>false (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/structured_outputs.py#L25" target="_blank" rel="noopener" title="vllm/config/structured_outputs.py:25 at 3e44c0d"><code>vllm/config/structured_outputs.py:25</code></a>)</td><td>Compact JSON; only xgrammar and guidance, else <code>ValueError</code> at start-up (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/structured_outputs.py#L62-L66" target="_blank" rel="noopener" title="vllm/config/structured_outputs.py:62-66 at 3e44c0d"><code>vllm/config/structured_outputs.py:62-66</code></a>).</td></tr>
+    <tr><td><code>--structured-outputs-config.disable_additional_properties</code></td><td>false</td><td>Guidance only.</td></tr>
+    <tr><td><code>--structured-outputs-config.enable_in_reasoning</code></td><td>false (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/structured_outputs.py#L40" target="_blank" rel="noopener" title="vllm/config/structured_outputs.py:40 at 3e44c0d"><code>vllm/config/structured_outputs.py:40</code></a>)</td><td>Constrain the thinking too.</td></tr>
+    <tr><td><code>--reasoning-parser</code></td><td>""</td><td>Lets the engine core find the end of the thinking.</td></tr>
+    <tr><td><code>VLLM_XGRAMMAR_CACHE_MB</code></td><td>512 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L1689" target="_blank" rel="noopener" title="vllm/envs.py:1689 at 3e44c0d"><code>vllm/envs.py:1689</code></a>)</td><td>Size limit of the xgrammar compile cache. The type stub at <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L226" target="_blank" rel="noopener" title="vllm/envs.py:226 at 3e44c0d"><code>vllm/envs.py:226</code></a> says 0; the reader returns 512.</td></tr>
+  </tbody>
+</table></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<aside class="callout callout-warning"><p class="callout-title">Mixed schemas with backend auto can be rejected</p><div class="callout-body"><p>The API server picks a backend per request, but the engine core keeps the first one it built (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L143-L150" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:143-150 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:143-150</code></a>). If the first constrained request used xgrammar, a later schema that only guidance supports is rejected with a validation error, and the other way around. Set <code>--structured-outputs-config.backend</code> to one backend if your clients send mixed schemas. (Derived from the two code paths.)</p></div></aside>
+<ul>
+  <li><strong>Unconstrained output with HTTP 200.</strong> The request uses <code>guided_json</code> or another removed field (Step 1).</li>
+  <li><strong>JSON appears only after a long thinking text.</strong> With a reasoning parser, the grammar starts after the thinking (Step 7). Set <code>enable_in_reasoning</code> or turn the thinking off.</li>
+  <li><strong>The JSON is cut off.</strong> <code>max_tokens</code> ended the request before the matcher reached a final state; check <code>finish_reason: "length"</code>.</li>
+  <li><strong>Slow first token for new schemas.</strong> The request waits for its compile (Step 3). Repeat schemas hit the cache.</li>
+  <li><strong>Lower throughput with async scheduling.</strong> One constrained decode request defers the sampling of the whole step (Step 7).</li>
+</ul>
+<p><strong>Why it matters.</strong> Structured outputs make agent and tool pipelines reliable, but they add a compile wait, a per-step CPU job and, with async scheduling, less overlap. Knowing where each part runs tells you what to tune.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Which field of the OpenAI API asks for JSON that matches a schema, and what does vLLM turn it into?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>response_format</code> with <code>type: "json_schema"</code>. vLLM turns it into <code>StructuredOutputsParams(json=&lt;schema&gt;)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/generate/base/protocol.py#L192-L195" target="_blank" rel="noopener" title="vllm/entrypoints/generate/base/protocol.py:192-195 at 3e44c0d"><code>vllm/entrypoints/generate/base/protocol.py:192-195</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>In which process and on which thread does the grammar compile, and what does the request do meanwhile?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>In the engine core process, in the <code>ThreadPoolExecutor</code> of the structured output manager; the input thread submits the job (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1128-L1135" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1128-1135 at 3e44c0d"><code>vllm/v1/engine/core.py:1128-1135</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L196-L197" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:196-197 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:196-197</code></a>). The request waits in the status <code>WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR</code>, and the scheduler skips it until the <code>Future</code> is done (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L3291-L3303" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:3291-3303 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:3291-3303</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>How large is one bitmask row for a vocabulary of 151,936 tokens? How many rows does a structured request own with 3 speculative tokens?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>cdiv(151936, 32)</code> = 4,748 int32 words, 18,992 bytes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/structured_outputs.py#L63-L65" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/structured_outputs.py:63-65 at 3e44c0d"><code>vllm/v1/worker/gpu/structured_outputs.py:63-65</code></a>). With 3 speculative tokens, <code>mask_stride</code> = 3 + 1 = 4 rows per request (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L393-L395" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:393-395 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:393-395</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>The server uses async scheduling. A batch has 200 normal requests and 1 JSON-schema request in decode. What happens to the sampling of that step, and why?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The step is scheduled while the previous token of the JSON request is still in flight, so the scheduler sets <code>pending_structured_output_tokens</code> for the step (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/async_scheduler.py#L37-L39" target="_blank" rel="noopener" title="vllm/v1/core/sched/async_scheduler.py:37-39 at 3e44c0d"><code>vllm/v1/core/sched/async_scheduler.py:37-39</code></a>). The engine core starts the forward pass but defers <code>sample_tokens</code> for the whole batch. It first processes the previous step's output, then fills the bitmask and samples (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L737-L749" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:737-749 at 3e44c0d"><code>vllm/v1/engine/core.py:737-749</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L789-L810" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:789-810 at 3e44c0d"><code>vllm/v1/engine/core.py:789-810</code></a>). The flag is per batch, so all 201 requests wait (derived).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>A reasoning model with <code>--reasoning-parser deepseek_r1</code> gets a JSON-schema request. Which tokens does the grammar see, and what is the bitmask while the model thinks?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>While the thinking is not ended, the constraint bounds start after the thinking, so the rows are full rows: every token is allowed (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L300-L319" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:300-319 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:300-319</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L241-L247" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:241-247 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:241-247</code></a>). <code>accept_tokens</code> ignores the tokens before the end; when <code>&lt;/think&gt;</code> arrives, it latches <code>reasoning_ended</code> and feeds only the tokens after it to the matcher (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/structured_output/__init__.py#L545-L553" target="_blank" rel="noopener" title="vllm/v1/structured_output/__init__.py:545-553 at 3e44c0d"><code>vllm/v1/structured_output/__init__.py:545-553</code></a>).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers: from model text to tool_calls and reasoning</a><span class="rel-sum">How vllm serve turns the model&#x27;s raw text into the OpenAI fields reasoning, content and tool_calls - the flags, the parser registries, the Parser object that composes them, how each tool_choice mode is enforced, streaming deltas, reasoning-end detection, the reasoning parser in the engine core and the declarative parser engine.</span></li><li><a href="../concepts/openai-server.html">The OpenAI-compatible server: launch modes, app, serving classes and streaming</a><span class="rel-sum">How vllm serve builds its HTTP front end: the launch modes, the FastAPI app with its middleware, routers and exception handlers, the serving objects in app.state, the request flow down to AsyncLLM, streaming, n &gt; 1, request ids, priorities and admission limits.</span></li><li><a href="../concepts/scheduler.html">The V1 scheduler: one token budget, no phases</a><span class="rel-sum">In each engine step, Scheduler.schedule() shares one token budget: first among the running requests, then among the waiting ones. It has no prefill or decode phase, it preempts the last running request when KV blocks run out, and update_from_output() appends the sampled tokens.</span></li><li><a href="../concepts/async-scheduling.html">Async scheduling: overlap the CPU and the GPU</a><span class="rel-sum">With async scheduling, the engine core schedules and starts step N+1 before it waits for the token of step N. Placeholders in the scheduler and a GPU-side token buffer in Model Runner V2 make this possible.</span></li><li><a href="../concepts/model-runner.html">The model runner (Model Runner V2)</a><span class="rel-sum">Model Runner V2 keeps every running request in a fixed row of GPU tensors, gathers each step&#x27;s inputs from those rows with GPU kernels, runs the model (CUDA graph or eager), and samples in a second call that returns an AsyncOutput without a GPU wait.</span></li><li><a href="../concepts/speculative-decoding.html">Speculative decoding in vLLM serving</a><span class="rel-sum">How vLLM serves with draft tokens - SpeculativeConfig and the methods, how drafts take part in the token budget and in async scheduling, the Model Runner V2 speculator, verification with the RejectionSampler and its four variants, multi-token outputs, the acceptance metrics, CUDA graphs and tuning.</span></li><li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors in Model Runner V2</a><span class="rel-sum">How the Model Runner V2 sampler turns logits into tokens - the order of the built-in stages, where custom logits processors plug in, when the fused FlashInfer sampler runs and when the Gumbel sampler runs, how seeds work, and what logprobs and prompt_logprobs cost.</span></li><li><a href="../learn/openai-api.html">The OpenAI-compatible API</a><span class="rel-sum">vllm serve answers HTTP requests in the format of the OpenAI API. This page shows the routes that vLLM registers, the request fields that matter for serving, vLLM&#x27;s extra fields, the SSE stream format, tool calls, reasoning output and errors.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../concepts/tool-and-reasoning-parsers.html"><span class="pn-dir">← Previous</span><span class="pn-title">Tool and reasoning parsers: from model text to tool_calls and reasoning</span></a><a class="pn pn-next" href="../concepts/speculative-decoding.html"><span class="pn-dir">Next →</span><span class="pn-title">Speculative decoding in vLLM serving</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-the-code">In the code</a></li><li class="toc-l3"><a href="#step-1-the-request-fields">Step 1: the request fields</a></li><li class="toc-l3"><a href="#step-2-structuredoutputsconfig-and-the-backend-choice">Step 2: StructuredOutputsConfig and the backend choice</a></li><li class="toc-l3"><a href="#step-3-compile-in-the-engine-core-wait-in-the-scheduler">Step 3: compile in the engine core, wait in the scheduler</a></li><li class="toc-l3"><a href="#step-4-the-bitmask-of-each-step">Step 4: the bitmask of each step</a></li><li class="toc-l3"><a href="#step-5-masking-on-the-worker">Step 5: masking on the worker</a></li><li class="toc-l3"><a href="#step-6-after-the-step">Step 6: after the step</a></li><li class="toc-l3"><a href="#step-7-async-scheduling-speculative-decoding-and-reasoning">Step 7: async scheduling, speculative decoding and reasoning</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#worked-example-one-json-schema-request-step-by-step">Worked example: one JSON-schema request, step by step</a></li><li class="toc-l3"><a href="#costs-where-structured-outputs-spend-time">Costs: where structured outputs spend time</a></li><li class="toc-l3"><a href="#errors-what-fails-where">Errors: what fails where</a></li><li class="toc-l3"><a href="#flags-and-environment-variables">Flags and environment variables</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

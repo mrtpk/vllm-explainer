@@ -1,0 +1,701 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>distributed/parallel_state.py: process groups and GroupCoordinator · vLLM Explained</title>
+<meta name="description" content="vllm/distributed/parallel_state.py builds the world group and the model-parallel groups (TP, PP, DP, EP, PCP, DCP, EPLB, ...) of each worker, wraps each in a GroupCoordinator, registers the collectives as torch custom ops, and tears everything down at shutdown.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="code/distributed-parallel-state">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a class="current" aria-current="page" href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>Code map</span><span class="sep">›</span><span>Distributed</span><span class="sep">›</span><span aria-current="page">distributed/parallel_state.py</span></nav>
+<h1 class="page-title">distributed/parallel_state.py: process groups and GroupCoordinator</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">Code map</span><span class="meta-time">about 9 min read + 3 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a> <span class="level level-advanced level-sm">Advanced</span></li></ul></aside>
+<h2 id="purpose">Purpose<a class="h-anchor" href="#purpose" aria-label="Link to this section">#</a></h2>
+<p><code>vllm/distributed/parallel_state.py</code> owns the <a class="term" href="../reference/glossary.html#term-process-group" data-term="process group" data-def="A fixed set of ranks that run collectives together, for example the two ranks of one TP group. vLLM wraps each one in a GroupCoordinator.">process groups</a> of a worker process: it creates them from the <a class="term" href="../reference/glossary.html#term-rank-layout" data-term="rank layout" data-def="The order in which vLLM arranges all ranks before it cuts them into groups: ExternalDP × DP × PP × PCP × TP, with TP as the fastest dimension.">rank layout</a>, keeps them in module globals such as <code>_TP</code>, and gives model code one object per group, the <a class="term" href="../reference/glossary.html#term-group-coordinator" data-term="GroupCoordinator" data-def="vLLM&#x27;s wrapper for one process group. It holds a gloo CPU group, an NCCL device group, an optional device communicator and an optional shared-memory broadcaster.">GroupCoordinator</a>, with all collectives.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/distributed/parallel_state.py</code>, 2,767 lines of Python. The header says it is adapted from Megatron-LM (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L4-L23" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:4-23 at 3e44c0d"><code>vllm/distributed/parallel_state.py:4-23</code></a>).</td></tr>
+    <tr><th>Main class</th><td><code>GroupCoordinator</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L427" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:427 at 3e44c0d"><code>vllm/distributed/parallel_state.py:427</code></a>).</td></tr>
+    <tr><th>Main functions</th><td><code>init_distributed_environment</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1836" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1836 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1836</code></a>), <code>initialize_model_parallel</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2078" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2078 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2078</code></a>), <code>ensure_model_parallel_initialized</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2388" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2388 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2388</code></a>), the getters <code>get_tp_group</code> … <code>get_eplb_group</code>, <code>graph_capture</code>, <code>destroy_model_parallel</code>, <code>cleanup_dist_env_and_memory</code>.</td></tr>
+    <tr><th>Runs in</th><td>Each worker process (or the engine core process with the uni executor), main thread. The groups are per process.</td></tr>
+    <tr><th>Called by</th><td><code>init_worker_distributed_environment</code> in the GPU worker (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L1678-L1720" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:1678-1720 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:1678-1720</code></a>); model layers through <code>vllm.distributed</code>, which re-exports this module (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/__init__.py#L4-L6" target="_blank" rel="noopener" title="vllm/distributed/__init__.py:4-6 at 3e44c0d"><code>vllm/distributed/__init__.py:4-6</code></a>).</td></tr>
+    <tr><th>Calls</th><td><code>torch.distributed</code> (<code>init_process_group</code>, <code>new_group</code>, send/recv), the platform's device communicator class, <code>MessageQueue</code> from <code>shm_broadcast.py</code>, <code>direct_register_custom_op</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The all-reduce kernels and their selection (<code>device_communicators/cuda_communicator.py</code> and friends), the ring buffer (<code>shm_broadcast.py</code>), the MoE all2all managers (<code>device_communicators/all2all.py</code>), the stateless DP group of the engine core (<code>config/parallel.py</code>), the helpers <code>tensor_model_parallel_all_reduce</code> etc. (<code>communication_op.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page <a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a> explains the ideas and the rank layout. This page reads the file function by function.</p>
+
+<h2 id="where-it-sits">Where it sits<a class="h-anchor" href="#where-it-sits" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b8b_rank_grid"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: eight ranks for TP = 2, PP = 2, DP = 2 of an MoE model, in two lanes for DP rank 0 and 1, each a 2 by 2 grid of PP stage and TP rank. Panel 2: TP groups [0,1] [2,3] [4,5] [6,7], PP groups [0,2] [1,3] [4,6] [5,7], DP groups [0,4] [2,6] [1,5] [3,7], EP groups [0,1,4,5] and [2,3,6,7]. Panel 3: the TP group gets a CudaCommunicator with pynccl, custom all-reduce, symmetric memory, FlashInfer and a MessageQueue broadcaster; PP and DP groups get pynccl only; the EP group gets pynccl and an all2all manager; the world group has no device communicator."><svg role="img" aria-label="Panel 1: eight ranks for TP = 2, PP = 2, DP = 2 of an MoE model, in two lanes for DP rank 0 and 1, each a 2 by 2 grid of PP stage and TP rank. Panel 2: TP groups [0,1] [2,3] [4,5] [6,7], PP groups [0,2] [1,3] [4,6] [5,7], DP groups [0,4] [2,6] [1,5] [3,7], EP groups [0,1,4,5] and [2,3,6,7]. Panel 3: the TP group gets a CudaCommunicator with pynccl, custom all-reduce, symmetric memory, FlashInfer and a MessageQueue broadcaster; PP and DP groups get pynccl only; the EP group gets pynccl and an all2all manager; the world group has no device communicator." xmlns="http://www.w3.org/2000/svg" width="1100" height="976" viewBox="0 0 1100 976">
+<defs></defs>
+<rect width="1100" height="976" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">One rank grid, sliced into process groups</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">TP = 2  ·  PP = 2  ·  DP = 2  ·  MoE model (DPEngineCoreProc)  ·  8 GPUs on one node</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">all_ranks = arange(8).reshape(1, DP=2, PP=2, PCP=1, TP=2)   →   rank = 4·dp + 2·pp + tp</text>
+<rect x="20.0" y="116.0" width="1060.0" height="318.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="142.0" r="13" fill="#111827"/>
+<text x="46.0" y="146.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="147.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Where does each rank sit?</text>
+<text x="68.0" y="166.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">TP is the last (fastest) dimension, so the two ranks of a TP group are neighbours.</text>
+<rect x="46.0" y="184.0" width="486.0" height="214.0" rx="12" fill="#fffdf6" fill-opacity="1.0" stroke="#d97706" stroke-width="1.2" stroke-opacity="0.35" stroke-dasharray="4 4"/>
+<rect x="46.0" y="184.0" width="486.0" height="50.0" rx="12" fill="#d97706" fill-opacity="1.0" stroke="none"/>
+<rect x="46.0" y="210.0" width="486.0" height="24.0" rx="0" fill="#d97706" fill-opacity="1.0" stroke="none"/>
+<text x="60.0" y="207.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="15" fill="#fff" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">DP rank 0  (engine core 0)</text>
+<text x="60.0" y="225.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#fff" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">workers of EngineCore_DP0  ·  GPUs 0–3</text>
+<text x="62.0" y="282.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">PP stage 0</text>
+<rect x="162.0" y="248.0" width="166.0" height="56.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="245.0" y="270.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">rank 0</text>
+<text x="245.0" y="289.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">GPU 0  tp=0 pp=0</text>
+<rect x="344.0" y="248.0" width="166.0" height="56.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="427.0" y="270.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">rank 1</text>
+<text x="427.0" y="289.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">GPU 1  tp=1 pp=0</text>
+<text x="62.0" y="354.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">PP stage 1</text>
+<rect x="162.0" y="320.0" width="166.0" height="56.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="245.0" y="342.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">rank 2</text>
+<text x="245.0" y="361.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">GPU 2  tp=0 pp=1</text>
+<rect x="344.0" y="320.0" width="166.0" height="56.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="427.0" y="342.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">rank 3</text>
+<text x="427.0" y="361.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">GPU 3  tp=1 pp=1</text>
+<rect x="568.0" y="184.0" width="486.0" height="214.0" rx="12" fill="#fffdf6" fill-opacity="1.0" stroke="#d97706" stroke-width="1.2" stroke-opacity="0.35" stroke-dasharray="4 4"/>
+<rect x="568.0" y="184.0" width="486.0" height="50.0" rx="12" fill="#d97706" fill-opacity="1.0" stroke="none"/>
+<rect x="568.0" y="210.0" width="486.0" height="24.0" rx="0" fill="#d97706" fill-opacity="1.0" stroke="none"/>
+<text x="582.0" y="207.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="15" fill="#fff" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">DP rank 1  (engine core 1)</text>
+<text x="582.0" y="225.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#fff" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">workers of EngineCore_DP1  ·  GPUs 4–7</text>
+<text x="584.0" y="282.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">PP stage 0</text>
+<rect x="684.0" y="248.0" width="166.0" height="56.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="767.0" y="270.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">rank 4</text>
+<text x="767.0" y="289.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">GPU 4  tp=0 pp=0</text>
+<rect x="866.0" y="248.0" width="166.0" height="56.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="949.0" y="270.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">rank 5</text>
+<text x="949.0" y="289.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">GPU 5  tp=1 pp=0</text>
+<text x="584.0" y="354.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">PP stage 1</text>
+<rect x="684.0" y="320.0" width="166.0" height="56.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="767.0" y="342.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">rank 6</text>
+<text x="767.0" y="361.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">GPU 6  tp=0 pp=1</text>
+<rect x="866.0" y="320.0" width="166.0" height="56.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="949.0" y="342.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">rank 7</text>
+<text x="949.0" y="361.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">GPU 7  tp=1 pp=1</text>
+<text x="46.0" y="422.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre" font-style="italic">Each DP rank is one engine core with world_size = TP·PP = 4 workers; their global rank adds dp_rank·4.</text>
+<rect x="20.0" y="456.0" width="1060.0" height="196.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="482.0" r="13" fill="#111827"/>
+<text x="46.0" y="486.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="487.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Which ranks form each group?</text>
+<text x="68.0" y="506.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Move the group&#x27;s dimension to the end, reshape to rows of its size: each row is one group.</text>
+<rect x="46.0" y="524.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="70.0" y="536.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">TP  (size 2)</text>
+<text x="200.0" y="536.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">view(-1, TP)</text>
+<text x="380.0" y="536.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[0,1] [2,3] [4,5] [6,7]</text>
+<rect x="46.0" y="550.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="70.0" y="562.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">PP  (size 2)</text>
+<text x="200.0" y="562.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">transpose(2, 4)</text>
+<text x="380.0" y="562.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[0,2] [1,3] [4,6] [5,7]</text>
+<rect x="46.0" y="576.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="70.0" y="588.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">DP  (size 2)</text>
+<text x="200.0" y="588.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">transpose(1, 4)</text>
+<text x="380.0" y="588.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[0,4] [2,6] [1,5] [3,7]</text>
+<rect x="46.0" y="602.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="70.0" y="614.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">EP  (size 4)</text>
+<text x="200.0" y="614.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">transpose(1, 2)</text>
+<text x="380.0" y="614.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[0,1,4,5] [2,3,6,7]      (MoE models only)</text>
+<text x="46.0" y="640.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre" font-style="italic">PCP, DCP: groups of 1 rank by default.  EPLB: same ranks as EP, only with --enable-eplb.  World: all 8.</text>
+<rect x="20.0" y="674.0" width="1060.0" height="192.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="700.0" r="13" fill="#111827"/>
+<text x="46.0" y="704.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="705.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Which communicator does each group get?</text>
+<text x="68.0" y="724.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">A GroupCoordinator gets a device communicator only when the group has more than one rank.</text>
+<rect x="46.0" y="742.0" width="330.0" height="104.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="58.0" y="762.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">TP group (&quot;tp&quot;)</text>
+<text x="58.0" y="780.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">CudaCommunicator with pynccl</text>
+<text x="58.0" y="795.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">+ custom all-reduce, symm mem,</text>
+<text x="58.0" y="810.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  FlashInfer (TP groups only)</text>
+<text x="58.0" y="825.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">+ MessageQueue broadcaster (4 MiB × 6)</text>
+<rect x="385.0" y="742.0" width="330.0" height="104.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="397.0" y="762.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">PP and DP groups</text>
+<text x="397.0" y="780.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">CudaCommunicator with pynccl only</text>
+<text x="397.0" y="795.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">PP: send / recv of IntermediateTensors</text>
+<text x="397.0" y="810.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">DP (MoE): gloo cpu_group all-reduce</text>
+<text x="397.0" y="825.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  of the per-step padding</text>
+<rect x="724.0" y="742.0" width="330.0" height="104.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="736.0" y="762.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">EP group (&quot;ep&quot;)</text>
+<text x="736.0" y="780.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">CudaCommunicator with pynccl</text>
+<text x="736.0" y="795.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">+ all2all manager (DP &gt; 1):</text>
+<text x="736.0" y="810.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  default allgather_reducescatter</text>
+<text x="736.0" y="825.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">world group: no device communicator</text>
+<text x="30.0" y="901.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="890.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="901.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">tensor parallel</text>
+<rect x="228.7" y="890.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="249.7" y="901.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">pipeline parallel</text>
+<rect x="364.5" y="890.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="385.5" y="901.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">data parallel</text>
+<rect x="483.1" y="890.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="504.1" y="901.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">expert parallel</text>
+<text x="30.0" y="926.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Dense model: each DP rank is reconfigured to DP = 1, so each engine core has its own 4-rank world and no EP group.</text>
+<text x="30.0" y="944.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Not shown: the gloo cpu_group that every GroupCoordinator also creates, and the ETP / engram groups.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: what <code>initialize_model_parallel</code> builds for TP = 2 × PP = 2 × DP = 2 (MoE): the grid, the groups and their communicators.</figcaption><a class="diagram-open" href="../diagrams/b8b_rank_grid.svg" target="_blank">Open full size ↗</a></div></figure>
+
+<h3 id="who-calls-it">Who calls it<a class="h-anchor" href="#who-calls-it" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li>The GPU worker, in <code>init_device</code>, before the memory snapshot (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L497-L507" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:497-507 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:497-507</code></a>). Its helper calls <code>set_custom_all_reduce</code>, <code>init_distributed_environment</code> and <code>ensure_model_parallel_initialized</code> in that order (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L1694-L1716" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:1694-1716 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:1694-1716</code></a>).</li>
+  <li>Model layers call the getters at construction and the collectives at run time, for example <code>RowParallelLinear</code> through <code>tensor_model_parallel_all_reduce</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1803-L1806" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1803-1806 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1803-1806</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/communication_op.py#L12-L14" target="_blank" rel="noopener" title="vllm/distributed/communication_op.py:12-14 at 3e44c0d"><code>vllm/distributed/communication_op.py:12-14</code></a>).</li>
+  <li>Model Runner V2 wraps CUDA graph capture in <code>graph_capture</code>, and the worker uses the PP group for <code>isend_tensor_dict</code>/<code>irecv_tensor_dict</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L1336-L1347" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:1336-1347 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:1336-1347</code></a>).</li>
+  <li>Shutdown: the worker process calls <code>destroy_model_parallel</code> and <code>destroy_distributed_environment</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L824-L833" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:824-833 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:824-833</code></a>); the engine core calls <code>cleanup_dist_env_and_memory</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L837-L839" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:837-839 at 3e44c0d"><code>vllm/v1/engine/core.py:837-839</code></a>).</li>
+</ul>
+
+<h3 id="what-it-calls">What it calls<a class="h-anchor" href="#what-it-calls" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><code>torch.distributed.init_process_group</code> for the world, then <code>new_group</code> twice per group: device backend and gloo (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1973-L1982" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1973-1982 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1973-1982</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L501-L518" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:501-518 at 3e44c0d"><code>vllm/distributed/parallel_state.py:501-518</code></a>).</li>
+  <li><code>current_platform.get_device_communicator_cls()</code>, only for groups with more than one rank (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L549-L560" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:549-560 at 3e44c0d"><code>vllm/distributed/parallel_state.py:549-560</code></a>).</li>
+  <li><code>MessageQueue.create_from_process_group</code> for the groups that ask for a broadcaster (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L562-L567" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:562-567 at 3e44c0d"><code>vllm/distributed/parallel_state.py:562-567</code></a>).</li>
+  <li><code>direct_register_custom_op</code> for <code>all_reduce</code>, <code>reduce_scatter</code>, <code>all_gather</code> and a patched scaled-matmul reduce-scatter, at import time (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L399-L425" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:399-425 at 3e44c0d"><code>vllm/distributed/parallel_state.py:399-425</code></a>).</li>
+</ul>
+
+<h2 id="key-classes-and-functions">Key classes and functions<a class="h-anchor" href="#key-classes-and-functions" aria-label="Link to this section">#</a></h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>_split_tensor_dict</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L116-L139" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:116-139 at 3e44c0d"><code>vllm/distributed/parallel_state.py:116-139</code></a></td><td>Splits a dict into metadata (with <code>TensorMetadata</code> for tensors) and a tensor list.</td></tr>
+    <tr><td><code>_get_unique_name</code>, <code>_register_group</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L145-L164" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:145-164 at 3e44c0d"><code>vllm/distributed/parallel_state.py:145-164</code></a></td><td>Names like <code>tp:0</code>; weak references by name for the custom ops.</td></tr>
+    <tr><td><code>all_reduce</code>, <code>reduce_scatter</code>, <code>all_gather</code> (+ fakes)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L199-L244" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:199-244 at 3e44c0d"><code>vllm/distributed/parallel_state.py:199-244</code></a></td><td>The custom-op bodies: look up the group by name, call its out-of-place method.</td></tr>
+    <tr><td><code>GroupCoordinator</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L427-L1489" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:427-1489 at 3e44c0d"><code>vllm/distributed/parallel_state.py:427-1489</code></a></td><td>One process group: CPU and device groups, communicator, broadcaster, collectives, send/recv, MoE dispatch/combine.</td></tr>
+    <tr><td><code>init_world_group</code>, <code>init_model_parallel_group</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1507-L1536" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1507-1536 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1507-1536</code></a></td><td>Thin constructors for <code>GroupCoordinator</code>.</td></tr>
+    <tr><td><code>get_tp_group</code> … <code>get_pcp_group</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1590-L1685" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1590-1685 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1590-1685</code></a></td><td>Getters that assert the group exists.</td></tr>
+    <tr><td><code>graph_capture</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1693-L1726" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1693-1726 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1693-1726</code></a></td><td>Capture stream plus the capture contexts of TP, PP and DP.</td></tr>
+    <tr><td><code>init_distributed_environment</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1836-L2039" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1836-2039 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1836-2039</code></a></td><td>Default process group and the world <code>GroupCoordinator</code>.</td></tr>
+    <tr><td><code>initialize_model_parallel</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2078-L2385" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2078-2385 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2078-2385</code></a></td><td>The rank grid and every model-parallel group.</td></tr>
+    <tr><td><code>ensure_model_parallel_initialized</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2388-L2437" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2388-2437 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2388-2437</code></a></td><td>Build once; on a second call, assert the same sizes.</td></tr>
+    <tr><td><code>destroy_model_parallel</code>, <code>destroy_distributed_environment</code>, <code>cleanup_dist_env_and_memory</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2480-L2583" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2480-2583 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2480-2583</code></a></td><td>Tear-down in a fixed order.</td></tr>
+    <tr><td><code>in_the_same_node_as</code>, <code>_node_count</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2586-L2767" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2586-2767 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2586-2767</code></a></td><td>Node detection through a shared-memory segment.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="walk-through-the-main-methods">Walk through the main methods<a class="h-anchor" href="#walk-through-the-main-methods" aria-label="Link to this section">#</a></h2>
+
+<h3 id="groupcoordinator-init-two-pytorch-groups-per-row"><code>GroupCoordinator.__init__</code>: two PyTorch groups per row<a class="h-anchor" href="#groupcoordinator-init-two-pytorch-groups-per-row" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L493-L518" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/distributed/parallel_state.py:493-518</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L493-L518" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">493</span><span class="ln">494</span><span class="ln">495</span><span class="ln">496</span><span class="ln">497</span><span class="ln hl">498</span><span class="ln hl">499</span><span class="ln">500</span><span class="ln hl">501</span><span class="ln hl">502</span><span class="ln hl">503</span><span class="ln hl">504</span><span class="ln hl">505</span><span class="ln hl">506</span><span class="ln hl">507</span><span class="ln hl">508</span><span class="ln hl">509</span><span class="ln hl">510</span><span class="ln hl">511</span><span class="ln hl">512</span><span class="ln hl">513</span><span class="ln hl">514</span><span class="ln hl">515</span><span class="ln hl">516</span><span class="ln hl">517</span><span class="ln hl">518</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><pre><code class="language-python">            from vllm.distributed.utils import (
+                get_cpu_distributed_timeout_or_none,
+                get_distributed_timeout_or_none,
+            )
+
+            timeout = get_cpu_distributed_timeout_or_none()
+            device_timeout = get_distributed_timeout_or_none()
+
+            for ranks in group_ranks:
+                device_group = torch.distributed.new_group(
+                    ranks,
+                    backend=torch_distributed_backend,
+                    timeout=device_timeout,
+                )
+                # a group with `gloo` backend, to allow direct coordination between
+                # processes through the CPU.
+                with suppress_stdout():
+                    cpu_group = torch.distributed.new_group(
+                        ranks, backend=&quot;gloo&quot;, timeout=timeout
+                    )
+                if self.rank in ranks:
+                    self.ranks = ranks
+                    self.world_size = len(ranks)
+                    self.rank_in_group = ranks.index(self.rank)
+                    self_device_group = device_group
+                    self_cpu_group = cpu_group</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 498-499.</strong> Optional timeouts for the device and CPU groups (from <code>--distributed-timeout-seconds</code> and its CPU twin).</li>
+  <li><strong>Lines 501-512.</strong> For <em>every</em> row of <code>group_ranks</code>, the process makes a device group and a gloo group. <code>new_group</code> is collective, so all ranks must make all rows in the same order, even rows they are not in.</li>
+  <li><strong>Lines 513-518.</strong> The process keeps the pair for its own row, and records its rank inside the group.</li>
+</ol>
+<p>The class comment shows the difference between <code>rank</code>, <code>local_rank</code> and <code>rank_in_group</code> with a 4-rank group over two nodes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L436-L449" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:436-449 at 3e44c0d"><code>vllm/distributed/parallel_state.py:436-449</code></a>). With <code>VLLM_DISTRIBUTED_USE_SPLIT_GROUP=1</code>, the groups come from PyTorch <code>split_group</code> instead (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L480-L491" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:480-491 at 3e44c0d"><code>vllm/distributed/parallel_state.py:480-491</code></a>). The rest of the constructor picks the device, then adds the optional parts:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L546-L574" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/distributed/parallel_state.py:546-574</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L546-L574" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">546</span><span class="ln">547</span><span class="ln">548</span><span class="ln hl">549</span><span class="ln hl">550</span><span class="ln hl">551</span><span class="ln hl">552</span><span class="ln hl">553</span><span class="ln hl">554</span><span class="ln hl">555</span><span class="ln hl">556</span><span class="ln hl">557</span><span class="ln hl">558</span><span class="ln hl">559</span><span class="ln">560</span><span class="ln">561</span><span class="ln">562</span><span class="ln hl">563</span><span class="ln hl">564</span><span class="ln hl">565</span><span class="ln hl">566</span><span class="ln hl">567</span><span class="ln">568</span><span class="ln">569</span><span class="ln">570</span><span class="ln hl">571</span><span class="ln hl">572</span><span class="ln hl">573</span><span class="ln">574</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><pre><code class="language-python">
+        self.use_device_communicator = use_device_communicator
+        self.device_communicator = None
+        if use_device_communicator and self.world_size &gt; 1:
+            device_comm_cls = resolve_obj_by_qualname(
+                current_platform.get_device_communicator_cls()
+            )
+            self.device_communicator = device_comm_cls(
+                cpu_group=self.cpu_group,
+                device=self.device,
+                device_group=self.device_group,
+                unique_name=self.unique_name,
+                use_all2all=use_all2all,
+            )
+
+        from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
+
+        self.mq_broadcaster: MessageQueue | None = None
+        if use_message_queue_broadcaster and self.world_size &gt; 1:
+            self.mq_broadcaster = MessageQueue.create_from_process_group(
+                self.cpu_group, 1 &lt;&lt; 22, 6
+            )
+
+        # TODO(#35915): Remove is_tpu() check once tpu_inference
+        # overrides use_custom_op_collectives() to return True.
+        self.use_custom_op_call = (
+            current_platform.is_tpu() or current_platform.use_custom_op_collectives()
+        )
+</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 549-559.</strong> A device communicator only for more than one rank. <code>use_all2all</code> is passed through; the communicator honours it only for groups named <code>ep</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/base_device_communicator.py#L244-L245" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/base_device_communicator.py:244-245 at 3e44c0d"><code>vllm/distributed/device_communicators/base_device_communicator.py:244-245</code></a>).</li>
+  <li><strong>Lines 563-567.</strong> The broadcaster: a <code>MessageQueue</code> of 6 chunks × 4 MiB, writer = the group's first rank.</li>
+  <li><strong>Lines 571-573.</strong> <code>use_custom_op_call</code> decides whether the collectives go through <code>torch.ops.vllm.*</code>.</li>
+</ol>
+
+<h3 id="all-reduce-and-friends"><code>all_reduce</code> and friends<a class="h-anchor" href="#all-reduce-and-friends" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L725-L751" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/distributed/parallel_state.py:725-751</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L725-L751" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">725</span><span class="ln">726</span><span class="ln">727</span><span class="ln">728</span><span class="ln">729</span><span class="ln">730</span><span class="ln">731</span><span class="ln">732</span><span class="ln">733</span><span class="ln">734</span><span class="ln">735</span><span class="ln">736</span><span class="ln">737</span><span class="ln">738</span><span class="ln">739</span><span class="ln hl">740</span><span class="ln hl">741</span><span class="ln">742</span><span class="ln hl">743</span><span class="ln hl">744</span><span class="ln hl">745</span><span class="ln hl">746</span><span class="ln">747</span><span class="ln hl">748</span><span class="ln hl">749</span><span class="ln hl">750</span><span class="ln hl">751</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><pre><code class="language-python">    def all_reduce(self, input_: torch.Tensor) -&gt; torch.Tensor:
+        &quot;&quot;&quot;User-facing all-reduce function before we actually call the
+        all-reduce operation.
+
+        We need this because Dynamo does not support passing an arbitrary
+        object (`self` in this case) to a custom op. We need to pass the
+         group name as a string, and then look up the group coordinator from
+         the group name, dispatch the all-reduce operation to the group
+         coordinator.
+
+        In addition, PyTorch custom ops do not support mutation or returning
+        a new tensor in the same op. So we always make the all-reduce operation
+        out-of-place.
+        &quot;&quot;&quot;
+        # Bypass the function if we are using only 1 GPU.
+        if self.world_size == 1:
+            return input_
+
+        if self.use_custom_op_call:
+            return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
+        else:
+            return self._all_reduce_out_place(input_)
+
+    def _all_reduce_out_place(self, input_: torch.Tensor) -&gt; torch.Tensor:
+        if self.device_communicator is None:
+            raise ValueError(&quot;No device communicator found&quot;)
+        return self.device_communicator.all_reduce(input_)</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 740-741.</strong> A group of one returns the input; no kernel runs.</li>
+  <li><strong>Lines 743-746.</strong> The registered op takes the group's unique name (a string), because Dynamo cannot pass the Python object. The op body looks the group up in <code>_groups</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L199-L204" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:199-204 at 3e44c0d"><code>vllm/distributed/parallel_state.py:199-204</code></a>).</li>
+  <li><strong>Lines 748-751.</strong> The real work is in the device communicator; without one this raises "No device communicator found".</li>
+</ol>
+<p><code>all_gather</code> and <code>reduce_scatter</code> follow the same pattern and check the <code>dim</code> argument (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L753-L798" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:753-798 at 3e44c0d"><code>vllm/distributed/parallel_state.py:753-798</code></a>). <code>gather</code>, <code>all_gatherv</code> and <code>reduce_scatterv</code> go straight to the communicator (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L774-L838" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:774-838 at 3e44c0d"><code>vllm/distributed/parallel_state.py:774-838</code></a>). <code>broadcast</code> uses <code>torch.distributed.broadcast</code> on the device group (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L840-L853" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:840-853 at 3e44c0d"><code>vllm/distributed/parallel_state.py:840-853</code></a>); <code>broadcast_object</code> prefers the shared-memory broadcaster (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L855-L877" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:855-877 at 3e44c0d"><code>vllm/distributed/parallel_state.py:855-877</code></a>).</p>
+
+<h3 id="isend-tensor-dict-and-irecv-tensor-dict-the-pp-hand-off"><code>isend_tensor_dict</code> and <code>irecv_tensor_dict</code>: the PP hand-off<a class="h-anchor" href="#isend-tensor-dict-and-irecv-tensor-dict-the-pp-hand-off" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1201-L1245" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/distributed/parallel_state.py:1201-1245</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1201-L1245" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1201</span><span class="ln">1202</span><span class="ln">1203</span><span class="ln">1204</span><span class="ln">1205</span><span class="ln">1206</span><span class="ln">1207</span><span class="ln">1208</span><span class="ln">1209</span><span class="ln">1210</span><span class="ln hl">1211</span><span class="ln hl">1212</span><span class="ln">1213</span><span class="ln">1214</span><span class="ln">1215</span><span class="ln">1216</span><span class="ln">1217</span><span class="ln">1218</span><span class="ln hl">1219</span><span class="ln hl">1220</span><span class="ln hl">1221</span><span class="ln hl">1222</span><span class="ln">1223</span><span class="ln hl">1224</span><span class="ln hl">1225</span><span class="ln hl">1226</span><span class="ln hl">1227</span><span class="ln hl">1228</span><span class="ln hl">1229</span><span class="ln">1230</span><span class="ln">1231</span><span class="ln">1232</span><span class="ln">1233</span><span class="ln">1234</span><span class="ln">1235</span><span class="ln">1236</span><span class="ln">1237</span><span class="ln">1238</span><span class="ln">1239</span><span class="ln hl">1240</span><span class="ln hl">1241</span><span class="ln hl">1242</span><span class="ln hl">1243</span><span class="ln">1244</span><span class="ln">1245</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(40 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(41 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(42 * var(--code-lh))"></span><pre><code class="language-python">        group = self.device_group
+        metadata_group = self.cpu_group
+
+        metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
+
+        tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
+        assert len(tensor_keys) == len(tensor_list)
+
+        # Reap completed sends before posting new ones, bounding the
+        # self-retention FIFO.
+        self._reap_completed_isends()
+        handles: list[Handle] = [self.isend_object(metadata_list, dst=dst)]
+
+        sent_tensors: list[torch.Tensor] = []
+        for key, tensor in zip(tensor_keys, tensor_list):
+            if tensor.numel() == 0:
+                continue
+
+            if self._should_use_all_gather(
+                key, tensor.numel(), all_gather_group, all_gather_tensors
+            ):
+                tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]
+
+            comm_group = metadata_group if tensor.is_cpu else group
+            handle = torch.distributed.isend(
+                tensor, dst=self.ranks[dst], group=comm_group
+            )
+            if tensor.is_cuda:
+                tensor.record_stream(torch.cuda.current_stream(tensor.device))
+            handles.append(handle)
+            sent_tensors.append(tensor)
+
+        # Self-retain for fire-and-forget callers: keep the handles and
+        # the source tensors alive until the sends complete (reaped
+        # lazily by ``_reap_completed_isends``). Without this, dropping
+        # the returned handles would GC the ``_RetainedHandle``&#x27;s
+        # serialized metadata buffers mid-send, and non-CUDA devices
+        # have no ``record_stream`` equivalent protecting the tensor
+        # sources.
+        pending = getattr(self, &quot;_pending_isends&quot;, None)
+        if pending is None:
+            self._pending_isends = pending = deque()
+        pending.append((handles, sent_tensors))
+
+        return handles</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 1211.</strong> Clean up finished earlier sends before posting new ones.</li>
+  <li><strong>Line 1212.</strong> The metadata (keys, dtypes, shapes, plain values) goes first, pickled on the gloo group by <code>isend_object</code>.</li>
+  <li><strong>Lines 1219-1222.</strong> The all-gather trick: with <code>all_gather_group</code> (the TP group), each TP rank sends only its 1/TP slice; the receiver rebuilds the full tensor with an all-gather.</li>
+  <li><strong>Lines 1224-1229.</strong> Each tensor goes by <code>isend</code> on the device group (CPU tensors on gloo). <code>record_stream</code> keeps the CUDA memory alive until the send finishes.</li>
+  <li><strong>Lines 1240-1243.</strong> The handles are also kept in <code>_pending_isends</code>, so a caller may drop them safely.</li>
+</ol>
+<p>The receiver posts <code>irecv</code> for each tensor and returns post-processing callbacks for the all-gather case (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1285-L1369" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1285-1369 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1285-1369</code></a>). The worker uses exactly this pair with <code>all_gather_group=get_tp_group()</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L1336-L1347" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:1336-1347 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:1336-1347</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L1372-L1378" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:1372-1378 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:1372-1378</code></a>).</p>
+
+<h3 id="init-distributed-environment"><code>init_distributed_environment</code><a class="h-anchor" href="#init-distributed-environment" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1855-L1873" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/distributed/parallel_state.py:1855-1873</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1855-L1873" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1855</span><span class="ln">1856</span><span class="ln hl">1857</span><span class="ln hl">1858</span><span class="ln hl">1859</span><span class="ln hl">1860</span><span class="ln hl">1861</span><span class="ln hl">1862</span><span class="ln hl">1863</span><span class="ln hl">1864</span><span class="ln hl">1865</span><span class="ln">1866</span><span class="ln">1867</span><span class="ln">1868</span><span class="ln hl">1869</span><span class="ln">1870</span><span class="ln hl">1871</span><span class="ln">1872</span><span class="ln">1873</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><pre><code class="language-python">    enable_elastic_ep = config is not None and config.parallel_config.enable_elastic_ep
+    world_pg_store: Store | None = None
+    if (
+        config is not None
+        and config.parallel_config.distributed_executor_backend != &quot;external_launcher&quot;
+        and (
+            config.parallel_config.nnodes &gt; 1
+            or config.parallel_config.data_parallel_size &gt; 1
+        )
+        and not enable_elastic_ep
+    ):
+        parallel_config = config.parallel_config
+        # adjust to take into account data parallelism
+        # offset the rank by the data parallel rank
+        rank = parallel_config.data_parallel_rank * world_size + rank
+        # adjust the world size to take into account data parallelism
+        world_size = parallel_config.world_size_across_dp
+
+        # Use appropriate IP and port based on configuration</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 1857-1865.</strong> The DP/multi-node branch runs only with a config, no external launcher, no elastic EP, and DP &gt; 1 or several nodes. A dense model's engine reset its DP size to 1, so it never enters for DP.</li>
+  <li><strong>Lines 1869-1871.</strong> Shift the rank by <code>dp_rank × world_size</code> and widen the world to all DP ranks.</li>
+</ol>
+<p>Then the default process group starts, with a gloo fallback when the backend is not available (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1927-L1982" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1927-1982 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1927-1982</code></a>), and the world <code>GroupCoordinator</code> is made once. When one DP replica spans several nodes and DP &gt; 1, an extra <code>inner_dp_world</code> group with a broadcaster is made for the executor's cross-node queue; with DP = 1 the name points to the world group (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2022-L2038" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2022-2038 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2022-2038</code></a>).</p>
+
+<h3 id="initialize-model-parallel"><code>initialize_model_parallel</code><a class="h-anchor" href="#initialize-model-parallel" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2148-L2168" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/distributed/parallel_state.py:2148-2168</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2148-L2168" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">2148</span><span class="ln">2149</span><span class="ln">2150</span><span class="ln">2151</span><span class="ln">2152</span><span class="ln">2153</span><span class="ln">2154</span><span class="ln">2155</span><span class="ln">2156</span><span class="ln hl">2157</span><span class="ln hl">2158</span><span class="ln hl">2159</span><span class="ln hl">2160</span><span class="ln hl">2161</span><span class="ln hl">2162</span><span class="ln hl">2163</span><span class="ln">2164</span><span class="ln">2165</span><span class="ln">2166</span><span class="ln">2167</span><span class="ln hl">2168</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><pre><code class="language-python">    # the layout order is: ExternalDP x DP x PP x PCP x TP
+    # ExternalDP is the data parallel group that is not part of the model,
+    # every dp rank can generate independently (in verl integration).
+    # DP is the data parallel group that is part of the model,
+    # all the ranks in the same DP group should generate simultaneously,
+    # i.e. the `generate` call in the same DP group should be called together,
+    # otherwise it will cause deadlock.
+    # to get group_ranks for each dimension, transpose that dimension to the
+    # last dimension, then reshape to 2D, then unbind the last dimension
+    all_ranks = torch.arange(world_size).reshape(
+        -1,
+        data_parallel_size,
+        pipeline_model_parallel_size,
+        prefill_context_model_parallel_size,
+        tensor_model_parallel_size,
+    )  # noqa
+
+    # Build the tensor model-parallel groups.
+    global _TP
+    assert _TP is None, &quot;tensor model parallel group is already initialized&quot;
+    group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)</code></pre></div></div></div></figure>
+<p>Every group comes from this one tensor: TP with <code>view(-1, TP)</code>, PP with <code>transpose(2, 4)</code>, DP with <code>transpose(1, 4)</code>, PCP with <code>transpose(3, 4)</code>, and EP (MoE only) with <code>transpose(1, 2)</code> into rows of DP × PCP × TP (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2256-L2345" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2256-2345 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2256-2345</code></a>). With elastic EP, TP/PP/PCP use a local grid and DP/EP/EPLB become stateless groups (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2122-L2140" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2122-2140 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2122-2140</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2297-L2305" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2297-2305 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2297-2305</code></a>). The function ends with one INFO log line per rank, logged once (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2372-L2385" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2372-2385 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2372-2385</code></a>).</p>
+
+<h3 id="tear-down">Tear-down<a class="h-anchor" href="#tear-down" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2538-L2565" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/distributed/parallel_state.py:2538-2565</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2538-L2565" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">2538</span><span class="ln">2539</span><span class="ln">2540</span><span class="ln">2541</span><span class="ln">2542</span><span class="ln">2543</span><span class="ln hl">2544</span><span class="ln">2545</span><span class="ln">2546</span><span class="ln">2547</span><span class="ln">2548</span><span class="ln">2549</span><span class="ln">2550</span><span class="ln">2551</span><span class="ln">2552</span><span class="ln">2553</span><span class="ln">2554</span><span class="ln">2555</span><span class="ln">2556</span><span class="ln hl">2557</span><span class="ln">2558</span><span class="ln hl">2559</span><span class="ln hl">2560</span><span class="ln">2561</span><span class="ln">2562</span><span class="ln">2563</span><span class="ln">2564</span><span class="ln hl">2565</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><pre><code class="language-python">def cleanup_dist_env_and_memory(shutdown_ray: bool = False):
+    logger.debug(
+        &quot;[shutdown] Distributed: cleanup start shutdown_ray=%s&quot;,
+        shutdown_ray,
+    )
+    # Reset environment variable cache
+    envs.disable_envs_cache()
+
+    # Reset rocm_aiter_ops class variables to match current os.environ.
+    # These are class-level attributes that persist across tests and are
+    # NOT restored by monkeypatch (which only restores os.environ).
+    from vllm.platforms import current_platform
+
+    if current_platform.is_rocm():
+        from vllm._aiter_ops import rocm_aiter_ops
+
+        rocm_aiter_ops.refresh_env_variables()
+
+    # Ensure all objects are not frozen before cleanup
+    gc.unfreeze()
+
+    destroy_model_parallel()
+    destroy_distributed_environment()
+    if shutdown_ray:
+        import ray  # Lazy import Ray
+
+        ray.shutdown()
+    gc.collect()</code></pre></div></div></div></figure>
+<p><code>destroy_model_parallel</code> destroys the groups in the order ETP, TP, Engram DP, DCP, PCP, PP, DP, EP, EPLB (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2480-L2525" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2480-2525 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2480-2525</code></a>). Each <code>GroupCoordinator.destroy</code> first destroys its device communicator, because communicator workspaces may need the groups for their own tear-down (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1400-L1413" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1400-1413 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1400-1413</code></a>).</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="data-flow-types-in-and-out" class="dd-title">Data flow: types in and out</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Value</th><th>Type</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>group_ranks</code></td><td><code>list[list[int]]</code>, global ranks, one list per group</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2168-L2169" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2168-2169 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2168-2169</code></a></td></tr>
+    <tr><td><code>all_ranks</code></td><td><code>torch.Tensor</code> int64, shape <code>(ExternalDP, DP, PP, PCP, TP)</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2157-L2163" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2157-2163 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2157-2163</code></a></td></tr>
+    <tr><td>tensor-dict metadata</td><td><code>list[tuple[str, TensorMetadata | Any]]</code>; <code>TensorMetadata(device, dtype, size)</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L116-L139" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:116-139 at 3e44c0d"><code>vllm/distributed/parallel_state.py:116-139</code></a></td></tr>
+    <tr><td>PP payload for Llama</td><td><code>{"hidden_states": [T, H], "residual": [T, H]}</code>; each TP rank sends <code>T × H / TP</code> elements per tensor when the size divides</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1068-L1080" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1068-1080 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1068-1080</code></a></td></tr>
+    <tr><td><code>all_reduce</code> in/out</td><td>same shape and dtype; out-of-place</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L207-L208" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:207-208 at 3e44c0d"><code>vllm/distributed/parallel_state.py:207-208</code></a></td></tr>
+    <tr><td><code>all_gather(x, dim)</code></td><td>size of <code>dim</code> × world size</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L239-L244" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:239-244 at 3e44c0d"><code>vllm/distributed/parallel_state.py:239-244</code></a></td></tr>
+    <tr><td><code>reduce_scatter(x, dim)</code></td><td>size of <code>dim</code> ÷ world size</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L221-L226" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:221-226 at 3e44c0d"><code>vllm/distributed/parallel_state.py:221-226</code></a></td></tr>
+  </tbody>
+</table></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="processes-threads-and-when-each-part-runs" class="dd-title">Processes, threads and when each part runs</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>When</th><th>Process / thread</th><th>What runs</th></tr></thead>
+  <tbody>
+    <tr><td>module import</td><td>every process that imports <code>vllm.distributed</code></td><td>custom op registration (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L399-L425" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:399-425 at 3e44c0d"><code>vllm/distributed/parallel_state.py:399-425</code></a>)</td></tr>
+    <tr><td><code>init_device</code></td><td>each worker, main thread</td><td>world + model-parallel groups, communicators, broadcasters (all collective)</td></tr>
+    <tr><td>forward pass</td><td>each worker, main thread (and the compiled graph)</td><td>collectives on the TP / PP / EP / DP groups</td></tr>
+    <tr><td>CUDA graph capture</td><td>each worker, capture stream</td><td><code>graph_capture</code> contexts</td></tr>
+    <tr><td>shutdown</td><td>each worker</td><td>destroy groups, then the default PG</td></tr>
+  </tbody>
+</table>
+<p>The engine core of an MoE DP rank has its own DP process group, but it does not come from this file: <code>stateless_init_dp_group</code> builds a gloo group "since the engine process might not have cuda device" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L735-L743" target="_blank" rel="noopener" title="vllm/config/parallel.py:735-743 at 3e44c0d"><code>vllm/config/parallel.py:735-743</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-what-one-tp-2-worker-builds" class="dd-title">Worked example: what one TP = 2 worker builds</h3></summary><div class="dd-body"><p><code>vllm serve meta-llama/Llama-3.1-8B-Instruct -tp 2</code>, worker rank 1 (derived from the code above):</p>
+<ol>
+  <li><code>init_distributed_environment(world_size=2, rank=1, "file:///tmp/vllm_dist_…", local_rank=1, "nccl")</code>: no DP branch; default PG of 2 ranks; <code>_WORLD</code> = ranks [0, 1], no device communicator; <code>_NODE_COUNT</code> = 1.</li>
+  <li><code>all_ranks = arange(2).reshape(1, 1, 1, 1, 2)</code>.</li>
+  <li><code>_TP</code> = [0, 1] (<code>tp:0</code>), with a <code>CudaCommunicator</code> and a 6 × 4 MiB <code>MessageQueue</code>. <code>_ETP</code> is the same object.</li>
+  <li><code>_DCP</code>, <code>_PCP</code>, <code>_PP</code>, <code>_DP</code>: two groups of one rank each ([0] and [1]), so this rank's object has no communicator and no broadcaster.</li>
+  <li><code>_EP</code>, <code>_EPLB</code>: <code>None</code>, because Llama is not an MoE model.</li>
+  <li>The log: "rank 1 in world size 2 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 1, ETP rank 1, EP rank N/A, EPLB rank N/A".</li>
+</ol>
+<p>Every <code>new_group</code> call above makes two PyTorch groups (NCCL and gloo), and each rank takes part in both rows of each size-1 group kind. That is 2 + 2 + 4 × 4 = 20 <code>new_group</code> calls for this worker: world and TP have 1 row each, DCP, PCP, PP and DP have 2 rows each, and each row needs two calls. The communicators then do their own setup (derived from lines 501-518 and the group list).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="error-paths-what-raises-what-only-logs" class="dd-title">Error paths: what raises, what only logs</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>a getter before init (or <code>get_ep_group</code> for a dense model)</td><td><code>AssertionError</code> with a hint</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1659-L1665" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1659-1665 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1659-1665</code></a></td></tr>
+    <tr><td>groups built twice</td><td><code>AssertionError</code> "… group is already initialized"</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2167" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2167 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2167</code></a></td></tr>
+    <tr><td>different sizes on a second <code>ensure_model_parallel_initialized</code></td><td><code>AssertionError</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2412-L2437" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2412-2437 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2412-2437</code></a></td></tr>
+    <tr><td>the backend is not available</td><td>WARNING, falls back to gloo</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1940-L1948" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1940-1948 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1940-1948</code></a></td></tr>
+    <tr><td>collective on a group without communicator (size &gt; 1, CPU platform paths)</td><td><code>ValueError("No device communicator found")</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L748-L751" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:748-751 at 3e44c0d"><code>vllm/distributed/parallel_state.py:748-751</code></a></td></tr>
+    <tr><td>the custom op finds a destroyed group</td><td><code>ValueError("Group … is destroyed.")</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L199-L204" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:199-204 at 3e44c0d"><code>vllm/distributed/parallel_state.py:199-204</code></a></td></tr>
+    <tr><td>node detection cannot open the segment</td><td>ERROR "Error ignored in is_in_the_same_node", rank counted as another node</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2651-L2652" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2651-2652 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2651-2652</code></a></td></tr>
+    <tr><td>elastic EP with TP/PP across nodes</td><td><code>RuntimeError</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1983-L1994" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1983-1994 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1983-1994</code></a></td></tr>
+  </tbody>
+</table></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="environment-variables" class="dd-title">Environment variables</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_DISTRIBUTED_USE_SPLIT_GROUP</code></td><td>0 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L933-L935" target="_blank" rel="noopener" title="vllm/envs.py:933-935 at 3e44c0d"><code>vllm/envs.py:933-935</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L482" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:482 at 3e44c0d"><code>vllm/distributed/parallel_state.py:482</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1954" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1954 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1954</code></a></td><td>Use <code>split_group</code> with an eagerly bound device; the default PG then needs both gloo and NCCL (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1738-L1798" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1738-1798 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1738-1798</code></a>).</td></tr>
+    <tr><td><code>LOCAL_RANK</code></td><td>read only with <code>env://</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2000-L2004" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2000-2004 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2000-2004</code></a></td><td>Local rank when the caller passes −1 (torchrun-style launch).</td></tr>
+    <tr><td><code>VLLM_ELASTIC_EP_SCALE_UP_LAUNCH</code></td><td>0</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2041-L2052" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2041-2052 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2041-2052</code></a></td><td>Defers communicator warm-up when joining a live elastic-EP cluster on ROCm.</td></tr>
+  </tbody>
+</table>
+<p>The variables that pick the all-reduce implementation are read in the device communicators; see <a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a>.</p></div></details>
+
+<h2 id="related-concepts">Related concepts<a class="h-anchor" href="#related-concepts" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a>: the rank layout, the communicator chain and the worked 8-GPU example.</li>
+  <li><a href="../concepts/tp-layers.html">The tensor-parallel layers (linear.py and vocab_parallel_embedding.py)</a>: the layers that call the TP collectives.</li>
+  <li><a href="../concepts/expert-parallel-moe.html">Expert parallelism and MoE serving</a>: the EP group and its all2all managers.</li>
+  <li><a href="../code/distributed-device-communicators-shm-broadcast.html">distributed/device_communicators/shm_broadcast.py: MessageQueue</a>: the <code>MessageQueue</code> behind the broadcasters.</li>
+</ul>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>What does <code>GroupCoordinator.all_reduce</code> do in a group of one rank?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>It returns the input tensor; no kernel runs (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L739-L741" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:739-741 at 3e44c0d"><code>vllm/distributed/parallel_state.py:739-741</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>Why must every rank call <code>torch.distributed.new_group</code> for every row, even rows it does not belong to?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>new_group</code> is a collective call in PyTorch. The constructor loops over all rows of <code>group_ranks</code> and keeps only its own pair (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L501-L518" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:501-518 at 3e44c0d"><code>vllm/distributed/parallel_state.py:501-518</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>A PP stage sends a <code>hidden_states</code> tensor of <code>[2048, 4096]</code> BF16 with TP = 4. How many bytes does each TP rank send for it, and how does the receiver get the full tensor?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The size divides by 4, so each rank sends its 1/4 slice: 2048 × 4096 × 2 / 4 = 4 MiB (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1068-L1080" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1068-1080 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1068-1080</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1219-L1222" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1219-1222 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1219-1222</code></a>). The receiver posts an <code>irecv</code> into its slice and runs an all-gather on the TP group in a post-processing callback (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1332-L1355" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1332-1355 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1332-1355</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>In the TP = 2 example of the deep dive, which groups of worker 1 have a device communicator, and why does the PP group have none?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Only the TP group (and ETP, the same object). The PP, DP, PCP and DCP groups of this rank have one rank each, and the constructor makes a communicator only when <code>world_size &gt; 1</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L549" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:549 at 3e44c0d"><code>vllm/distributed/parallel_state.py:549</code></a>). The world group is built with <code>use_device_communicator=False</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1507-L1516" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1507-1516 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1507-1516</code></a>).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a><span class="rel-sum">Each worker puts all ranks into one grid of shape (DP, PP, PCP, TP) and cuts it into process groups. Each group is a GroupCoordinator with a gloo CPU group, an NCCL device group and, for groups of more than one rank, a device communicator that picks the all-reduce implementation.</span></li><li><a href="../concepts/tp-layers.html">The tensor-parallel layers (linear.py and vocab_parallel_embedding.py)</a><span class="rel-sum">vLLM&#x27;s linear and embedding layers know their tensor-parallel rank. They resolve a quantization method per layer, allocate only their slice, cut checkpoint tensors when they load, and call the all-reduce or all-gather in forward. QKVParallelLinear splits by heads and copies KV heads when TP is larger than their count.</span></li><li><a href="../concepts/expert-parallel-moe.html">Expert parallelism and MoE serving</a><span class="rel-sum">An MoE layer in vLLM is an MoERunner built by FusedMoEFactory. Its kernel has two exchangeable parts - a prepare/finalize object that dispatches and combines tokens, and an experts object that runs the GEMMs. With --enable-expert-parallel the experts are split over all DP x TP ranks; EPLB moves busy experts, DBO overlaps the communication.</span></li><li><a href="../concepts/data-parallel-serving.html">Data parallel serving: several engine cores behind one endpoint</a><span class="rel-sum">With --data-parallel-size N, vllm serve runs N engine cores with their own KV caches. API servers pick an engine for each request with a load score; a DP coordinator publishes the load counts. Dense models run independent engines; MoE models step in lockstep, in waves, with dummy batches.</span></li><li><a href="../code/distributed-device-communicators-shm-broadcast.html">distributed/device_communicators/shm_broadcast.py: MessageQueue</a><span class="rel-sum">vllm/distributed/device_communicators/shm_broadcast.py implements MessageQueue, a one-writer, many-reader queue. Local readers share a lock-free ring of chunks in /dev/shm with one flag byte per reader; large messages and remote readers use ZMQ XPUB sockets. The executor uses it to send every call to its workers, and each worker uses one to reply.</span></li><li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py: the GPU Worker</a><span class="rel-sum">vllm/v1/worker/gpu_worker.py defines Worker, the object that owns one GPU. It sets up the device and NCCL, builds Model Runner V2, profiles memory to size the KV cache, warms up the model, and forwards each step to the model runner.</span></li><li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py: MultiprocExecutor and WorkerProc</a><span class="rel-sum">vllm/v1/executor/multiproc_executor.py starts one worker process per local GPU, broadcasts every call to them through a shared-memory MessageQueue, reads the reply of one output rank, and watches the processes for failures.</span></li><li><a href="../tours/multi-gpu-step.html">Tour: One step across GPUs</a><span class="rel-sum">Follow two requests through vllm serve -tp 2 -dp 2 in 13 stops: the API servers pick an engine each, two independent engine cores schedule, each broadcasts the step to its two workers through shared memory, the workers meet in 65 all-reduces on their TP group, only rank 0 replies, and the coordinator publishes the new load.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../code/envs.html"><span class="pn-dir">← Previous</span><span class="pn-title">envs.py: environment variables as a dict of lambdas</span></a><a class="pn pn-next" href="../code/distributed-device-communicators-shm-broadcast.html"><span class="pn-dir">Next →</span><span class="pn-title">distributed/device_communicators/shm_broadcast.py: MessageQueue</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#purpose">Purpose</a></li><li class="toc-l2"><a href="#where-it-sits">Where it sits</a></li><li class="toc-l3"><a href="#who-calls-it">Who calls it</a></li><li class="toc-l3"><a href="#what-it-calls">What it calls</a></li><li class="toc-l2"><a href="#key-classes-and-functions">Key classes and functions</a></li><li class="toc-l2"><a href="#walk-through-the-main-methods">Walk through the main methods</a></li><li class="toc-l3"><a href="#groupcoordinator-init-two-pytorch-groups-per-row">GroupCoordinator.__init__: two PyTorch groups per row</a></li><li class="toc-l3"><a href="#all-reduce-and-friends">all_reduce and friends</a></li><li class="toc-l3"><a href="#isend-tensor-dict-and-irecv-tensor-dict-the-pp-hand-off">isend_tensor_dict and irecv_tensor_dict: the PP hand-off</a></li><li class="toc-l3"><a href="#init-distributed-environment">init_distributed_environment</a></li><li class="toc-l3"><a href="#initialize-model-parallel">initialize_model_parallel</a></li><li class="toc-l3"><a href="#tear-down">Tear-down</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#data-flow-types-in-and-out">Data flow: types in and out</a></li><li class="toc-l3"><a href="#processes-threads-and-when-each-part-runs">Processes, threads and when each part runs</a></li><li class="toc-l3"><a href="#worked-example-what-one-tp-2-worker-builds">Worked example: what one TP = 2 worker builds</a></li><li class="toc-l3"><a href="#error-paths-what-raises-what-only-logs">Error paths: what raises, what only logs</a></li><li class="toc-l3"><a href="#environment-variables">Environment variables</a></li><li class="toc-l2"><a href="#related-concepts">Related concepts</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

@@ -14,9 +14,11 @@
  *   R3  exactly one active out-of-tree platform wins over built-ins (:272-279)
  *   R4  VLLM_PLUGINS filters general, platform, stat logger, endpoint, IO processor groups (plugins/__init__.py:63-64)
  *   R5  general plugins: once per process, guard plugins_loaded (plugins/__init__.py:82-90)
- *   R6  front end: add_cli_args loads general plugins, then pre_register_and_update(parser) (arg_utils.py:3243, :3257)
+ *   R6  front end: add_cli_args loads general plugins, then pre_register_and_update(parser) (arg_utils.py:3243, :3257);
+ *       4 parser builds: serve, launch render, run-batch (cli/main.py:100-110) + setup_server (startup.py:70-71)
  *   R7  create_engine_config: pre_register_and_update(), validate_environ, VllmConfig.__post_init__ with
- *       apply_config_platform_defaults and check_and_update_config (arg_utils.py:2246-2250; vllm.py:1804, :2046)
+ *       apply_config_platform_defaults and check_and_update_config (arg_utils.py:2246-2250; vllm.py:1804, :2046);
+ *       each engine core runs vllm_config.__post_init__() again after its handshake (core.py:1336-1337)
  *   R8  executor: uni when world size is 1, mp otherwise (parallel.py:1055-1100); CPU platform turns uni into mp
  *       (cpu.py:346-353); CPU turns async scheduling off (cpu.py:343)
  *   R9  worker_cls from check_and_update_config: CUDA gpu_worker.Worker (cuda.py:330-331), CPU CPUWorker (cpu.py:355-356)
@@ -192,7 +194,7 @@
     // API server: CLI start, argument parsing, VllmConfig
     detect(api, "import of arg_utils.py");
     general(api, "add_cli_args", false);
-    add(api, "hook", "pre_register_and_update(parser)", "after the parser has all flags", "R6");
+    add(api, "hook", "pre_register_and_update(parser)", "4 times: once per parser build (3 CLI parsers, then setup_server)", "R6");
     general(api, "EngineArgs.__post_init__", true);
     add(api, "hook", "pre_register_and_update(), validate_environ()", "create_engine_config", "R7");
     add(api, "hook", "apply_config_platform_defaults()", "VllmConfig.__post_init__", "R7");
@@ -214,6 +216,7 @@
     }
     add(core, "hook", "get_kv_cache_config_builder_cls()", "KV cache planning", "R12");
     add(core, "step", "scheduler class -> " + m.sched, "get_scheduler_cls()", "R12 R16");
+    add(core, "hook", "apply_config_platform_defaults(), check_and_update_config()", "again: VllmConfig.__post_init__() after the handshake", "R7");
 
     // API server again: the HTTP app
     if (s.plugins === "unset") skip(api, "vllm.endpoint_plugins", "build_app: " + m.endpoint, "R14");

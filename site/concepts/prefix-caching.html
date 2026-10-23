@@ -1,0 +1,987 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prefix caching in the engine core: hashes, lookup, caching, eviction and KV events · vLLM Explained</title>
+<meta name="description" content="The mechanics of prefix caching in the engine core. The input thread hashes each new request, the scheduler looks the hashes up in the block pool and touches the hits, allocate_slots hashes blocks that become full, and the free queue decides what to evict. KV events tell an external router what each engine holds.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="../assets/viz/viz.css">
+</head>
+<body data-root="../" data-page="concepts/prefix-caching">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a class="current" aria-current="page" href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>vLLM concepts</span><span class="sep">›</span><span>Architecture and engine</span><span class="sep">›</span><span aria-current="page">Prefix caching</span></nav>
+<h1 class="page-title">Prefix caching in the engine core: hashes, lookup, caching, eviction and KV events</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">vLLM concepts</span><span class="meta-time">about 19 min read + 4 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../learn/prefix-caching.html">Prefix caching: the idea</a> <span class="level level-beginner level-sm">Beginner</span></li><li><a href="../concepts/kv-cache-manager.html">The KV cache manager: blocks, the block pool and memory sizing</a> <span class="level level-advanced level-sm">Advanced</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">The engine core names each full block by a chained hash, looks up the hashes of new requests, and evicts cached blocks only for space.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>The page <a href="../learn/prefix-caching.html">Prefix caching: the idea</a> teaches the idea: why chat traffic repeats, the <a class="term" href="../reference/glossary.html#term-hash-chain" data-term="hash chain" data-def="A list of hashes where each hash also includes the hash before it. In prefix caching, the hash of a block names the whole prefix up to the end of that block.">hash chain</a>, the extra keys, two chat turns and the metrics. Read it first. This page shows <em>who</em> does each part in the engine core, <em>when</em>, and with which data. It also covers what the basics page leaves out. That is the hash types, the lookup code and the moment a block gets its hash. It is also the reset route, external hits from a KV connector, and KV events.</p>
+
+<p>Four parts work together, all in the <a class="term" href="../reference/glossary.html#term-engine-core" data-term="EngineCore" data-def="The inner loop of vLLM. It owns the scheduler (which holds the KV cache manager) and the executor, and it runs steps on the workers. vllm serve runs it in its own process.">EngineCore</a> process:</p>
+<ol>
+  <li><strong>The hasher.</strong> When a request arrives, the input thread computes one <a class="term" href="../reference/glossary.html#term-block-hash" data-term="block hash" data-def="The bytes that name one full KV cache block for prefix caching: a hash of the parent block hash, the block&#x27;s token ids and its extra keys. In the map it gets a 4-byte group id.">block hash</a> per full block of its tokens. When the request gets new tokens, the hasher adds the hashes of new full blocks.</li>
+  <li><strong>The lookup.</strong> When the scheduler admits a request, the KV cache manager walks the hashes from block 0 and stops at the first miss. It never looks past <code>num_tokens − 1</code> tokens (<a class="term" href="../reference/glossary.html#term-cache-hit-cap" data-term="cache hit cap" data-def="A prefix-cache hit covers at most num_tokens - 1 tokens, because the model must compute the last prompt token to get its logits. With whole blocks, the last block is often computed again.">cache hit cap</a>).</li>
+  <li><strong>The cache.</strong> When <code>allocate_slots()</code> gives a request its blocks, the blocks that will be full after this step get their hash. From then on, other requests can hit them.</li>
+  <li><strong>The eviction.</strong> A freed block keeps its hash in the <a class="term" href="../reference/glossary.html#term-free-block-queue" data-term="free block queue" data-def="A doubly linked list of all free KV blocks in eviction order. The pool takes new blocks from the front. Freed blocks without a hash go to the front, cached blocks to the end.">free block queue</a>. Normally its hash goes away only when the pool hands the block out again, or when somebody resets the cache. A failed load from a KV connector can also evict hashes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L3515-L3516" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:3515-3516 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:3515-3516</code></a>).</li>
+</ol>
+
+<p><strong>An everyday comparison.</strong> Think of a library that keeps photocopies of book chapters. Each copy has a label that names the book and all earlier chapters. A reader asks for chapters 1 to 5. The desk checks the labels in order and stops at the first chapter that has no copy. Old copies stay on a "free" shelf, and the library recycles the oldest copy only when it needs paper. The comparison stops at the label: vLLM does not compare text. Two blocks match when their hashes are equal, and the hash includes every earlier token.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b3b_prefix_lookup"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: a request with 90 prompt tokens and block size 16 has hashes h0 to h4 for blocks 0 to 4; each hash includes the previous one; block 5 with tokens 80 to 89 is not full and has no hash. The lookup may check at most 89 // 16 = 5 hashes. Panel 2: the hash map returns block 7 for h0 (ref_cnt 1, used by request R1), block 3 for h1 (ref_cnt 0, in the free queue), block 12 for h2 (ref_cnt 0), and nothing for h3, so the walk stops; h4 is not checked. The hit is 3 blocks, 48 tokens; the request computes 42 tokens. Panel 3: the free queue before is 9, 40, 3#, 12#, 21#, 5#. touch removes 3 and 12; get_new_blocks(3) pops 9, 40 and 21 and evicts the old hash of block 21. The block table becomes 7, 3, 12, 9, 40, 21 with ref counts 2, 1, 1, 1, 1, 1; blocks 9 and 40 get hashes h3 and h4, block 21 is not full."><svg role="img" aria-label="Panel 1: a request with 90 prompt tokens and block size 16 has hashes h0 to h4 for blocks 0 to 4; each hash includes the previous one; block 5 with tokens 80 to 89 is not full and has no hash. The lookup may check at most 89 // 16 = 5 hashes. Panel 2: the hash map returns block 7 for h0 (ref_cnt 1, used by request R1), block 3 for h1 (ref_cnt 0, in the free queue), block 12 for h2 (ref_cnt 0), and nothing for h3, so the walk stops; h4 is not checked. The hit is 3 blocks, 48 tokens; the request computes 42 tokens. Panel 3: the free queue before is 9, 40, 3#, 12#, 21#, 5#. touch removes 3 and 12; get_new_blocks(3) pops 9, 40 and 21 and evicts the old hash of block 21. The block table becomes 7, 3, 12, 9, 40, 21 with ref counts 2, 1, 1, 1, 1, 1; blocks 9 and 40 get hashes h3 and h4, block 21 is not full." xmlns="http://www.w3.org/2000/svg" width="1100" height="946" viewBox="0 0 1100 946">
+<defs><marker id="dg-b3b_prefix_lookup-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker></defs>
+<rect width="1100" height="946" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">get_computed_blocks(): walk the hash chain, stop at the first miss</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">One KV cache group (full attention)  ·  block_size 16  ·  a new request with 90 prompt tokens</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">max_cache_hit_length = num_tokens - 1 = 89   ·   hashes checked: at most 89 // 16 = 5</text>
+<rect x="20.0" y="118.0" width="1060.0" height="176.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="144.0" r="13" fill="#111827"/>
+<text x="46.0" y="148.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="149.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Which hashes does the request have?</text>
+<text x="68.0" y="168.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The engine core hashed every full block when the request arrived. The last 10 tokens fill no block: no hash.</text>
+<rect x="46.0" y="188.0" width="152.0" height="74.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="56.0" y="206.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">block 0</text>
+<text x="56.0" y="222.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">tokens 0-15</text>
+<text x="56.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">h0 = H(NONE_HASH,</text>
+<text x="56.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  tokens, keys)</text>
+<line x1="198.0" y1="225.0" x2="214.0" y2="225.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b3b_prefix_lookup-m0)"/>
+<rect x="216.0" y="188.0" width="152.0" height="74.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="226.0" y="206.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">block 1</text>
+<text x="226.0" y="222.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">tokens 16-31</text>
+<text x="226.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">h1 = H(h0, ...)</text>
+<line x1="368.0" y1="225.0" x2="384.0" y2="225.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b3b_prefix_lookup-m0)"/>
+<rect x="386.0" y="188.0" width="152.0" height="74.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="396.0" y="206.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">block 2</text>
+<text x="396.0" y="222.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">tokens 32-47</text>
+<text x="396.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">h2 = H(h1, ...)</text>
+<line x1="538.0" y1="225.0" x2="554.0" y2="225.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b3b_prefix_lookup-m0)"/>
+<rect x="556.0" y="188.0" width="152.0" height="74.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="566.0" y="206.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">block 3</text>
+<text x="566.0" y="222.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">tokens 48-63</text>
+<text x="566.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">h3 = H(h2, ...)</text>
+<line x1="708.0" y1="225.0" x2="724.0" y2="225.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b3b_prefix_lookup-m0)"/>
+<rect x="726.0" y="188.0" width="152.0" height="74.0" rx="6" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="736.0" y="206.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">block 4</text>
+<text x="736.0" y="222.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">tokens 64-79</text>
+<text x="736.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">h4 = H(h3, ...)</text>
+<rect x="896.0" y="188.0" width="152.0" height="74.0" rx="6" fill="#f3f4f6" fill-opacity="1.0" stroke="#6b7280" stroke-width="1.4" stroke-dasharray="4 3"/>
+<text x="906.0" y="206.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">block 5</text>
+<text x="906.0" y="222.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">tokens 80-89</text>
+<text x="906.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">not full</text>
+<text x="906.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">no hash</text>
+<text x="46.0" y="288.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Each arrow carries the parent hash into the next hash, so h4 names all 80 tokens before it, plus the extra keys (LoRA, images, salt).</text>
+<rect x="20.0" y="314.0" width="1060.0" height="214.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="340.0" r="13" fill="#111827"/>
+<text x="46.0" y="344.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="345.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What does the hash map return?</text>
+<text x="68.0" y="364.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">get_cached_block(h, [group 0]) for h0, h1, ... A miss ends the walk: every later hash includes the missed one.</text>
+<rect x="46.0" y="384.0" width="152.0" height="84.0" rx="6" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="56.0" y="403.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">map[h0]</text>
+<text x="188.0" y="403.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#059669" font-weight="bold" text-anchor="end" xml:space="preserve" style="white-space:pre">HIT</text>
+<text x="56.0" y="424.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">block 7</text>
+<text x="56.0" y="441.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ref_cnt 1</text>
+<text x="56.0" y="457.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">(R1 uses it)</text>
+<rect x="216.0" y="384.0" width="152.0" height="84.0" rx="6" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="226.0" y="403.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">map[h1]</text>
+<text x="358.0" y="403.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#059669" font-weight="bold" text-anchor="end" xml:space="preserve" style="white-space:pre">HIT</text>
+<text x="226.0" y="424.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">block 3</text>
+<text x="226.0" y="441.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ref_cnt 0</text>
+<text x="226.0" y="457.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">(in free queue)</text>
+<rect x="386.0" y="384.0" width="152.0" height="84.0" rx="6" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="396.0" y="403.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">map[h2]</text>
+<text x="528.0" y="403.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#059669" font-weight="bold" text-anchor="end" xml:space="preserve" style="white-space:pre">HIT</text>
+<text x="396.0" y="424.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">block 12</text>
+<text x="396.0" y="441.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ref_cnt 0</text>
+<text x="396.0" y="457.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">(in free queue)</text>
+<rect x="556.0" y="384.0" width="152.0" height="84.0" rx="6" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="566.0" y="403.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">map[h3]</text>
+<text x="698.0" y="403.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#d97706" font-weight="bold" text-anchor="end" xml:space="preserve" style="white-space:pre">MISS</text>
+<text x="566.0" y="424.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">no block</text>
+<text x="566.0" y="441.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">stop here</text>
+<rect x="726.0" y="384.0" width="152.0" height="84.0" rx="6" fill="#f3f4f6" fill-opacity="1.0" stroke="#6b7280" stroke-width="1.4"/>
+<text x="736.0" y="403.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">map[h4]</text>
+<text x="868.0" y="403.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="bold" text-anchor="end" xml:space="preserve" style="white-space:pre">-</text>
+<text x="736.0" y="424.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">not checked</text>
+<rect x="896.0" y="384.0" width="152.0" height="84.0" rx="6" fill="#f3f4f6" fill-opacity="1.0" stroke="#6b7280" stroke-width="1.4"/>
+<text x="906.0" y="403.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">block 5</text>
+<text x="1038.0" y="403.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="bold" text-anchor="end" xml:space="preserve" style="white-space:pre">-</text>
+<text x="906.0" y="424.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">no hash</text>
+<rect x="46.0" y="486.0" width="520.0" height="30.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="306.0" y="505.2" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">hit = 3 blocks x 16 = 48 tokens; compute 90 - 48 = 42</text>
+<text x="586.0" y="506.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Admission count: 3 new blocks + 2 free hit blocks = 5 free blocks needed.</text>
+<rect x="20.0" y="548.0" width="1060.0" height="292.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="574.0" r="13" fill="#111827"/>
+<text x="46.0" y="578.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="579.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What does allocate_slots() change?</text>
+<text x="68.0" y="598.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">touch() first takes the hits out of the free queue. Then get_new_blocks() pops new blocks from the front.</text>
+<text x="46.0" y="616.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">free queue (front -&gt; back)</text>
+<text x="46.0" y="645.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">before</text>
+<rect x="158.0" y="624.0" width="58.0" height="30.0" rx="4" fill="#f3f4f6" fill-opacity="1.0" stroke="#6b7280" stroke-width="1.2"/>
+<text x="187.0" y="644.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">9</text>
+<rect x="222.0" y="624.0" width="58.0" height="30.0" rx="4" fill="#f3f4f6" fill-opacity="1.0" stroke="#6b7280" stroke-width="1.2"/>
+<text x="251.0" y="644.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">40</text>
+<rect x="286.0" y="624.0" width="58.0" height="30.0" rx="4" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.2"/>
+<text x="315.0" y="644.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3 #</text>
+<rect x="350.0" y="624.0" width="58.0" height="30.0" rx="4" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.2"/>
+<text x="379.0" y="644.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">12 #</text>
+<rect x="414.0" y="624.0" width="58.0" height="30.0" rx="4" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.2"/>
+<text x="443.0" y="644.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">21 #</text>
+<rect x="478.0" y="624.0" width="58.0" height="30.0" rx="4" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.2"/>
+<text x="507.0" y="644.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">5 #</text>
+<text x="46.0" y="685.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">after touch</text>
+<rect x="158.0" y="664.0" width="58.0" height="30.0" rx="4" fill="#f3f4f6" fill-opacity="1.0" stroke="#6b7280" stroke-width="1.2"/>
+<text x="187.0" y="684.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">9</text>
+<rect x="222.0" y="664.0" width="58.0" height="30.0" rx="4" fill="#f3f4f6" fill-opacity="1.0" stroke="#6b7280" stroke-width="1.2"/>
+<text x="251.0" y="684.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">40</text>
+<rect x="286.0" y="664.0" width="58.0" height="30.0" rx="4" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.2"/>
+<text x="315.0" y="684.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">21 #</text>
+<rect x="350.0" y="664.0" width="58.0" height="30.0" rx="4" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.2"/>
+<text x="379.0" y="684.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">5 #</text>
+<text x="46.0" y="725.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">after pop 3</text>
+<rect x="158.0" y="704.0" width="58.0" height="30.0" rx="4" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.2"/>
+<text x="187.0" y="724.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">5 #</text>
+<text x="46.0" y="758.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">touch(7, 3, 12): ref_cnt 1-&gt;2, 0-&gt;1, 0-&gt;1;</text>
+<text x="46.0" y="774.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#7c3aed" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  blocks 3 and 12 leave the queue (O(1) remove).</text>
+<text x="46.0" y="792.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#db2777" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">get_new_blocks(3) pops 9, 40, 21; block 21 loses</text>
+<text x="46.0" y="808.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#db2777" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  its old hash: that is the eviction.</text>
+<text x="596.0" y="616.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">block table of the new request</text>
+<rect x="596.0" y="624.0" width="68.0" height="76.0" rx="4" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.3"/>
+<text x="630.0" y="644.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">blk 7</text>
+<text x="630.0" y="666.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">h0</text>
+<text x="630.0" y="687.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">ref 2</text>
+<rect x="670.0" y="624.0" width="68.0" height="76.0" rx="4" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.3"/>
+<text x="704.0" y="644.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">blk 3</text>
+<text x="704.0" y="666.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">h1</text>
+<text x="704.0" y="687.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">ref 1</text>
+<rect x="744.0" y="624.0" width="68.0" height="76.0" rx="4" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.3"/>
+<text x="778.0" y="644.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">blk 12</text>
+<text x="778.0" y="666.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">h2</text>
+<text x="778.0" y="687.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">ref 1</text>
+<rect x="818.0" y="624.0" width="68.0" height="76.0" rx="4" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="852.0" y="644.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">blk 9</text>
+<text x="852.0" y="666.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">h3</text>
+<text x="852.0" y="687.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">ref 1</text>
+<rect x="892.0" y="624.0" width="68.0" height="76.0" rx="4" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="926.0" y="644.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">blk 40</text>
+<text x="926.0" y="666.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">h4</text>
+<text x="926.0" y="687.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">ref 1</text>
+<rect x="966.0" y="624.0" width="68.0" height="76.0" rx="4" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.3"/>
+<text x="1000.0" y="644.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">blk 21</text>
+<text x="1000.0" y="666.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">-</text>
+<text x="1000.0" y="687.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">ref 1</text>
+<text x="596.0" y="722.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">cache_full_blocks: 90 // 16 = 5 full blocks.</text>
+<text x="596.0" y="738.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Blocks 9 and 40 get h3 and h4 now, before</text>
+<text x="596.0" y="754.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">the GPU runs the step. Block 21 has 10</text>
+<text x="596.0" y="770.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">tokens: no hash until it is full.</text>
+<text x="30.0" y="873.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="862.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="118.3" y="873.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">prefix-cache hit / cached block</text>
+<rect x="322.2" y="862.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="343.2" y="873.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">new block</text>
+<rect x="424.7" y="862.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="445.7" y="873.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">miss</text>
+<rect x="498.3" y="862.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="519.3" y="873.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">touch</text>
+<rect x="577.1" y="862.0" width="14.0" height="14.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="598.1" y="873.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">eviction</text>
+<text x="30.0" y="898.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre"># = block with a hash. Block ids and the queue are illustrative. With several KV cache groups, the coordinator runs this</text>
+<text x="30.0" y="916.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">walk per group and keeps the shortest common hit (see the hybrid KV cache page).</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the hashes of a new request (1), the walk over the hash map (2), and what <code>allocate_slots()</code> changes in the free queue and the block table (3). Block ids are illustrative.</figcaption><a class="diagram-open" href="../diagrams/b3b_prefix_lookup.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read the panels from top to bottom. Panel 2 is <code>get_computed_blocks()</code>: a miss ends the walk, because every later hash includes the missed one. Panel 3 is the first part of <code>allocate_slots()</code>. <code>touch()</code> runs before <code>get_new_blocks()</code>, so the request cannot pop and evict its own hit blocks.</p>
+
+<figure class="diagram" id="fig-b3b_block_life"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: three boxes. 1. Allocated: get_new_blocks pops the front of the free queue, removes an old hash, sets ref_cnt from 0 to 1. 2. Full, hashed: allocate_slots caches every block that is full after this step, before the step runs; set_block_hash, map insert, BlockStored event. 3. Freed, still cached: the request frees in reverse order; ref_cnt minus 1; at 0 the block goes to the back of the free queue with its hash. A note says that a block that is not full has no hash and goes to the front. Panel 2: three ways out. 4a. Hit again: touch removes it from the queue, ref_cnt 0 to 1, back to state 2. 4b. Evicted: it reaches the front, get_new_blocks pops it, the hash is removed, BlockRemoved event, back to state 1. 4c. Reset: reset_prefix_cache drops all hashes, only when no block is in use, AllBlocksCleared event."><svg role="img" aria-label="Panel 1: three boxes. 1. Allocated: get_new_blocks pops the front of the free queue, removes an old hash, sets ref_cnt from 0 to 1. 2. Full, hashed: allocate_slots caches every block that is full after this step, before the step runs; set_block_hash, map insert, BlockStored event. 3. Freed, still cached: the request frees in reverse order; ref_cnt minus 1; at 0 the block goes to the back of the free queue with its hash. A note says that a block that is not full has no hash and goes to the front. Panel 2: three ways out. 4a. Hit again: touch removes it from the queue, ref_cnt 0 to 1, back to state 2. 4b. Evicted: it reaches the front, get_new_blocks pops it, the hash is removed, BlockRemoved event, back to state 1. 4c. Reset: reset_prefix_cache drops all hashes, only when no block is in use, AllBlocksCleared event." xmlns="http://www.w3.org/2000/svg" width="1100" height="744" viewBox="0 0 1100 744">
+<defs><marker id="dg-b3b_block_life-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b3b_block_life-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker></defs>
+<rect width="1100" height="744" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">The life of one cached block</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">One KV cache group, prefix caching on  ·  ref_cnt = requests that hold the block  ·  # = the block has a hash</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">get_new_blocks -&gt; cache_full_blocks -&gt; free_blocks -&gt; touch (hit) or get_new_blocks (eviction)</text>
+<rect x="20.0" y="118.0" width="1060.0" height="248.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="144.0" r="13" fill="#111827"/>
+<text x="46.0" y="148.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="149.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">From a free block to a cached free block</text>
+<text x="68.0" y="168.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The hash is set when the block becomes full. It stays when the last request lets the block go.</text>
+<rect x="46.0" y="188.0" width="300.0" height="136.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="58.0" y="208.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">1. Allocated</text>
+<text x="58.0" y="226.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">get_new_blocks(): pop the</text>
+<text x="58.0" y="241.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  front of the free queue</text>
+<text x="58.0" y="256.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">old hash? remove it (eviction)</text>
+<text x="58.0" y="271.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ref_cnt 0 -&gt; 1</text>
+<text x="58.0" y="286.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">the request writes tokens into it</text>
+<rect x="400.0" y="188.0" width="300.0" height="136.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="412.0" y="208.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">2. Full: hashed #</text>
+<text x="412.0" y="226.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">allocate_slots() caches every</text>
+<text x="412.0" y="241.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  block that is full after this</text>
+<text x="412.0" y="256.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  step, before the step runs</text>
+<text x="412.0" y="271.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">set_block_hash(hash + group id)</text>
+<text x="412.0" y="286.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">map insert; BlockStored event</text>
+<text x="412.0" y="301.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">other requests can hit it now</text>
+<rect x="754.0" y="188.0" width="300.0" height="136.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="766.0" y="208.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">3. Freed, still cached #</text>
+<text x="766.0" y="226.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">request ends: free in reverse</text>
+<text x="766.0" y="241.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  order, ref_cnt -= 1</text>
+<text x="766.0" y="256.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ref_cnt &gt; 0: another request</text>
+<text x="766.0" y="271.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  holds it, stays out of queue</text>
+<text x="766.0" y="286.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ref_cnt 0: append to the BACK</text>
+<text x="766.0" y="301.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  of the free queue, hash kept</text>
+<line x1="346.0" y1="232.0" x2="398.0" y2="232.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b3b_block_life-m0)"/>
+<line x1="700.0" y1="232.0" x2="752.0" y2="232.0" stroke="#059669" stroke-width="1.6" marker-end="url(#dg-b3b_block_life-m1)"/>
+<text x="46.0" y="350.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">A block that is not full when its request ends has no hash: it goes to the FRONT and is reused first.</text>
+<rect x="20.0" y="388.0" width="1060.0" height="248.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="414.0" r="13" fill="#111827"/>
+<text x="46.0" y="418.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="419.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Two ways out of the free queue</text>
+<text x="68.0" y="438.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">A hit takes the block back into use. Otherwise it drifts to the front and the pool reuses it for other tokens.</text>
+<rect x="46.0" y="458.0" width="300.0" height="136.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="58.0" y="478.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">4a. Hit again</text>
+<text x="58.0" y="496.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">a new request&#x27;s lookup finds</text>
+<text x="58.0" y="511.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  the hash in the map</text>
+<text x="58.0" y="526.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">touch(): remove from the free</text>
+<text x="58.0" y="541.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  queue (O(1)), ref_cnt 0 -&gt; 1</text>
+<text x="58.0" y="556.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">-&gt; back to state 2 (in use,</text>
+<text x="58.0" y="571.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  hash kept, no copy)</text>
+<rect x="400.0" y="458.0" width="300.0" height="136.0" rx="8" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.5"/>
+<text x="412.0" y="478.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#db2777" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">4b. Evicted</text>
+<text x="412.0" y="496.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">it reaches the front and</text>
+<text x="412.0" y="511.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  get_new_blocks() pops it</text>
+<text x="412.0" y="526.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">hash removed from the map,</text>
+<text x="412.0" y="541.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  BlockRemoved event</text>
+<text x="412.0" y="556.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">-&gt; state 1 for another request,</text>
+<text x="412.0" y="571.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  with other tokens</text>
+<rect x="754.0" y="458.0" width="300.0" height="136.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="766.0" y="478.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">4c. Reset</text>
+<text x="766.0" y="496.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">reset_prefix_cache(): drops</text>
+<text x="766.0" y="511.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  every hash at once</text>
+<text x="766.0" y="526.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">only when no block is in use</text>
+<text x="766.0" y="541.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  (else WARNING, False)</text>
+<text x="766.0" y="556.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">AllBlocksCleared event</text>
+<text x="766.0" y="571.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">the dev route can call it</text>
+<text x="46.0" y="620.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">No timer and no size limit: a cached block lives until 4b or 4c (or a failed KV connector load evicts it).</text>
+<text x="30.0" y="671.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="660.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="671.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">in use, not full</text>
+<rect x="226.8" y="660.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="247.8" y="671.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">has a hash</text>
+<rect x="331.9" y="660.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="352.9" y="671.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">hit</text>
+<rect x="395.2" y="660.0" width="14.0" height="14.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="416.2" y="671.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">eviction</text>
+<rect x="487.5" y="660.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="508.5" y="671.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">reset</text>
+<text x="30.0" y="696.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Not shown: with an async KV connector load (delay_cache_blocks), caching waits until the transfer is done. The</text>
+<text x="30.0" y="714.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">AsyncScheduler also caches when the sampled tokens arrive. Events are queued only with KV events on.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the life of one cached block. It enters the map in state 2 and normally leaves it only by eviction (4b) or a reset (4c).</figcaption><a class="diagram-open" href="../diagrams/b3b_block_life.svg" target="_blank">Open full size ↗</a></div></figure>
+
+<figure class="viz" id="viz-prefix-cache-explorer"><div class="viz-head"><span class="viz-badge">Interactive</span><span class="viz-title">Prefix cache explorer</span></div><div class="viz-mount" data-viz="prefix-cache-explorer" role="region" aria-label="Prefix cache explorer"><div class="viz-fallback"><p>This interactive visual needs JavaScript. Turn on JavaScript in your browser to use it. The text on this page explains the same idea.</p></div></div><figcaption class="viz-caption">Edit the prompts, then press <em>Send</em>, <em>+1 token</em> and <em>Finish</em> (Tab, then Enter or Space). <em>Undo</em> and every settings change replay all actions on an empty pool. The hash is a stand-in (FNV-1a, 32 bits), not SHA-256.</figcaption></figure>
+<p>The explorer follows these rules of the real code:</p>
+<ol>
+  <li>Only full blocks get a hash. The hash of block <em>i</em> uses the hash of block <em>i − 1</em>, and block 0 uses <code>NONE_HASH</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L988-L1008" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:988-1008 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:988-1008</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L731-L737" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:731-737 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:731-737</code></a>).</li>
+  <li>The lookup checks at most <code>(num_tokens − 1) // block_size</code> hashes and stops at the first miss (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_manager.py#L295-L300" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_manager.py:295-300 at 3e44c0d"><code>vllm/v1/core/kv_cache_manager.py:295-300</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L791-L799" target="_blank" rel="noopener" title="vllm/v1/core/single_type_kv_cache_manager.py:791-799 at 3e44c0d"><code>vllm/v1/core/single_type_kv_cache_manager.py:791-799</code></a>).</li>
+  <li>A request starts only if its new blocks plus its free hit blocks fit in the free queue (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L256-L266" target="_blank" rel="noopener" title="vllm/v1/core/single_type_kv_cache_manager.py:256-266 at 3e44c0d"><code>vllm/v1/core/single_type_kv_cache_manager.py:256-266</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_manager.py#L575-L579" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_manager.py:575-579 at 3e44c0d"><code>vllm/v1/core/kv_cache_manager.py:575-579</code></a>).</li>
+  <li><code>touch()</code> adds 1 to <code>ref_cnt</code> and takes a free hit block out of the queue (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L761-L768" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:761-768 at 3e44c0d"><code>vllm/v1/core/block_pool.py:761-768</code></a>). Only then does <code>get_new_blocks()</code> pop new blocks from the front and evict their old hashes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L681-L691" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:681-691 at 3e44c0d"><code>vllm/v1/core/block_pool.py:681-691</code></a>).</li>
+  <li>The blocks that are full now get their hash; an equal hash on a second block is kept as a duplicate (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L273-L299" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:273-299 at 3e44c0d"><code>vllm/v1/core/block_pool.py:273-299</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L48-L52" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:48-52 at 3e44c0d"><code>vllm/v1/core/block_pool.py:48-52</code></a>).</li>
+  <li>A finished request frees its blocks in reverse order. At <code>ref_cnt</code> 0, a block without a hash goes to the front, a block with a hash to the back (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L597-L598" target="_blank" rel="noopener" title="vllm/v1/core/single_type_kv_cache_manager.py:597-598 at 3e44c0d"><code>vllm/v1/core/single_type_kv_cache_manager.py:597-598</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L795-L807" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:795-807 at 3e44c0d"><code>vllm/v1/core/block_pool.py:795-807</code></a>).</li>
+  <li>Block 0 is the <a class="term" href="../reference/glossary.html#term-null-block" data-term="null block" data-def="Block 0 of the block pool. It is never given to a request. It fills block table places that hold no data, for example blocks outside a sliding window.">null block</a>; the pool never hands it out (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L184-L188" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:184-188 at 3e44c0d"><code>vllm/v1/core/block_pool.py:184-188</code></a>).</li>
+</ol>
+<aside class="callout callout-simplified"><p class="callout-title">Simplified</p><div class="callout-body"><p>The explorer has no steps, no token budget and no chunked prefill. <em>Send</em> admits the whole prompt at once, and <em>+1 token</em> adds one generated token. The real scheduler computes the KV of a new token in the step after the sampler gives it. When no block is free, it preempts a running request (<a href="../concepts/scheduler.html">The V1 scheduler: one token budget, no phases</a>). The explorer has one KV cache group and no <a class="term" href="../reference/glossary.html#term-extra-keys" data-term="extra keys" data-def="Values besides the token ids that go into a block hash: the LoRA name and path, multimodal item ids, the cache salt (block 0 only) and a hash of prompt embeddings.">extra keys</a>, and its hash is FNV-1a over a text string, not SHA-256 over pickled data.</p></div></aside>
+
+<h2 id="in-the-code">In the code<a class="h-anchor" href="#in-the-code" aria-label="Link to this section">#</a></h2>
+
+<h3 id="step-1-the-hasher-is-made-once-and-runs-when-a-request-arrives">Step 1: the hasher is made once, and runs when a request arrives<a class="h-anchor" href="#step-1-the-hasher-is-made-once-and-runs-when-a-request-arrives" aria-label="Link to this section">#</a></h3>
+<p><code>EngineCore.__init__</code> first resolves the hash granularity, <code>hash_block_size</code>. With one <a class="term" href="../reference/glossary.html#term-kv-cache-group" data-term="KV cache group" data-def="A set of layers that use the same KV cache layout and share one block table, for example all full-attention layers.">KV cache group</a>, it is the block size (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L173-L175" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:173-175 at 3e44c0d"><code>vllm/v1/engine/core.py:173-175</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L840-L858" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:840-858 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:840-858</code></a>). Then it makes the request hasher, but only when prefix caching or a KV connector is on:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L216-L225" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:216-225</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L216-L225" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">216</span><span class="ln hl">217</span><span class="ln">218</span><span class="ln">219</span><span class="ln">220</span><span class="ln hl">221</span><span class="ln">222</span><span class="ln hl">223</span><span class="ln hl">224</span><span class="ln hl">225</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><pre><code class="language-python">        self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
+        if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
+            caching_hash_fn = get_hash_fn_by_name(
+                vllm_config.cache_config.prefix_caching_hash_algo
+            )
+            init_none_hash(caching_hash_fn)
+
+            self.request_block_hasher = get_request_block_hasher(
+                hash_block_size, caching_hash_fn
+            )</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 217.</strong> No prefix caching and no connector: <code>request_block_hasher</code> stays <code>None</code>, and requests get no hashes at all.</li>
+  <li><strong>Lines 218-221.</strong> The hash function comes from <code>--prefix-caching-hash-algo</code>. <code>init_none_hash()</code> sets the module-level <a class="term" href="../reference/glossary.html#term-none-hash" data-term="NONE_HASH" data-def="The value that stands for the parent hash of block 0. vLLM derives it from a seed: PYTHONHASHSEED if set, else a fixed seed for the sha256 algorithms and a random seed for the xxhash algorithms.">NONE_HASH</a> for this process.</li>
+  <li><strong>Lines 223-225.</strong> <code>get_request_block_hasher()</code> returns a closure over the block size and the hash function (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L953-L1012" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:953-1012 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:953-1012</code></a>).</li>
+</ol>
+<p>Each new <code>Request</code> gets this function and calls it in its constructor (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1128" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1128 at 3e44c0d"><code>vllm/v1/engine/core.py:1128</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/request.py#L225-L230" target="_blank" rel="noopener" title="vllm/v1/request.py:225-230 at 3e44c0d"><code>vllm/v1/request.py:225-230</code></a>). In <code>vllm serve</code>, the input thread of the engine core process builds the <code>Request</code> while the main thread runs the model (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1114-L1119" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1114-1119 at 3e44c0d"><code>vllm/v1/engine/core.py:1114-1119</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1990-L1993" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1990-1993 at 3e44c0d"><code>vllm/v1/engine/core.py:1990-1993</code></a>). So the hashing of a long prompt does not delay the current step.</p>
+<p>When the scheduler appends a sampled token, the request runs the hasher again (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2598-L2599" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2598-2599 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2598-2599</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/request.py#L272-L288" target="_blank" rel="noopener" title="vllm/v1/request.py:272-288 at 3e44c0d"><code>vllm/v1/request.py:272-288</code></a>). The hasher starts after the last hash and returns an empty list until a new block is full (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L967-L972" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:967-972 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:967-972</code></a>). So <code>request.block_hashes</code> always covers every full block of the known tokens.</p>
+
+<h3 id="step-2-the-hash-types">Step 2: the hash types<a class="h-anchor" href="#step-2-the-hash-types" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L44-L85" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/kv_cache_utils.py:44-85</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L44-L85" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">44</span><span class="ln">45</span><span class="ln">46</span><span class="ln hl">47</span><span class="ln">48</span><span class="ln">49</span><span class="ln">50</span><span class="ln">51</span><span class="ln hl">52</span><span class="ln">53</span><span class="ln">54</span><span class="ln">55</span><span class="ln">56</span><span class="ln hl">57</span><span class="ln">58</span><span class="ln">59</span><span class="ln">60</span><span class="ln">61</span><span class="ln">62</span><span class="ln">63</span><span class="ln">64</span><span class="ln">65</span><span class="ln">66</span><span class="ln">67</span><span class="ln">68</span><span class="ln hl">69</span><span class="ln">70</span><span class="ln">71</span><span class="ln">72</span><span class="ln">73</span><span class="ln">74</span><span class="ln">75</span><span class="ln">76</span><span class="ln">77</span><span class="ln">78</span><span class="ln">79</span><span class="ln">80</span><span class="ln">81</span><span class="ln">82</span><span class="ln">83</span><span class="ln">84</span><span class="ln hl">85</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(41 * var(--code-lh))"></span><pre><code class="language-python"># BlockHash represents the hash of a single KV-cache block used for
+# prefix caching.  Treating it as a distinct type from `bytes` helps
+# catch accidental misuse when passing around raw byte strings.
+BlockHash = NewType(&quot;BlockHash&quot;, bytes)
+
+# `BlockHashWithGroupId` combines a `BlockHash` with its KV cache group ID.
+# It is represented as raw bytes for compactness and efficiency. The helper
+# functions below pack/unpack the `BlockHash` and group id into/from the key.
+BlockHashWithGroupId = NewType(&quot;BlockHashWithGroupId&quot;, bytes)
+
+# ExternalBlockHash is used for reproducible prefix-cache block hashing.
+# It&#x27;s a union of `bytes` and `int` to keep backward compatibility
+# after we default block hashing to use sha256 bytes.
+ExternalBlockHash: TypeAlias = bytes | int
+
+
+def make_block_hash_with_group_id(
+    block_hash: BlockHash, group_id: int
+) -&gt; BlockHashWithGroupId:
+    &quot;&quot;&quot;Pack a `BlockHash` and group id into a `BlockHashWithGroupId`.
+
+    The group id is encoded using 4 bytes in big-endian order and appended to
+    the block hash bytes.  This representation avoids creating tuples while
+    still allowing us to recover both components when needed.
+    &quot;&quot;&quot;
+    return BlockHashWithGroupId(block_hash + group_id.to_bytes(4, &quot;big&quot;, signed=False))
+
+
+def get_block_hash(key: BlockHashWithGroupId) -&gt; BlockHash:
+    &quot;&quot;&quot;Extract the `BlockHash` from a `BlockHashWithGroupId`.&quot;&quot;&quot;
+    return BlockHash(key[:-4])
+
+
+def get_group_id(key: BlockHashWithGroupId) -&gt; int:
+    &quot;&quot;&quot;Extract the group id from a `BlockHashWithGroupId`.&quot;&quot;&quot;
+    return int.from_bytes(key[-4:], &quot;big&quot;, signed=False)
+
+
+def maybe_convert_block_hash(hash_bytes: BlockHash) -&gt; ExternalBlockHash:
+    if not envs.VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES:
+        return hash_bytes
+    return int.from_bytes(hash_bytes, byteorder=&quot;big&quot;) &amp; ((1 &lt;&lt; 64) - 1)</code></pre></div></div></div></figure>
+<ul>
+  <li><code>BlockHash</code> is the raw digest of one block: 32 bytes for <code>sha256</code>, 16 bytes for the xxHash 128-bit options (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/utils/hashing.py#L41" target="_blank" rel="noopener" title="vllm/utils/hashing.py:41 at 3e44c0d"><code>vllm/utils/hashing.py:41</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/utils/hashing.py#L69" target="_blank" rel="noopener" title="vllm/utils/hashing.py:69 at 3e44c0d"><code>vllm/utils/hashing.py:69</code></a>).</li>
+  <li><code>BlockHashWithGroupId</code> appends the KV cache group id as 4 big-endian bytes. The hash map uses this key, so the same tokens in two groups are two entries (line 69).</li>
+  <li><code>ExternalBlockHash</code> is what KV events publish. By default <code>VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES=1</code> turns the digest into a 64-bit integer: the low 64 bits of the big-endian number (line 85, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L2022-L2024" target="_blank" rel="noopener" title="vllm/envs.py:2022-2024 at 3e44c0d"><code>vllm/envs.py:2022-2024</code></a>).</li>
+</ul>
+
+<h3 id="step-3-the-hash-function-and-none-hash">Step 3: the hash function and NONE_HASH<a class="h-anchor" href="#step-3-the-hash-function-and-none-hash" aria-label="Link to this section">#</a></h3>
+<p>The four names of <code>--prefix-caching-hash-algo</code> and their serialization are in the basics page (<a href="../learn/prefix-caching.html">Prefix caching: the idea</a>, deep dive "The hash chain in the code"). In short: <code>sha256</code> (the default) pickles the tuple <code>(parent, tokens, extra_keys)</code>; the <code>_cbor</code> options use canonical CBOR, so other languages can compute the same hash (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/utils/hashing.py#L26-L81" target="_blank" rel="noopener" title="vllm/utils/hashing.py:26-81 at 3e44c0d"><code>vllm/utils/hashing.py:26-81</code></a>).</p>
+<p>The comment above <code>NONE_HASH</code> gives the reason for the two seeds. A cryptographic hash can use a fixed, public seed, so independent processes compute equal hashes and can share a cache. A non-cryptographic hash keeps a secret random seed, because a known seed would let an attacker build colliding blocks (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L90-L101" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:90-101 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:90-101</code></a>). <code>PYTHONHASHSEED</code> overrides both (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L125-L130" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:125-130 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:125-130</code></a>).</p>
+
+<h3 id="step-4-extra-keys">Step 4: extra keys<a class="h-anchor" href="#step-4-extra-keys" aria-label="Link to this section">#</a></h3>
+<p><code>generate_block_hash_extra_keys()</code> joins four lists in a fixed order: LoRA, multimodal items, cache salt, prompt-embedding digests. Without any key it returns <code>None</code>, so a plain text block hashes <code>(parent, tokens, None)</code>:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L654-L675" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/kv_cache_utils.py:654-675</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L654-L675" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">654</span><span class="ln">655</span><span class="ln">656</span><span class="ln">657</span><span class="ln">658</span><span class="ln hl">659</span><span class="ln hl">660</span><span class="ln hl">661</span><span class="ln hl">662</span><span class="ln hl">663</span><span class="ln">664</span><span class="ln">665</span><span class="ln">666</span><span class="ln">667</span><span class="ln hl">668</span><span class="ln hl">669</span><span class="ln hl">670</span><span class="ln hl">671</span><span class="ln hl">672</span><span class="ln hl">673</span><span class="ln">674</span><span class="ln">675</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><pre><code class="language-python">    mm_extra_keys: list[Any]
+    mm_extra_keys, new_start_mm_idx = _gen_mm_extra_hash_keys(
+        request, start_token_idx, end_token_idx, start_mm_idx
+    )
+    lora_extra_keys = _gen_lora_extra_hash_keys(request)
+    cache_salt_keys: list[tuple[str, str]] = (
+        [(&quot;cache_salt&quot;, request.cache_salt)]
+        if (start_token_idx == 0 and request.cache_salt)
+        else []
+    )
+    prompt_embeds_keys = _gen_prompt_embeds_extra_hash_keys(
+        request, start_token_idx, end_token_idx
+    )
+
+    extra_keys: list[Any] = (
+        lora_extra_keys + mm_extra_keys + cache_salt_keys + prompt_embeds_keys
+    )
+
+    if not extra_keys:
+        return None, new_start_mm_idx
+
+    return tuple(extra_keys), new_start_mm_idx</code></pre></div></div></div></figure>
+<p>The basics page explains each key (<a href="../learn/prefix-caching.html">Prefix caching: the idea</a>, deep dive "Extra keys"). KV events publish the keys without their tags: a bare LoRA name, a bare salt, <code>(identifier, offset)</code> pairs for images (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L678-L704" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:678-704 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:678-704</code></a>).</p>
+
+<h3 id="step-5-the-lookup">Step 5: the lookup<a class="h-anchor" href="#step-5-the-lookup" aria-label="Link to this section">#</a></h3>
+<p>The scheduler asks for the hit only in the waiting pass, and only for a request with <code>num_computed_tokens == 0</code>: a new or a preempted request (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L1016-L1024" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:1016-1024 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:1016-1024</code></a>). <code>KVCacheManager.get_computed_blocks()</code> does the work:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_manager.py#L282-L300" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/kv_cache_manager.py:282-300</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_manager.py#L282-L300" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">282</span><span class="ln">283</span><span class="ln">284</span><span class="ln">285</span><span class="ln hl">286</span><span class="ln hl">287</span><span class="ln">288</span><span class="ln">289</span><span class="ln">290</span><span class="ln">291</span><span class="ln">292</span><span class="ln">293</span><span class="ln">294</span><span class="ln hl">295</span><span class="ln hl">296</span><span class="ln hl">297</span><span class="ln hl">298</span><span class="ln hl">299</span><span class="ln hl">300</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><pre><code class="language-python">        # We skip finding the prefix cache hit when prefix caching is
+        # disabled or the request is marked as skipping kv cache read
+        # (which happens when the request requires prompt logprobs
+        # or calls a pooling model with all pooling).
+        if not self.prefix_cache_lookup_enabled(request):
+            return self.empty_kv_cache_blocks, 0, 0
+
+        # NOTE: When all tokens hit the cache, we must recompute the last token
+        # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
+        # This can trigger recomputation of an entire block, rather than just
+        # the single last token, because allocate_slots() requires
+        # num_computed_tokens to be block-size aligned. Removing this limitation
+        # could slightly improve performance in the future.
+        max_cache_hit_length = request.num_tokens - 1
+        computed_blocks, num_new_computed_tokens, num_uncached = (
+            self.coordinator.find_longest_cache_hit(
+                request.block_hashes, max_cache_hit_length
+            )
+        )</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 286-287.</strong> No lookup when prefix caching is off, or when the request sets <code>skip_reading_prefix_cache</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_manager.py#L249-L251" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_manager.py:249-251 at 3e44c0d"><code>vllm/v1/core/kv_cache_manager.py:249-251</code></a>). Sampling parameters set it for prompt logprobs; pooling parameters can set it too (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/sampling_params.py#L625-L632" target="_blank" rel="noopener" title="vllm/sampling_params.py:625-632 at 3e44c0d"><code>vllm/sampling_params.py:625-632</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/request.py#L314-L325" target="_blank" rel="noopener" title="vllm/v1/request.py:314-325 at 3e44c0d"><code>vllm/v1/request.py:314-325</code></a>).</li>
+  <li><strong>Line 295.</strong> The <a class="term" href="../reference/glossary.html#term-cache-hit-cap" data-term="cache hit cap" data-def="A prefix-cache hit covers at most num_tokens - 1 tokens, because the model must compute the last prompt token to get its logits. With whole blocks, the last block is often computed again.">cache hit cap</a>: the last token must be computed, so it gives logits.</li>
+  <li><strong>Lines 296-300.</strong> The coordinator finds the hit. With one group, <code>UnitaryKVCacheCoordinator</code> calls the manager of that group directly (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_coordinator.py#L574-L591" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_coordinator.py:574-591 at 3e44c0d"><code>vllm/v1/core/kv_cache_coordinator.py:574-591</code></a>).</li>
+</ol>
+<p>For full attention, the walk is short:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L788-L799" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/single_type_kv_cache_manager.py:788-799</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L788-L799" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">788</span><span class="ln">789</span><span class="ln">790</span><span class="ln">791</span><span class="ln">792</span><span class="ln hl">793</span><span class="ln hl">794</span><span class="ln hl">795</span><span class="ln hl">796</span><span class="ln">797</span><span class="ln">798</span><span class="ln">799</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><pre><code class="language-python">        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            [] for _ in range(len(kv_cache_group_ids))
+        )
+        # Phase 1: longest run of cached full blocks from the start. A missing
+        # block implies every later block misses too (chained hashes).
+        for block_hash in itertools.islice(full_block_hashes, max_length // block_size):
+            cached_block = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
+            if not cached_block:
+                break
+            for computed, cached in zip(computed_blocks, cached_block):
+                computed.append(cached)
+        hit_length = len(computed_blocks[0]) * block_size</code></pre></div></div></div></figure>
+<p>Line 793 checks only <code>max_length // block_size</code> hashes. Line 794 asks the pool for a block per group. <code>get_cached_block()</code> builds the key from the hash and the group id. It returns the first block with that key, or <code>None</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L198-L224" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:198-224 at 3e44c0d"><code>vllm/v1/core/block_pool.py:198-224</code></a>). A model with several groups needs one hit length that is valid for every group; <a href="../concepts/hybrid-kv-cache.html">The hybrid KV cache: specs, groups and one manager per layer type</a> explains that search.</p>
+
+<h3 id="step-6-adopting-the-hit">Step 6: adopting the hit<a class="h-anchor" href="#step-6-adopting-the-hit" aria-label="Link to this section">#</a></h3>
+<p>The scheduler passes the hit blocks to <code>allocate_slots()</code>. The count check includes free hit blocks, because <code>touch()</code> will take them out of the free queue (<a href="../concepts/kv-cache-manager.html">The KV cache manager: blocks, the block pool and memory sizing</a>, Step 3). If the blocks fit, <code>allocate_slots()</code> adds the hit blocks first and allocates the new blocks after that (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_manager.py#L581-L600" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_manager.py:581-600 at 3e44c0d"><code>vllm/v1/core/kv_cache_manager.py:581-600</code></a>). The coordinator adds the hits in two phases. First it touches the hit blocks of every group, then it allocates blocks for external tokens of a KV connector. The comment names the bug that this order prevents:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_coordinator.py#L291-L301" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/kv_cache_coordinator.py:291-301</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_coordinator.py#L291-L301" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">291</span><span class="ln">292</span><span class="ln">293</span><span class="ln">294</span><span class="ln">295</span><span class="ln">296</span><span class="ln">297</span><span class="ln">298</span><span class="ln">299</span><span class="ln">300</span><span class="ln">301</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">        # Two-phase allocation (issue #33775): first touch every group&#x27;s local
+        # cache-hit blocks, then allocate external blocks for every group. This
+        # ensures an earlier group&#x27;s external `get_new_blocks` cannot evict a
+        # later group&#x27;s not-yet-touched cache-hit blocks.
+        for i, manager in enumerate(self.single_type_managers):
+            manager.add_local_computed_blocks(
+                request_id,
+                new_computed_blocks[i],
+                num_local_computed_tokens,
+                num_external_computed_tokens,
+            )</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L303-L318" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/single_type_kv_cache_manager.py:303-318</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L303-L318" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">303</span><span class="ln">304</span><span class="ln hl">305</span><span class="ln">306</span><span class="ln">307</span><span class="ln">308</span><span class="ln">309</span><span class="ln">310</span><span class="ln">311</span><span class="ln hl">312</span><span class="ln">313</span><span class="ln hl">314</span><span class="ln">315</span><span class="ln">316</span><span class="ln">317</span><span class="ln hl">318</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><pre><code class="language-python">        # Touch the computed blocks to make sure they won&#x27;t be evicted.
+        if self.enable_caching:
+            self.block_pool.touch(new_computed_blocks)
+        else:
+            assert not any(new_computed_blocks), (
+                &quot;Computed blocks should be empty when prefix caching is disabled&quot;
+            )
+
+        # Skip blocks are padded with null blocks.
+        req_blocks.extend([self._null_block] * num_skipped_blocks)
+        # Add the remaining computed blocks.
+        req_blocks.extend(new_computed_blocks)
+        # All cached hits (including skipped nulls) are already cached; mark
+        # them so cache_blocks() will not try to re-cache blocks that already
+        # have a block_hash set.
+        self.num_cached_block[request_id] = len(req_blocks)</code></pre></div></div></div></figure>
+<p>Line 305 is the <a class="term" href="../reference/glossary.html#term-touch" data-term="touch" data-def="BlockPool.touch(): add 1 to the ref_cnt of a prefix-cache hit block. A block with ref_cnt 0 first leaves the free block queue, so it cannot be evicted.">touch</a>. Line 318 records that the hit blocks are already cached, so the caching step does not hash them again. Line 312 puts null blocks where a sliding window has skipped blocks (see <a href="../concepts/hybrid-kv-cache.html">The hybrid KV cache: specs, groups and one manager per layer type</a>).</p>
+
+<h3 id="step-7-caching-blocks-that-become-full">Step 7: caching blocks that become full<a class="h-anchor" href="#step-7-caching-blocks-that-become-full" aria-label="Link to this section">#</a></h3>
+<p>At the end of <code>allocate_slots()</code>, the manager hashes every block that will be full after this step:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_manager.py#L602-L616" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/kv_cache_manager.py:602-616</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_manager.py#L602-L616" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">602</span><span class="ln">603</span><span class="ln hl">604</span><span class="ln hl">605</span><span class="ln">606</span><span class="ln">607</span><span class="ln">608</span><span class="ln">609</span><span class="ln">610</span><span class="ln">611</span><span class="ln hl">612</span><span class="ln hl">613</span><span class="ln hl">614</span><span class="ln hl">615</span><span class="ln hl">616</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><pre><code class="language-python">        # P/D: delay caching blocks if we have to recv from
+        # remote. Update state for locally cached blocks.
+        if delay_cache_blocks:
+            return self.create_kv_cache_blocks(new_blocks)
+
+        # NOTE(woosuk): We want to commit (cache) up to num_local_computed_tokens
+        # + num_external_computed_tokens + num_new_tokens, but must exclude
+        # &quot;non-committable&quot; tokens (e.g., draft tokens that could be rejected).
+        # Therefore, we cap the number at `request.num_tokens`, ensuring only
+        # &quot;finalized&quot; tokens are cached.
+        num_tokens_to_cache = min(
+            total_computed_tokens + num_new_tokens,
+            request.num_tokens,
+        )
+        self.coordinator.cache_blocks(request, num_tokens_to_cache)</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 604-605.</strong> With an asynchronous load from a KV connector, the data is not there yet, so caching waits. The scheduler caches these blocks when the transfer is done (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L3254-L3257" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:3254-3257 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:3254-3257</code></a>).</li>
+  <li><strong>Lines 612-616.</strong> Otherwise it caches up to <code>computed + new</code> tokens, but not past <code>request.num_tokens</code>. So draft tokens never get a hash. The hash is set when the step is <em>scheduled</em>, before the GPU computes the KV values.</li>
+</ol>
+<p>The default <code>AsyncScheduler</code> plans the next step before the sampled token is known. That token is a placeholder and not part of <code>num_tokens</code> yet, so a block that it fills is not hashed at that allocation. The block gets its hash in a later <code>allocate_slots()</code>, after the token arrives. When tokens arrive, the async scheduler also caches up to <code>num_computed_tokens − num_output_placeholders</code> tokens (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/async_scheduler.py#L75-L79" target="_blank" rel="noopener" title="vllm/v1/core/sched/async_scheduler.py:75-79 at 3e44c0d"><code>vllm/v1/core/sched/async_scheduler.py:75-79</code></a>).</p>
+<p>The single-type manager skips the blocks that already have a hash. Then it calls the pool for the new full blocks only (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L531-L541" target="_blank" rel="noopener" title="vllm/v1/core/single_type_kv_cache_manager.py:531-541 at 3e44c0d"><code>vllm/v1/core/single_type_kv_cache_manager.py:531-541</code></a>):</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L499-L505" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/single_type_kv_cache_manager.py:499-505</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L499-L505" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">499</span><span class="ln">500</span><span class="ln">501</span><span class="ln">502</span><span class="ln">503</span><span class="ln">504</span><span class="ln">505</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">        if not self.kv_cache_spec.prefix_cacheable:
+            return
+        num_cached_blocks = self.num_cached_block.get(request.request_id, 0)
+        num_full_blocks = num_tokens // self.block_size
+
+        if num_cached_blocks &gt;= num_full_blocks:
+            return</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L273-L299" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/block_pool.py:273-299</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L273-L299" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">273</span><span class="ln">274</span><span class="ln">275</span><span class="ln">276</span><span class="ln hl">277</span><span class="ln hl">278</span><span class="ln">279</span><span class="ln">280</span><span class="ln">281</span><span class="ln">282</span><span class="ln hl">283</span><span class="ln hl">284</span><span class="ln hl">285</span><span class="ln">286</span><span class="ln">287</span><span class="ln">288</span><span class="ln">289</span><span class="ln">290</span><span class="ln">291</span><span class="ln">292</span><span class="ln">293</span><span class="ln">294</span><span class="ln hl">295</span><span class="ln hl">296</span><span class="ln hl">297</span><span class="ln hl">298</span><span class="ln hl">299</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><pre><code class="language-python">        for i, blk in enumerate(new_full_blocks):
+            # Some blocks may be null or masked out when enabling sparse attention
+            # like sliding window attention, or Mamba models with prefix-caching
+            # in align mode. We skip null blocks here.
+            if blk.is_null or (block_mask is not None and not block_mask[i]):
+                continue
+            block_hash = new_block_hashes[i]
+            num_hash_tokens = (num_cached_blocks + i + 1) * block_size
+
+            # Update and added the full block to the cache.
+            block_hash_with_group_id = make_block_hash_with_group_id(
+                block_hash, kv_cache_group_id
+            )
+            if blk.block_hash is not None:
+                # The only valid case where a &quot;new full block&quot; already has a
+                # hash is partial-&gt;full promotion of the same cache block.
+                assert (
+                    blk.block_hash_num_tokens is not None
+                    and blk.block_hash_num_tokens &lt; num_hash_tokens
+                )
+                removed_hashes = self._remove_cached_block_hashes(blk)
+                self._emit_block_removed_events(removed_hashes)
+            self._insert_block_hash(
+                block_hash_with_group_id,
+                blk,
+                num_tokens=num_hash_tokens,
+            )</code></pre></div></div></div></figure>
+<p>Lines 277-278 skip null blocks and blocks that a mask leaves out (sliding-window and Mamba groups). Lines 295-299 set the hash on the block and insert it into the map. The map does not remove duplicates: two blocks with the same hash both stay, so the block ids in running block tables never change (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L48-L52" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:48-52 at 3e44c0d"><code>vllm/v1/core/block_pool.py:48-52</code></a>).</p>
+
+<h3 id="step-8-free-eviction-and-reset">Step 8: free, eviction and reset<a class="h-anchor" href="#step-8-free-eviction-and-reset" aria-label="Link to this section">#</a></h3>
+<p><a href="../concepts/kv-cache-manager.html">The KV cache manager: blocks, the block pool and memory sizing</a> (Step 5) and the basics deep dive "Free blocks, LRU order and eviction" explain the free order and the eviction. In short, a request frees its blocks in reverse order. At <code>ref_cnt</code> 0, an unhashed block goes to the front and a hashed block to the back (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L795-L807" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:795-807 at 3e44c0d"><code>vllm/v1/core/block_pool.py:795-807</code></a>). <code>get_new_blocks()</code> pops the front and evicts the old hash (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L729-L750" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:729-750 at 3e44c0d"><code>vllm/v1/core/block_pool.py:729-750</code></a>).</p>
+<p>A reset drops every hash at once. The API server has the route only in dev mode (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/launchers/api_server/routers.py#L46-L49" target="_blank" rel="noopener" title="vllm/entrypoints/launchers/api_server/routers.py:46-49 at 3e44c0d"><code>vllm/entrypoints/launchers/api_server/routers.py:46-49</code></a>):</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/dev/cache/api_router.py#L20-L44" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/entrypoints/serve/dev/cache/api_router.py:20-44</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/dev/cache/api_router.py#L20-L44" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">20</span><span class="ln">21</span><span class="ln">22</span><span class="ln hl">23</span><span class="ln hl">24</span><span class="ln">25</span><span class="ln">26</span><span class="ln">27</span><span class="ln">28</span><span class="ln">29</span><span class="ln">30</span><span class="ln">31</span><span class="ln">32</span><span class="ln">33</span><span class="ln">34</span><span class="ln">35</span><span class="ln">36</span><span class="ln">37</span><span class="ln">38</span><span class="ln">39</span><span class="ln">40</span><span class="ln hl">41</span><span class="ln hl">42</span><span class="ln hl">43</span><span class="ln">44</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><pre><code class="language-python">@router.post(&quot;/reset_prefix_cache&quot;)
+async def reset_prefix_cache(
+    raw_request: Request,
+    reset_running_requests: bool = Query(default=False),
+    reset_external: bool = Query(default=False),
+):
+    &quot;&quot;&quot;Reset the local prefix cache.
+
+    Optionally, if the query parameter `reset_external=true`
+    also resets the external (connector-managed) prefix cache.
+
+    Returns `{&quot;success&quot;: bool}`. The reset fails (`success=false`) while
+    blocks are still held, e.g. by running requests or in-flight async KV
+    offload transfers; callers may retry.
+
+    Example:
+       POST /reset_prefix_cache?reset_external=true
+
+    &quot;&quot;&quot;
+    logger.info(&quot;Resetting prefix cache...&quot;)
+
+    success = await engine_client(raw_request).reset_prefix_cache(
+        reset_running_requests, reset_external
+    )
+    return JSONResponse(content={&quot;success&quot;: bool(success)})</code></pre></div></div></div></figure>
+<p><code>Scheduler.reset_prefix_cache()</code> can first preempt every running request (<code>reset_running_requests=true</code>), so that all blocks are free. Without it, the reset fails while any block is in use (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2950-L2975" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2950-2975 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2950-2975</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L841-L848" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:841-848 at 3e44c0d"><code>vllm/v1/core/block_pool.py:841-848</code></a>). <code>reset_external=true</code> also resets the cache of the KV connector (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2977-L2978" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2977-2978 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2977-2978</code></a>). The docstring of the pool names two uses: RLHF after a weight update, and benchmarks (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L831-L835" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:831-835 at 3e44c0d"><code>vllm/v1/core/block_pool.py:831-835</code></a>).</p>
+
+<h3 id="step-9-external-hits-from-a-kv-connector">Step 9: external hits from a KV connector<a class="h-anchor" href="#step-9-external-hits-from-a-kv-connector" aria-label="Link to this section">#</a></h3>
+<p>A <a href="../concepts/kv-connectors.html">KV connector</a> can hold KV blocks outside this engine: in CPU memory, on disk, or in another vLLM instance. After the local lookup, the scheduler asks the connector how many tokens <em>after</em> the local hit it can load (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L1026-L1039" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:1026-1039 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:1026-1039</code></a>). A request that skips the prefix cache gets 0 external tokens too (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L1040-L1041" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:1040-1041 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:1040-1041</code></a>). The external tokens are added to the computed tokens, and an asynchronous load puts the request into <code>WAITING_FOR_REMOTE_KVS</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L1101-L1104" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:1101-1104 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:1101-1104</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L1384-L1393" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:1384-1393 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:1384-1393</code></a>). The connector uses the same block hashes, which is one reason why the hasher also runs when only a connector is on (Step 1).</p>
+
+<h3 id="step-10-kv-events">Step 10: KV events<a class="h-anchor" href="#step-10-kv-events" aria-label="Link to this section">#</a></h3>
+<p>With <a class="term" href="../reference/glossary.html#term-kv-events" data-term="KV events" data-def="Messages that an engine core publishes when its prefix cache changes: BlockStored, BlockRemoved and AllBlocksCleared. An external router can subscribe over ZMQ to know which prefixes each engine holds.">KV events</a> on, the pool queues an event for each change of the prefix cache. Turn them on with <code>--kv-events-config</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L1873" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:1873 at 3e44c0d"><code>vllm/engine/arg_utils.py:1873</code></a>):</p>
+<pre><code class="language-bash">vllm serve Qwen/Qwen3-0.6B \
+  --kv-events-config '{"enable_kv_cache_events": true, "publisher": "zmq", "topic": "kv-events"}'</code></pre>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/kv_events.py#L10-L52" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/config/kv_events.py:10-52</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/kv_events.py#L10-L52" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">10</span><span class="ln">11</span><span class="ln">12</span><span class="ln">13</span><span class="ln hl">14</span><span class="ln">15</span><span class="ln">16</span><span class="ln">17</span><span class="ln">18</span><span class="ln hl">19</span><span class="ln">20</span><span class="ln">21</span><span class="ln">22</span><span class="ln hl">23</span><span class="ln">24</span><span class="ln">25</span><span class="ln">26</span><span class="ln hl">27</span><span class="ln">28</span><span class="ln">29</span><span class="ln">30</span><span class="ln hl">31</span><span class="ln">32</span><span class="ln">33</span><span class="ln">34</span><span class="ln">35</span><span class="ln hl">36</span><span class="ln">37</span><span class="ln">38</span><span class="ln">39</span><span class="ln">40</span><span class="ln">41</span><span class="ln">42</span><span class="ln">43</span><span class="ln">44</span><span class="ln hl">45</span><span class="ln">46</span><span class="ln">47</span><span class="ln">48</span><span class="ln">49</span><span class="ln">50</span><span class="ln hl">51</span><span class="ln hl">52</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(41 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(42 * var(--code-lh))"></span><pre><code class="language-python">@config
+class KVEventsConfig:
+    &quot;&quot;&quot;Configuration for KV event publishing.&quot;&quot;&quot;
+
+    enable_kv_cache_events: bool = False
+    &quot;&quot;&quot;If True, enable KV cache events for tracking block storage and removal.
+    Events can be published externally by zmq using the event publisher config.
+    &quot;&quot;&quot;
+
+    publisher: Literal[&quot;null&quot;, &quot;zmq&quot;] = None  # type: ignore[assignment]
+    &quot;&quot;&quot;The publisher to use for publishing kv events. Can be &quot;null&quot;, &quot;zmq&quot;.
+    &quot;&quot;&quot;
+
+    endpoint: str = &quot;tcp://*:5557&quot;
+    &quot;&quot;&quot;The zmq endpoint to use for publishing kv events.
+    &quot;&quot;&quot;
+
+    replay_endpoint: str | None = None
+    &quot;&quot;&quot;The zmq endpoint to use for replaying kv events.
+    &quot;&quot;&quot;
+
+    buffer_steps: int = 10_000
+    &quot;&quot;&quot;The number of steps to cache for replay endpoint. Will only save
+    events from the last N steps for the replay endpoint.
+    &quot;&quot;&quot;
+
+    hwm: int = 100_000
+    &quot;&quot;&quot;The zmq high water mark for the event publisher. After queueing N events,
+    events will start dropping if the consumer is not keeping up.
+    &quot;&quot;&quot;
+
+    max_queue_size: int = 100_000
+    &quot;&quot;&quot;The maximum number of events to queue while waiting for publishing.
+    &quot;&quot;&quot;
+
+    topic: str = &quot;&quot;
+    &quot;&quot;&quot;The topic to use for the event publisher. Consumers can subscribe to
+    this topic to receive events.
+    &quot;&quot;&quot;
+
+    def __post_init__(self):
+        if self.publisher is None:
+            self.publisher = &quot;zmq&quot; if self.enable_kv_cache_events else &quot;null&quot;</code></pre></div></div></div></figure>
+<p>Three event types exist (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_events.py#L56-L142" target="_blank" rel="noopener" title="vllm/distributed/kv_events.py:56-142 at 3e44c0d"><code>vllm/distributed/kv_events.py:56-142</code></a>):</p>
+<table>
+  <thead><tr><th>Event</th><th>When</th><th>Main fields</th></tr></thead>
+  <tbody>
+    <tr><td><code>BlockStored</code></td><td>blocks get hashes in <code>cache_full_blocks()</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L303-L344" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:303-344 at 3e44c0d"><code>vllm/v1/core/block_pool.py:303-344</code></a>)</td><td><code>block_hashes</code>, <code>parent_block_hash</code>, <code>token_ids</code>, <code>block_size</code>, <code>lora_name</code>, <code>extra_keys</code>, <code>group_idx</code>, <code>medium</code> ("GPU"), spec kind and sliding window</td></tr>
+    <tr><td><code>BlockRemoved</code></td><td>a hash leaves the map: eviction (also after a failed connector load) or a partial-to-full change (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L611-L624" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:611-624 at 3e44c0d"><code>vllm/v1/core/block_pool.py:611-624</code></a>)</td><td><code>block_hashes</code>, <code>medium</code>, <code>group_idx</code></td></tr>
+    <tr><td><code>AllBlocksCleared</code></td><td>a successful reset (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L867-L868" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:867-868 at 3e44c0d"><code>vllm/v1/core/block_pool.py:867-868</code></a>)</td><td>none</td></tr>
+  </tbody>
+</table>
+<p>The KV cache manager adds the spec kind and the window size of the group to each <code>BlockStored</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_manager.py#L703-L720" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_manager.py:703-720 at 3e44c0d"><code>vllm/v1/core/kv_cache_manager.py:703-720</code></a>). At the end of <code>update_from_output()</code>, the scheduler takes the events of the pool and of the connector, and publishes one <code>KVEventBatch</code> per step (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2469-L2484" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2469-2484 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2469-2484</code></a>). The ZMQ publisher runs its own thread. It sends three frames per batch: the topic, an 8-byte sequence number and the msgpack payload (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_events.py#L472-L507" target="_blank" rel="noopener" title="vllm/distributed/kv_events.py:472-507 at 3e44c0d"><code>vllm/distributed/kv_events.py:472-507</code></a>). With <code>replay_endpoint</code>, a subscriber that missed a sequence number can ask for the batches from that number on. The publisher keeps the last <code>buffer_steps</code> batches for this (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_events.py#L306-L329" target="_blank" rel="noopener" title="vllm/distributed/kv_events.py:306-329 at 3e44c0d"><code>vllm/distributed/kv_events.py:306-329</code></a>). Each data-parallel rank adds its rank to the port (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_events.py#L530-L563" target="_blank" rel="noopener" title="vllm/distributed/kv_events.py:530-563 at 3e44c0d"><code>vllm/distributed/kv_events.py:530-563</code></a>).</p>
+<p><strong>What an external router can do with them.</strong> A router in front of several vLLM instances can subscribe to every instance. From <code>BlockStored</code> and <code>BlockRemoved</code> it keeps, per instance, the set of block hashes that the instance holds. For a new request, the router tokenizes the prompt and computes the same hash chain. Then it sends the request to the instance with the longest run of known hashes.</p>
+<p>This works only when the router computes the same digests: the same block size, algorithm, extra keys and <code>NONE_HASH</code> seed. By default, the events carry only the low 64 bits of each digest as an integer. The router must convert its digests the same way (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L82-L85" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:82-85 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:82-85</code></a>). The default <code>sha256</code> with its fixed seed allows it; xxhash without <code>PYTHONHASHSEED</code> does not (Step 3). <code>sha256</code> hashes a Python pickle, so a router in another language needs <code>sha256_cbor</code>. The repository has a small subscriber that prints the events (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/examples/features/kv_events/kv_events_subscriber.py#L72-L120" target="_blank" rel="noopener" title="examples/features/kv_events/kv_events_subscriber.py:72-120 at 3e44c0d"><code>examples/features/kv_events/kv_events_subscriber.py:72-120</code></a>).</p>
+<aside class="callout callout-note"><p class="callout-title">Report mode &quot;full&quot;</p><div class="callout-body"><p>By default, a prefix-cache hit emits no event, because the blocks are already known. A request can set <code>kv_cache_report_mode</code> to <code>"full"</code> in the extra arguments of its sampling parameters. Then a hit re-emits <code>BlockStored</code> for the reused blocks, so a gateway also learns about them (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/request.py#L126-L130" target="_blank" rel="noopener" title="vllm/v1/request.py:126-130 at 3e44c0d"><code>vllm/v1/request.py:126-130</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_manager.py#L302-L310" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_manager.py:302-310 at 3e44c0d"><code>vllm/v1/core/kv_cache_manager.py:302-310</code></a>).</p></div></aside>
+
+<h3 id="step-11-the-metrics">Step 11: the metrics<a class="h-anchor" href="#step-11-the-metrics" aria-label="Link to this section">#</a></h3>
+<p><code>vllm:prefix_cache_queries</code> and <code>vllm:prefix_cache_hits</code> count tokens; the basics page shows the PromQL (<a href="../learn/prefix-caching.html">Prefix caching: the idea</a>). Three details are new here:</p>
+<ul>
+  <li>The scheduler records a lookup only when the request is admitted (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L1378-L1382" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:1378-1382 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:1378-1382</code></a>). A lookup for a request that waits is not counted.</li>
+  <li>A request that was preempted before is counted in separate <code>preempted_*</code> fields, not in <code>queries</code> and <code>hits</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/metrics/stats.py#L138-L155" target="_blank" rel="noopener" title="vllm/v1/metrics/stats.py:138-155 at 3e44c0d"><code>vllm/v1/metrics/stats.py:138-155</code></a>). No logger exports these fields, so the Prometheus counters show only first admissions.</li>
+  <li>The log line "Prefix cache hit rate" is a moving value over about the last 1,000 requests, not a total (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/metrics/stats.py#L39-L57" target="_blank" rel="noopener" title="vllm/v1/metrics/stats.py:39-57 at 3e44c0d"><code>vllm/v1/metrics/stats.py:39-57</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/metrics/loggers.py#L321-L323" target="_blank" rel="noopener" title="vllm/v1/metrics/loggers.py:321-323 at 3e44c0d"><code>vllm/v1/metrics/loggers.py:321-323</code></a>).</li>
+</ul>
+<p>With a KV connector, <code>vllm:external_prefix_cache_queries</code> and <code>vllm:external_prefix_cache_hits</code> count the external lookup (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/metrics/loggers.py#L685-L707" target="_blank" rel="noopener" title="vllm/v1/metrics/loggers.py:685-707 at 3e44c0d"><code>vllm/v1/metrics/loggers.py:685-707</code></a>). Its queries are the tokens after the local hit (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L1096-L1099" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:1096-1099 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:1096-1099</code></a>). <code>vllm:prompt_tokens_cached_by_source</code> splits the cached prompt tokens by tier: device, host, disk, p2p or external_unspecified (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/metrics/loggers.py#L781-L796" target="_blank" rel="noopener" title="vllm/v1/metrics/loggers.py:781-796 at 3e44c0d"><code>vllm/v1/metrics/loggers.py:781-796</code></a>). Local hits count as device (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/metrics/loggers.py#L1174-L1177" target="_blank" rel="noopener" title="vllm/v1/metrics/loggers.py:1174-1177 at 3e44c0d"><code>vllm/v1/metrics/loggers.py:1174-1177</code></a>).</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="data-shapes-and-sizes" class="dd-title">Data shapes and sizes</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Data</th><th>Type</th><th>Size</th><th>Owner</th></tr></thead>
+  <tbody>
+    <tr><td><code>Request.block_hashes</code></td><td><code>list[BlockHash]</code></td><td>one entry per full block; 32 bytes each with sha256</td><td>the request (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/request.py#L225" target="_blank" rel="noopener" title="vllm/v1/request.py:225 at 3e44c0d"><code>vllm/v1/request.py:225</code></a>)</td></tr>
+    <tr><td>map key</td><td><code>BlockHashWithGroupId</code></td><td>digest + 4 bytes (36 bytes with sha256)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L60-L69" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:60-69 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:60-69</code></a></td></tr>
+    <tr><td><code>cached_block_hash_to_block</code></td><td><code>dict[key, KVCacheBlock | dict[int, KVCacheBlock]]</code></td><td>one entry per cached block and group</td><td>the pool (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L57-L60" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:57-60 at 3e44c0d"><code>vllm/v1/core/block_pool.py:57-60</code></a>)</td></tr>
+    <tr><td><code>KVCacheBlock._block_hash</code></td><td>key or <code>None</code></td><td>set only when full and cached</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L173-L178" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:173-178 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:173-178</code></a></td></tr>
+    <tr><td><code>num_cached_block[req_id]</code></td><td><code>int</code></td><td>blocks of the request that already have a hash</td><td>each single-type manager (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L128-L132" target="_blank" rel="noopener" title="vllm/v1/core/single_type_kv_cache_manager.py:128-132 at 3e44c0d"><code>vllm/v1/core/single_type_kv_cache_manager.py:128-132</code></a>)</td></tr>
+  </tbody>
+</table>
+<p><strong>Worked example.</strong> A prompt of 2,000 tokens with block size 16 has <code>2000 // 16 = 125</code> full blocks. The input thread computes 125 SHA-256 digests over pickled tuples of 16 integers: 125 × 32 = 4,000 bytes of hashes. The lookup checks at most <code>1999 // 16 = 124</code> of them, so even a complete hit computes the last 16 tokens: 2,000 − 124 × 16 = 16. If the request also generates 500 tokens, it reaches 2,500 tokens and <code>156</code> hashes. Block 156 (tokens 2,496-2,499) has no hash when the request ends. (Derived from the lines above.)</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="the-full-attention-lookup-line-by-line" class="dd-title">The full-attention lookup, line by line</h3></summary><div class="dd-body"><figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L760-L837" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/single_type_kv_cache_manager.py:760-837</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L760-L837" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">760</span><span class="ln">761</span><span class="ln">762</span><span class="ln">763</span><span class="ln">764</span><span class="ln">765</span><span class="ln">766</span><span class="ln">767</span><span class="ln">768</span><span class="ln">769</span><span class="ln">770</span><span class="ln">771</span><span class="ln">772</span><span class="ln">773</span><span class="ln">774</span><span class="ln">775</span><span class="ln">776</span><span class="ln">777</span><span class="ln">778</span><span class="ln">779</span><span class="ln">780</span><span class="ln">781</span><span class="ln">782</span><span class="ln">783</span><span class="ln">784</span><span class="ln">785</span><span class="ln">786</span><span class="ln">787</span><span class="ln">788</span><span class="ln">789</span><span class="ln">790</span><span class="ln">791</span><span class="ln">792</span><span class="ln">793</span><span class="ln">794</span><span class="ln">795</span><span class="ln">796</span><span class="ln">797</span><span class="ln">798</span><span class="ln">799</span><span class="ln">800</span><span class="ln">801</span><span class="ln">802</span><span class="ln">803</span><span class="ln">804</span><span class="ln">805</span><span class="ln">806</span><span class="ln">807</span><span class="ln">808</span><span class="ln">809</span><span class="ln">810</span><span class="ln">811</span><span class="ln">812</span><span class="ln">813</span><span class="ln">814</span><span class="ln">815</span><span class="ln">816</span><span class="ln">817</span><span class="ln">818</span><span class="ln">819</span><span class="ln">820</span><span class="ln">821</span><span class="ln">822</span><span class="ln">823</span><span class="ln">824</span><span class="ln">825</span><span class="ln">826</span><span class="ln">827</span><span class="ln">828</span><span class="ln">829</span><span class="ln">830</span><span class="ln">831</span><span class="ln">832</span><span class="ln">833</span><span class="ln">834</span><span class="ln">835</span><span class="ln">836</span><span class="ln">837</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">        block_size = kv_cache_spec.block_size
+        if dcp_world_size &gt; 1:
+            # DCP shards each block&#x27;s KV across ranks; hashes must be viewed at
+            # the sharded block size.
+            block_size *= dcp_world_size
+        block_hashes = resolve_block_hashes(
+            block_hashes,
+            block_pool.hash_block_size,
+            block_size,
+            supports_fine_grained_hash_lookup=cls.supports_fine_grained_hash_lookup,
+            alignment_tokens=alignment_tokens,
+        )
+
+        # Fine-grained mode (alignment_tokens == hash_block_size &lt;
+        # block_size): resolve_block_hashes kept the raw hash-granularity
+        # list so interior boundaries can be probed.
+        fine_grained = (
+            alignment_tokens &lt; block_size and block_size % alignment_tokens == 0
+        )
+        if fine_grained:
+            # list or lazy BlobBlockHashes view
+            assert isinstance(block_hashes, Sequence)
+            full_block_hashes: BlockHashList = BlockHashListWithBlockSize(
+                block_hashes, alignment_tokens, block_size
+            )
+        else:
+            full_block_hashes = block_hashes
+
+        computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
+            [] for _ in range(len(kv_cache_group_ids))
+        )
+        # Phase 1: longest run of cached full blocks from the start. A missing
+        # block implies every later block misses too (chained hashes).
+        for block_hash in itertools.islice(full_block_hashes, max_length // block_size):
+            cached_block = block_pool.get_cached_block(block_hash, kv_cache_group_ids)
+            if not cached_block:
+                break
+            for computed, cached in zip(computed_blocks, cached_block):
+                computed.append(cached)
+        hit_length = len(computed_blocks[0]) * block_size
+
+        # Phase 2 (fine-grained only): extend into the first non-full block by
+        # probing its interior hash boundaries high-to-low (longest hit first).
+        if fine_grained:
+            # list or lazy BlobBlockHashes view
+            assert isinstance(block_hashes, Sequence)
+            scale_factor = block_size // alignment_tokens
+            first_partial_idx = len(computed_blocks[0]) * scale_factor
+            max_partial_idx = min(
+                first_partial_idx + scale_factor - 1,
+                max_length // alignment_tokens,
+                len(block_hashes),
+            )
+            for fine_idx in range(max_partial_idx - 1, first_partial_idx - 1, -1):
+                cached_tail = block_pool.get_cached_block(
+                    block_hashes[fine_idx], kv_cache_group_ids
+                )
+                if not cached_tail:
+                    continue
+                for computed, cached in zip(computed_blocks, cached_tail):
+                    computed.append(cached)
+                hit_length = (fine_idx + 1) * alignment_tokens
+                break
+
+        # Eagle needs the tokens right before the generation point recomputed:
+        # drop one hash unit when fine-grained (the tail block&#x27;s KV is
+        # append-only, so it still covers the reduced length), else one cache
+        # block.
+        if drop_eagle_block and hit_length &gt; 0:
+            hit_length -= min(alignment_tokens, block_size)
+        # Round down to the alignment; a no-op when fine-grained (hits land on
+        # hash boundaries by construction) and when alignment_tokens ==
+        # block_size. Then trim blocks past the new tail.
+        hit_length -= hit_length % alignment_tokens
+        num_blocks = cdiv(hit_length, block_size)
+        for computed in computed_blocks:
+            del computed[num_blocks:]
+        return computed_blocks, hit_length</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 760-771.</strong> The block size of this group, times the decode context parallel size if the KV is sharded. <code>resolve_block_hashes()</code> gives a view of the hashes at this block size; with one group it returns the list as it is (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L1201-L1202" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:1201-1202 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:1201-1202</code></a>).</li>
+  <li><strong>Lines 776-786.</strong> Fine-grained mode only for hybrid models whose hits can end inside a block. Normal models skip it.</li>
+  <li><strong>Lines 791-799.</strong> Phase 1, the walk of the figure. <code>hit_length</code> is a whole number of blocks.</li>
+  <li><strong>Lines 803-822.</strong> Phase 2, only in fine-grained mode: try a partial hit inside the next block, longest first.</li>
+  <li><strong>Lines 828-829.</strong> With EAGLE or MTP drafting, drop the last matched block (or hash unit). The drafter needs the hidden states of those tokens, so they are computed again.</li>
+  <li><strong>Lines 833-837.</strong> Round down to the alignment and cut the block lists to the new length.</li>
+</ol></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="when-exactly-does-a-block-get-its-hash" class="dd-title">When exactly does a block get its hash?</h3></summary><div class="dd-body"><p>Assume block size 16, synchronous scheduling, and a prompt of 40 tokens that runs in one step.</p>
+<ol>
+  <li>The request arrives. The input thread computes <code>h0</code> and <code>h1</code> (tokens 0-31). Tokens 32-39 fill no block.</li>
+  <li>The scheduler admits it: <code>allocate_slots(num_new_tokens=40)</code> gets 3 blocks. It caches <code>min(0 + 40, 40) = 40</code> tokens: <code>40 // 16 = 2</code> blocks get <code>h0</code> and <code>h1</code>. The GPU has not run yet.</li>
+  <li>The step runs, and the sampler gives token 40. <code>append_output_token_ids()</code> runs the hasher: 41 tokens, still 2 full blocks.</li>
+  <li>Decode steps follow. When the request has 48 tokens, the hasher adds <code>h2</code>. The next <code>allocate_slots()</code> caches <code>min(47 + 1, 48) = 48</code> tokens, so block 2 gets <code>h2</code>.</li>
+</ol>
+<p>With the <code>AsyncScheduler</code>, step 4 differs. The step that computes the KV of token 47 is planned while token 47 is still a placeholder. Then <code>request.num_tokens</code> is 47, so that allocation caches only <code>47 // 16 = 2</code> blocks. When token 47 arrives, that step is already planned: <code>num_computed_tokens</code> is 48, and 1 placeholder is left. <code>_update_request_with_output()</code> caches <code>48 − 1 = 47</code> tokens, which adds no block (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/async_scheduler.py#L75-L79" target="_blank" rel="noopener" title="vllm/v1/core/sched/async_scheduler.py:75-79 at 3e44c0d"><code>vllm/v1/core/sched/async_scheduler.py:75-79</code></a>). The <code>allocate_slots()</code> of the step after that caches <code>min(48 + 1, 48) = 48</code> tokens, and block 2 gets <code>h2</code>. (Derived from the cited lines and <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L759-L763" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:759-763 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:759-763</code></a>, with a batch queue of 2.)</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="flags-fields-and-environment-variables" class="dd-title">Flags, fields and environment variables</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Name</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--enable-prefix-caching</code></td><td><code>None</code> → from the model (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L3062-L3063" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:3062-3063 at 3e44c0d"><code>vllm/engine/arg_utils.py:3062-3063</code></a>)</td><td>on for generative decoder and hybrid models; see <a href="../learn/prefix-caching.html">Prefix caching: the idea</a></td></tr>
+    <tr><td><code>--prefix-caching-hash-algo</code></td><td><code>sha256</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/cache.py#L256" target="_blank" rel="noopener" title="vllm/config/cache.py:256 at 3e44c0d"><code>vllm/config/cache.py:256</code></a>)</td><td>hash function of the chain</td></tr>
+    <tr><td><code>--prefix-match-unit</code></td><td><code>None</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/cache.py#L200-L211" target="_blank" rel="noopener" title="vllm/config/cache.py:200-211 at 3e44c0d"><code>vllm/config/cache.py:200-211</code></a>)</td><td>finer hash granularity, for hybrid models only; with one group any other value than the block size raises <code>ValueError</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L845-L857" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:845-857 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:845-857</code></a>)</td></tr>
+    <tr><td><code>--prefix-cache-retention-interval</code></td><td><code>0</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/cache.py#L272-L278" target="_blank" rel="noopener" title="vllm/config/cache.py:272-278 at 3e44c0d"><code>vllm/config/cache.py:272-278</code></a>)</td><td>how many sliding-window and Mamba checkpoints keep a hash; see <a href="../concepts/hybrid-kv-cache.html">The hybrid KV cache: specs, groups and one manager per layer type</a></td></tr>
+    <tr><td><code>--kv-events-config</code></td><td><code>None</code></td><td>KV events (Step 10)</td></tr>
+    <tr><td><code>VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES</code></td><td><code>1</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L2022-L2024" target="_blank" rel="noopener" title="vllm/envs.py:2022-2024 at 3e44c0d"><code>vllm/envs.py:2022-2024</code></a>)</td><td>events carry 64-bit integers instead of the digest bytes</td></tr>
+    <tr><td><code>PYTHONHASHSEED</code></td><td>unset</td><td>seed of <code>NONE_HASH</code> for every algorithm (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L125-L127" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:125-127 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:125-127</code></a>)</td></tr>
+    <tr><td><code>VLLM_SERVER_DEV_MODE</code></td><td>unset</td><td>adds <code>POST /reset_prefix_cache</code> (Step 8)</td></tr>
+  </tbody>
+</table></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="errors-and-edge-cases" class="dd-title">Errors and edge cases</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>Unknown hash algorithm name</td><td><code>ValueError</code> "Unsupported hash function"</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/utils/hashing.py#L103" target="_blank" rel="noopener" title="vllm/utils/hashing.py:103 at 3e44c0d"><code>vllm/utils/hashing.py:103</code></a></td></tr>
+    <tr><td><code>xxhash</code> chosen, package missing</td><td><code>ModuleNotFoundError</code> at the first hash</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/utils/hashing.py#L63-L69" target="_blank" rel="noopener" title="vllm/utils/hashing.py:63-69 at 3e44c0d"><code>vllm/utils/hashing.py:63-69</code></a></td></tr>
+    <tr><td><code>xxhash</code> without <code>PYTHONHASHSEED</code></td><td>WARNING; hashes differ between processes</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L150-L157" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:150-157 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:150-157</code></a></td></tr>
+    <tr><td>A block gets a second hash</td><td><code>AssertionError</code> (only a partial-to-full change is allowed)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L201-L203" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:201-203 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:201-203</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L286-L294" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:286-294 at 3e44c0d"><code>vllm/v1/core/block_pool.py:286-294</code></a></td></tr>
+    <tr><td>KV events on, prefix caching off</td><td>WARNING; no <code>BlockStored</code> events</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L2026-L2034" target="_blank" rel="noopener" title="vllm/config/vllm.py:2026-2034 at 3e44c0d"><code>vllm/config/vllm.py:2026-2034</code></a></td></tr>
+    <tr><td>Reset while blocks are in use</td><td>WARNING, <code>{"success": false}</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L841-L848" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:841-848 at 3e44c0d"><code>vllm/v1/core/block_pool.py:841-848</code></a></td></tr>
+    <tr><td>Reset with <code>reset_running_requests</code> fails anyway</td><td><code>RuntimeError</code> (requests wait for remote KV)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2969-L2975" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2969-2975 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2969-2975</code></a></td></tr>
+    <tr><td>The ZMQ subscriber is too slow</td><td>events dropped after <code>hwm</code> queued messages</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/kv_events.py#L36-L39" target="_blank" rel="noopener" title="vllm/config/kv_events.py:36-39 at 3e44c0d"><code>vllm/config/kv_events.py:36-39</code></a></td></tr>
+  </tbody>
+</table></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><strong>The router sends requests to the wrong instance.</strong> The router hashes with another algorithm, block size or seed than the engines. Its hashes never match the events. Use the default <code>sha256</code>, or set <code>PYTHONHASHSEED</code> on every instance, and convert digests the same way as <code>VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L82-L85" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:82-85 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:82-85</code></a>).</li>
+  <li><strong>Prompt logprobs give no cache benefit.</strong> The request skips the lookup and the external lookup (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/sampling_params.py#L625-L632" target="_blank" rel="noopener" title="vllm/sampling_params.py:625-632 at 3e44c0d"><code>vllm/sampling_params.py:625-632</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L1040-L1041" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:1040-1041 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:1040-1041</code></a>).</li>
+  <li><strong>The reset route returns 404.</strong> The dev routes exist only with <code>VLLM_SERVER_DEV_MODE</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/launchers/api_server/routers.py#L46-L49" target="_blank" rel="noopener" title="vllm/entrypoints/launchers/api_server/routers.py:46-49 at 3e44c0d"><code>vllm/entrypoints/launchers/api_server/routers.py:46-49</code></a>). A reset under load returns <code>false</code> unless you also pass <code>reset_running_requests=true</code>.</li>
+  <li><strong>The hit rate in the log differs from Prometheus.</strong> The log uses a window of recent requests; the counters are totals since start-up (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/metrics/stats.py#L47-L57" target="_blank" rel="noopener" title="vllm/v1/metrics/stats.py:47-57 at 3e44c0d"><code>vllm/v1/metrics/stats.py:47-57</code></a>).</li>
+  <li><strong>An identical prompt still computes a whole block.</strong> The cap is <code>num_tokens − 1</code>, and hits are whole blocks. A prompt of 4,096 tokens hits at most 4,080 tokens with block size 16.</li>
+</ul>
+<p><strong>Why it matters.</strong> The prefix cache uses no extra memory: it has no size limit and no timer, only the order of the free queue. The metrics, a prefix-aware router and a reset after a weight update all depend on one fact. It is when a block gets its hash, and when it loses it.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Which thread computes the block hashes of a new request in <code>vllm serve</code>?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The input thread of the engine core process. It builds the <code>Request</code> in <code>preprocess_add_request()</code>, and the constructor runs the hasher (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1990-L1993" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1990-1993 at 3e44c0d"><code>vllm/v1/engine/core.py:1990-1993</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/request.py#L225-L230" target="_blank" rel="noopener" title="vllm/v1/request.py:225-230 at 3e44c0d"><code>vllm/v1/request.py:225-230</code></a>). The docstring says that this runs in parallel with the model forward (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1114-L1119" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1114-1119 at 3e44c0d"><code>vllm/v1/engine/core.py:1114-1119</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>Prefix caching is off, but a KV connector is configured. Do requests get block hashes?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Yes. The engine core makes the hasher when prefix caching <em>or</em> a connector is on (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L217" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:217 at 3e44c0d"><code>vllm/v1/engine/core.py:217</code></a>). The connector needs the hashes to find blocks outside the engine.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>A new request hits three blocks. Two of them have <code>ref_cnt</code> 0. Why does <code>allocate_slots()</code> touch them before it calls <code>get_new_blocks()</code>?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>touch()</code> removes free hit blocks from the free queue (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L766-L768" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:766-768 at 3e44c0d"><code>vllm/v1/core/block_pool.py:766-768</code></a>). If <code>get_new_blocks()</code> ran first, it could pop one of those blocks and evict its hash. Then the request would lose its own hit. <code>allocate_slots()</code> adds the hit blocks before it allocates new blocks (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_manager.py#L581-L600" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_manager.py:581-600 at 3e44c0d"><code>vllm/v1/core/kv_cache_manager.py:581-600</code></a>). The coordinator comment gives the same rule across KV cache groups (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_coordinator.py#L291-L301" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_coordinator.py:291-301 at 3e44c0d"><code>vllm/v1/core/kv_cache_coordinator.py:291-301</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>With synchronous scheduling, a request has just sampled its 48th token (tokens 0-47 now exist). When does block 2 (tokens 32-47) get its hash, compared with the GPU step that computes the KV of token 47?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Before it. The hasher adds <code>h2</code> as soon as the request has 48 tokens. The next <code>allocate_slots()</code> caches <code>min(computed + new, num_tokens) = 48</code> tokens, so block 2 enters the map when that step is scheduled (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_manager.py#L612-L616" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_manager.py:612-616 at 3e44c0d"><code>vllm/v1/core/kv_cache_manager.py:612-616</code></a>). The GPU computes the KV of the last token in that same step. See the deep dive "When exactly does a block get its hash?".</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>An external router uses <code>xxhash</code> with a fixed seed, and the engines run with <code>--prefix-caching-hash-algo xxhash</code> and no <code>PYTHONHASHSEED</code>. Why does routing by prefix fail?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Without <code>PYTHONHASHSEED</code>, each engine process picks a random seed for <code>NONE_HASH</code> when the algorithm is xxhash (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L125-L130" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:125-130 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:125-130</code></a>). Every chain starts from <code>NONE_HASH</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L731-L732" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:731-732 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:731-732</code></a>), so the router's hashes and the hashes in the events never match. Set the same <code>PYTHONHASHSEED</code> everywhere, or use <code>sha256</code>.</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../learn/prefix-caching.html">Prefix caching: the idea</a><span class="rel-sum">Chat requests often start with the same tokens. Prefix caching keeps the KV cache blocks of earlier requests under a chain of hashes, so a new request with the same prefix skips the prefill of those blocks and gets a shorter TTFT.</span></li><li><a href="../concepts/kv-cache-manager.html">The KV cache manager: blocks, the block pool and memory sizing</a><span class="rel-sum">In the engine core, the KVCacheManager hands out KV blocks to the scheduler through a coordinator, one single-type manager per KV cache group and one BlockPool. The workers only receive block ids. The number of blocks comes from a memory profile at start-up.</span></li><li><a href="../concepts/hybrid-kv-cache.html">The hybrid KV cache: specs, groups and one manager per layer type</a><span class="rel-sum">Models that mix full attention with sliding-window, chunked-local or Mamba layers get one KV cache group per layer type. Each group has its own block table and single-type manager, all groups share one block pool, and so every group must use the same page size. Prefix caching finds one hit length that is valid for all groups.</span></li><li><a href="../concepts/kv-connectors.html">KV connectors</a><span class="rel-sum">A KV connector moves KV cache blocks between vLLM and something outside it. One connector class runs as two objects - a scheduler-side object in the engine core that plans loads and saves, and a worker-side object in each worker that moves the bytes. KVConnectorFactory finds the class by name.</span></li><li><a href="../concepts/scheduler.html">The V1 scheduler: one token budget, no phases</a><span class="rel-sum">In each engine step, Scheduler.schedule() shares one token budget: first among the running requests, then among the waiting ones. It has no prefill or decode phase, it preempts the last running request when KV blocks run out, and update_from_output() appends the sampled tokens.</span></li><li><a href="../concepts/metrics-and-observability.html">Metrics and observability: how to watch a vLLM server</a><span class="rel-sum">Where the signals of vllm serve come from and how to read them: the /metrics endpoint and its multiprocess mode, the metrics to watch first with valid PromQL, the periodic log line, per-request metrics in responses, OpenTelemetry traces, stat logger plugins, the profiler routes, and the known gaps.</span></li><li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py: block hashes, KVCacheBlock and the free queue</a><span class="rel-sum">vllm/v1/core/kv_cache_utils.py holds the building blocks of the KV cache manager. It defines the block hash types, NONE_HASH, the extra keys and the request block hasher, the KVCacheBlock record, the FreeKVCacheBlockQueue linked list, the block-size resolution for several KV cache groups, and the capacity log line.</span></li><li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py: BlockPool and the prefix-cache map</a><span class="rel-sum">vllm/v1/core/block_pool.py holds BlockPool, the owner of every KVCacheBlock of an engine core. It hands out blocks from the free queue, frees them in eviction order, keeps the hash-to-block map of the prefix cache, emits KV cache events and computes the KV cache usage.</span></li><li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py: KVCacheManager and KVCacheBlocks</a><span class="rel-sum">vllm/v1/core/kv_cache_manager.py is the KV cache API of the scheduler. KVCacheManager looks up prefix-cache hits, allocates slots, caches full blocks, frees requests and reports usage; KVCacheBlocks carries the result per KV cache group.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../concepts/kv-cache-manager.html"><span class="pn-dir">← Previous</span><span class="pn-title">The KV cache manager: blocks, the block pool and memory sizing</span></a><a class="pn pn-next" href="../concepts/hybrid-kv-cache.html"><span class="pn-dir">Next →</span><span class="pn-title">The hybrid KV cache: specs, groups and one manager per layer type</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-the-code">In the code</a></li><li class="toc-l3"><a href="#step-1-the-hasher-is-made-once-and-runs-when-a-request-arrives">Step 1: the hasher is made once, and runs when a request arrives</a></li><li class="toc-l3"><a href="#step-2-the-hash-types">Step 2: the hash types</a></li><li class="toc-l3"><a href="#step-3-the-hash-function-and-none-hash">Step 3: the hash function and NONE_HASH</a></li><li class="toc-l3"><a href="#step-4-extra-keys">Step 4: extra keys</a></li><li class="toc-l3"><a href="#step-5-the-lookup">Step 5: the lookup</a></li><li class="toc-l3"><a href="#step-6-adopting-the-hit">Step 6: adopting the hit</a></li><li class="toc-l3"><a href="#step-7-caching-blocks-that-become-full">Step 7: caching blocks that become full</a></li><li class="toc-l3"><a href="#step-8-free-eviction-and-reset">Step 8: free, eviction and reset</a></li><li class="toc-l3"><a href="#step-9-external-hits-from-a-kv-connector">Step 9: external hits from a KV connector</a></li><li class="toc-l3"><a href="#step-10-kv-events">Step 10: KV events</a></li><li class="toc-l3"><a href="#step-11-the-metrics">Step 11: the metrics</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#data-shapes-and-sizes">Data shapes and sizes</a></li><li class="toc-l3"><a href="#the-full-attention-lookup-line-by-line">The full-attention lookup, line by line</a></li><li class="toc-l3"><a href="#when-exactly-does-a-block-get-its-hash">When exactly does a block get its hash?</a></li><li class="toc-l3"><a href="#flags-fields-and-environment-variables">Flags, fields and environment variables</a></li><li class="toc-l3"><a href="#errors-and-edge-cases">Errors and edge cases</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="../assets/viz/prefix_cache_explorer.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

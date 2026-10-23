@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multimodal serving: images, audio and video in vLLM · vLLM Explained</title>
+<meta name="description" content="An overview of how vLLM serves a multimodal request - content parts and media loading in the API server, the per-model multimodal processor and its placeholder tokens, the processor cache between processes, the encoder cache and its budget in the scheduler, the encoder runs in Model Runner V2, and encoder-only disaggregation.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="concepts/multimodal-serving">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a class="current" aria-current="page" href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>vLLM concepts</span><span class="sep">›</span><span>Serving features</span><span class="sep">›</span><span aria-current="page">Multimodal serving</span></nav>
+<h1 class="page-title">Multimodal serving: images, audio and video in vLLM</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">vLLM concepts</span><span class="meta-time">about 9 min read + 3 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../concepts/openai-server.html">The OpenAI-compatible server: launch modes, app, serving classes and streaming</a> <span class="level level-intermediate level-sm">Intermediate</span></li><li><a href="../concepts/scheduler.html">The V1 scheduler: one token budget, no phases</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../concepts/model-runner.html">The model runner (Model Runner V2)</a> <span class="level level-advanced level-sm">Advanced</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">The API server turns each image into placeholder tokens; the worker runs the vision encoder once per image and puts its output at those positions.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>A vision-language model has a vision encoder next to the language model. The encoder turns an image into a sequence of vectors in the model's embedding space. The language model then reads them like token embeddings (<a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/concepts/vision-encoder.html" target="_blank" rel="noopener" title="DeepInfer Explained: Vision encoder (VL)">The vision encoder<span class="ext-mark" aria-hidden="true">↗</span></a>). vLLM must fit this into its token-based scheduler and its KV cache.</p>
+<p>The trick is the <a class="term" href="../reference/glossary.html#term-placeholder-token" data-term="placeholder token" data-def="A prompt token that stands for one embedding of an image, audio or video item. The model replaces it with encoder output.">placeholder token</a>. The <a class="term" href="../reference/glossary.html#term-mm-processor" data-term="multimodal processor" data-def="The per-model class that turns the HF processor output into tensors and placeholder tokens in the prompt (BaseMultiModalProcessor).">multimodal processor</a> of the model replaces the image marker in the prompt with N placeholder tokens, one per encoder output vector. From then on, the scheduler treats the request as a normal prompt of text plus N tokens. When a step reaches the placeholders, the worker runs the encoder and splices the N vectors into the input embeddings. The <a class="term" href="../reference/glossary.html#term-encoder-cache" data-term="encoder cache" data-def="Storage for multimodal encoder outputs, keyed by the item hash. The scheduler budgets it in embeddings; the worker keeps the tensors.">encoder cache</a> keeps the output, keyed by a hash of the image. So a long prompt split over several steps needs no second encoder run, and nor does a second request with the same image.</p>
+<p><strong>An everyday comparison.</strong> Think of a book with a figure. The typesetter leaves a blank area of the right size on the page (the placeholders). A separate studio draws the figure (the encoder), and the printer pastes it into the blank area. The comparison stops being true in one place. vLLM keeps the drawn figure in a cache, and can paste it into other books with the same figure.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b7b_mm_flow"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Three panels. Panel 1, API server: an image_url content part goes to the MediaConnector, which accepts base64 data URLs, http URLs limited by --allowed-media-domains with a 5 second VLLM_IMAGE_FETCH_TIMEOUT, and file URLs only under --allowed-local-media-path; the model&#x27;s BaseMultiModalProcessor runs the HF processor to get pixel_values, inserts N placeholder tokens, computes the mm_hash and checks --limit-mm-per-prompt; the processor cache of 4 GiB by default, type lru, sends only the hash on a hit, and falls back to a processor-only cache with more than one API server, or with data parallelism without an external load balancer. Panel 2, engine core: the request has mm_features with the hash, the placeholder offset and length N, and the data; the prefix-cache key adds mm, hash and offset; the EncoderCacheManager counts in encoder embeddings with a size of the larger of max_num_batched_tokens and the largest item, and a hit by hash skips the encoder; the SchedulerOutput carries scheduled_encoder_inputs and free_encoder_mm_hashes; the encoder compute budget equals the encoder cache size. Panel 3, worker: the EncoderRunner skips cached items and runs model.embed_multimodal per modality, storing an output of N by hidden per hash; gather_mm_embeddings takes the slice of each item inside this step&#x27;s token window and builds an is_mm_embed mask; the decoder forward calls embed_input_ids with the multimodal embeddings, so placeholder rows get image embeddings and text rows get token embeddings."><svg role="img" aria-label="Three panels. Panel 1, API server: an image_url content part goes to the MediaConnector, which accepts base64 data URLs, http URLs limited by --allowed-media-domains with a 5 second VLLM_IMAGE_FETCH_TIMEOUT, and file URLs only under --allowed-local-media-path; the model&#x27;s BaseMultiModalProcessor runs the HF processor to get pixel_values, inserts N placeholder tokens, computes the mm_hash and checks --limit-mm-per-prompt; the processor cache of 4 GiB by default, type lru, sends only the hash on a hit, and falls back to a processor-only cache with more than one API server, or with data parallelism without an external load balancer. Panel 2, engine core: the request has mm_features with the hash, the placeholder offset and length N, and the data; the prefix-cache key adds mm, hash and offset; the EncoderCacheManager counts in encoder embeddings with a size of the larger of max_num_batched_tokens and the largest item, and a hit by hash skips the encoder; the SchedulerOutput carries scheduled_encoder_inputs and free_encoder_mm_hashes; the encoder compute budget equals the encoder cache size. Panel 3, worker: the EncoderRunner skips cached items and runs model.embed_multimodal per modality, storing an output of N by hidden per hash; gather_mm_embeddings takes the slice of each item inside this step&#x27;s token window and builds an is_mm_embed mask; the decoder forward calls embed_input_ids with the multimodal embeddings, so placeholder rows get image embeddings and text rows get token embeddings." xmlns="http://www.w3.org/2000/svg" width="1100" height="990" viewBox="0 0 1100 990">
+<defs><marker id="dg-b7b_mm_flow-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b7b_mm_flow-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker><marker id="dg-b7b_mm_flow-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0d9488"/></marker></defs>
+<rect width="1100" height="990" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">An image request through vLLM</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">vllm serve with a vision-language model  ·  Model Runner V2  ·  one image_url part  ·  N = embeddings of the image (model-specific)</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">prompt = text tokens + N placeholder tokens  ·  encoder output [N, hidden] cached by mm_hash  ·  merged into inputs_embeds</text>
+<rect x="20.0" y="124.0" width="1060.0" height="236.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="150.0" r="13" fill="#111827"/>
+<text x="46.0" y="154.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="155.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What does the API server do with the image?</text>
+<text x="68.0" y="174.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">It loads the media, runs the model&#x27;s processor, and puts N placeholder tokens into the prompt.</text>
+<rect x="46.0" y="194.0" width="300.0" height="136.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="58.0" y="214.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Content part → MediaConnector</text>
+<text x="58.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">{&quot;type&quot;: &quot;image_url&quot;, ...}</text>
+<text x="58.0" y="247.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">data: base64 | http(s) | file:</text>
+<text x="58.0" y="262.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">http: --allowed-media-domains,</text>
+<text x="58.0" y="277.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  VLLM_IMAGE_FETCH_TIMEOUT 5 s</text>
+<text x="58.0" y="292.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">file: --allowed-local-media-path</text>
+<text x="58.0" y="307.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">media/connector.py:348-427</text>
+<rect x="400.0" y="194.0" width="300.0" height="136.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="412.0" y="214.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Processor (per model)</text>
+<text x="412.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">BaseMultiModalProcessor.apply</text>
+<text x="412.0" y="247.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">HF processor → pixel_values</text>
+<text x="412.0" y="262.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">prompt update: N placeholders</text>
+<text x="412.0" y="277.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">mm_hash of the item</text>
+<text x="412.0" y="292.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">limit: --limit-mm-per-prompt</text>
+<text x="412.0" y="307.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">processing/processor.py:1811-1847</text>
+<rect x="754.0" y="194.0" width="300.0" height="136.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="766.0" y="214.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Processor cache (sender)</text>
+<text x="766.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">--mm-processor-cache-gb 4</text>
+<text x="766.0" y="247.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">type lru: hit → send hash only,</text>
+<text x="766.0" y="262.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  engine core keeps the data</text>
+<text x="766.0" y="277.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">&gt; 1 API server, or DP without an</text>
+<text x="766.0" y="292.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  external LB: processor_only</text>
+<text x="766.0" y="307.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">cache/factories.py:23-87</text>
+<line x1="346.0" y1="262.0" x2="398.0" y2="262.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b7b_mm_flow-m0)"/>
+<line x1="700.0" y1="262.0" x2="752.0" y2="262.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b7b_mm_flow-m0)"/>
+<rect x="20.0" y="382.0" width="1060.0" height="236.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="408.0" r="13" fill="#111827"/>
+<text x="46.0" y="412.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="413.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">How does the engine core schedule the encoder?</text>
+<text x="68.0" y="432.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">With the prompt chunk that covers the placeholders, if the encoder cache and the encoder budget have room.</text>
+<rect x="46.0" y="452.0" width="300.0" height="136.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="58.0" y="472.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Request with mm_features</text>
+<text x="58.0" y="490.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">identifier = mm_hash</text>
+<text x="58.0" y="505.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">mm_position: offset, length N</text>
+<text x="58.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">data: pixel_values (or None</text>
+<text x="58.0" y="535.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  on a processor-cache hit)</text>
+<text x="58.0" y="550.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">prefix-cache key:</text>
+<text x="58.0" y="565.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  (&quot;mm&quot;, hash, offset in block)</text>
+<rect x="400.0" y="452.0" width="300.0" height="136.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="412.0" y="472.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">EncoderCacheManager</text>
+<text x="412.0" y="490.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">unit: encoder embeddings</text>
+<text x="412.0" y="505.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">size = max(max_num_batched_tokens,</text>
+<text x="412.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  largest item)</text>
+<text x="412.0" y="535.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">hit by hash → no encoder run</text>
+<text x="412.0" y="550.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">free entries evicted lazily</text>
+<text x="412.0" y="565.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">encoder_cache_manager.py:316-362</text>
+<rect x="754.0" y="452.0" width="300.0" height="136.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="766.0" y="472.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">SchedulerOutput</text>
+<text x="766.0" y="490.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">scheduled_encoder_inputs:</text>
+<text x="766.0" y="505.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  {req_id: [input index]}</text>
+<text x="766.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">free_encoder_mm_hashes</text>
+<text x="766.0" y="535.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  (entries to drop on workers)</text>
+<text x="766.0" y="550.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">encoder compute budget</text>
+<text x="766.0" y="565.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  = encoder cache size</text>
+<line x1="346.0" y1="520.0" x2="398.0" y2="520.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b7b_mm_flow-m1)"/>
+<line x1="700.0" y1="520.0" x2="752.0" y2="520.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b7b_mm_flow-m1)"/>
+<rect x="20.0" y="640.0" width="1060.0" height="236.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="666.0" r="13" fill="#111827"/>
+<text x="46.0" y="670.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="671.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">How do the image embeddings reach the decoder?</text>
+<text x="68.0" y="690.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The worker encodes the image once, caches the output by hash, and splices it in at the placeholder positions.</text>
+<rect x="46.0" y="710.0" width="300.0" height="136.0" rx="8" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.5"/>
+<text x="58.0" y="730.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#0d9488" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">EncoderRunner (gpu/mm)</text>
+<text x="58.0" y="748.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">prepare_mm_inputs: skip cached</text>
+<text x="58.0" y="763.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">execute_mm_encoder:</text>
+<text x="58.0" y="778.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  model.embed_multimodal(...)</text>
+<text x="58.0" y="793.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  batched per modality</text>
+<text x="58.0" y="808.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">encoder_outputs[hash] = [N, hidden]</text>
+<text x="58.0" y="823.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">encoder_runner.py:81-176</text>
+<rect x="400.0" y="710.0" width="300.0" height="136.0" rx="8" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.5"/>
+<text x="412.0" y="730.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#0d9488" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">gather_mm_embeddings</text>
+<text x="412.0" y="748.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">slice of the item that lies in</text>
+<text x="412.0" y="763.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  this step&#x27;s token window</text>
+<text x="412.0" y="778.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">is_mm_embed mask [num_tokens]</text>
+<text x="412.0" y="793.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">decodes only: nothing to gather</text>
+<text x="412.0" y="808.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">missing entry → RuntimeError</text>
+<text x="412.0" y="823.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">encoder_runner.py:207-294</text>
+<rect x="754.0" y="710.0" width="300.0" height="136.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="766.0" y="730.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Decoder forward</text>
+<text x="766.0" y="748.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">embed_input_ids(input_ids,</text>
+<text x="766.0" y="763.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  mm_embeds, is_multimodal)</text>
+<text x="766.0" y="778.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  → inputs_embeds</text>
+<text x="766.0" y="793.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">text rows: token embeddings</text>
+<text x="766.0" y="808.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">placeholder rows: image embeds</text>
+<text x="766.0" y="823.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">encoder_runner.py:296-308</text>
+<line x1="346.0" y1="778.0" x2="398.0" y2="778.0" stroke="#0d9488" stroke-width="1.6" marker-end="url(#dg-b7b_mm_flow-m2)"/>
+<line x1="700.0" y1="778.0" x2="752.0" y2="778.0" stroke="#0d9488" stroke-width="1.6" marker-end="url(#dg-b7b_mm_flow-m2)"/>
+<text x="30.0" y="911.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="900.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="911.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">API server</text>
+<rect x="209.1" y="900.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="230.1" y="911.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">cache across processes</text>
+<rect x="390.5" y="900.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="411.5" y="911.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">engine core</text>
+<rect x="502.0" y="900.0" width="14.0" height="14.0" rx="3" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.4"/>
+<text x="523.0" y="911.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">worker: encoder</text>
+<rect x="642.7" y="900.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="663.7" y="911.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">worker: decoder</text>
+<text x="30.0" y="940.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">N and the processor output depend on the model and the image size; the flow and the cache rules come from the cited lines.</text>
+<text x="30.0" y="958.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">A request whose prompt is chunked runs the encoder with the chunk that first reaches the placeholders; later chunks reuse the cached output.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the API server makes placeholders (panel 1), the scheduler decides when the encoder runs (panel 2), and the worker caches the encoder output and merges it into the input embeddings (panel 3).</figcaption><a class="diagram-open" href="../diagrams/b7b_mm_flow.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read the panels from top to bottom; each panel is one process. N depends on the model and the image size, so the figure leaves it as a symbol. The amber box is the one cache that spans two processes.</p>
+
+<h2 id="in-the-code">In the code<a class="h-anchor" href="#in-the-code" aria-label="Link to this section">#</a></h2>
+
+<h3 id="step-1-content-parts-and-media-loading">Step 1: content parts and media loading<a class="h-anchor" href="#step-1-content-parts-and-media-loading" aria-label="Link to this section">#</a></h3>
+<p>A chat message can hold a list of content parts. The renderer has one parser per part type:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/chat_utils/chat_message.py#L101-L119" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/renderers/chat_utils/chat_message.py:101-119</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/chat_utils/chat_message.py#L101-L119" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">101</span><span class="ln">102</span><span class="ln">103</span><span class="ln">104</span><span class="ln">105</span><span class="ln">106</span><span class="ln">107</span><span class="ln">108</span><span class="ln">109</span><span class="ln">110</span><span class="ln">111</span><span class="ln">112</span><span class="ln">113</span><span class="ln">114</span><span class="ln">115</span><span class="ln">116</span><span class="ln">117</span><span class="ln">118</span><span class="ln">119</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">] = {
+    &quot;text&quot;: lambda part: _TextParser(part).get(&quot;text&quot;, None),
+    &quot;thinking&quot;: lambda part: _ThinkParser(part).get(&quot;thinking&quot;, None),
+    &quot;input_text&quot;: lambda part: _TextParser(part).get(&quot;text&quot;, None),
+    &quot;output_text&quot;: lambda part: _TextParser(part).get(&quot;text&quot;, None),
+    &quot;input_image&quot;: lambda part: _ResponsesInputImageParser(part).get(&quot;image_url&quot;, None),
+    &quot;image_url&quot;: lambda part: _ImageParser(part).get(&quot;image_url&quot;, {}).get(&quot;url&quot;, None),
+    &quot;image_embeds&quot;: lambda part: _ImageEmbedsParser(part).get(&quot;image_embeds&quot;, None),
+    &quot;audio_embeds&quot;: lambda part: _AudioEmbedsParser(part).get(&quot;audio_embeds&quot;, None),
+    &quot;video_embeds&quot;: lambda part: _VideoEmbedsParser(part).get(&quot;video_embeds&quot;, None),
+    &quot;prompt_embeds&quot;: lambda part: _PromptEmbedsParser(part).get(&quot;data&quot;, None),
+    &quot;image_pil&quot;: lambda part: _PILImageParser(part).get(&quot;image_pil&quot;, None),
+    &quot;audio_url&quot;: lambda part: _AudioParser(part).get(&quot;audio_url&quot;, {}).get(&quot;url&quot;, None),
+    &quot;input_audio&quot;: lambda part: _InputAudioParser(part).get(&quot;input_audio&quot;, None),
+    &quot;refusal&quot;: lambda part: _RefusalParser(part).get(&quot;refusal&quot;, None),
+    &quot;video_url&quot;: lambda part: _VideoParser(part).get(&quot;video_url&quot;, {}).get(&quot;url&quot;, None),
+    &quot;tool_reference&quot;: lambda part: cast(
+        CustomChatCompletionContentToolReferenceParam, part
+    ).get(&quot;name&quot;, None),</code></pre></div></div></div></figure>
+<p><code>image_url</code>, <code>audio_url</code>, <code>input_audio</code> and <code>video_url</code> load media. The <code>image_embeds</code>, <code>audio_embeds</code> and <code>video_embeds</code> parts take precomputed embeddings and need <code>--enable-mm-embeds</code>, which the config marks as "only for trusted users" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/multimodal.py#L326-L338" target="_blank" rel="noopener" title="vllm/config/multimodal.py:326-338 at 3e44c0d"><code>vllm/config/multimodal.py:326-338</code></a>; the checks at <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/chat_utils/content_parser.py#L186-L190" target="_blank" rel="noopener" title="vllm/renderers/chat_utils/content_parser.py:186-190 at 3e44c0d"><code>vllm/renderers/chat_utils/content_parser.py:186-190</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/chat_utils/content_parser.py#L214-L218" target="_blank" rel="noopener" title="vllm/renderers/chat_utils/content_parser.py:214-218 at 3e44c0d"><code>vllm/renderers/chat_utils/content_parser.py:214-218</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/chat_utils/content_parser.py#L296-L300" target="_blank" rel="noopener" title="vllm/renderers/chat_utils/content_parser.py:296-300 at 3e44c0d"><code>vllm/renderers/chat_utils/content_parser.py:296-300</code></a>). <code>prompt_embeds</code> needs <code>--enable-prompt-embeds</code> instead (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/chat_utils/content_parser.py#L165-L168" target="_blank" rel="noopener" title="vllm/renderers/chat_utils/content_parser.py:165-168 at 3e44c0d"><code>vllm/renderers/chat_utils/content_parser.py:165-168</code></a>). The renderer gets its media loader, the media connector, from a registry; <code>VLLM_MEDIA_CONNECTOR</code> picks it, default <code>http</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/chat_utils/content_parser.py#L140-L151" target="_blank" rel="noopener" title="vllm/renderers/chat_utils/content_parser.py:140-151 at 3e44c0d"><code>vllm/renderers/chat_utils/content_parser.py:140-151</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L1072-L1076" target="_blank" rel="noopener" title="vllm/envs.py:1072-1076 at 3e44c0d"><code>vllm/envs.py:1072-1076</code></a>).</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/media/connector.py#L381-L428" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/multimodal/media/connector.py:381-428</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/media/connector.py#L381-L428" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">381</span><span class="ln">382</span><span class="ln">383</span><span class="ln">384</span><span class="ln">385</span><span class="ln">386</span><span class="ln">387</span><span class="ln hl">388</span><span class="ln hl">389</span><span class="ln">390</span><span class="ln">391</span><span class="ln">392</span><span class="ln hl">393</span><span class="ln hl">394</span><span class="ln">395</span><span class="ln">396</span><span class="ln">397</span><span class="ln">398</span><span class="ln">399</span><span class="ln">400</span><span class="ln">401</span><span class="ln">402</span><span class="ln">403</span><span class="ln">404</span><span class="ln">405</span><span class="ln">406</span><span class="ln">407</span><span class="ln">408</span><span class="ln">409</span><span class="ln">410</span><span class="ln">411</span><span class="ln">412</span><span class="ln">413</span><span class="ln">414</span><span class="ln">415</span><span class="ln">416</span><span class="ln">417</span><span class="ln">418</span><span class="ln">419</span><span class="ln">420</span><span class="ln">421</span><span class="ln">422</span><span class="ln">423</span><span class="ln hl">424</span><span class="ln hl">425</span><span class="ln">426</span><span class="ln">427</span><span class="ln">428</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(43 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(44 * var(--code-lh))"></span><pre><code class="language-python">    def load_from_url(
+        self,
+        url: str,
+        media_io: MediaIO[_M],
+        *,
+        fetch_timeout: int | None = None,
+    ) -&gt; _M:  # type: ignore[type-var]
+        if url[:5].lower() == &quot;data:&quot;:
+            return self._load_data_url(url, media_io)
+
+        url_spec = parse_url(url)
+
+        if url_spec.scheme and url_spec.scheme.startswith(&quot;http&quot;):
+            self._assert_url_in_allowed_media_domains(url_spec)
+            max_bytes = media_io.get_max_bytes()
+
+            cached = self._get_cached_bytes(url)
+            if cached is not None:
+                return media_io.load_bytes(cached)
+
+            connection = self.connection
+            budget_kwargs = (
+                {&quot;request_budget&quot;: self.download_budget}
+                if self.download_budget is not None
+                else {}
+            )
+            try:
+                data = connection.get_bytes(
+                    url_spec.url,
+                    timeout=fetch_timeout,
+                    allow_redirects=envs.VLLM_MEDIA_URL_ALLOW_REDIRECTS,
+                    max_bytes=max_bytes,
+                    **budget_kwargs,
+                )
+            except Exception as e:
+                wrapped = _wrap_media_fetch_error(url, e)
+                if isinstance(wrapped, VLLMUnprocessableEntityError):
+                    raise wrapped from e
+                raise
+
+            self._put_cached_bytes(url, data)
+            return media_io.load_bytes(data)
+
+        if url_spec.scheme == &quot;file&quot;:
+            return self._load_file_url(url_spec, media_io)
+
+        msg = &quot;The URL must be either a HTTP, data or file URL.&quot;
+        raise ValueError(msg)</code></pre></div></div></div></figure>
+<ul>
+  <li><strong><code>data:</code> URLs</strong> must be base64 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/media/connector.py#L328-L346" target="_blank" rel="noopener" title="vllm/multimodal/media/connector.py:328-346 at 3e44c0d"><code>vllm/multimodal/media/connector.py:328-346</code></a>).</li>
+  <li><strong>HTTP(S)</strong>: with <code>--allowed-media-domains</code> set, other hosts raise <code>ValueError</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/media/connector.py#L370-L379" target="_blank" rel="noopener" title="vllm/multimodal/media/connector.py:370-379 at 3e44c0d"><code>vllm/multimodal/media/connector.py:370-379</code></a>). Timeouts are <code>VLLM_IMAGE_FETCH_TIMEOUT</code> 5 s, <code>VLLM_VIDEO_FETCH_TIMEOUT</code> 30 s and <code>VLLM_AUDIO_FETCH_TIMEOUT</code> 10 s; one download is at most <code>VLLM_MAX_MEDIA_DOWNLOAD_SIZE_MB</code> 256 MB; redirects are allowed by default (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L955-L994" target="_blank" rel="noopener" title="vllm/envs.py:955-994 at 3e44c0d"><code>vllm/envs.py:955-994</code></a>). The timeouts are for the first attempt. By default vLLM makes up to 3 attempts, and each new attempt has a 4 times longer timeout (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/connections.py#L292-L306" target="_blank" rel="noopener" title="vllm/connections.py:292-306 at 3e44c0d"><code>vllm/connections.py:292-306</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/connections.py#L30" target="_blank" rel="noopener" title="vllm/connections.py:30 at 3e44c0d"><code>vllm/connections.py:30</code></a>).</li>
+  <li><strong><code>file:</code></strong> works only with <code>--allowed-local-media-path</code>, and only for files under it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/media/connector.py#L348-L368" target="_blank" rel="noopener" title="vllm/multimodal/media/connector.py:348-368 at 3e44c0d"><code>vllm/multimodal/media/connector.py:348-368</code></a>). The config calls this "a security risk" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/model.py#L231-L237" target="_blank" rel="noopener" title="vllm/config/model.py:231-237 at 3e44c0d"><code>vllm/config/model.py:231-237</code></a>).</li>
+</ul>
+
+<h3 id="step-2-the-multimodal-processor-and-its-placeholders">Step 2: the multimodal processor and its placeholders<a class="h-anchor" href="#step-2-the-multimodal-processor-and-its-placeholders" aria-label="Link to this section">#</a></h3>
+<p>Each multimodal model class registers its processor on the global <code>MULTIMODAL_REGISTRY</code> with a decorator (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/__init__.py#L7" target="_blank" rel="noopener" title="vllm/multimodal/__init__.py:7 at 3e44c0d"><code>vllm/multimodal/__init__.py:7</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/registry.py#L82-L113" target="_blank" rel="noopener" title="vllm/multimodal/registry.py:82-113 at 3e44c0d"><code>vllm/multimodal/registry.py:82-113</code></a>); Llava is one example (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llava.py#L487-L491" target="_blank" rel="noopener" title="vllm/model_executor/models/llava.py:487-491 at 3e44c0d"><code>vllm/model_executor/models/llava.py:487-491</code></a>). The registry builds the processor for the served model (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/registry.py#L150-L166" target="_blank" rel="noopener" title="vllm/multimodal/registry.py:150-166 at 3e44c0d"><code>vllm/multimodal/registry.py:150-166</code></a>). Its <code>apply</code> method does the work:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/processing/processor.py#L1811-L1847" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/multimodal/processing/processor.py:1811-1847</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/processing/processor.py#L1811-L1847" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1811</span><span class="ln">1812</span><span class="ln">1813</span><span class="ln">1814</span><span class="ln">1815</span><span class="ln hl">1816</span><span class="ln hl">1817</span><span class="ln hl">1818</span><span class="ln hl">1819</span><span class="ln hl">1820</span><span class="ln hl">1821</span><span class="ln hl">1822</span><span class="ln hl">1823</span><span class="ln hl">1824</span><span class="ln hl">1825</span><span class="ln hl">1826</span><span class="ln hl">1827</span><span class="ln">1828</span><span class="ln">1829</span><span class="ln hl">1830</span><span class="ln hl">1831</span><span class="ln hl">1832</span><span class="ln hl">1833</span><span class="ln">1834</span><span class="ln">1835</span><span class="ln">1836</span><span class="ln">1837</span><span class="ln">1838</span><span class="ln">1839</span><span class="ln hl">1840</span><span class="ln hl">1841</span><span class="ln hl">1842</span><span class="ln hl">1843</span><span class="ln hl">1844</span><span class="ln hl">1845</span><span class="ln hl">1846</span><span class="ln">1847</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><pre><code class="language-python">    def apply(
+        self,
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ) -&gt; MultiModalInput:
+        &quot;&quot;&quot;Process multi-modal inputs to be used in vLLM.
+
+        The main steps are:
+
+        1. Perform MM-specific post-processing to the token inputs.
+        2. Apply HF Processor on multi-modal data together with optional
+           dummy text, outputting processed multi-modal data tensors.
+        3. Find and update sequences in the token IDs with placeholder tokens.
+           The number of placeholder tokens equals the feature size of the
+           multi-modal data outputted by the multi-modal encoder.
+        4. Extract information about the placeholder tokens from the
+           processed token IDs.
+        &quot;&quot;&quot;
+        mm_res = self._cached_apply_hf_processor(inputs, timing_ctx)
+
+        with timing_ctx.record(&quot;apply_prompt_updates&quot;):
+            prompt_ids, mm_placeholders = self._maybe_apply_prompt_updates(
+                mm_items=inputs.mm_data_items,
+                mm_res=mm_res,
+            )
+
+        mm_placeholder_ranges = {
+            modality: [item.to_range() for item in placeholders]
+            for modality, placeholders in mm_placeholders.items()
+        }
+
+        return mm_input(
+            prompt_token_ids=prompt_ids,
+            mm_kwargs=mm_res.kwargs,
+            mm_hashes=mm_res.hashes,
+            mm_placeholders=mm_placeholder_ranges,
+        )</code></pre></div></div></div></figure>
+<p>The result holds the new prompt token ids, the processed tensors (<code>mm_kwargs</code>), one hash per item, and the placeholder ranges. A range is an offset and a length in the prompt. The count limit is <code>--limit-mm-per-prompt</code>: 999 per modality when unset, capped by what the model supports. A prompt above it gets a validation error, "At most ... may be provided in one prompt." (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/multimodal.py#L695-L707" target="_blank" rel="noopener" title="vllm/config/multimodal.py:695-707 at 3e44c0d"><code>vllm/config/multimodal.py:695-707</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/processing/context.py#L608-L626" target="_blank" rel="noopener" title="vllm/multimodal/processing/context.py:608-626 at 3e44c0d"><code>vllm/multimodal/processing/context.py:608-626</code></a>).</p>
+<p><code>--mm-processor-kwargs</code> passes options to the HF processor, for example <code>{"num_crops": 4}</code> for Phi-3-Vision (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/multimodal.py#L343-L351" target="_blank" rel="noopener" title="vllm/config/multimodal.py:343-351 at 3e44c0d"><code>vllm/config/multimodal.py:343-351</code></a>). A request can also send <code>mm_processor_kwargs</code> or <code>media_io_kwargs</code>, but the server rejects non-empty values unless it runs with <code>--trust-request-mm-kwargs</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/generate/base/protocol.py#L70-L95" target="_blank" rel="noopener" title="vllm/entrypoints/generate/base/protocol.py:70-95 at 3e44c0d"><code>vllm/entrypoints/generate/base/protocol.py:70-95</code></a>).</p>
+
+<h3 id="step-3-the-processor-cache-between-the-api-server-and-the-engine-core">Step 3: the processor cache between the API server and the engine core<a class="h-anchor" href="#step-3-the-processor-cache-between-the-api-server-and-the-engine-core" aria-label="Link to this section">#</a></h3>
+<p>Processing an image can cost more than the HTTP request itself. The processor cache keeps processed items by hash. Its type depends on the deployment:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/cache/factories.py#L23-L46" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/multimodal/cache/factories.py:23-46</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/cache/factories.py#L23-L46" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">23</span><span class="ln">24</span><span class="ln">25</span><span class="ln">26</span><span class="ln">27</span><span class="ln">28</span><span class="ln">29</span><span class="ln">30</span><span class="ln hl">31</span><span class="ln hl">32</span><span class="ln">33</span><span class="ln">34</span><span class="ln">35</span><span class="ln hl">36</span><span class="ln hl">37</span><span class="ln hl">38</span><span class="ln hl">39</span><span class="ln hl">40</span><span class="ln hl">41</span><span class="ln hl">42</span><span class="ln hl">43</span><span class="ln">44</span><span class="ln">45</span><span class="ln">46</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><pre><code class="language-python">def _get_cache_type(
+    vllm_config: VllmConfig,
+) -&gt; Literal[None, &quot;processor_only&quot;, &quot;lru&quot;, &quot;shm&quot;]:
+    model_config = vllm_config.model_config
+    if not model_config.supports_multimodal_inputs:
+        return None
+
+    # Check if the cache is disabled.
+    mm_config = model_config.get_multimodal_config()
+    if mm_config.mm_processor_cache_gb &lt;= 0:
+        return None
+
+    # Check if IPC caching is supported.
+    parallel_config = vllm_config.parallel_config
+    is_ipc_supported = parallel_config._api_process_count == 1 and (
+        parallel_config.data_parallel_size == 1
+        or parallel_config.data_parallel_external_lb
+    )
+
+    if not is_ipc_supported:
+        return &quot;processor_only&quot;
+
+    mm_config = model_config.get_multimodal_config()
+    return mm_config.mm_processor_cache_type</code></pre></div></div></div></figure>
+<ul>
+  <li><strong><code>lru</code></strong> (default, one API server): the API server keeps a "sender" cache and the engine core a mirrored "receiver" cache. On a hit, the API server sends the hash without the data, and the engine core fills it in (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/cache/factories.py#L49-L87" target="_blank" rel="noopener" title="vllm/multimodal/cache/factories.py:49-87 at 3e44c0d"><code>vllm/multimodal/cache/factories.py:49-87</code></a>).</li>
+  <li><strong><code>processor_only</code></strong>: with more than one API server, or with data parallelism without an external load balancer, only the API server caches its own processing results.</li>
+  <li><strong><code>shm</code></strong>: a shared-memory FIFO that the workers read; objects up to 128 MiB each (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/multimodal.py#L369-L378" target="_blank" rel="noopener" title="vllm/config/multimodal.py:369-378 at 3e44c0d"><code>vllm/config/multimodal.py:369-378</code></a>).</li>
+</ul>
+<p>The size is <code>--mm-processor-cache-gb</code>, 4 GiB by default, once per API server process and once per engine core (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/multimodal.py#L357-L368" target="_blank" rel="noopener" title="vllm/config/multimodal.py:357-368 at 3e44c0d"><code>vllm/config/multimodal.py:357-368</code></a>). The two mirrored caches can drift. The engine core then raises <code>MultiModalCacheMissError</code>, and the API server drops the stale entries so a retry sends the data again (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/cache/base.py#L33-L52" target="_blank" rel="noopener" title="vllm/multimodal/cache/base.py:33-52 at 3e44c0d"><code>vllm/multimodal/cache/base.py:33-52</code></a>).</p>
+
+<h3 id="step-4-the-encoder-cache-and-its-budget-in-the-scheduler">Step 4: the encoder cache and its budget in the scheduler<a class="h-anchor" href="#step-4-the-encoder-cache-and-its-budget-in-the-scheduler" aria-label="Link to this section">#</a></h3>
+<p>The scheduler owns an <code>EncoderCacheManager</code>. It counts in encoder embeddings, not in bytes, and shares entries between requests with the same hash (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/encoder_cache_manager.py#L19-L46" target="_blank" rel="noopener" title="vllm/v1/core/encoder_cache_manager.py:19-46 at 3e44c0d"><code>vllm/v1/core/encoder_cache_manager.py:19-46</code></a>). Its size and the per-step encoder budget come from <code>compute_mm_encoder_budget</code>:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/encoder_cache_manager.py#L355-L362" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/encoder_cache_manager.py:355-362</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/encoder_cache_manager.py#L355-L362" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">355</span><span class="ln">356</span><span class="ln">357</span><span class="ln">358</span><span class="ln">359</span><span class="ln">360</span><span class="ln">361</span><span class="ln">362</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">
+    encoder_compute_budget = max(
+        scheduler_config.max_num_encoder_input_tokens, max_tokens_per_mm_item
+    )
+    encoder_cache_size = max(
+        scheduler_config.encoder_cache_size, max_tokens_per_mm_item
+    )
+</code></pre></div></div></div></figure>
+<p>Both base values are <code>max_num_batched_tokens</code>; they are not configurable (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/scheduler.py#L145-L157" target="_blank" rel="noopener" title="vllm/config/scheduler.py:145-157 at 3e44c0d"><code>vllm/config/scheduler.py:145-157</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/scheduler.py#L306-L307" target="_blank" rel="noopener" title="vllm/config/scheduler.py:306-307 at 3e44c0d"><code>vllm/config/scheduler.py:306-307</code></a>). So by default the cache holds as many embeddings as one step holds tokens, or one largest item if that is bigger.</p>
+<p>When the scheduler gives a request new tokens, it checks the multimodal items in that token window. It schedules an encoder input only if its output is not cached, there is budget, and the cache has room. Otherwise it stops the request's chunk just before the item (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2007-L2032" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2007-2032 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2007-2032</code></a>). The <code>SchedulerOutput</code> lists the scheduled inputs per request and the hashes that workers may drop (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/output.py#L255" target="_blank" rel="noopener" title="vllm/v1/core/sched/output.py:255 at 3e44c0d"><code>vllm/v1/core/sched/output.py:255</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/output.py#L263" target="_blank" rel="noopener" title="vllm/v1/core/sched/output.py:263 at 3e44c0d"><code>vllm/v1/core/sched/output.py:263</code></a>).</p>
+
+<h3 id="step-5-the-encoder-run-in-model-runner-v2">Step 5: the encoder run in Model Runner V2<a class="h-anchor" href="#step-5-the-encoder-run-in-model-runner-v2" aria-label="Link to this section">#</a></h3>
+<p>The worker keeps the encoder outputs in a dict from hash to tensor (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/mm/encoder_cache.py#L8-L13" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/mm/encoder_cache.py:8-13 at 3e44c0d"><code>vllm/v1/worker/gpu/mm/encoder_cache.py:8-13</code></a>). Before the forward pass, the model state runs the encoder and builds the input embeddings:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_states/default.py#L98-L120" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/model_states/default.py:98-120</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_states/default.py#L98-L120" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">98</span><span class="ln">99</span><span class="ln">100</span><span class="ln">101</span><span class="ln">102</span><span class="ln">103</span><span class="ln">104</span><span class="ln">105</span><span class="ln">106</span><span class="ln">107</span><span class="ln hl">108</span><span class="ln hl">109</span><span class="ln hl">110</span><span class="ln hl">111</span><span class="ln">112</span><span class="ln">113</span><span class="ln">114</span><span class="ln">115</span><span class="ln">116</span><span class="ln">117</span><span class="ln hl">118</span><span class="ln hl">119</span><span class="ln hl">120</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><pre><code class="language-python">    def prepare_inputs_embeds(
+        self,
+        scheduled_encoder_inputs: dict[str, list[int]],
+        input_batch: InputBatch,
+        req_states: RequestState,
+    ) -&gt; torch.Tensor:
+        # Use unpadded input_ids to match is_mm_embed size (num_tokens).
+        # input_batch.input_ids may be padded for CUDA graphs.
+        input_ids_unpadded = input_batch.input_ids[: input_batch.num_tokens]
+
+        if self.supports_mm_inputs:
+            self.execute_mm_encoder(scheduled_encoder_inputs)
+
+            mm_embeds, is_mm_embed = super().gather_mm_embeddings(input_batch)
+            if self.mm_pruner is not None and mm_embeds:
+                # EVS: recompute mrope positions for pruned media.
+                mm_embeds = self.mm_pruner.recompute(mm_embeds, input_batch, req_states)
+                # We must flush the staged rope updates for prepare_inputs() to pick up.
+                self.apply_staged_writes()
+
+            inputs_embeds = self.encoder_runner.get_inputs_embeds(
+                input_ids_unpadded, mm_embeds, is_mm_embed
+            )</code></pre></div></div></div></figure>
+<ol>
+  <li><code>prepare_mm_inputs</code> skips items that are already in the cache (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/mm/encoder_runner.py#L81-L108" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/mm/encoder_runner.py:81-108 at 3e44c0d"><code>vllm/v1/worker/gpu/mm/encoder_runner.py:81-108</code></a>).</li>
+  <li><code>execute_mm_encoder</code> groups the items by modality and calls the model's <code>embed_multimodal</code>, or a captured encoder CUDA graph (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/mm/encoder_runner.py#L150-L176" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/mm/encoder_runner.py:150-176 at 3e44c0d"><code>vllm/v1/worker/gpu/mm/encoder_runner.py:150-176</code></a>).</li>
+  <li><code>gather_mm_embeddings</code> takes, for each request, the part of each item that falls into this step's tokens, and a boolean mask <code>is_mm_embed</code>. A step with only decodes gathers nothing (except for realtime models). A missing cache entry raises <code>RuntimeError</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/mm/encoder_runner.py#L207-L294" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/mm/encoder_runner.py:207-294 at 3e44c0d"><code>vllm/v1/worker/gpu/mm/encoder_runner.py:207-294</code></a>).</li>
+  <li><code>get_inputs_embeds</code> calls the model's <code>embed_input_ids</code> with the embeddings and the mask, and copies the result into the fixed buffer for CUDA graphs (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/mm/encoder_runner.py#L296-L308" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/mm/encoder_runner.py:296-308 at 3e44c0d"><code>vllm/v1/worker/gpu/mm/encoder_runner.py:296-308</code></a>).</li>
+</ol>
+<p>The worker drops entries when the scheduler lists them in <code>free_encoder_mm_hashes</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1187-L1190" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1187-1190 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1187-1190</code></a>).</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-one-image-in-a-chunked-prompt" class="dd-title">Worked example: one image in a chunked prompt</h3></summary><div class="dd-body"><p>Example values: a server with <code>max_num_batched_tokens = 2048</code>, a prompt of 100 text tokens, then an image, then 50 text tokens. Assume the processor gives N = 1,500 placeholder tokens for this image (the real N depends on the model and the image size).</p>
+<ol>
+  <li><strong>API server.</strong> The prompt has 100 + 1,500 + 50 = 1,650 tokens. The placeholder range is offset 100, length 1,500. The item hash is computed from the image data (default hasher <code>blake3</code>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/multimodal.py#L372-L374" target="_blank" rel="noopener" title="vllm/config/multimodal.py:372-374 at 3e44c0d"><code>vllm/config/multimodal.py:372-374</code></a>).</li>
+  <li><strong>Encoder budget.</strong> <code>max(2048, largest item)</code>. With 1,500 as the largest item for this model, the cache and the per-step budget are both 2,048 embeddings.</li>
+  <li><strong>Step 1.</strong> Suppose other requests leave 600 tokens of budget. The window is tokens 0 to 599, which reaches the image at 100. The image is not cached, budget and space are free, so the encoder runs for all 1,500 embeddings. The decoder uses positions 100 to 599 of it (500 rows).</li>
+  <li><strong>Step 2.</strong> The next chunk covers tokens 600 to 1,649. The scheduler finds the item in the cache, so the encoder does not run again. The worker gathers rows 500 to 1,499 of the cached output.</li>
+  <li><strong>Prefix cache.</strong> The KV blocks that contain image positions get the extra key <code>("mm", hash, offset)</code>, with the item offset relative to the block start. So a later request with the same image and the same text can hit these blocks; a different image cannot (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L559-L574" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:559-574 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:559-574</code></a>).</li>
+  <li><strong>End.</strong> When no running request needs the item, its cache entry becomes freeable. It is evicted only when space is needed. Then the hash goes to the workers in <code>free_encoder_mm_hashes</code>.</li>
+</ol>
+<aside class="callout callout-simplified"><p class="callout-title">Simplified</p><div class="callout-body"><p>With <code>--disable-chunked-mm-input</code>, step 1 would stop the chunk before position 100, because a chunk may not cover only part of an item (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L1953-L1970" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:1953-1970 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:1953-1970</code></a>). Encoder-decoder models turn this option on by themselves (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/scheduler.py#L295-L298" target="_blank" rel="noopener" title="vllm/config/scheduler.py:295-298 at 3e44c0d"><code>vllm/config/scheduler.py:295-298</code></a>).</p></div></aside></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="flags-and-environment-variables" class="dd-title">Flags and environment variables</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--limit-mm-per-prompt</code></td><td>999 per modality</td><td>Count limit, also options per modality (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/multimodal.py#L307-L325" target="_blank" rel="noopener" title="vllm/config/multimodal.py:307-325 at 3e44c0d"><code>vllm/config/multimodal.py:307-325</code></a>).</td></tr>
+    <tr><td><code>--language-model-only</code></td><td>false</td><td>All limits 0: a text-only server (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/multimodal.py#L304-L306" target="_blank" rel="noopener" title="vllm/config/multimodal.py:304-306 at 3e44c0d"><code>vllm/config/multimodal.py:304-306</code></a>).</td></tr>
+    <tr><td><code>--mm-processor-kwargs</code></td><td>none</td><td>Options for the HF processor.</td></tr>
+    <tr><td><code>--media-io-kwargs</code></td><td>{}</td><td>Media loading options per modality, for example video <code>num_frames</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/multimodal.py#L339-L342" target="_blank" rel="noopener" title="vllm/config/multimodal.py:339-342 at 3e44c0d"><code>vllm/config/multimodal.py:339-342</code></a>).</td></tr>
+    <tr><td><code>--mm-processor-cache-gb</code> / <code>--mm-processor-cache-type</code></td><td>4 / <code>lru</code></td><td>Step 3; 0 turns the cache off. Encoder-decoder models get 0 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/model.py#L826-L828" target="_blank" rel="noopener" title="vllm/config/model.py:826-828 at 3e44c0d"><code>vllm/config/model.py:826-828</code></a>).</td></tr>
+    <tr><td><code>--mm-encoder-tp-mode</code></td><td><code>weights</code></td><td><code>data</code> splits the image batch over TP ranks instead of the weights, if the model supports it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/multimodal.py#L385-L397" target="_blank" rel="noopener" title="vllm/config/multimodal.py:385-397 at 3e44c0d"><code>vllm/config/multimodal.py:385-397</code></a>).</td></tr>
+    <tr><td><code>--allowed-local-media-path</code>, <code>--allowed-media-domains</code></td><td>"", none</td><td>Step 1.</td></tr>
+    <tr><td><code>--enable-mm-embeds</code></td><td>false</td><td>Allows <code>*_embeds</code> parts.</td></tr>
+    <tr><td><code>VLLM_MEDIA_CACHE</code></td><td>"" (off)</td><td>Disk cache for downloads, 5,120 MB and 24 h by default when on (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L966-L978" target="_blank" rel="noopener" title="vllm/envs.py:966-978 at 3e44c0d"><code>vllm/envs.py:966-978</code></a>).</td></tr>
+    <tr><td><code>VLLM_MEDIA_LOADING_THREAD_COUNT</code></td><td>8</td><td>Threads that decode media bytes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L998-L1000" target="_blank" rel="noopener" title="vllm/envs.py:998-1000 at 3e44c0d"><code>vllm/envs.py:998-1000</code></a>).</td></tr>
+    <tr><td><code>VLLM_MAX_AUDIO_CLIP_FILESIZE_MB</code></td><td>25</td><td>Size limit of one audio input (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L1005-L1007" target="_blank" rel="noopener" title="vllm/envs.py:1005-1007 at 3e44c0d"><code>vllm/envs.py:1005-1007</code></a>).</td></tr>
+  </tbody>
+</table></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="encoder-only-epd-disaggregation" class="dd-title">Encoder-only (EPD) disaggregation</h3></summary><div class="dd-body"><p>vLLM can run the vision encoder in a separate instance and send the embeddings to the language-model instance. The docs list the gains: independent scaling, lower TTFT and shared reuse of encoder outputs (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/features/disagg_encoder.md#L1-L8" target="_blank" rel="noopener" title="docs/features/disagg_encoder.md:1-8 at 3e44c0d"><code>docs/features/disagg_encoder.md:1-8</code></a>). An <a class="term" href="../reference/glossary.html#term-ec-connector" data-term="EC connector" data-def="An encoder-cache connector. It moves the outputs of a multimodal encoder between vLLM instances, with the same scheduler and worker roles as a KV connector.">EC connector</a> moves the encoder cache entries, as a KV connector moves KV blocks (<a href="../concepts/kv-connectors.html">KV connectors</a>). <code>--ec-transfer-config</code> sets the connector and the role (<code>ec_producer</code>, <code>ec_consumer</code>, <code>ec_both</code>) (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/ec_transfer.py#L16-L45" target="_blank" rel="noopener" title="vllm/config/ec_transfer.py:16-45 at 3e44c0d"><code>vllm/config/ec_transfer.py:16-45</code></a>). A producer-only instance sets <code>mm_encoder_only</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L2863-L2875" target="_blank" rel="noopener" title="vllm/config/vllm.py:2863-2875 at 3e44c0d"><code>vllm/config/vllm.py:2863-2875</code></a>), turns off prefix caching (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L1505-L1516" target="_blank" rel="noopener" title="vllm/config/vllm.py:1505-1516 at 3e44c0d"><code>vllm/config/vllm.py:1505-1516</code></a>), and its workers build an <code>MMEncoderModelRunner</code> instead of the normal Model Runner V2 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L567-L576" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:567-576 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:567-576</code></a>).</p></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<aside class="callout callout-warning"><p class="callout-title">Local files and remote URLs are an attack surface</p><div class="callout-body"><p><code>--allowed-local-media-path</code> lets any client read files under that folder. Without <code>--allowed-media-domains</code>, the API server fetches any HTTP URL that a client sends. Set both on a public server (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/media/connector.py#L348-L379" target="_blank" rel="noopener" title="vllm/multimodal/media/connector.py:348-379 at 3e44c0d"><code>vllm/multimodal/media/connector.py:348-379</code></a>).</p></div></aside>
+<ul>
+  <li><strong>"At most N image(s) may be provided in one prompt."</strong> The request is above <code>--limit-mm-per-prompt</code> or the model's own limit (Step 2).</li>
+  <li><strong>"Cannot load local files without <code>--allowed-local-media-path</code>."</strong> A <code>file:</code> URL without the flag (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/media/connector.py#L353-L357" target="_blank" rel="noopener" title="vllm/multimodal/media/connector.py:353-357 at 3e44c0d"><code>vllm/multimodal/media/connector.py:353-357</code></a>).</li>
+  <li><strong>Slow TTFT for large images.</strong> The encoder runs inside the step that first reaches the image. The scheduler may also cut the chunk before an item that does not fit the encoder budget (Step 4).</li>
+  <li><strong>Per-request <code>mm_processor_kwargs</code> rejected.</strong> Start the server with <code>--trust-request-mm-kwargs</code> only for trusted clients (Step 2).</li>
+  <li><strong>Host memory.</strong> The processor cache exists once per API server and once per engine core (Step 3).</li>
+</ul>
+<p><strong>Why it matters.</strong> A multimodal request costs more than its token count shows: media download, processing, an encoder run and cache space. Knowing which cache sits where helps you to size the server and to keep repeated images cheap.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>What does a placeholder token stand for, and who inserts it?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>One encoder output vector of a multimodal item. The model's multimodal processor inserts them in <code>apply()</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/processing/processor.py#L1816-L1826" target="_blank" rel="noopener" title="vllm/multimodal/processing/processor.py:1816-1826 at 3e44c0d"><code>vllm/multimodal/processing/processor.py:1816-1826</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>How large is the encoder cache with <code>max_num_batched_tokens = 8192</code> and a largest item of 1,200 embeddings, and in which unit?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>8,192 encoder embeddings: <code>max(8192, 1200)</code>. The unit is embeddings, not bytes or tokens of text (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/encoder_cache_manager.py#L355-L362" target="_blank" rel="noopener" title="vllm/v1/core/encoder_cache_manager.py:355-362 at 3e44c0d"><code>vllm/v1/core/encoder_cache_manager.py:355-362</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/encoder_cache_manager.py#L19-L46" target="_blank" rel="noopener" title="vllm/v1/core/encoder_cache_manager.py:19-46 at 3e44c0d"><code>vllm/v1/core/encoder_cache_manager.py:19-46</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>You start 4 API servers. Which processor cache type does vLLM use, and what changes?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>processor_only</code>: IPC caching needs exactly one API process (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/multimodal/cache/factories.py#L36-L43" target="_blank" rel="noopener" title="vllm/multimodal/cache/factories.py:36-43 at 3e44c0d"><code>vllm/multimodal/cache/factories.py:36-43</code></a>). Each API server caches only its own processing results, and the engine core gets the full data every time.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>A prompt with one image is split over two steps. Why does the encoder run only once, and how does the worker get the second half?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>In the second step the scheduler finds the item's hash in the encoder cache and does not schedule it again (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2007-L2010" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2007-2010 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2007-2010</code></a>). The worker's <code>gather_mm_embeddings</code> slices the cached output by the step's token window (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/mm/encoder_runner.py#L240-L290" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/mm/encoder_runner.py:240-290 at 3e44c0d"><code>vllm/v1/worker/gpu/mm/encoder_runner.py:240-290</code></a>).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates: from messages to token ids</a><span class="rel-sum">The renderer is the front-end layer that turns a chat or completion request into token ids. This page shows which renderer vLLM picks, how it finds and fills the chat template, the thread pool and its timeout, the length check, multimodal placeholders, and the derender and token-in token-out paths.</span></li><li><a href="../concepts/prefix-caching.html">Prefix caching in the engine core: hashes, lookup, caching, eviction and KV events</a><span class="rel-sum">The mechanics of prefix caching in the engine core. The input thread hashes each new request, the scheduler looks the hashes up in the block pool and touches the hits, allocate_slots hashes blocks that become full, and the free queue decides what to evict. KV events tell an external router what each engine holds.</span></li><li><a href="../concepts/model-runner.html">The model runner (Model Runner V2)</a><span class="rel-sum">Model Runner V2 keeps every running request in a fixed row of GPU tensors, gathers each step&#x27;s inputs from those rows with GPU kernels, runs the model (CUDA graph or eager), and samples in a second call that returns an AsyncOutput without a GPU wait.</span></li><li><a href="../concepts/kv-connectors.html">KV connectors</a><span class="rel-sum">A KV connector moves KV cache blocks between vLLM and something outside it. One connector class runs as two objects - a scheduler-side object in the engine core that plans loads and saves, and a worker-side object in each worker that moves the bytes. KVConnectorFactory finds the class by name.</span></li><li><a href="../concepts/lora-serving.html">Serving LoRA adapters: from the model name to the wrapped layer</a><span class="rel-sum">The mechanics of multi-LoRA serving in vLLM - the LoRARequest of a request, the max_loras check in the scheduler, the worker&#x27;s CPU and GPU adapter caches, the wrapped layers and the Punica kernels, token_lora_mapping in Model Runner V2, CUDA graphs per LoRA count, and the limits of runtime loading.</span></li><li><a href="../learn/openai-api.html">The OpenAI-compatible API</a><span class="rel-sum">vllm serve answers HTTP requests in the format of the OpenAI API. This page shows the routes that vLLM registers, the request fields that matter for serving, vLLM&#x27;s extra fields, the SSE stream format, tool calls, reasoning output and errors.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../concepts/lora-serving.html"><span class="pn-dir">← Previous</span><span class="pn-title">Serving LoRA adapters: from the model name to the wrapped layer</span></a><a class="pn pn-next" href="../concepts/pooling-and-embeddings.html"><span class="pn-dir">Next →</span><span class="pn-title">Pooling models and embeddings in vLLM serving</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-the-code">In the code</a></li><li class="toc-l3"><a href="#step-1-content-parts-and-media-loading">Step 1: content parts and media loading</a></li><li class="toc-l3"><a href="#step-2-the-multimodal-processor-and-its-placeholders">Step 2: the multimodal processor and its placeholders</a></li><li class="toc-l3"><a href="#step-3-the-processor-cache-between-the-api-server-and-the-engine-core">Step 3: the processor cache between the API server and the engine core</a></li><li class="toc-l3"><a href="#step-4-the-encoder-cache-and-its-budget-in-the-scheduler">Step 4: the encoder cache and its budget in the scheduler</a></li><li class="toc-l3"><a href="#step-5-the-encoder-run-in-model-runner-v2">Step 5: the encoder run in Model Runner V2</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#worked-example-one-image-in-a-chunked-prompt">Worked example: one image in a chunked prompt</a></li><li class="toc-l3"><a href="#flags-and-environment-variables">Flags and environment variables</a></li><li class="toc-l3"><a href="#encoder-only-epd-disaggregation">Encoder-only (EPD) disaggregation</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

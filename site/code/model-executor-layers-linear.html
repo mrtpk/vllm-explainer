@@ -1,0 +1,841 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>&quot;model_executor/layers/linear.py: tensor-parallel linear layers&quot; · vLLM Explained</title>
+<meta name="description" content="vllm/model_executor/layers/linear.py holds LinearBase and the replicated, column-parallel, merged-column, QKV and row-parallel linear layers. Each one resolves a quantize method, allocates its per-rank weight through it, cuts checkpoint tensors in weight_loader or weight_loader_v2, and calls the TP all-gather or all-reduce in forward.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="code/model-executor-layers-linear">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a class="current" aria-current="page" href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>Code map</span><span class="sep">›</span><span>Model execution</span><span class="sep">›</span><span aria-current="page">layers/linear.py</span></nav>
+<h1 class="page-title">&quot;model_executor/layers/linear.py: tensor-parallel linear layers&quot;</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">Code map</span><span class="meta-time">about 8 min read + 3 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../concepts/tp-layers.html">The tensor-parallel layers (linear.py and vocab_parallel_embedding.py)</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../concepts/weight-loading.html">&quot;Weight loading: from checkpoint files to GPU parameters&quot;</a> <span class="level level-advanced level-sm">Advanced</span></li></ul></aside>
+<h2 id="purpose">Purpose<a class="h-anchor" href="#purpose" aria-label="Link to this section">#</a></h2>
+<p><code>vllm/model_executor/layers/linear.py</code> gives model files linear layers that know their tensor-parallel rank: each layer stores only its slice of the weight, loads that slice from a full checkpoint tensor, and does the communication of its split.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/model_executor/layers/linear.py</code>, 1,819 lines of Python.</td></tr>
+    <tr><th>Main classes</th><td><code>LinearBase</code>, <code>ReplicatedLinear</code>, <code>ColumnParallelLinear</code>, <code>MergedColumnParallelLinear</code>, <code>QKVParallelLinear</code>, <code>RowParallelLinear</code>; the quantize methods <code>LinearMethodBase</code> and <code>UnquantizedLinearMethod</code>.</td></tr>
+    <tr><th>Runs in</th><td>Each worker. Constructors and loaders run once at model load; <code>forward</code> runs on the GPU in every step.</td></tr>
+    <tr><th>Called by</th><td>Model files (for example <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L95-L111" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:95-111 at 3e44c0d"><code>vllm/model_executor/models/llama.py:95-111</code></a>), quantization methods that subclass <code>LinearMethodBase</code>, and LoRA wrappers. About 315 files in <code>vllm/</code> name this module (git grep at this commit).</td></tr>
+    <tr><th>Calls</th><td><code>resolve_quant_method</code>, the TP helpers <code>divide</code>, <code>split_tensor_along_last_dim</code>, <code>tensor_model_parallel_all_gather</code> and <code>tensor_model_parallel_all_reduce</code>, and the parameter classes of <code>parameter.py</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L14-L45" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:14-45 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:14-45</code></a>).</td></tr>
+    <tr><th>Not in this file</th><td>The embedding and LM head (<code>vocab_parallel_embedding.py</code>), the GEMM kernels (chosen by each quantize method), the communicators (<a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a>), and the per-parameter load methods (<code>parameter.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page <a href="../concepts/tp-layers.html">The tensor-parallel layers (linear.py and vocab_parallel_embedding.py)</a> explains the ideas. This page maps the file and reads the <code>forward</code> and loader methods line by line.</p>
+
+<h2 id="where-it-sits">Where it sits<a class="h-anchor" href="#where-it-sits" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b6a_qkv_split"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: QKVParallelLinear with 32 query heads and 8 KV heads. With TP = 2, each rank owns 16 query heads and 4 KV heads. With TP = 16, each rank owns 2 query heads and one KV head, and each KV head is on two ranks."><svg role="img" aria-label="QKVParallelLinear with 32 query heads and 8 KV heads. With TP = 2, each rank owns 16 query heads and 4 KV heads. With TP = 16, each rank owns 2 query heads and one KV head, and each KV head is on two ranks." xmlns="http://www.w3.org/2000/svg" width="1100" height="880" viewBox="0 0 1100 880">
+<defs></defs>
+<rect width="1100" height="880" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">QKVParallelLinear: which heads each TP rank owns</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">32 query heads, 8 KV heads, head size 128  ·  colour = KV head (GQA group of 4 query heads)</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">per rank: q_size = num_heads x 128, kv_size = num_kv_heads x 128, output = q_size + 2 x kv_size</text>
+<rect x="20.0" y="116.0" width="1060.0" height="300.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="142.0" r="13" fill="#111827"/>
+<text x="46.0" y="146.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="147.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">TP = 2: every rank gets 16 query heads and 4 KV heads; nothing is copied</text>
+<text x="68.0" y="166.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">num_heads = 32 / 2 = 16, num_kv_heads = 8 / 2 = 4, num_kv_head_replicas = 1. qkv_proj.weight per rank: [3072, 4096].</text>
+<text x="46.0" y="208.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">rank 0</text>
+<text x="46.0" y="226.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">q: 16 heads</text>
+<text x="46.0" y="260.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">k, v: 4 heads</text>
+<rect x="150.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="164.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">0</text>
+<rect x="182.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="196.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<rect x="214.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="228.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<rect x="246.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="260.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<rect x="278.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1"/>
+<text x="292.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">4</text>
+<rect x="310.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1"/>
+<text x="324.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">5</text>
+<rect x="342.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1"/>
+<text x="356.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">6</text>
+<rect x="374.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1"/>
+<text x="388.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">7</text>
+<rect x="406.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#f0fdf4" fill-opacity="1.0" stroke="#16a34a" stroke-width="1"/>
+<text x="420.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#16a34a" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">8</text>
+<rect x="438.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#f0fdf4" fill-opacity="1.0" stroke="#16a34a" stroke-width="1"/>
+<text x="452.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#16a34a" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">9</text>
+<rect x="470.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#f0fdf4" fill-opacity="1.0" stroke="#16a34a" stroke-width="1"/>
+<text x="484.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#16a34a" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">10</text>
+<rect x="502.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#f0fdf4" fill-opacity="1.0" stroke="#16a34a" stroke-width="1"/>
+<text x="516.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#16a34a" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">11</text>
+<rect x="534.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#fff7ed" fill-opacity="1.0" stroke="#ea580c" stroke-width="1"/>
+<text x="548.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ea580c" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">12</text>
+<rect x="566.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#fff7ed" fill-opacity="1.0" stroke="#ea580c" stroke-width="1"/>
+<text x="580.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ea580c" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">13</text>
+<rect x="598.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#fff7ed" fill-opacity="1.0" stroke="#ea580c" stroke-width="1"/>
+<text x="612.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ea580c" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">14</text>
+<rect x="630.0" y="194.0" width="28.0" height="26.0" rx="3" fill="#fff7ed" fill-opacity="1.0" stroke="#ea580c" stroke-width="1"/>
+<text x="644.0" y="211.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ea580c" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">15</text>
+<rect x="150.0" y="246.0" width="60.0" height="26.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="180.0" y="263.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k0</text>
+<rect x="406.0" y="246.0" width="60.0" height="26.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="436.0" y="263.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v0</text>
+<rect x="214.0" y="246.0" width="60.0" height="26.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1"/>
+<text x="244.0" y="263.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k1</text>
+<rect x="470.0" y="246.0" width="60.0" height="26.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1"/>
+<text x="500.0" y="263.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v1</text>
+<rect x="278.0" y="246.0" width="60.0" height="26.0" rx="3" fill="#f0fdf4" fill-opacity="1.0" stroke="#16a34a" stroke-width="1"/>
+<text x="308.0" y="263.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#16a34a" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k2</text>
+<rect x="534.0" y="246.0" width="60.0" height="26.0" rx="3" fill="#f0fdf4" fill-opacity="1.0" stroke="#16a34a" stroke-width="1"/>
+<text x="564.0" y="263.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#16a34a" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v2</text>
+<rect x="342.0" y="246.0" width="60.0" height="26.0" rx="3" fill="#fff7ed" fill-opacity="1.0" stroke="#ea580c" stroke-width="1"/>
+<text x="372.0" y="263.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ea580c" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k3</text>
+<rect x="598.0" y="246.0" width="60.0" height="26.0" rx="3" fill="#fff7ed" fill-opacity="1.0" stroke="#ea580c" stroke-width="1"/>
+<text x="628.0" y="263.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ea580c" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v3</text>
+<text x="680.0" y="212.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">q rows 0-2047 of q_proj</text>
+<text x="680.0" y="264.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">k, v rows 0-511 of k_proj, v_proj</text>
+<text x="46.0" y="314.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">rank 1</text>
+<text x="46.0" y="332.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">q: 16 heads</text>
+<text x="46.0" y="366.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">k, v: 4 heads</text>
+<rect x="150.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="164.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">16</text>
+<rect x="182.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="196.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">17</text>
+<rect x="214.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="228.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">18</text>
+<rect x="246.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="260.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">19</text>
+<rect x="278.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#ecfeff" fill-opacity="1.0" stroke="#0891b2" stroke-width="1"/>
+<text x="292.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#0891b2" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">20</text>
+<rect x="310.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#ecfeff" fill-opacity="1.0" stroke="#0891b2" stroke-width="1"/>
+<text x="324.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#0891b2" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">21</text>
+<rect x="342.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#ecfeff" fill-opacity="1.0" stroke="#0891b2" stroke-width="1"/>
+<text x="356.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#0891b2" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">22</text>
+<rect x="374.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#ecfeff" fill-opacity="1.0" stroke="#0891b2" stroke-width="1"/>
+<text x="388.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#0891b2" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">23</text>
+<rect x="406.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#fefce8" fill-opacity="1.0" stroke="#ca8a04" stroke-width="1"/>
+<text x="420.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ca8a04" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">24</text>
+<rect x="438.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#fefce8" fill-opacity="1.0" stroke="#ca8a04" stroke-width="1"/>
+<text x="452.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ca8a04" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">25</text>
+<rect x="470.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#fefce8" fill-opacity="1.0" stroke="#ca8a04" stroke-width="1"/>
+<text x="484.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ca8a04" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">26</text>
+<rect x="502.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#fefce8" fill-opacity="1.0" stroke="#ca8a04" stroke-width="1"/>
+<text x="516.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ca8a04" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">27</text>
+<rect x="534.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#fef2f2" fill-opacity="1.0" stroke="#dc2626" stroke-width="1"/>
+<text x="548.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#dc2626" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">28</text>
+<rect x="566.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#fef2f2" fill-opacity="1.0" stroke="#dc2626" stroke-width="1"/>
+<text x="580.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#dc2626" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">29</text>
+<rect x="598.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#fef2f2" fill-opacity="1.0" stroke="#dc2626" stroke-width="1"/>
+<text x="612.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#dc2626" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">30</text>
+<rect x="630.0" y="300.0" width="28.0" height="26.0" rx="3" fill="#fef2f2" fill-opacity="1.0" stroke="#dc2626" stroke-width="1"/>
+<text x="644.0" y="317.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#dc2626" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">31</text>
+<rect x="150.0" y="352.0" width="60.0" height="26.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="180.0" y="369.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k4</text>
+<rect x="406.0" y="352.0" width="60.0" height="26.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="436.0" y="369.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v4</text>
+<rect x="214.0" y="352.0" width="60.0" height="26.0" rx="3" fill="#ecfeff" fill-opacity="1.0" stroke="#0891b2" stroke-width="1"/>
+<text x="244.0" y="369.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#0891b2" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k5</text>
+<rect x="470.0" y="352.0" width="60.0" height="26.0" rx="3" fill="#ecfeff" fill-opacity="1.0" stroke="#0891b2" stroke-width="1"/>
+<text x="500.0" y="369.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#0891b2" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v5</text>
+<rect x="278.0" y="352.0" width="60.0" height="26.0" rx="3" fill="#fefce8" fill-opacity="1.0" stroke="#ca8a04" stroke-width="1"/>
+<text x="308.0" y="369.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ca8a04" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k6</text>
+<rect x="534.0" y="352.0" width="60.0" height="26.0" rx="3" fill="#fefce8" fill-opacity="1.0" stroke="#ca8a04" stroke-width="1"/>
+<text x="564.0" y="369.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ca8a04" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v6</text>
+<rect x="342.0" y="352.0" width="60.0" height="26.0" rx="3" fill="#fef2f2" fill-opacity="1.0" stroke="#dc2626" stroke-width="1"/>
+<text x="372.0" y="369.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#dc2626" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k7</text>
+<rect x="598.0" y="352.0" width="60.0" height="26.0" rx="3" fill="#fef2f2" fill-opacity="1.0" stroke="#dc2626" stroke-width="1"/>
+<text x="628.0" y="369.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#dc2626" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v7</text>
+<text x="680.0" y="318.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">q rows 2048-4095 of q_proj</text>
+<text x="680.0" y="370.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">k, v rows 512-1023 of k_proj, v_proj</text>
+<rect x="20.0" y="436.0" width="1060.0" height="330.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="462.0" r="13" fill="#111827"/>
+<text x="46.0" y="466.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="467.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">TP = 16: each rank gets 2 query heads; each KV head is copied to 2 ranks</text>
+<text x="68.0" y="486.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">tp_size &gt;= 8 KV heads: num_kv_heads = 1, num_kv_head_replicas = 16 / 8 = 2. qkv_proj.weight per rank: [512, 4096].</text>
+<text x="76.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r0</text>
+<rect x="46.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="76.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">0</text>
+<rect x="46.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="76.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<rect x="46.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="76.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k0</text>
+<rect x="46.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="76.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v0</text>
+<text x="139.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r1</text>
+<rect x="109.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="139.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<rect x="109.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="139.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<rect x="109.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="139.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k0</text>
+<rect x="109.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="139.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v0</text>
+<text x="202.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r2</text>
+<rect x="172.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1"/>
+<text x="202.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">4</text>
+<rect x="172.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1"/>
+<text x="202.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">5</text>
+<rect x="172.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="202.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k1</text>
+<rect x="172.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="202.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v1</text>
+<text x="265.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r3</text>
+<rect x="235.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1"/>
+<text x="265.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">6</text>
+<rect x="235.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1"/>
+<text x="265.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">7</text>
+<rect x="235.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="265.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k1</text>
+<rect x="235.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="265.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v1</text>
+<text x="328.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r4</text>
+<rect x="298.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#f0fdf4" fill-opacity="1.0" stroke="#16a34a" stroke-width="1"/>
+<text x="328.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#16a34a" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">8</text>
+<rect x="298.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#f0fdf4" fill-opacity="1.0" stroke="#16a34a" stroke-width="1"/>
+<text x="328.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#16a34a" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">9</text>
+<rect x="298.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#f0fdf4" fill-opacity="1.0" stroke="#16a34a" stroke-width="1.4"/>
+<text x="328.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#16a34a" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k2</text>
+<rect x="298.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#f0fdf4" fill-opacity="1.0" stroke="#16a34a" stroke-width="1.4"/>
+<text x="328.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#16a34a" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v2</text>
+<text x="391.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r5</text>
+<rect x="361.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#f0fdf4" fill-opacity="1.0" stroke="#16a34a" stroke-width="1"/>
+<text x="391.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#16a34a" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">10</text>
+<rect x="361.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#f0fdf4" fill-opacity="1.0" stroke="#16a34a" stroke-width="1"/>
+<text x="391.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#16a34a" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">11</text>
+<rect x="361.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#f0fdf4" fill-opacity="1.0" stroke="#16a34a" stroke-width="1.4"/>
+<text x="391.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#16a34a" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k2</text>
+<rect x="361.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#f0fdf4" fill-opacity="1.0" stroke="#16a34a" stroke-width="1.4"/>
+<text x="391.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#16a34a" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v2</text>
+<text x="454.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r6</text>
+<rect x="424.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#fff7ed" fill-opacity="1.0" stroke="#ea580c" stroke-width="1"/>
+<text x="454.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ea580c" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">12</text>
+<rect x="424.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#fff7ed" fill-opacity="1.0" stroke="#ea580c" stroke-width="1"/>
+<text x="454.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ea580c" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">13</text>
+<rect x="424.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#fff7ed" fill-opacity="1.0" stroke="#ea580c" stroke-width="1.4"/>
+<text x="454.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ea580c" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k3</text>
+<rect x="424.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#fff7ed" fill-opacity="1.0" stroke="#ea580c" stroke-width="1.4"/>
+<text x="454.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ea580c" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v3</text>
+<text x="517.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r7</text>
+<rect x="487.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#fff7ed" fill-opacity="1.0" stroke="#ea580c" stroke-width="1"/>
+<text x="517.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ea580c" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">14</text>
+<rect x="487.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#fff7ed" fill-opacity="1.0" stroke="#ea580c" stroke-width="1"/>
+<text x="517.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ea580c" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">15</text>
+<rect x="487.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#fff7ed" fill-opacity="1.0" stroke="#ea580c" stroke-width="1.4"/>
+<text x="517.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ea580c" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k3</text>
+<rect x="487.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#fff7ed" fill-opacity="1.0" stroke="#ea580c" stroke-width="1.4"/>
+<text x="517.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ea580c" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v3</text>
+<text x="580.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r8</text>
+<rect x="550.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="580.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">16</text>
+<rect x="550.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="580.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">17</text>
+<rect x="550.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="580.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k4</text>
+<rect x="550.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="580.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v4</text>
+<text x="643.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r9</text>
+<rect x="613.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="643.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">18</text>
+<rect x="613.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="643.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">19</text>
+<rect x="613.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="643.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k4</text>
+<rect x="613.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="643.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v4</text>
+<text x="706.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r10</text>
+<rect x="676.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#ecfeff" fill-opacity="1.0" stroke="#0891b2" stroke-width="1"/>
+<text x="706.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#0891b2" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">20</text>
+<rect x="676.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#ecfeff" fill-opacity="1.0" stroke="#0891b2" stroke-width="1"/>
+<text x="706.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#0891b2" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">21</text>
+<rect x="676.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#ecfeff" fill-opacity="1.0" stroke="#0891b2" stroke-width="1.4"/>
+<text x="706.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#0891b2" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k5</text>
+<rect x="676.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#ecfeff" fill-opacity="1.0" stroke="#0891b2" stroke-width="1.4"/>
+<text x="706.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#0891b2" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v5</text>
+<text x="769.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r11</text>
+<rect x="739.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#ecfeff" fill-opacity="1.0" stroke="#0891b2" stroke-width="1"/>
+<text x="769.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#0891b2" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">22</text>
+<rect x="739.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#ecfeff" fill-opacity="1.0" stroke="#0891b2" stroke-width="1"/>
+<text x="769.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#0891b2" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">23</text>
+<rect x="739.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#ecfeff" fill-opacity="1.0" stroke="#0891b2" stroke-width="1.4"/>
+<text x="769.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#0891b2" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k5</text>
+<rect x="739.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#ecfeff" fill-opacity="1.0" stroke="#0891b2" stroke-width="1.4"/>
+<text x="769.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#0891b2" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v5</text>
+<text x="832.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r12</text>
+<rect x="802.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#fefce8" fill-opacity="1.0" stroke="#ca8a04" stroke-width="1"/>
+<text x="832.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ca8a04" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">24</text>
+<rect x="802.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#fefce8" fill-opacity="1.0" stroke="#ca8a04" stroke-width="1"/>
+<text x="832.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ca8a04" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">25</text>
+<rect x="802.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#fefce8" fill-opacity="1.0" stroke="#ca8a04" stroke-width="1.4"/>
+<text x="832.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ca8a04" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k6</text>
+<rect x="802.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#fefce8" fill-opacity="1.0" stroke="#ca8a04" stroke-width="1.4"/>
+<text x="832.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ca8a04" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v6</text>
+<text x="895.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r13</text>
+<rect x="865.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#fefce8" fill-opacity="1.0" stroke="#ca8a04" stroke-width="1"/>
+<text x="895.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ca8a04" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">26</text>
+<rect x="865.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#fefce8" fill-opacity="1.0" stroke="#ca8a04" stroke-width="1"/>
+<text x="895.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ca8a04" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">27</text>
+<rect x="865.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#fefce8" fill-opacity="1.0" stroke="#ca8a04" stroke-width="1.4"/>
+<text x="895.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ca8a04" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k6</text>
+<rect x="865.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#fefce8" fill-opacity="1.0" stroke="#ca8a04" stroke-width="1.4"/>
+<text x="895.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#ca8a04" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v6</text>
+<text x="958.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r14</text>
+<rect x="928.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#fef2f2" fill-opacity="1.0" stroke="#dc2626" stroke-width="1"/>
+<text x="958.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#dc2626" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">28</text>
+<rect x="928.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#fef2f2" fill-opacity="1.0" stroke="#dc2626" stroke-width="1"/>
+<text x="958.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#dc2626" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">29</text>
+<rect x="928.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#fef2f2" fill-opacity="1.0" stroke="#dc2626" stroke-width="1.4"/>
+<text x="958.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#dc2626" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k7</text>
+<rect x="928.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#fef2f2" fill-opacity="1.0" stroke="#dc2626" stroke-width="1.4"/>
+<text x="958.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#dc2626" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v7</text>
+<text x="1021.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">r15</text>
+<rect x="991.0" y="530.0" width="60.0" height="24.0" rx="3" fill="#fef2f2" fill-opacity="1.0" stroke="#dc2626" stroke-width="1"/>
+<text x="1021.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#dc2626" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">30</text>
+<rect x="991.0" y="558.0" width="60.0" height="24.0" rx="3" fill="#fef2f2" fill-opacity="1.0" stroke="#dc2626" stroke-width="1"/>
+<text x="1021.0" y="574.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#dc2626" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">31</text>
+<rect x="991.0" y="594.0" width="60.0" height="24.0" rx="3" fill="#fef2f2" fill-opacity="1.0" stroke="#dc2626" stroke-width="1.4"/>
+<text x="1021.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#dc2626" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">k7</text>
+<rect x="991.0" y="622.0" width="60.0" height="24.0" rx="3" fill="#fef2f2" fill-opacity="1.0" stroke="#dc2626" stroke-width="1.4"/>
+<text x="1021.0" y="638.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#dc2626" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">v7</text>
+<text x="46.0" y="672.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">q heads: rank r takes heads 2r and 2r+1 (slice index = tp_rank).</text>
+<text x="46.0" y="692.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">k, v: rank r takes KV head r // 2 (slice index = tp_rank // num_kv_head_replicas).</text>
+<text x="46.0" y="712.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The query heads of a rank always use the KV head that the same rank holds: heads 2r, 2r+1 -&gt; KV head r // 2.</text>
+<text x="46.0" y="736.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">KV cache: each rank stores 1 KV head per layer, so the 16 ranks store 16 copies of the 8 real KV heads (2 of each).</text>
+<text x="30.0" y="801.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="96.0" y="790.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="116.0" y="801.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">KV head 0</text>
+<rect x="202.0" y="790.0" width="14.0" height="14.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="222.0" y="801.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">KV head 1</text>
+<rect x="308.0" y="790.0" width="14.0" height="14.0" rx="3" fill="#f0fdf4" fill-opacity="1.0" stroke="#16a34a" stroke-width="1.4"/>
+<text x="328.0" y="801.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">KV head 2</text>
+<rect x="414.0" y="790.0" width="14.0" height="14.0" rx="3" fill="#fff7ed" fill-opacity="1.0" stroke="#ea580c" stroke-width="1.4"/>
+<text x="434.0" y="801.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">KV head 3</text>
+<rect x="520.0" y="790.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="540.0" y="801.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">KV head 4</text>
+<rect x="626.0" y="790.0" width="14.0" height="14.0" rx="3" fill="#ecfeff" fill-opacity="1.0" stroke="#0891b2" stroke-width="1.4"/>
+<text x="646.0" y="801.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">KV head 5</text>
+<rect x="732.0" y="790.0" width="14.0" height="14.0" rx="3" fill="#fefce8" fill-opacity="1.0" stroke="#ca8a04" stroke-width="1.4"/>
+<text x="752.0" y="801.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">KV head 6</text>
+<rect x="838.0" y="790.0" width="14.0" height="14.0" rx="3" fill="#fef2f2" fill-opacity="1.0" stroke="#dc2626" stroke-width="1.4"/>
+<text x="858.0" y="801.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">KV head 7</text>
+<text x="30.0" y="830.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Numbers in cells are query head ids; k3 and v3 are the key and value of KV head 3. Query head h uses KV head h // 4 (grouped-query attention).</text>
+<text x="30.0" y="848.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">TP = 8 (not shown): 4 query heads and exactly 1 KV head per rank, replicas = 1. TP = 3 fails: 32 heads do not divide by 3.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the head split of QKVParallelLinear, the most complex layer of this file, for TP = 2 and TP = 16.</figcaption><a class="diagram-open" href="../diagrams/b6a_qkv_split.svg" target="_blank">Open full size ↗</a></div></figure>
+
+<h3 id="who-calls-it">Who calls it<a class="h-anchor" href="#who-calls-it" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><strong>Model constructors</strong> build the layers with full sizes, a <code>quant_config</code> and a prefix (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L165-L181" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:165-181 at 3e44c0d"><code>vllm/model_executor/models/llama.py:165-181</code></a>).</li>
+  <li><strong><code>AutoWeightsLoader</code></strong> calls <code>load_weights</code> of the merged and QKV layers, and the <code>weight_loader</code> of other parameters (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L387-L424" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:387-424 at 3e44c0d"><code>vllm/model_executor/models/utils.py:387-424</code></a>).</li>
+  <li><strong>Quantization methods</strong> subclass <code>LinearMethodBase</code>, for example <code>Fp8LinearMethod</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/quantization/fp8.py#L225" target="_blank" rel="noopener" title="vllm/model_executor/layers/quantization/fp8.py:225 at 3e44c0d"><code>vllm/model_executor/layers/quantization/fp8.py:225</code></a>).</li>
+  <li><strong>LoRA</strong> wraps these layers; it finds a replaced class with <code>maybe_get_oot_by_class</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/layers/column_parallel_linear.py#L169" target="_blank" rel="noopener" title="vllm/lora/layers/column_parallel_linear.py:169 at 3e44c0d"><code>vllm/lora/layers/column_parallel_linear.py:169</code></a>).</li>
+</ul>
+
+<h3 id="what-it-calls">What it calls<a class="h-anchor" href="#what-it-calls" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><code>resolve_quant_method(quant_config, layer, prefix)</code> in <code>LinearBase.__init__</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L293" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:293 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:293</code></a>).</li>
+  <li><code>quant_method.create_weights(...)</code> and <code>quant_method.apply(...)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L536-L544" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:536-544 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:536-544</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L623" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:623 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:623</code></a>).</li>
+  <li>The collectives in <code>forward</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L627" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:627 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:627</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1804" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1804 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1804</code></a>).</li>
+  <li>The parameter methods <code>load_column_parallel_weight</code>, <code>load_merged_column_weight</code>, <code>load_qkv_weight</code> and <code>load_row_parallel_weight</code> in the v2 loaders (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/parameter.py#L145-L226" target="_blank" rel="noopener" title="vllm/model_executor/parameter.py:145-226 at 3e44c0d"><code>vllm/model_executor/parameter.py:145-226</code></a>).</li>
+</ul>
+
+<h2 id="key-classes-and-functions">Key classes and functions<a class="h-anchor" href="#key-classes-and-functions" aria-label="Link to this section">#</a></h2>
+<table>
+  <thead><tr><th>Name</th><th>Lines</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>WEIGHT_LOADER_V2_SUPPORTED</code>, <code>register_weight_loader_v2_supported_method</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L50-L70" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:50-70 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:50-70</code></a></td><td>Quantize-method class names that use the v2 loaders.</td></tr>
+    <tr><td><code>adjust_marlin_shard</code>, <code>adjust_block_scale_shard</code>, <code>adjust_scalar_to_fused_array</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L73-L121" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:73-121 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:73-121</code></a></td><td>Offset fixes for Marlin tiles, block scales and per-part scalar scales.</td></tr>
+    <tr><td><code>LinearMethodBase</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L124-L163" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:124-163 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:124-163</code></a></td><td>Abstract quantize method: <code>create_weights</code>, <code>apply</code>.</td></tr>
+    <tr><td><code>UnquantizedLinearMethod</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L166-L242" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:166-242 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:166-242</code></a></td><td>BF16/FP16 weights; GEMM from <code>dispatch_unquantized_gemm</code>.</td></tr>
+    <tr><td><code>LinearBase</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L245-L324" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:245-324 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:245-324</code></a></td><td>Common fields, quantize method, TP rank and size.</td></tr>
+    <tr><td><code>ReplicatedLinear</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L327-L431" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:327-431 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:327-431</code></a></td><td>Full weight on every rank.</td></tr>
+    <tr><td><code>ColumnParallelLinear</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L434-L642" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:434-642 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:434-642</code></a></td><td>Output split; optional all-gather.</td></tr>
+    <tr><td><code>DCPGroupColumnParallelLinear</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L645-L683" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:645-683 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:645-683</code></a></td><td>Splits across decode-context-parallel groups, not every rank.</td></tr>
+    <tr><td><code>MergedColumnParallelLinear</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L686-L1008" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:686-1008 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:686-1008</code></a></td><td>Several column parts in one weight; integer shard ids.</td></tr>
+    <tr><td><code>QKVParallelLinear</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1011-L1362" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1011-1362 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1011-1362</code></a></td><td>Q, K, V by heads; KV replication; shard ids q, k, v.</td></tr>
+    <tr><td><code>MinimaxM3QKVParallelLinearWithIndexer</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1365-L1545" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1365-1545 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1365-1545</code></a></td><td>Model-specific: QKV plus indexer heads (MiniMax-M3).</td></tr>
+    <tr><td><code>KimiK3MergedQKVGateLinear</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1548-L1634" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1548-1634 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1548-1634</code></a></td><td>Model-specific: replicated latents plus a TP gate (Kimi-K3).</td></tr>
+    <tr><td><code>RowParallelLinear</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1637-L1819" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1637-1819 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1637-1819</code></a></td><td>Input split; bias on rank 0; optional all-reduce.</td></tr>
+  </tbody>
+</table>
+<p>Three classes are registered as <code>PluggableLayer</code> names: <code>replicated_linear</code>, <code>column_parallel_linear</code> and <code>row_parallel_linear</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L328" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:328 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:328</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L435" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:435 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:435</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1638" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1638 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1638</code></a>). The merged and QKV classes have no name of their own. A plugin can swap a registered class (<a href="../concepts/custom-ops.html">CustomOp, out-of-tree ops and IR op providers</a>).</p>
+
+<h2 id="walk-through-the-main-methods">Walk through the main methods<a class="h-anchor" href="#walk-through-the-main-methods" aria-label="Link to this section">#</a></h2>
+
+<h3 id="columnparallellinear-init-sizes-and-the-loader-choice"><code>ColumnParallelLinear.__init__</code>: sizes and the loader choice<a class="h-anchor" href="#columnparallellinear-init-sizes-and-the-loader-choice" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L484-L544" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/layers/linear.py:484-544</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L484-L544" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">484</span><span class="ln">485</span><span class="ln">486</span><span class="ln">487</span><span class="ln">488</span><span class="ln">489</span><span class="ln">490</span><span class="ln">491</span><span class="ln">492</span><span class="ln">493</span><span class="ln">494</span><span class="ln">495</span><span class="ln hl">496</span><span class="ln hl">497</span><span class="ln hl">498</span><span class="ln hl">499</span><span class="ln hl">500</span><span class="ln hl">501</span><span class="ln hl">502</span><span class="ln hl">503</span><span class="ln">504</span><span class="ln">505</span><span class="ln">506</span><span class="ln">507</span><span class="ln">508</span><span class="ln">509</span><span class="ln">510</span><span class="ln">511</span><span class="ln">512</span><span class="ln">513</span><span class="ln">514</span><span class="ln">515</span><span class="ln">516</span><span class="ln">517</span><span class="ln">518</span><span class="ln">519</span><span class="ln">520</span><span class="ln">521</span><span class="ln">522</span><span class="ln">523</span><span class="ln hl">524</span><span class="ln hl">525</span><span class="ln hl">526</span><span class="ln hl">527</span><span class="ln hl">528</span><span class="ln hl">529</span><span class="ln hl">530</span><span class="ln hl">531</span><span class="ln hl">532</span><span class="ln hl">533</span><span class="ln hl">534</span><span class="ln">535</span><span class="ln hl">536</span><span class="ln hl">537</span><span class="ln hl">538</span><span class="ln hl">539</span><span class="ln hl">540</span><span class="ln hl">541</span><span class="ln hl">542</span><span class="ln hl">543</span><span class="ln hl">544</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(40 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(41 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(42 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(43 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(44 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(45 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(46 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(47 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(48 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(49 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(50 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(52 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(53 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(54 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(55 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(56 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(57 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(58 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(59 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(60 * var(--code-lh))"></span><pre><code class="language-python">        # Divide the weight matrix along the last dimension.
+        if disable_tp:
+            self.tp_rank, self.tp_size = 0, 1
+        else:
+            self.tp_rank = (
+                tp_rank if tp_rank is not None else get_tensor_model_parallel_rank()
+            )
+            self.tp_size = (
+                tp_size
+                if tp_size is not None
+                else get_tensor_model_parallel_world_size()
+            )
+        self.input_size_per_partition = input_size
+        self.output_size_per_partition = divide(output_size, self.tp_size)
+        self.output_partition_sizes = [self.output_size_per_partition]
+        # If QKV or MergedColumn, use output size of each partition.
+        if hasattr(self, &quot;output_sizes&quot;):
+            self.output_partition_sizes = [
+                divide(output_size, self.tp_size) for output_size in self.output_sizes
+            ]
+
+        super().__init__(
+            input_size,
+            output_size,
+            bias,
+            skip_bias_add,
+            params_dtype,
+            quant_config,
+            prefix,
+            return_bias=return_bias,
+            disable_tp=disable_tp,
+            tp_rank=self.tp_rank,
+            tp_size=self.tp_size,
+        )
+
+        self._maybe_allow_fp8_block_shape_mismatch()
+        self.gather_output = gather_output
+
+        from vllm.model_executor.layers.quantization.online.fp8 import OnlineLinearBase
+
+        quant_method = self.quant_method
+        if (
+            isinstance(quant_method, OnlineLinearBase)
+            and quant_method.requantization_source is not None
+        ):
+            quant_method = quant_method.requantization_source
+        weight_loader = (
+            self.weight_loader_v2
+            if quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+            else self.weight_loader
+        )
+
+        self.quant_method.create_weights(
+            layer=self,
+            input_size_per_partition=self.input_size_per_partition,
+            output_partition_sizes=self.output_partition_sizes,
+            input_size=self.input_size,
+            output_size=self.output_size,
+            params_dtype=self.params_dtype,
+            weight_loader=weight_loader,
+        )</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 484-495.</strong> The rank and size come from the TP group, unless <code>disable_tp</code> or explicit values are given. <code>DCPGroupColumnParallelLinear</code> uses the explicit values to split across groups.</li>
+  <li><strong>Lines 496-503.</strong> The full input and <code>output_size / tp_size</code>. If the subclass set <code>output_sizes</code> (merged and QKV), each part is divided separately.</li>
+  <li><strong>Lines 524-534.</strong> The v2 loader if the quantize method's class name is in the list; an online-quantization method is judged by its source method.</li>
+  <li><strong>Lines 536-544.</strong> The quantize method makes the weight parameters and gives each one the chosen loader. For <code>UnquantizedLinearMethod</code> this is one <code>ModelWeightParameter</code> of shape <code>[sum(output_partition_sizes), input_size]</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L192-L205" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:192-205 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:192-205</code></a>).</li>
+</ol>
+
+<h3 id="columnparallellinear-forward-and-weight-loader"><code>ColumnParallelLinear.forward</code> and <code>weight_loader</code><a class="h-anchor" href="#columnparallellinear-forward-and-weight-loader" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L589-L634" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/layers/linear.py:589-634</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L589-L634" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">589</span><span class="ln">590</span><span class="ln">591</span><span class="ln">592</span><span class="ln">593</span><span class="ln">594</span><span class="ln hl">595</span><span class="ln hl">596</span><span class="ln hl">597</span><span class="ln hl">598</span><span class="ln">599</span><span class="ln">600</span><span class="ln">601</span><span class="ln hl">602</span><span class="ln hl">603</span><span class="ln">604</span><span class="ln">605</span><span class="ln">606</span><span class="ln">607</span><span class="ln">608</span><span class="ln">609</span><span class="ln">610</span><span class="ln">611</span><span class="ln">612</span><span class="ln">613</span><span class="ln">614</span><span class="ln">615</span><span class="ln">616</span><span class="ln">617</span><span class="ln">618</span><span class="ln">619</span><span class="ln">620</span><span class="ln">621</span><span class="ln">622</span><span class="ln hl">623</span><span class="ln">624</span><span class="ln hl">625</span><span class="ln hl">626</span><span class="ln hl">627</span><span class="ln">628</span><span class="ln">629</span><span class="ln">630</span><span class="ln">631</span><span class="ln">632</span><span class="ln">633</span><span class="ln">634</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(37 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(38 * var(--code-lh))"></span><pre><code class="language-python">    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+        output_dim = getattr(param, &quot;output_dim&quot;, None)
+
+        is_sharded_weight = getattr(param, &quot;is_sharded_weight&quot;, False)
+
+        param_data = param.data
+        if output_dim is not None and not is_sharded_weight:
+            shard_size = param_data.shape[output_dim]
+            start_idx = self.tp_rank * shard_size
+            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+
+        # Special case for loading scales off disk, which often do not
+        # have a shape (such as in the case of AutoFP8).
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)
+
+    def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
+        # Special case for loading scales off disk, which often do not
+        # have a shape (such as in the case of AutoFP8).
+        if len(loaded_weight.shape) == 0:
+            assert loaded_weight.numel() == 1
+            loaded_weight = loaded_weight.reshape(1)
+        param.load_column_parallel_weight(loaded_weight=loaded_weight)
+
+    def forward(
+        self,
+        input_,
+    ) -&gt; torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        bias = self.bias if not self.skip_bias_add else None
+
+        # Matrix multiply.
+        output_parallel = self.quant_method.apply(self, input_, bias)
+
+        if self.gather_output and self.tp_size &gt; 1:
+            # All-gather across the partitions.
+            output = tensor_model_parallel_all_gather(output_parallel)
+        else:
+            output = output_parallel
+
+        if not self.return_bias:
+            return output
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 595-598.</strong> v1 loader: if the parameter has <code>output_dim</code> and is not already sharded, cut <code>shard_size</code> rows at <code>tp_rank × shard_size</code>. <code>shard_size</code> is the parameter's own size, so the cut needs no TP size.</li>
+  <li><strong>Lines 602-603.</strong> A scalar scale from the checkpoint becomes a 1-element tensor.</li>
+  <li><strong>Lines 608-614.</strong> The v2 loader gives the work to <code>param.load_column_parallel_weight</code>.</li>
+  <li><strong>Line 623.</strong> <code>quant_method.apply(self, input_, bias)</code>: the GEMM. Every rank gets the same full input.</li>
+  <li><strong>Lines 625-627.</strong> The all-gather only with <code>gather_output</code> and TP &gt; 1; else the output stays a slice <code>[T, out / tp_size]</code>.</li>
+</ol>
+
+<h3 id="qkvparallellinear-weight-loader-v1"><code>QKVParallelLinear.weight_loader</code> (v1)<a class="h-anchor" href="#qkvparallellinear-weight-loader-v1" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1278-L1320" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/layers/linear.py:1278-1320</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1278-L1320" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1278</span><span class="ln">1279</span><span class="ln">1280</span><span class="ln">1281</span><span class="ln hl">1282</span><span class="ln hl">1283</span><span class="ln hl">1284</span><span class="ln hl">1285</span><span class="ln hl">1286</span><span class="ln hl">1287</span><span class="ln hl">1288</span><span class="ln hl">1289</span><span class="ln hl">1290</span><span class="ln">1291</span><span class="ln">1292</span><span class="ln">1293</span><span class="ln">1294</span><span class="ln">1295</span><span class="ln">1296</span><span class="ln">1297</span><span class="ln">1298</span><span class="ln">1299</span><span class="ln">1300</span><span class="ln">1301</span><span class="ln">1302</span><span class="ln">1303</span><span class="ln">1304</span><span class="ln">1305</span><span class="ln">1306</span><span class="ln">1307</span><span class="ln">1308</span><span class="ln">1309</span><span class="ln">1310</span><span class="ln">1311</span><span class="ln hl">1312</span><span class="ln hl">1313</span><span class="ln hl">1314</span><span class="ln hl">1315</span><span class="ln hl">1316</span><span class="ln hl">1317</span><span class="ln">1318</span><span class="ln hl">1319</span><span class="ln hl">1320</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(37 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(38 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(41 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(42 * var(--code-lh))"></span><pre><code class="language-python">        assert loaded_shard_id in [&quot;q&quot;, &quot;k&quot;, &quot;v&quot;]
+
+        # If output dim is defined, use the default loading process.
+        if output_dim is not None:
+            if loaded_shard_id == &quot;q&quot;:
+                shard_offset = 0
+                shard_size = self.num_heads * self.head_size
+            elif loaded_shard_id == &quot;k&quot;:
+                shard_offset = self.num_heads * self.head_size
+                shard_size = self.num_kv_heads * self.head_size
+            elif loaded_shard_id == &quot;v&quot;:
+                shard_offset = (self.num_heads + self.num_kv_heads) * self.head_size
+                shard_size = self.num_kv_heads * self.v_head_size
+
+            if isinstance(param, BlockQuantScaleParameter):
+                weight_block_size = getattr(self, &quot;weight_block_size&quot;, None)
+                shard_size, shard_offset = adjust_block_scale_shard(
+                    weight_block_size, shard_size, shard_offset
+                )
+
+            # Special case for Quantized Weights.
+            # If quantized, we need to adjust the offset and size to account
+            # for the packing.
+            packed_dim = getattr(param, &quot;packed_dim&quot;, None)
+            if packed_dim == output_dim:
+                shard_size = round(shard_size // param.packed_factor)
+                shard_offset = round(shard_offset // param.packed_factor)
+
+                # Special case for Marlin.
+                shard_size, shard_offset = adjust_marlin_shard(
+                    param, shard_size, shard_offset
+                )
+
+            is_sharded_weight = getattr(param, &quot;is_sharded_weight&quot;, False)
+            param_data = param_data.narrow(output_dim, shard_offset, shard_size)
+            if loaded_shard_id == &quot;q&quot;:
+                shard_rank = self.tp_rank
+            else:
+                shard_rank = self.tp_rank // self.num_kv_head_replicas
+            start_idx = shard_rank * shard_size
+
+            if not is_sharded_weight:
+                loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 1282-1290.</strong> Offset and size of the shard inside this rank's parameter: q first, then k, then v, all in per-rank head counts.</li>
+  <li><strong>Lines 1292-1309.</strong> Fixes for block scales and packed or Marlin weights (see the deep dive).</li>
+  <li><strong>Line 1312.</strong> The view of the parameter for this shard.</li>
+  <li><strong>Lines 1313-1317.</strong> The slice index in the checkpoint tensor: <code>tp_rank</code> for q, <code>tp_rank // num_kv_head_replicas</code> for k and v.</li>
+  <li><strong>Lines 1319-1320.</strong> The cut of the checkpoint tensor; then the assertion and the copy at lines 1336-1337.</li>
+</ol>
+<p>A <code>None</code> shard id means the checkpoint already stores QKV fused (Phi-3 style). Then the loader cuts the full tensor into q, k and v by the <em>total</em> head counts and calls itself once per part (lines 1225-1276). The v2 loader does the same through <code>param.load_qkv_weight</code>, with <code>num_heads=self.num_kv_head_replicas</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1191-L1209" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1191-1209 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1191-1209</code></a>).</p>
+
+<h3 id="rowparallellinear-weight-loader-and-forward"><code>RowParallelLinear.weight_loader</code> and <code>forward</code><a class="h-anchor" href="#rowparallellinear-weight-loader-and-forward" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1758-L1774" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/layers/linear.py:1758-1774</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1758-L1774" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1758</span><span class="ln">1759</span><span class="ln">1760</span><span class="ln">1761</span><span class="ln">1762</span><span class="ln hl">1763</span><span class="ln hl">1764</span><span class="ln hl">1765</span><span class="ln hl">1766</span><span class="ln">1767</span><span class="ln">1768</span><span class="ln">1769</span><span class="ln">1770</span><span class="ln">1771</span><span class="ln">1772</span><span class="ln">1773</span><span class="ln">1774</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><pre><code class="language-python">    def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
+        input_dim = getattr(param, &quot;input_dim&quot;, None)
+        is_sharded_weight = getattr(param, &quot;is_sharded_weight&quot;, False)
+
+        param_data = param.data
+        if input_dim is not None and not is_sharded_weight:
+            shard_size = param_data.shape[input_dim]
+            start_idx = self.tp_rank * shard_size
+            loaded_weight = loaded_weight.narrow(input_dim, start_idx, shard_size)
+
+        # Special case for loading scales off disk, which often do not
+        # have a shape (such as in the case of AutoFP8).
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 1763-1766.</strong> The cut is along <code>input_dim</code> (dimension 1 of <code>[out, in]</code>) at <code>tp_rank × shard_size</code>.</li>
+  <li><strong>Lines 1770-1774.</strong> Scalars become 1-element tensors; then a shape assertion and the copy.</li>
+</ol>
+<p>The bias is a full <code>[output_size]</code> parameter with the v1 loader (lines 1742-1753). Its <code>output_dim</code> is 0 and it has no <code>input_dim</code>, so the row loader copies it whole on every rank. In <code>forward</code>, only rank 0 adds it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1798-L1801" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1798-1801 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1798-1801</code></a>). <code>forward</code> is on <a href="../concepts/tp-layers.html">The tensor-parallel layers (linear.py and vocab_parallel_embedding.py)</a>: optional split of the input, GEMM, and the all-reduce when <code>reduce_results</code> and TP &gt; 1 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1785-L1811" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1785-1811 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1785-1811</code></a>).</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="data-flow-types-and-shapes" class="dd-title">Data flow: types and shapes</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Layer</th><th>Input (per rank)</th><th>Weight (per rank, unquantized)</th><th>Output (per rank)</th><th>Collective</th></tr></thead>
+  <tbody>
+    <tr><td><code>ReplicatedLinear</code></td><td><code>[T, in]</code></td><td><code>[out, in]</code></td><td><code>[T, out]</code></td><td>none</td></tr>
+    <tr><td><code>ColumnParallelLinear</code></td><td><code>[T, in]</code></td><td><code>[out / tp, in]</code></td><td><code>[T, out / tp]</code>, or <code>[T, out]</code> with gather</td><td>all-gather if <code>gather_output</code></td></tr>
+    <tr><td><code>MergedColumnParallelLinear</code></td><td><code>[T, in]</code></td><td><code>[Σ out_i / tp, in]</code></td><td><code>[T, Σ out_i / tp]</code></td><td>same</td></tr>
+    <tr><td><code>QKVParallelLinear</code></td><td><code>[T, hidden]</code></td><td><code>[(h_q + 2 h_kv) × d, hidden]</code></td><td><code>[T, (h_q + 2 h_kv) × d]</code></td><td>none</td></tr>
+    <tr><td><code>RowParallelLinear</code></td><td><code>[T, in / tp]</code></td><td><code>[out, in / tp]</code></td><td><code>[T, out]</code> (full after the all-reduce)</td><td>all-reduce if <code>reduce_results</code></td></tr>
+  </tbody>
+</table>
+<p><code>h_q</code> and <code>h_kv</code> are the per-rank head counts and <code>d</code> the head size (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1065-L1077" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1065-1077 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1065-1077</code></a>). Every <code>forward</code> returns <code>(output, output_bias)</code> unless <code>return_bias=False</code>; <code>output_bias</code> is not <code>None</code> only with <code>skip_bias_add</code> (for example <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L631-L634" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:631-634 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:631-634</code></a>). This is why llama.py writes <code>x, _ = self.gate_up_proj(x)</code>.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-gate-up-proj-and-down-proj-of-llama-3-8b-tp-2" class="dd-title">Worked example: gate_up_proj and down_proj of Llama-3-8B, TP = 2</h3></summary><div class="dd-body"><p>From the Llama-3-8B <code>config.json</code> on the Hugging Face Hub: hidden 4,096, intermediate 14,336. llama.py builds <code>MergedColumnParallelLinear(4096, [14336, 14336])</code> and <code>RowParallelLinear(14336, 4096)</code>.</p>
+<ol>
+  <li><strong>gate_up, constructor.</strong> <code>output_partition_sizes = [7168, 7168]</code> (lines 500-503). The weight is <code>[14336, 4096]</code>, 112 MiB in BF16.</li>
+  <li><strong>Load <code>gate_proj</code> (shard 0) on rank 1.</strong> Offset 0, size 7168 in the parameter; checkpoint rows 7168-14335 (lines 966-983 and <code>load_merged_column_weight</code>).</li>
+  <li><strong>Load <code>up_proj</code> (shard 1) on rank 1.</strong> Offset 14336 / 2 = 7168, size 7168 in the parameter; checkpoint rows 7168-14335 of <code>up_proj</code>.</li>
+  <li><strong>down, constructor.</strong> <code>input_size_per_partition</code> = 7168; the weight is <code>[4096, 7168]</code>, 56 MiB.</li>
+  <li><strong>Load <code>down_proj</code> on rank 1.</strong> Columns 7168-14335 of the checkpoint tensor (lines 1763-1766, or <code>load_row_parallel_weight</code>).</li>
+  <li><strong>Forward with T = 2048.</strong> gate_up gives <code>[2048, 14336]</code>; <code>SiluAndMul</code> gives <code>[2048, 7168]</code>; down gives a partial <code>[2048, 4096]</code>; the all-reduce moves 2048 × 4096 × 2 B = 16 MiB.</li>
+</ol>
+<p>These are the numbers of <a href="../learn/tp-pp-in-practice.html">Tensor and pipeline parallelism in practice</a>, now with the line of each step (derived).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="quantized-storage-in-the-loaders" class="dd-title">Quantized storage in the loaders</h3></summary><div class="dd-body"><ul>
+  <li><strong>Packed weights.</strong> INT4 formats pack several values into one element. A parameter with <code>packed_dim == output_dim</code> divides the offset and size by <code>packed_factor</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1301-L1304" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1301-1304 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1301-1304</code></a>).</li>
+  <li><strong>Marlin.</strong> <code>adjust_marlin_shard</code> multiplies offset and size by <code>marlin_tile_size</code> when the parameter has one (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L73-L82" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:73-82 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:73-82</code></a>).</li>
+  <li><strong>Block scales.</strong> For <code>BlockQuantScaleParameter</code>, offsets and sizes are rounded up to whole blocks of <code>weight_block_size[0]</code> rows (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L85-L94" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:85-94 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:85-94</code></a>). <code>_maybe_allow_fp8_block_shape_mismatch</code> allows parts that do not fill whole blocks, with a DEBUG log (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L562-L587" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:562-587 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:562-587</code></a>).</li>
+  <li><strong>Per-part scalars.</strong> A stacked layer with per-tensor scales keeps one scale per part; <code>adjust_scalar_to_fused_array</code> picks slot 0, 1 or 2 from the shard id (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L97-L121" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:97-121 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:97-121</code></a>).</li>
+  <li><strong>After the copy.</strong> A quantize method may replace parameters in <code>process_weights_after_loading</code>. <code>update_param_tp_status</code> then resets the rank fields of the new parameters (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L311-L324" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:311-324 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:311-324</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/utils.py#L187-L193" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/utils.py:187-193 at 3e44c0d"><code>vllm/model_executor/model_loader/utils.py:187-193</code></a>).</li>
+</ul></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="error-paths" class="dd-title">Error paths</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>No quantize method for a linear layer</td><td><code>ValueError</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L295-L296" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:295-296 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:295-296</code></a></td></tr>
+    <tr><td>An output part does not divide by TP (merged)</td><td><code>AssertionError</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L731" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:731 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:731</code></a></td></tr>
+    <tr><td>Heads, or TP and KV heads, do not divide (QKV)</td><td><code>AssertionError</code> from <code>divide</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1065-L1070" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1065-1070 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1065-1070</code></a></td></tr>
+    <tr><td>Bad shard id</td><td><code>ValueError</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L745-L770" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:745-770 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:745-770</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1093-L1099" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1093-1099 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1093-1099</code></a></td></tr>
+    <tr><td>Slice and parameter shapes differ</td><td><code>AssertionError</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L605" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:605 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:605</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1773" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1773 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1773</code></a></td></tr>
+    <tr><td><code>reduce_results=False</code> with an added bias</td><td><code>ValueError</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1736-L1740" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1736-1740 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1736-1740</code></a></td></tr>
+    <tr><td>Parameter without <code>output_dim</code> in a merged or QKV layer (v1 loader)</td><td>WARNING; the same tensor on all ranks</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L870-L877" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:870-877 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:870-877</code></a></td></tr>
+  </tbody>
+</table></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="environment-variables" class="dd-title">Environment variables</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_BATCH_INVARIANT</code></td><td><code>0</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L637" target="_blank" rel="noopener" title="vllm/envs.py:637 at 3e44c0d"><code>vllm/envs.py:637</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L238-L241" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:238-241 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:238-241</code></a></td><td>On CUDA-like and XPU platforms, the unquantized GEMM uses a batch-invariant kernel.</td></tr>
+    <tr><td><code>VLLM_XPU_FORCE_N_CONTIG_WEIGHT</code></td><td><code>0</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L2221-L2223" target="_blank" rel="noopener" title="vllm/envs.py:2221-2223 at 3e44c0d"><code>vllm/envs.py:2221-2223</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L222-L228" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:222-228 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:222-228</code></a></td><td>On XPU, re-lays out an unquantized weight after loading.</td></tr>
+  </tbody>
+</table>
+<p>The GEMM backend of <code>UnquantizedLinearMethod</code> comes from <code>kernel_config.linear_backend</code>, default <code>"auto"</code> when no config is current (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L171-L176" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:171-176 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:171-176</code></a>).</p></div></details>
+
+<h2 id="related-concepts">Related concepts<a class="h-anchor" href="#related-concepts" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><a href="../concepts/tp-layers.html">The tensor-parallel layers (linear.py and vocab_parallel_embedding.py)</a>: the ideas and the vocabulary layers.</li>
+  <li><a href="../concepts/weight-loading.html">&quot;Weight loading: from checkpoint files to GPU parameters&quot;</a>: how tensors reach these loaders.</li>
+  <li><a href="../concepts/quantization-plugins.html">Quantization methods as plugins</a>: the quantize methods that make and use the weights.</li>
+  <li><a href="../concepts/custom-ops.html">CustomOp, out-of-tree ops and IR op providers</a>: <code>PluggableLayer</code> and how a plugin replaces a layer class.</li>
+  <li><a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a>: the TP group behind the collectives.</li>
+</ul>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>What is the default of <code>gather_output</code> in <code>ColumnParallelLinear</code>, and why?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>False</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L473" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:473 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:473</code></a>). The next layer is usually row-parallel and wants the slice; a gather would only add traffic.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>Which loader does a BF16 <code>QKVParallelLinear</code> weight use, and where is the cut done?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>weight_loader_v2</code>, because <code>UnquantizedLinearMethod</code> is in <code>WEIGHT_LOADER_V2_SUPPORTED</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L50-L51" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:50-51 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:50-51</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L530-L534" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:530-534 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:530-534</code></a>). It calls <code>param.load_qkv_weight</code>, which cuts the parameter and the checkpoint tensor (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/parameter.py#L175-L198" target="_blank" rel="noopener" title="vllm/model_executor/parameter.py:175-198 at 3e44c0d"><code>vllm/model_executor/parameter.py:175-198</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>Why does every linear <code>forward</code> return a tuple?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>With <code>return_bias=True</code> (the default), it returns <code>(output, output_bias)</code>. <code>output_bias</code> is the bias only with <code>skip_bias_add</code>, so a caller can fuse the bias into a later op (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L631-L634" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:631-634 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:631-634</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>A checkpoint stores <code>qkv_proj.weight</code> already fused, for a model with 32 query heads, 8 KV heads and head size 128, and TP = 2. Which rows of the fused tensor does rank 1 copy for its k part?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>For a BF16 weight the v2 loader runs. The shard id is <code>None</code>, so it calls <code>_load_fused_module_from_checkpoint</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1174-L1189" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1174-1189 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1174-1189</code></a>). That method cuts the fused tensor by total head counts: k is rows 4096-5119 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1130-L1143" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1130-1143 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1130-1143</code></a>). It then loads that part with shard id <code>k</code>. Rank 1 takes slice 1 // 1 = 1 of size 512 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/parameter.py#L191-L195" target="_blank" rel="noopener" title="vllm/model_executor/parameter.py:191-195 at 3e44c0d"><code>vllm/model_executor/parameter.py:191-195</code></a>): rows 512-1023 of the k part, which are rows 4608-5119 of the fused tensor. The v1 loader gives the same rows (lines 1237-1320).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/tp-layers.html">The tensor-parallel layers (linear.py and vocab_parallel_embedding.py)</a><span class="rel-sum">vLLM&#x27;s linear and embedding layers know their tensor-parallel rank. They resolve a quantization method per layer, allocate only their slice, cut checkpoint tensors when they load, and call the all-reduce or all-gather in forward. QKVParallelLinear splits by heads and copies KV heads when TP is larger than their count.</span></li><li><a href="../concepts/weight-loading.html">&quot;Weight loading: from checkpoint files to GPU parameters&quot;</a><span class="rel-sum">Each worker picks a model loader by --load-format, builds the model with empty per-rank parameters on its GPU, streams every checkpoint tensor once, renames it with a WeightsMapper, and lets the parameter&#x27;s weight_loader copy only this rank&#x27;s slice.</span></li><li><a href="../concepts/quantization-plugins.html">Quantization methods as plugins</a><span class="rel-sum">A quantization method is a QuantizationConfig subclass registered under a name. The front end picks the name from the checkpoint or --quantization and makes one config object; each layer in the worker asks it for a quantize method that makes the weights and runs the forward.</span></li><li><a href="../concepts/custom-ops.html">CustomOp, out-of-tree ops and IR op providers</a><span class="rel-sum">A CustomOp is a layer with one forward method per platform. It picks one method when it is built - forward_native when disabled, the platform&#x27;s method when enabled. Plugins replace whole classes with register_oot, and vllm.ir adds a second, per-op provider choice.</span></li><li><a href="../code/model-executor-models-llama.html">&quot;model_executor/models/llama.py: the Llama model&quot;</a><span class="rel-sum">vllm/model_executor/models/llama.py defines LlamaMLP, LlamaAttention, LlamaDecoderLayer, LlamaModel and LlamaForCausalLM from tensor-parallel layers, plus two bidirectional wrappers. It is the reference model file of vLLM; nine registry names and many other model files reuse it.</span></li><li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py: CustomOp, PluggableLayer and their registries</a><span class="rel-sum">vllm/model_executor/custom_op.py defines the CustomOp base class (one forward method per platform, chosen once per object), the PluggableLayer base class (whole-layer replacement), the two name registries and the register_oot decorators.</span></li><li><a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a><span class="rel-sum">Each worker puts all ranks into one grid of shape (DP, PP, PCP, TP) and cuts it into process groups. Each group is a GroupCoordinator with a gloo CPU group, an NCCL device group and, for groups of more than one rank, a device communicator that picks the all-reduce implementation.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../code/model-executor-models-llama.html"><span class="pn-dir">← Previous</span><span class="pn-title">&quot;model_executor/models/llama.py: the Llama model&quot;</span></a><a class="pn pn-next" href="../code/entrypoints-cli-serve.html"><span class="pn-dir">Next →</span><span class="pn-title">entrypoints/cli/serve.py: the vllm serve subcommand and its launch modes</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#purpose">Purpose</a></li><li class="toc-l2"><a href="#where-it-sits">Where it sits</a></li><li class="toc-l3"><a href="#who-calls-it">Who calls it</a></li><li class="toc-l3"><a href="#what-it-calls">What it calls</a></li><li class="toc-l2"><a href="#key-classes-and-functions">Key classes and functions</a></li><li class="toc-l2"><a href="#walk-through-the-main-methods">Walk through the main methods</a></li><li class="toc-l3"><a href="#columnparallellinear-init-sizes-and-the-loader-choice">ColumnParallelLinear.__init__: sizes and the loader choice</a></li><li class="toc-l3"><a href="#columnparallellinear-forward-and-weight-loader">ColumnParallelLinear.forward and weight_loader</a></li><li class="toc-l3"><a href="#qkvparallellinear-weight-loader-v1">QKVParallelLinear.weight_loader (v1)</a></li><li class="toc-l3"><a href="#rowparallellinear-weight-loader-and-forward">RowParallelLinear.weight_loader and forward</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#data-flow-types-and-shapes">Data flow: types and shapes</a></li><li class="toc-l3"><a href="#worked-example-gate-up-proj-and-down-proj-of-llama-3-8b-tp-2">Worked example: gate_up_proj and down_proj of Llama-3-8B, TP = 2</a></li><li class="toc-l3"><a href="#quantized-storage-in-the-loaders">Quantized storage in the loaders</a></li><li class="toc-l3"><a href="#error-paths">Error paths</a></li><li class="toc-l3"><a href="#environment-variables">Environment variables</a></li><li class="toc-l2"><a href="#related-concepts">Related concepts</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

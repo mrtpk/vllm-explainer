@@ -1,0 +1,755 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>&quot;Weight loading: from checkpoint files to GPU parameters&quot; · vLLM Explained</title>
+<meta name="description" content="Each worker picks a model loader by --load-format, builds the model with empty per-rank parameters on its GPU, streams every checkpoint tensor once, renames it with a WeightsMapper, and lets the parameter&#x27;s weight_loader copy only this rank&#x27;s slice.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="concepts/weight-loading">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a class="current" aria-current="page" href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>vLLM concepts</span><span class="sep">›</span><span>Model execution</span><span class="sep">›</span><span aria-current="page">Weight loading</span></nav>
+<h1 class="page-title">&quot;Weight loading: from checkpoint files to GPU parameters&quot;</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">vLLM concepts</span><span class="meta-time">about 14 min read + 4 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a> <span class="level level-beginner level-sm">Beginner</span></li><li><a href="../concepts/model-definition.html">How a vLLM model file is written (llama.py)</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../learn/tp-pp-in-practice.html">Tensor and pipeline parallelism in practice</a> <span class="level level-intermediate level-sm">Intermediate</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">Each worker streams all checkpoint tensors; a mapper renames each one, and the target parameter's weight loader copies only this rank's slice.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>A checkpoint is a set of named tensors in safetensors files, and loading copies each tensor into the matching model parameter (<a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/concepts/weight-loading.html" target="_blank" rel="noopener" title="DeepInfer Explained: Weight loading">Weight loading<span class="ext-mark" aria-hidden="true">↗</span></a>). The page <a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a> shows which files vLLM downloads and keeps. This page follows the tensors from the files into the parameters of each GPU.</p>
+<p>vLLM loads the weights in six steps, in every <a class="term" href="../reference/glossary.html#term-worker" data-term="worker" data-def="The process or object that owns one GPU. It sets up the device and the process groups, and it holds the model runner.">worker</a>:</p>
+<ol>
+  <li><strong>Pick a loader.</strong> The <a class="term" href="../reference/glossary.html#term-load-format" data-term="load format" data-def="The value of --load-format (default auto). It selects the model loader class and, for the default loader, which weight files to read.">load format</a> (<code>--load-format</code>, default <code>auto</code>) selects a <a class="term" href="../reference/glossary.html#term-model-loader" data-term="model loader" data-def="A class that builds the model and loads its weights for one --load-format, for example safetensors, dummy or tensorizer.">model loader</a> class. For <code>auto</code> it is <code>DefaultModelLoader</code>.</li>
+  <li><strong>Build an empty model.</strong> The loader builds the model class on the GPU. Each tensor-parallel layer makes parameters of its <em>per-rank</em> shape, with no values yet.</li>
+  <li><strong>Stream the tensors.</strong> An iterator opens the files one by one and gives <code>(name, tensor)</code> pairs. In the default path, the tensors stay on the CPU.</li>
+  <li><strong>Map the names.</strong> The model's <code>load_weights()</code> uses an <a class="term" href="../reference/glossary.html#term-auto-weights-loader" data-term="AutoWeightsLoader" data-def="A helper that walks the module tree with the (name, tensor) stream. It calls a child&#x27;s own load_weights if it has one, else the weight_loader of each parameter.">AutoWeightsLoader</a>. A <a class="term" href="../reference/glossary.html#term-weights-mapper" data-term="WeightsMapper" data-def="A small rule set that renames checkpoint tensor names to vLLM parameter names (by prefix, suffix, substring, regex), drops some names, and adds shard ids for stacked parameters.">WeightsMapper</a> renames checkpoint names to vLLM names, for example <code>q_proj</code> to <code>qkv_proj</code> with the shard id <code>"q"</code>.</li>
+  <li><strong>Copy the slice.</strong> The target parameter has a <a class="term" href="../reference/glossary.html#term-weight-loader" data-term="weight loader" data-def="A function stored on a parameter (param.weight_loader). It copies one checkpoint tensor into the parameter and keeps only the slice that this TP rank owns.">weight loader</a>. It cuts the part of the tensor that this rank owns and copies it into the right rows of the parameter.</li>
+  <li><strong>Post-process.</strong> Each layer's quantization method can repack or quantize its weights once, in <code>process_weights_after_loading</code>.</li>
+</ol>
+<p><strong>An everyday comparison.</strong> Think of the branches of a library that all get the same delivery list. Each branch reads every line of the list. For each book, the list gives the shelf name in the publisher's words, and a branch translates it into its own shelf names. Some books go into a shared box with three marked parts, such as Q, K and V. Each branch keeps only the pages for its own readers. The comparison stops here. In vLLM, nobody sends a branch its part: every GPU walks the full list itself, and the parameter cuts its slice.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b6a_weight_flow"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: three boxes. Checkpoint folder with model-0000N-of-0000M.safetensors and model.safetensors.index.json, in the Hugging Face cache or a local path. DefaultModelLoader._prepare_weights: auto becomes hf when there is no consolidated file, patterns safetensors, bin, pt, keep files named in the index. safetensors_weights_iterator: files in natural sort order, safe_open with framework pt, yields name and CPU tensor. Panel 2: LlamaForCausalLM.load_weights makes an AutoWeightsLoader; the first name part model goes to LlamaModel.load_weights. The WeightsMapper renames layers.0.self_attn.q_proj.weight to layers.0.self_attn.qkv_proj.weight and sets tensor.shard_id to q; k and v likewise. QKVParallelLinear.load_weights calls param.weight_loader with the shard id; for BF16 this is weight_loader_v2, which calls param.load_qkv_weight. Panel 3: two lanes, TP rank 0 and TP rank 1, each with qkv_proj.weight of shape 3072 by 4096, 24 MiB in BF16. Rank 0: parameter rows 0-2047 get q_proj rows 0-2047, heads 0-15; rows 2048-2559 get k_proj rows 0-511, KV heads 0-3; rows 2560-3071 get v_proj rows 0-511. Rank 1: rows 0-2047 get q_proj rows 2048-4095, heads 16-31; rows 2048-2559 get k_proj rows 512-1023, KV heads 4-7; rows 2560-3071 get v_proj rows 512-1023."><svg role="img" aria-label="Panel 1: three boxes. Checkpoint folder with model-0000N-of-0000M.safetensors and model.safetensors.index.json, in the Hugging Face cache or a local path. DefaultModelLoader._prepare_weights: auto becomes hf when there is no consolidated file, patterns safetensors, bin, pt, keep files named in the index. safetensors_weights_iterator: files in natural sort order, safe_open with framework pt, yields name and CPU tensor. Panel 2: LlamaForCausalLM.load_weights makes an AutoWeightsLoader; the first name part model goes to LlamaModel.load_weights. The WeightsMapper renames layers.0.self_attn.q_proj.weight to layers.0.self_attn.qkv_proj.weight and sets tensor.shard_id to q; k and v likewise. QKVParallelLinear.load_weights calls param.weight_loader with the shard id; for BF16 this is weight_loader_v2, which calls param.load_qkv_weight. Panel 3: two lanes, TP rank 0 and TP rank 1, each with qkv_proj.weight of shape 3072 by 4096, 24 MiB in BF16. Rank 0: parameter rows 0-2047 get q_proj rows 0-2047, heads 0-15; rows 2048-2559 get k_proj rows 0-511, KV heads 0-3; rows 2560-3071 get v_proj rows 0-511. Rank 1: rows 0-2047 get q_proj rows 2048-4095, heads 16-31; rows 2048-2559 get k_proj rows 512-1023, KV heads 4-7; rows 2560-3071 get v_proj rows 512-1023." xmlns="http://www.w3.org/2000/svg" width="1100" height="968" viewBox="0 0 1100 968">
+<defs><marker id="dg-b6a_weight_flow-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#111827"/></marker><marker id="dg-b6a_weight_flow-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b6a_weight_flow-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker></defs>
+<rect width="1100" height="968" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Weight loading: from checkpoint files to one slice per GPU</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Default --load-format auto  ·  BF16 Llama-3-8B checkpoint  ·  TP = 2  ·  the same steps run in every worker</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">q_proj.weight [4096, 4096]   k_proj.weight [1024, 4096]   v_proj.weight [1024, 4096]   (checkpoint, [out, in])</text>
+<rect x="20.0" y="116.0" width="1060.0" height="196.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="142.0" r="13" fill="#111827"/>
+<text x="46.0" y="146.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="147.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">The loader picks the files and streams (name, tensor) pairs</text>
+<text x="68.0" y="166.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Every worker opens the same files; a tensor is read only when the iterator reaches its name.</text>
+<rect x="46.0" y="186.0" width="324.0" height="104.0" rx="8" fill="#ffffff" fill-opacity="1.0" stroke="#111827" stroke-width="1.5"/>
+<text x="208.0" y="206.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">Checkpoint folder</text>
+<text x="208.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">model-0000N-of-0000M.safetensors</text>
+<text x="208.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">model.safetensors.index.json</text>
+<text x="208.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">(HF cache or local path)</text>
+<rect x="388.0" y="186.0" width="324.0" height="104.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="550.0" y="206.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">DefaultModelLoader._prepare_weights</text>
+<text x="550.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">auto -&gt; &quot;hf&quot; (no consolidated*)</text>
+<text x="550.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">patterns *.safetensors, *.bin, *.pt</text>
+<text x="550.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">keep files named in the index</text>
+<rect x="730.0" y="186.0" width="324.0" height="104.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="892.0" y="206.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">safetensors_weights_iterator</text>
+<text x="892.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">files in natural sort order</text>
+<text x="892.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">safe_open(f, framework=&quot;pt&quot;)</text>
+<text x="892.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">yield (name, CPU tensor)</text>
+<line x1="370.0" y1="238.0" x2="386.0" y2="238.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b6a_weight_flow-m0)"/>
+<line x1="712.0" y1="238.0" x2="728.0" y2="238.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b6a_weight_flow-m1)"/>
+<rect x="20.0" y="332.0" width="1060.0" height="216.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="358.0" r="13" fill="#111827"/>
+<text x="46.0" y="362.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="363.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Names are mapped to vLLM parameters, then each parameter loads itself</text>
+<text x="68.0" y="382.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">q_proj, k_proj and v_proj all go into one stacked parameter, qkv_proj.weight, with shard ids &quot;q&quot;, &quot;k&quot;, &quot;v&quot;.</text>
+<rect x="46.0" y="402.0" width="324.0" height="124.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="208.0" y="422.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">LlamaForCausalLM.load_weights</text>
+<text x="208.0" y="440.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">AutoWeightsLoader(self)</text>
+<text x="208.0" y="455.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">first name part &quot;model&quot;</text>
+<text x="208.0" y="470.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">-&gt; LlamaModel.load_weights</text>
+<text x="208.0" y="485.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">(names lose &quot;model.&quot;)</text>
+<rect x="388.0" y="402.0" width="324.0" height="124.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="550.0" y="422.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">WeightsMapper (hf_to_vllm_mapper)</text>
+<text x="550.0" y="440.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">layers.0.self_attn.q_proj.weight</text>
+<text x="550.0" y="455.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">-&gt; layers.0.self_attn.qkv_proj.weight</text>
+<text x="550.0" y="470.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">tensor.shard_id = &quot;q&quot;</text>
+<text x="550.0" y="485.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">(k -&gt; &quot;k&quot;, v -&gt; &quot;v&quot;)</text>
+<rect x="730.0" y="402.0" width="324.0" height="124.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="892.0" y="422.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">QKVParallelLinear.load_weights</text>
+<text x="892.0" y="440.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">param = self.weight</text>
+<text x="892.0" y="455.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">param.weight_loader(param, w, &quot;q&quot;)</text>
+<text x="892.0" y="470.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">= weight_loader_v2 (BF16)</text>
+<text x="892.0" y="485.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">-&gt; param.load_qkv_weight(...)</text>
+<line x1="370.0" y1="464.0" x2="386.0" y2="464.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b6a_weight_flow-m2)"/>
+<line x1="712.0" y1="464.0" x2="728.0" y2="464.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b6a_weight_flow-m2)"/>
+<rect x="20.0" y="568.0" width="1060.0" height="268.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="594.0" r="13" fill="#111827"/>
+<text x="46.0" y="598.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="599.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Each rank copies only its rows into its own qkv_proj.weight [3072, 4096]</text>
+<text x="68.0" y="618.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Left: rows of the stacked parameter (same on both ranks). Right: rows of the checkpoint tensor (rank x slice size).</text>
+<rect x="46.0" y="634.0" width="500.0" height="188.0" rx="12" fill="#fffdf6" fill-opacity="1.0" stroke="#d97706" stroke-width="1.2" stroke-opacity="0.35" stroke-dasharray="4 4"/>
+<rect x="46.0" y="634.0" width="500.0" height="46.0" rx="12" fill="#d97706" fill-opacity="1.0" stroke="none"/>
+<rect x="46.0" y="656.0" width="500.0" height="24.0" rx="0" fill="#d97706" fill-opacity="1.0" stroke="none"/>
+<text x="60.0" y="657.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="15" fill="#fff" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">TP rank 0</text>
+<text x="60.0" y="675.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#fff" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">qkv_proj.weight [3072, 4096]  =  24 MiB in BF16</text>
+<rect x="60.0" y="692.0" width="472.0" height="36.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#d97706" stroke-width="1.2"/>
+<text x="74.0" y="715.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">q</text>
+<text x="98.0" y="715.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rows    0-2047</text>
+<text x="216.0" y="715.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">&lt;-</text>
+<text x="242.0" y="715.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">q_proj rows 0-2047</text>
+<text x="522.0" y="715.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="end" xml:space="preserve" style="white-space:pre">heads 0-15</text>
+<rect x="60.0" y="734.0" width="472.0" height="36.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#d97706" stroke-width="1.2"/>
+<text x="74.0" y="757.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">k</text>
+<text x="98.0" y="757.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rows 2048-2559</text>
+<text x="216.0" y="757.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">&lt;-</text>
+<text x="242.0" y="757.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">k_proj rows 0-511</text>
+<text x="522.0" y="757.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="end" xml:space="preserve" style="white-space:pre">KV heads 0-3</text>
+<rect x="60.0" y="776.0" width="472.0" height="36.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#d97706" stroke-width="1.2"/>
+<text x="74.0" y="799.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">v</text>
+<text x="98.0" y="799.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rows 2560-3071</text>
+<text x="216.0" y="799.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">&lt;-</text>
+<text x="242.0" y="799.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">v_proj rows 0-511</text>
+<text x="522.0" y="799.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="end" xml:space="preserve" style="white-space:pre">KV heads 0-3</text>
+<rect x="554.0" y="634.0" width="500.0" height="188.0" rx="12" fill="#f6fdf9" fill-opacity="1.0" stroke="#059669" stroke-width="1.2" stroke-opacity="0.35" stroke-dasharray="4 4"/>
+<rect x="554.0" y="634.0" width="500.0" height="46.0" rx="12" fill="#059669" fill-opacity="1.0" stroke="none"/>
+<rect x="554.0" y="656.0" width="500.0" height="24.0" rx="0" fill="#059669" fill-opacity="1.0" stroke="none"/>
+<text x="568.0" y="657.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="15" fill="#fff" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">TP rank 1</text>
+<text x="568.0" y="675.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#fff" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">qkv_proj.weight [3072, 4096]  =  24 MiB in BF16</text>
+<rect x="568.0" y="692.0" width="472.0" height="36.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#059669" stroke-width="1.2"/>
+<text x="582.0" y="715.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">q</text>
+<text x="606.0" y="715.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rows    0-2047</text>
+<text x="724.0" y="715.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">&lt;-</text>
+<text x="750.0" y="715.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">q_proj rows 2048-4095</text>
+<text x="1030.0" y="715.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="end" xml:space="preserve" style="white-space:pre">heads 16-31</text>
+<rect x="568.0" y="734.0" width="472.0" height="36.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#059669" stroke-width="1.2"/>
+<text x="582.0" y="757.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">k</text>
+<text x="606.0" y="757.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rows 2048-2559</text>
+<text x="724.0" y="757.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">&lt;-</text>
+<text x="750.0" y="757.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">k_proj rows 512-1023</text>
+<text x="1030.0" y="757.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="end" xml:space="preserve" style="white-space:pre">KV heads 4-7</text>
+<rect x="568.0" y="776.0" width="472.0" height="36.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#059669" stroke-width="1.2"/>
+<text x="582.0" y="799.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="13" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">v</text>
+<text x="606.0" y="799.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rows 2560-3071</text>
+<text x="724.0" y="799.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">&lt;-</text>
+<text x="750.0" y="799.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">v_proj rows 512-1023</text>
+<text x="1030.0" y="799.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="end" xml:space="preserve" style="white-space:pre">KV heads 4-7</text>
+<text x="30.0" y="871.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="860.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="871.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">file selection and reading</text>
+<rect x="287.6" y="860.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="308.6" y="871.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">name mapping and dispatch</text>
+<rect x="487.5" y="860.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="508.5" y="871.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rank 0 slice</text>
+<rect x="601.1" y="860.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="622.1" y="871.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rank 1 slice</text>
+<text x="30.0" y="900.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Shapes from the Llama-3-8B config.json on the Hugging Face Hub; head size 128. Each rank: 16 query heads, 4 KV heads.</text>
+<text x="30.0" y="918.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">A quantized layer makes other parameters (create_weights of its quant method) and may use weight_loader (v1) instead of v2.</text>
+<text x="30.0" y="936.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Not shown: process_weights_after_loading, which runs once per layer after all tensors are copied.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the loader streams (name, tensor) pairs (panel 1); a mapper and the module tree route each tensor to a parameter (panel 2); the parameter of each rank copies only its own rows (panel 3). Shapes: Llama-3-8B with TP = 2.</figcaption><a class="diagram-open" href="../diagrams/b6a_weight_flow.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read panels 1 and 2 from left to right: they run the same way in every worker. Panel 3 shows the only step where the ranks differ. The rows of the stacked parameter are the same on both ranks; the rows taken from the checkpoint tensor depend on the rank.</p>
+
+<h2 id="in-the-code">In the code<a class="h-anchor" href="#in-the-code" aria-label="Link to this section">#</a></h2>
+
+<h3 id="step-1-the-load-format-picks-the-loader">Step 1: the load format picks the loader<a class="h-anchor" href="#step-1-the-load-format-picks-the-loader" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/__init__.py#L50-L66" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/model_loader/__init__.py:50-66</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/__init__.py#L50-L66" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">50</span><span class="ln">51</span><span class="ln">52</span><span class="ln">53</span><span class="ln">54</span><span class="ln">55</span><span class="ln">56</span><span class="ln">57</span><span class="ln">58</span><span class="ln">59</span><span class="ln">60</span><span class="ln">61</span><span class="ln">62</span><span class="ln">63</span><span class="ln">64</span><span class="ln">65</span><span class="ln">66</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">_LOAD_FORMAT_TO_MODEL_LOADER: dict[str, type[BaseModelLoader]] = {
+    &quot;auto&quot;: DefaultModelLoader,
+    &quot;hf&quot;: DefaultModelLoader,
+    &quot;dummy&quot;: DummyModelLoader,
+    &quot;fastsafetensors&quot;: DefaultModelLoader,
+    &quot;instanttensor&quot;: DefaultModelLoader,
+    &quot;ipc_cache&quot;: IpcModelLoader,
+    &quot;mistral&quot;: DefaultModelLoader,
+    &quot;modelexpress&quot;: ModelExpressModelLoader,
+    &quot;npcache&quot;: DefaultModelLoader,
+    &quot;pt&quot;: DefaultModelLoader,
+    &quot;runai_streamer&quot;: RunaiModelStreamerLoader,
+    &quot;runai_streamer_sharded&quot;: ShardedStateLoader,
+    &quot;safetensors&quot;: DefaultModelLoader,
+    &quot;sharded_state&quot;: ShardedStateLoader,
+    &quot;tensorizer&quot;: TensorizerLoader,
+}</code></pre></div></div></div></figure>
+<p><code>get_model_loader()</code> looks up <code>load_config.load_format</code> in this table and raises <code>ValueError</code> for an unknown name (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/__init__.py#L123-L128" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/__init__.py:123-128 at 3e44c0d"><code>vllm/model_executor/model_loader/__init__.py:123-128</code></a>). The field default is <code>"auto"</code>, and a validator lower-cases the value (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L30" target="_blank" rel="noopener" title="vllm/config/load.py:30 at 3e44c0d"><code>vllm/config/load.py:30</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L136-L138" target="_blank" rel="noopener" title="vllm/config/load.py:136-138 at 3e44c0d"><code>vllm/config/load.py:136-138</code></a>). <code>EngineArgs</code> copies this default without a change (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L509" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:509 at 3e44c0d"><code>vllm/engine/arg_utils.py:509</code></a>). One later override exists: for a model in object storage (S3, GCS, Azure), <code>auto</code> becomes <code>runai_streamer</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L2754-L2762" target="_blank" rel="noopener" title="vllm/config/vllm.py:2754-2762 at 3e44c0d"><code>vllm/config/vllm.py:2754-2762</code></a>). A plugin can add a format with <code>register_model_loader</code> (<a href="../concepts/engine-hooks.html">Hooks in the engine core and the workers</a>).</p>
+<p>Model Runner V2 calls the loader in <code>load_model()</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L398-L406" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:398-406 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:398-406</code></a>). It runs in every worker: with TP = 2, two processes do all the steps below at the same time.</p>
+
+<h3 id="step-2-build-the-model-with-empty-parameters">Step 2: build the model with empty parameters<a class="h-anchor" href="#step-2-build-the-model-with-empty-parameters" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/base_loader.py#L62-L115" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/model_loader/base_loader.py:62-115</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/base_loader.py#L62-L115" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">62</span><span class="ln">63</span><span class="ln">64</span><span class="ln">65</span><span class="ln">66</span><span class="ln">67</span><span class="ln">68</span><span class="ln">69</span><span class="ln">70</span><span class="ln">71</span><span class="ln">72</span><span class="ln hl">73</span><span class="ln hl">74</span><span class="ln hl">75</span><span class="ln hl">76</span><span class="ln hl">77</span><span class="ln hl">78</span><span class="ln hl">79</span><span class="ln hl">80</span><span class="ln">81</span><span class="ln">82</span><span class="ln">83</span><span class="ln">84</span><span class="ln">85</span><span class="ln">86</span><span class="ln">87</span><span class="ln hl">88</span><span class="ln">89</span><span class="ln">90</span><span class="ln">91</span><span class="ln">92</span><span class="ln">93</span><span class="ln">94</span><span class="ln">95</span><span class="ln">96</span><span class="ln">97</span><span class="ln">98</span><span class="ln">99</span><span class="ln">100</span><span class="ln">101</span><span class="ln">102</span><span class="ln">103</span><span class="ln">104</span><span class="ln">105</span><span class="ln hl">106</span><span class="ln hl">107</span><span class="ln hl">108</span><span class="ln hl">109</span><span class="ln">110</span><span class="ln">111</span><span class="ln">112</span><span class="ln">113</span><span class="ln">114</span><span class="ln">115</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(44 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(45 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(46 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(47 * var(--code-lh))"></span><pre><code class="language-python">    @instrument(span_name=&quot;Load model&quot;)
+    def load_model(
+        self, vllm_config: VllmConfig, model_config: ModelConfig, prefix: str = &quot;&quot;
+    ) -&gt; nn.Module:
+        &quot;&quot;&quot;Load a model with the given configurations.&quot;&quot;&quot;
+        device_config = vllm_config.device_config
+        load_config = vllm_config.load_config
+        load_device = (
+            device_config.device if load_config.device is None else load_config.device
+        )
+        target_device = torch.device(load_device)
+        with set_default_torch_dtype(model_config.dtype):
+            with target_device:
+                time_before_load = time.perf_counter()
+                model = self.create_model(
+                    vllm_config=vllm_config,
+                    model_config=model_config,
+                    prefix=prefix,
+                )
+                time_after_load = time.perf_counter()
+                logger.info_once(
+                    &quot;Initializing model took %.6f seconds&quot;,
+                    time_after_load - time_before_load,
+                )
+
+            logger.debug(&quot;Loading weights on %s ...&quot;, load_device)
+            self.load_weights(model, model_config)
+
+            # Release transient tensors held by PyTorch&#x27;s caching allocator
+            # before weight post-processing and raw CUDA driver allocations.
+            gc.collect()
+            torch.accelerator.empty_cache()
+
+            # Log peak GPU memory after loading weights. This is needed
+            # to have test coverage on peak memory for online quantization.
+            if current_platform.is_cuda_alike() or current_platform.is_xpu():
+                peak_memory = torch.accelerator.max_memory_allocated()
+                logger.debug_once(
+                    &quot;Peak GPU memory after loading weights: %s GiB&quot;,
+                    format_gib(peak_memory),
+                )
+
+            # Process weights into kernel format. Note that when using online
+            # quantization, weights are (typically) quantized as they are loaded.
+            if _has_online_quant(model):
+                finalize_layerwise_processing(model, model_config)
+
+            process_weights_after_loading(model, model_config, target_device)
+            log_online_quantization_time(vllm_config)
+
+            gc.collect()
+            torch.accelerator.empty_cache()
+
+        return model.eval()</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 73-74.</strong> The default dtype is the model dtype, and the default device is the GPU of this worker. So every <code>torch.empty</code> in a layer constructor makes a GPU tensor of the right dtype.</li>
+  <li><strong>Lines 76-80.</strong> <code>create_model()</code> calls <code>initialize_model()</code>, which builds the class with <code>vllm_config</code> and <code>prefix</code> (<a href="../concepts/model-definition.html">How a vLLM model file is written (llama.py)</a>). The log line "Initializing model took ... seconds" measures this part.</li>
+  <li><strong>Line 88.</strong> <code>self.load_weights()</code> is the loader's method; for the default loader it streams the files (Step 3).</li>
+  <li><strong>Lines 106-109.</strong> Online quantization finishes first; then <code>process_weights_after_loading()</code> runs for every layer (Step 6).</li>
+</ol>
+<p>The layer constructors do the per-rank sizing. <code>UnquantizedLinearMethod.create_weights()</code> makes <code>torch.empty(sum(output_partition_sizes), input_size_per_partition)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L178-L205" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:178-205 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:178-205</code></a>). The page <a href="../concepts/tp-layers.html">The tensor-parallel layers (linear.py and vocab_parallel_embedding.py)</a> gives these sizes for each layer class.</p>
+
+<h3 id="step-3-choose-the-files-and-stream-the-tensors">Step 3: choose the files and stream the tensors<a class="h-anchor" href="#step-3-choose-the-files-and-stream-the-tensors" aria-label="Link to this section">#</a></h3>
+<p><code>DefaultModelLoader._prepare_weights()</code> finds, downloads and filters the files (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/default_loader.py#L147-L263" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/default_loader.py:147-263 at 3e44c0d"><code>vllm/model_executor/model_loader/default_loader.py:147-263</code></a>); <a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a> explains that part. Then <code>_get_weights_iterator()</code> picks an iterator by format (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/default_loader.py#L301-L365" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/default_loader.py:301-365 at 3e44c0d"><code>vllm/model_executor/model_loader/default_loader.py:301-365</code></a>). The usual case is <code>safetensors_weights_iterator()</code>:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/weight_utils.py#L1243-L1249" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/model_loader/weight_utils.py:1243-1249</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/weight_utils.py#L1243-L1249" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1243</span><span class="ln">1244</span><span class="ln">1245</span><span class="ln">1246</span><span class="ln">1247</span><span class="ln">1248</span><span class="ln">1249</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">        else:
+            with safe_open(st_file, framework=&quot;pt&quot;) as f:
+                for name in f.keys():  # noqa: SIM118
+                    if should_skip_weight(name, local_expert_ids):
+                        continue
+                    param = f.get_tensor(name)
+                    yield name, param</code></pre></div></div></div><figcaption class="code-caption">The default (lazy) strategy: the file is opened with safetensors, and each tensor is read when the loop reaches its name.</figcaption></figure>
+<ul>
+  <li><strong>Order.</strong> The files are sorted by a natural sort key, so <code>...-00002-of-...</code> comes before <code>...-00010-of-...</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/weight_utils.py#L1134" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/weight_utils.py:1134 at 3e44c0d"><code>vllm/model_executor/model_loader/weight_utils.py:1134</code></a>).</li>
+  <li><strong>Strategies.</strong> <code>--safetensors-load-strategy</code> is <code>None</code> by default. <code>eager</code> reads the whole file into CPU memory first; <code>torchao</code> rebuilds torchao tensors (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/weight_utils.py#L1207-L1242" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/weight_utils.py:1207-1242 at 3e44c0d"><code>vllm/model_executor/model_loader/weight_utils.py:1207-1242</code></a>).</li>
+  <li><strong>Prefetch.</strong> With the default <code>None</code>, vLLM prefetches the files into the page cache only on NFS or Lustre. They must also fit in 90% of the free RAM (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/weight_utils.py#L1136-L1155" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/weight_utils.py:1136-1155 at 3e44c0d"><code>vllm/model_executor/model_loader/weight_utils.py:1136-1155</code></a>). <code>prefetch</code> forces it. Each process prefetches a different part of the files, <code>sorted_files[rank::world_size]</code>. Rank and world size are the global values of <code>torch.distributed</code>, not the TP values (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/weight_utils.py#L1051-L1057" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/weight_utils.py:1051-1057 at 3e44c0d"><code>vllm/model_executor/model_loader/weight_utils.py:1051-1057</code></a>).</li>
+  <li><strong>PyTorch files.</strong> For <code>.bin</code> and <code>.pt</code> files, <code>pt_weights_iterator()</code> calls <code>torch.load(..., weights_only=True)</code> on each file and yields its items (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/weight_utils.py#L1479-L1495" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/weight_utils.py:1479-1495 at 3e44c0d"><code>vllm/model_executor/model_loader/weight_utils.py:1479-1495</code></a>).</li>
+  <li><strong>Many threads.</strong> <code>--model-loader-extra-config '{"enable_multithread_load": true}'</code> selects the multi-thread iterators, with 8 threads by default (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/default_loader.py#L58-L59" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/default_loader.py:58-59 at 3e44c0d"><code>vllm/model_executor/model_loader/default_loader.py:58-59</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/default_loader.py#L329-L336" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/default_loader.py:329-336 at 3e44c0d"><code>vllm/model_executor/model_loader/default_loader.py:329-336</code></a>).</li>
+</ul>
+<p>The loader then calls <code>model.load_weights()</code> with the iterator, and logs "Loading weights took ... seconds" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/default_loader.py#L503-L509" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/default_loader.py:503-509 at 3e44c0d"><code>vllm/model_executor/model_loader/default_loader.py:503-509</code></a>).</p>
+
+<h3 id="step-4-map-the-names-weightsmapper-and-autoweightsloader">Step 4: map the names (WeightsMapper and AutoWeightsLoader)<a class="h-anchor" href="#step-4-map-the-names-weightsmapper-and-autoweightsloader" aria-label="Link to this section">#</a></h3>
+<p>Llama has two <code>load_weights</code> methods. The outer class makes an <code>AutoWeightsLoader</code> without a mapper (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L559-L561" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:559-561 at 3e44c0d"><code>vllm/model_executor/models/llama.py:559-561</code></a>). The loader groups the names by their first part and finds the child <code>model</code>. That child has its own <code>load_weights</code>, so the loader gives it the names without <code>model.</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L387-L400" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:387-400 at 3e44c0d"><code>vllm/model_executor/models/utils.py:387-400</code></a>). <code>LlamaModel.load_weights</code> uses the mapper:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L348-L357" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/models/llama.py:348-357</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L348-L357" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">348</span><span class="ln">349</span><span class="ln">350</span><span class="ln">351</span><span class="ln">352</span><span class="ln">353</span><span class="ln">354</span><span class="ln">355</span><span class="ln">356</span><span class="ln">357</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_stacked={
+            # weight_name: (param_name, shard_id)
+            &quot;.q_proj&quot;: (&quot;.qkv_proj&quot;, &quot;q&quot;),
+            &quot;.k_proj&quot;: (&quot;.qkv_proj&quot;, &quot;k&quot;),
+            &quot;.v_proj&quot;: (&quot;.qkv_proj&quot;, &quot;v&quot;),
+            &quot;.gate_proj&quot;: (&quot;.gate_up_proj&quot;, 0),
+            &quot;.up_proj&quot;: (&quot;.gate_up_proj&quot;, 1),
+        }
+    )</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L125-L129" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/models/utils.py:125-129</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L125-L129" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">125</span><span class="ln">126</span><span class="ln">127</span><span class="ln">128</span><span class="ln">129</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">        shard_id: ShardIds | None = None
+        for substr, (new_key, new_shard_id) in self.orig_to_new_stacked.items():
+            if substr in key:
+                key = key.replace(substr, new_key, 1)
+                shard_id = new_shard_id</code></pre></div></div></div><figcaption class="code-caption">In <code>_map_name_with_shard()</code>: each stacked key that is in the name replaces its first occurrence, and the loop keeps the shard id.</figcaption></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L147-L164" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/models/utils.py:147-164</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L147-L164" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">147</span><span class="ln">148</span><span class="ln">149</span><span class="ln">150</span><span class="ln">151</span><span class="ln">152</span><span class="ln">153</span><span class="ln">154</span><span class="ln">155</span><span class="ln">156</span><span class="ln">157</span><span class="ln hl">158</span><span class="ln hl">159</span><span class="ln hl">160</span><span class="ln hl">161</span><span class="ln hl">162</span><span class="ln hl">163</span><span class="ln hl">164</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><pre><code class="language-python">    def apply(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -&gt; Iterable[tuple[str, torch.Tensor]]:
+        for name, data in weights:
+            result = self._map_name_with_shard(name)
+            if result is None:
+                continue
+            out_name, shard_id = result
+            if shard_id is None:
+                yield out_name, data
+                continue
+            shard_ids = shard_id if isinstance(shard_id, list) else [shard_id]
+            for i, one_shard_id in enumerate(shard_ids):
+                # Each shard carries its own id, so extra shards need their own
+                # tensor object; `detach` aliases the storage instead of copying.
+                shard_data = data if i == 0 else data.detach()
+                shard_data.shard_id = one_shard_id
+                yield out_name, shard_data</code></pre></div></div></div><figcaption class="code-caption"><code>apply()</code> puts the shard id on the tensor itself, as the attribute <code>shard_id</code>.</figcaption></figure>
+<p>The mapper has six kinds of rule: <code>orig_to_new_renaming</code>, <code>_regex</code>, <code>_substr</code>, <code>_stacked</code>, <code>_prefix</code> and <code>_suffix</code>, applied in this order. A regex, substring, prefix or suffix rule that maps to <code>None</code> drops the tensor (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L48-L61" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:48-61 at 3e44c0d"><code>vllm/model_executor/models/utils.py:48-61</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L108-L145" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:108-145 at 3e44c0d"><code>vllm/model_executor/models/utils.py:108-145</code></a>). <code>AutoWeightsLoader.load_weights()</code> adds more mappers. With a quantization config, it adds the config's mappers for KV cache scale names and checkpoint names. It always adds a rule that drops old rotary tables (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L460-L473" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:460-473 at 3e44c0d"><code>vllm/model_executor/models/utils.py:460-473</code></a>).</p>
+<p>Then the loader walks the module tree:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L402-L424" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/models/utils.py:402-424</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L402-L424" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">402</span><span class="ln">403</span><span class="ln">404</span><span class="ln">405</span><span class="ln">406</span><span class="ln">407</span><span class="ln">408</span><span class="ln">409</span><span class="ln">410</span><span class="ln">411</span><span class="ln">412</span><span class="ln">413</span><span class="ln">414</span><span class="ln">415</span><span class="ln">416</span><span class="ln">417</span><span class="ln">418</span><span class="ln">419</span><span class="ln">420</span><span class="ln">421</span><span class="ln">422</span><span class="ln">423</span><span class="ln">424</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">        child_modules = dict(module.named_children())
+        child_params = dict(module.named_parameters(recurse=False))
+
+        # Add missing tensors the weight loader needs to be able to load
+        # that aren&#x27;t registered as params, e.g., batchnorm statistics.
+        self._add_loadable_non_param_tensors(module, child_params)
+
+        for child_prefix, child_weights in self._groupby_prefix(weights):
+            prefix = self._get_qualname(base_prefix, child_prefix)
+
+            if child_prefix in child_modules:
+                yield from self._load_module(
+                    prefix, child_modules[child_prefix], child_weights
+                )
+            elif child_prefix in child_params:
+                if self._can_skip(prefix):
+                    logger.debug(&quot;Skipping param %s&quot;, prefix)
+
+                    continue
+
+                yield from self._load_param(
+                    prefix, child_params[child_prefix], child_weights
+                )</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 409.</strong> <code>_groupby_prefix()</code> splits each name at the first dot: <code>layers.0.self_attn.qkv_proj.weight</code> becomes <code>layers</code> and <code>0.self_attn.qkv_proj.weight</code>.</li>
+  <li><strong>Lines 412-415.</strong> A child module: recurse. For <code>QKVParallelLinear</code> the recursion ends early, because that layer has its own <code>load_weights</code> (line 388).</li>
+  <li><strong>Lines 416-424.</strong> A parameter: <code>_load_param()</code> calls <code>param.weight_loader</code>, or <code>default_weight_loader</code> when the parameter has none (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L340-L341" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:340-341 at 3e44c0d"><code>vllm/model_executor/models/utils.py:340-341</code></a>).</li>
+</ol>
+<p><code>QKVParallelLinear.load_weights</code> reads the shard id from the tensor and calls <code>param.weight_loader(param, loaded_weight, shard_id)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1339-L1354" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1339-1354 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1339-1354</code></a>). <code>MergedColumnParallelLinear</code> has the same method for the integer shard ids of <code>gate_up_proj</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L985-L1000" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:985-1000 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:985-1000</code></a>).</p>
+
+<h3 id="step-5-the-weight-loader-of-each-parameter">Step 5: the weight loader of each parameter<a class="h-anchor" href="#step-5-the-weight-loader-of-each-parameter" aria-label="Link to this section">#</a></h3>
+<p>A linear layer chooses one of two loader families when it is built. If the class name of its quantization method is in <code>WEIGHT_LOADER_V2_SUPPORTED</code>, it uses <code>weight_loader_v2</code>; else <code>weight_loader</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L530-L534" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:530-534 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:530-534</code></a>). <code>UnquantizedLinearMethod</code> is in the list, so a BF16 model uses v2 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L50-L64" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:50-64 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:50-64</code></a>). The v2 loaders give the work to the parameter class:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/parameter.py#L145-L151" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/parameter.py:145-151</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/parameter.py#L145-L151" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">145</span><span class="ln">146</span><span class="ln">147</span><span class="ln">148</span><span class="ln">149</span><span class="ln">150</span><span class="ln">151</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">    def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
+        shard_size = self.data.shape[self.output_dim]
+        loaded_weight = loaded_weight.narrow(
+            self.output_dim, self.tp_rank * shard_size, shard_size
+        )
+        assert self.data.shape == loaded_weight.shape
+        self.data.copy_(loaded_weight)</code></pre></div></div></div><figcaption class="code-caption">Column-parallel: cut along <code>output_dim</code> (dimension 0 of a <code>[out, in]</code> weight) at <code>tp_rank × shard_size</code>.</figcaption></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/parameter.py#L216-L226" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/parameter.py:216-226</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/parameter.py#L216-L226" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">216</span><span class="ln">217</span><span class="ln">218</span><span class="ln">219</span><span class="ln">220</span><span class="ln">221</span><span class="ln">222</span><span class="ln">223</span><span class="ln">224</span><span class="ln">225</span><span class="ln">226</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">    def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
+        shard_size = self.data.shape[self.input_dim]
+        loaded_weight = loaded_weight.narrow(
+            self.input_dim, self.tp_rank * shard_size, shard_size
+        )
+
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+
+        assert self.data.shape == loaded_weight.shape
+        self.data.copy_(loaded_weight)</code></pre></div></div></div><figcaption class="code-caption">Row-parallel: cut along <code>input_dim</code> (dimension 1) at <code>tp_rank × shard_size</code>.</figcaption></figure>
+<p>The shard size is the size of the parameter on this rank, so the loader needs no TP arithmetic of its own. <code>ModelWeightParameter</code> inherits both methods, and the layer calls the one that fits (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/parameter.py#L229-L234" target="_blank" rel="noopener" title="vllm/model_executor/parameter.py:229-234 at 3e44c0d"><code>vllm/model_executor/parameter.py:229-234</code></a>). The v1 loaders do the same cut with <code>getattr(param, "output_dim")</code> and <code>"input_dim"</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L589-L606" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:589-606 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:589-606</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1758-L1774" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1758-1774 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1758-1774</code></a>).</p>
+<p>For a stacked parameter, the loader first selects the part of the parameter, then the part of the tensor:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/parameter.py#L175-L198" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/parameter.py:175-198</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/parameter.py#L175-L198" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">175</span><span class="ln">176</span><span class="ln">177</span><span class="ln">178</span><span class="ln">179</span><span class="ln">180</span><span class="ln">181</span><span class="ln">182</span><span class="ln">183</span><span class="ln">184</span><span class="ln">185</span><span class="ln">186</span><span class="ln">187</span><span class="ln">188</span><span class="ln">189</span><span class="ln">190</span><span class="ln hl">191</span><span class="ln hl">192</span><span class="ln hl">193</span><span class="ln hl">194</span><span class="ln hl">195</span><span class="ln">196</span><span class="ln">197</span><span class="ln">198</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><pre><code class="language-python">    def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
+        shard_offset: int = kwargs[&quot;shard_offset&quot;]
+        shard_size: int = kwargs[&quot;shard_size&quot;]
+        shard_id: str = kwargs[&quot;shard_id&quot;]
+        num_heads: int = kwargs[&quot;num_heads&quot;]
+
+        # TODO: move these to PackedColumnParameter and PackedvLLMParameter
+        if (
+            isinstance(self, (PackedColumnParameter, PackedvLLMParameter))
+            and self.output_dim == self.packed_dim
+        ):
+            shard_size, shard_offset = self.adjust_shard_indexes_for_packing(
+                shard_offset=shard_offset, shard_size=shard_size
+            )
+
+        param_data = self.data
+        shard_id_int = self.tp_rank if shard_id == &quot;q&quot; else self.tp_rank // num_heads
+        param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
+        loaded_weight = loaded_weight.narrow(
+            self.output_dim, shard_id_int * shard_size, shard_size
+        )
+
+        assert param_data.shape == loaded_weight.shape
+        param_data.copy_(loaded_weight)</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 191.</strong> For <code>q</code>, the slice index is the TP rank. For <code>k</code> and <code>v</code> it is <code>tp_rank // num_kv_head_replicas</code>; <code>num_heads</code> here carries the replica count (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1203-L1209" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1203-1209 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1203-1209</code></a>).</li>
+  <li><strong>Line 192.</strong> The part of the parameter: offset and size from the head counts of this rank (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1101-L1117" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1101-1117 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1101-1117</code></a>).</li>
+  <li><strong>Lines 193-195.</strong> The part of the checkpoint tensor. Then an assertion and one copy.</li>
+</ol>
+<p>Other parameters:</p>
+<ul>
+  <li><strong>Embedding and LM head.</strong> <code>VocabParallelEmbedding.weight_loader</code> cuts rows <code>org_vocab_start_index</code> to <code>org_vocab_end_index</code>, and fills the padding rows with zeros (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/vocab_parallel_embedding.py#L497-L520" target="_blank" rel="noopener" title="vllm/model_executor/layers/vocab_parallel_embedding.py:497-520 at 3e44c0d"><code>vllm/model_executor/layers/vocab_parallel_embedding.py:497-520</code></a>).</li>
+  <li><strong>Norm weights.</strong> <code>RMSNorm.weight</code> is a plain <code>nn.Parameter</code> without a loader (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/layernorm.py#L65-L67" target="_blank" rel="noopener" title="vllm/model_executor/layers/layernorm.py:65-67 at 3e44c0d"><code>vllm/model_executor/layers/layernorm.py:65-67</code></a>). <code>default_weight_loader</code> checks the shape and copies the full tensor on every rank (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/weight_utils.py#L1529-L1547" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/weight_utils.py:1529-1547 at 3e44c0d"><code>vllm/model_executor/model_loader/weight_utils.py:1529-1547</code></a>).</li>
+</ul>
+
+<h3 id="step-6-older-model-files-stacked-params-mapping">Step 6: older model files: stacked_params_mapping<a class="h-anchor" href="#step-6-older-model-files-stacked-params-mapping" aria-label="Link to this section">#</a></h3>
+<p>Before <code>WeightsMapper</code> had stacked rules, each model wrote the loop itself. 38 files in <code>vllm/model_executor/models/</code> still do. 98 other files use <code>orig_to_new_stacked</code>, and no file uses both (git grep at this commit). An example:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/minicpm.py#L488-L529" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/models/minicpm.py:488-529</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/minicpm.py#L488-L529" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">488</span><span class="ln hl">489</span><span class="ln hl">490</span><span class="ln hl">491</span><span class="ln hl">492</span><span class="ln hl">493</span><span class="ln hl">494</span><span class="ln hl">495</span><span class="ln hl">496</span><span class="ln">497</span><span class="ln">498</span><span class="ln">499</span><span class="ln">500</span><span class="ln">501</span><span class="ln">502</span><span class="ln">503</span><span class="ln">504</span><span class="ln">505</span><span class="ln">506</span><span class="ln">507</span><span class="ln">508</span><span class="ln">509</span><span class="ln">510</span><span class="ln">511</span><span class="ln">512</span><span class="ln">513</span><span class="ln">514</span><span class="ln">515</span><span class="ln">516</span><span class="ln hl">517</span><span class="ln hl">518</span><span class="ln hl">519</span><span class="ln hl">520</span><span class="ln hl">521</span><span class="ln hl">522</span><span class="ln hl">523</span><span class="ln hl">524</span><span class="ln hl">525</span><span class="ln hl">526</span><span class="ln hl">527</span><span class="ln hl">528</span><span class="ln">529</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(37 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(38 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(40 * var(--code-lh))"></span><pre><code class="language-python">    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -&gt; set[str]:
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            (&quot;qkv_proj&quot;, &quot;q_proj&quot;, &quot;q&quot;),
+            (&quot;qkv_proj&quot;, &quot;k_proj&quot;, &quot;k&quot;),
+            (&quot;qkv_proj&quot;, &quot;v_proj&quot;, &quot;v&quot;),
+            (&quot;gate_up_proj&quot;, &quot;gate_proj&quot;, 0),
+            (&quot;gate_up_proj&quot;, &quot;up_proj&quot;, 1),
+        ]
+        expert_params_mapping = [
+            # (param_name, weight_name, expert_id)
+            (
+                &quot;ws&quot; if weight_name in [&quot;w1&quot;, &quot;w3&quot;] else &quot;w2s&quot;,
+                f&quot;experts.{expert_id}.{weight_name}.weight&quot;,
+                expert_id,
+            )
+            for expert_id in range(self.num_experts)
+            for weight_name in [&quot;w1&quot;, &quot;w2&quot;, &quot;w3&quot;]
+        ]
+        params_dict = dict(self.named_parameters())
+
+        loaded_params: set[str] = set()
+        for name, loaded_weight in weights:
+            if &quot;rotary_emb.inv_freq&quot; in name:
+                continue
+            if &quot;rotary_emb.cos_cached&quot; in name or &quot;rotary_emb.sin_cached&quot; in name:
+                # Models trained using ColossalAI may include these tensors in
+                # the checkpoint. Skip them.
+                continue
+            for param_name, weight_name, shard_id in stacked_params_mapping:
+                if weight_name not in name:
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(&quot;.bias&quot;) and name not in params_dict:
+                    continue
+                if is_pp_missing_parameter(name, self):
+                    continue
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 489-496.</strong> The list has the same content as Llama's mapper, as tuples <code>(param_name, shard_name, shard_id)</code>.</li>
+  <li><strong>Lines 517-528.</strong> For each name, find a matching tuple and rename. Skip parameters of other pipeline stages. Call the loader with the shard id as the third argument.</li>
+</ol>
+
+<h3 id="step-7-quantized-weights">Step 7: quantized weights<a class="h-anchor" href="#step-7-quantized-weights" aria-label="Link to this section">#</a></h3>
+<p>For a quantized checkpoint, the layer's quantization method makes the parameters in <code>create_weights()</code> (<a href="../concepts/quantization-plugins.html">Quantization methods as plugins</a>). FP8, for example, registers an FP8 <code>weight</code> and a <code>weight_scale</code> (or <code>weight_scale_inv</code> for block scales), each with the layer's weight loader (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/quantization/fp8.py#L312-L339" target="_blank" rel="noopener" title="vllm/model_executor/layers/quantization/fp8.py:312-339 at 3e44c0d"><code>vllm/model_executor/layers/quantization/fp8.py:312-339</code></a>). The checkpoint has tensors with the same names, so the mapping and slicing above work for them too. A per-tensor scale of a stacked layer has one slot per part (q, k, v). <code>PerTensorScaleParameter</code> copies each checkpoint scale into the slot of its shard id (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/parameter.py#L253-L301" target="_blank" rel="noopener" title="vllm/model_executor/parameter.py:253-301 at 3e44c0d"><code>vllm/model_executor/parameter.py:253-301</code></a>); the v1 loaders use <code>adjust_scalar_to_fused_array</code> for the same job (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L97-L121" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:97-121 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:97-121</code></a>).</p>
+<p>After all tensors are copied, <code>process_weights_after_loading()</code> visits every module with a quantization method and calls its post-processing (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/utils.py#L157-L196" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/utils.py:157-196 at 3e44c0d"><code>vllm/model_executor/model_loader/utils.py:157-196</code></a>). FP8 with per-tensor scales, for example, re-quantizes the parts of a stacked layer to one scale, the maximum of their scales, and transposes the weight. This happens only without block scales and without the Marlin kernel (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/quantization/fp8.py#L372-L409" target="_blank" rel="noopener" title="vllm/model_executor/layers/quantization/fp8.py:372-409 at 3e44c0d"><code>vllm/model_executor/layers/quantization/fp8.py:372-409</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/quantization/utils/fp8_utils.py#L1454-L1479" target="_blank" rel="noopener" title="vllm/model_executor/layers/quantization/utils/fp8_utils.py:1454-1479 at 3e44c0d"><code>vllm/model_executor/layers/quantization/utils/fp8_utils.py:1454-1479</code></a>). The page <a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a> explains the formats.</p>
+
+<h3 id="step-8-the-other-loaders">Step 8: the other loaders<a class="h-anchor" href="#step-8-the-other-loaders" aria-label="Link to this section">#</a></h3>
+<p>The table maps 15 format names to 7 classes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/__init__.py#L50-L66" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/__init__.py:50-66 at 3e44c0d"><code>vllm/model_executor/model_loader/__init__.py:50-66</code></a>). There is no <code>gguf</code> and no <code>bitsandbytes</code> format at this commit.</p>
+<table>
+  <thead><tr><th>Format names</th><th>Class</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>auto</code>, <code>hf</code>, <code>safetensors</code>, <code>pt</code>, <code>npcache</code>, <code>mistral</code>, <code>fastsafetensors</code>, <code>instanttensor</code></td><td><code>DefaultModelLoader</code></td><td>The path of this page; the name selects the file patterns and the iterator (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/default_loader.py#L184-L203" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/default_loader.py:184-203 at 3e44c0d"><code>vllm/model_executor/model_loader/default_loader.py:184-203</code></a>).</td></tr>
+    <tr><td><code>dummy</code></td><td><code>DummyModelLoader</code></td><td>Random values, no files; for profiling (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/dummy_loader.py#L21-L48" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/dummy_loader.py:21-48 at 3e44c0d"><code>vllm/model_executor/model_loader/dummy_loader.py:21-48</code></a>).</td></tr>
+    <tr><td><code>sharded_state</code>, <code>runai_streamer_sharded</code></td><td><code>ShardedStateLoader</code></td><td>Each rank reads its own pre-sharded files, for example <code>model-rank-{rank}-part-{part}.safetensors</code> (another pattern with PP), with no slicing (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/sharded_state_loader.py#L30-L39" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/sharded_state_loader.py:30-39 at 3e44c0d"><code>vllm/model_executor/model_loader/sharded_state_loader.py:30-39</code></a>).</td></tr>
+    <tr><td><code>tensorizer</code></td><td><code>TensorizerLoader</code></td><td>CoreWeave tensorizer files (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L48-L50" target="_blank" rel="noopener" title="vllm/config/load.py:48-50 at 3e44c0d"><code>vllm/config/load.py:48-50</code></a>).</td></tr>
+    <tr><td><code>runai_streamer</code></td><td><code>RunaiModelStreamerLoader</code></td><td>Safetensors through the Run:ai Model Streamer (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L51-L52" target="_blank" rel="noopener" title="vllm/config/load.py:51-52 at 3e44c0d"><code>vllm/config/load.py:51-52</code></a>).</td></tr>
+    <tr><td><code>modelexpress</code></td><td><code>ModelExpressModelLoader</code></td><td>Weights through ModelExpress (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L59" target="_blank" rel="noopener" title="vllm/config/load.py:59 at 3e44c0d"><code>vllm/config/load.py:59</code></a>).</td></tr>
+    <tr><td><code>ipc_cache</code></td><td><code>IpcModelLoader</code></td><td>Maps already processed weights from a local cache daemon over CUDA IPC (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L41-L43" target="_blank" rel="noopener" title="vllm/config/load.py:41-43 at 3e44c0d"><code>vllm/config/load.py:41-43</code></a>).</td></tr>
+  </tbody>
+</table>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-q-proj-k-proj-and-v-proj-of-layer-0-tp-2" class="dd-title">Worked example: q_proj, k_proj and v_proj of layer 0, TP = 2</h3></summary><div class="dd-body"><p>These values are from the Llama-3-8B <code>config.json</code> on the Hugging Face Hub: <code>hidden_size</code> 4096, <code>num_attention_heads</code> 32, <code>num_key_value_heads</code> 8. So the head size is 4096 / 32 = 128 (llama.py line 159). The checkpoint stores PyTorch linear weights as <code>[out, in]</code>.</p>
+<table>
+  <thead><tr><th>Checkpoint name</th><th>Shape</th><th>After the mapper</th><th>Shard id</th></tr></thead>
+  <tbody>
+    <tr><td><code>model.layers.0.self_attn.q_proj.weight</code></td><td><code>[4096, 4096]</code></td><td><code>layers.0.self_attn.qkv_proj.weight</code></td><td><code>"q"</code></td></tr>
+    <tr><td><code>model.layers.0.self_attn.k_proj.weight</code></td><td><code>[1024, 4096]</code></td><td><code>layers.0.self_attn.qkv_proj.weight</code></td><td><code>"k"</code></td></tr>
+    <tr><td><code>model.layers.0.self_attn.v_proj.weight</code></td><td><code>[1024, 4096]</code></td><td><code>layers.0.self_attn.qkv_proj.weight</code></td><td><code>"v"</code></td></tr>
+  </tbody>
+</table>
+<p>On each rank, <code>QKVParallelLinear</code> has <code>num_heads</code> = 16, <code>num_kv_heads</code> = 4 and <code>num_kv_head_replicas</code> = 1 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1064-L1071" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1064-1071 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1064-1071</code></a>). The parameter is <code>[16×128 + 4×128 + 4×128, 4096] = [3072, 4096]</code>, 24 MiB in BF16. The loads:</p>
+<table>
+  <thead><tr><th>Shard</th><th>Parameter rows (both ranks)</th><th>Checkpoint rows, rank 0</th><th>Checkpoint rows, rank 1</th></tr></thead>
+  <tbody>
+    <tr><td><code>q</code></td><td>0-2047 (offset 0, size 2048)</td><td>0-2047</td><td>2048-4095</td></tr>
+    <tr><td><code>k</code></td><td>2048-2559 (offset 16×128, size 512)</td><td>0-511</td><td>512-1023</td></tr>
+    <tr><td><code>v</code></td><td>2560-3071 (offset 20×128, size 512)</td><td>0-511</td><td>512-1023</td></tr>
+  </tbody>
+</table>
+<p>Each rank reads 4096 × 4096 + 2 × 1024 × 4096 values of the checkpoint (48 MiB) and keeps half of them (24 MiB). For the whole model, each rank keeps about 4.0 of the 8.03 billion parameters: about 8.0 GB in BF16. (Derived from the shapes. The small norm weights are on both ranks.)</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="autoweightsloader-load-weights-line-by-line" class="dd-title">AutoWeightsLoader.load_weights, line by line</h3></summary><div class="dd-body"><figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L450-L478" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/models/utils.py:450-478</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L450-L478" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">450</span><span class="ln">451</span><span class="ln">452</span><span class="ln">453</span><span class="ln">454</span><span class="ln">455</span><span class="ln">456</span><span class="ln">457</span><span class="ln">458</span><span class="ln">459</span><span class="ln">460</span><span class="ln">461</span><span class="ln">462</span><span class="ln">463</span><span class="ln">464</span><span class="ln">465</span><span class="ln">466</span><span class="ln">467</span><span class="ln">468</span><span class="ln">469</span><span class="ln">470</span><span class="ln">471</span><span class="ln">472</span><span class="ln">473</span><span class="ln">474</span><span class="ln">475</span><span class="ln">476</span><span class="ln">477</span><span class="ln">478</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">    @support_quantized_model_reload_from_hp_weights
+    def load_weights(
+        self,
+        weights: Iterable[tuple[str, torch.Tensor]],
+        *,
+        mapper: WeightsMapper | None = None,
+    ) -&gt; set[str]:
+        # Ignore unexpected biases (typically from GPTQ models)
+        self.ignore_unexpected_suffixes.append(&quot;.bias&quot;)
+
+        mapper = mapper or WeightsMapper()
+        # Many models store quant_config in the base model instead of the causal model.
+        # We look at the causal model&#x27;s direct children for this reason.
+        modules = (self.module, *self.module.children())
+        iterator = (m.quant_config for m in modules if hasattr(m, &quot;quant_config&quot;))
+        if quant_config := next(iterator, None):
+            # Apply mappings for quantization-specific checkpoint tensors.
+            mapper |= quant_config.get_cache_scale_mapper()
+            mapper |= quant_config.get_checkpoint_weight_mapper()
+            ignore_unexpected_suffixes = quant_config._ignore_unexpected_suffixes
+            self.ignore_unexpected_suffixes.extend(ignore_unexpected_suffixes)
+        mapper |= self.REMOVE_UNUSED_ROTARY_EMBEDS_MAPPER
+
+        weights = mapper.apply(weights)
+        weights = self._filter_skipped(weights)
+
+        autoloaded_weights = set(self._load_module(&quot;&quot;, self.module, weights))
+        self._check_skipped_aliases(autoloaded_weights)
+        return autoloaded_weights</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 458.</strong> Unexpected <code>.bias</code> tensors are ignored; the comment says GPTQ checkpoints often have them.</li>
+  <li><strong>Lines 463-470.</strong> The quantization config can be on the model or on a direct child. If it exists, its mappers and its ignore list join in.</li>
+  <li><strong>Line 471.</strong> Old rotary tables such as <code>rotary_emb.inv_freq</code> are dropped (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L233-L240" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:233-240 at 3e44c0d"><code>vllm/model_executor/models/utils.py:233-240</code></a>).</li>
+  <li><strong>Lines 473-474.</strong> Both steps are generators: no tensor is read before the tree walk asks for it.</li>
+  <li><strong>Line 476.</strong> The walk returns the names of all loaded parameters. The default loader compares them with <code>model.named_parameters()</code> (next deep dive).</li>
+  <li><strong>Line 477.</strong> With tied embeddings (<code>lm_head.weight</code> is <code>embed_tokens.weight</code>), the loader loads the first name only. If that name is missing in the checkpoint, it raises <code>ValueError</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L491-L502" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:491-502 at 3e44c0d"><code>vllm/model_executor/models/utils.py:491-502</code></a>).</li>
+</ol>
+<p>Inside the walk, a <code>PPMissingLayer</code> returns at once, so the tensors of other pipeline stages are skipped (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L382-L383" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:382-383 at 3e44c0d"><code>vllm/model_executor/models/utils.py:382-383</code></a>). A name that matches no child and no parameter raises <code>ValueError</code> with the list of available names (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L425-L448" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:425-448 at 3e44c0d"><code>vllm/model_executor/models/utils.py:425-448</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="memory-time-and-the-completeness-check" class="dd-title">Memory, time and the completeness check</h3></summary><div class="dd-body"><ul>
+  <li><strong>Where the bytes go.</strong> The parameters are allocated on the GPU in Step 2, at their final per-rank size. The checkpoint tensors stay on the CPU; each loader copies a slice into the GPU parameter with <code>copy_</code>.</li>
+  <li><strong>Peak memory.</strong> After the load, the loader logs "Peak GPU memory after loading weights" at DEBUG level on CUDA, ROCm and XPU (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/base_loader.py#L95-L102" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/base_loader.py:95-102 at 3e44c0d"><code>vllm/model_executor/model_loader/base_loader.py:95-102</code></a>).</li>
+  <li><strong>Three timers.</strong> "Initializing model took" (constructors, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/base_loader.py#L82-L85" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/base_loader.py:82-85 at 3e44c0d"><code>vllm/model_executor/model_loader/base_loader.py:82-85</code></a>), "Loading weights took" (the stream, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/default_loader.py#L505-L509" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/default_loader.py:505-509 at 3e44c0d"><code>vllm/model_executor/model_loader/default_loader.py:505-509</code></a>), and "Model loading took ... GiB memory and ... seconds" (the whole <code>load_model</code>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L428-L435" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:428-435 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:428-435</code></a>).</li>
+  <li><strong>Completeness.</strong> For a model without quantization, the default loader checks that parameters got a value; else "Following weights were not initialized from checkpoint" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/default_loader.py#L510-L523" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/default_loader.py:510-523 at 3e44c0d"><code>vllm/model_executor/model_loader/default_loader.py:510-523</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/default_loader.py#L567-L572" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/default_loader.py:567-572 at 3e44c0d"><code>vllm/model_executor/model_loader/default_loader.py:567-572</code></a>). In this case, it exempts all parameters of modules that have a quantization method (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/default_loader.py#L533-L566" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/default_loader.py:533-566 at 3e44c0d"><code>vllm/model_executor/model_loader/default_loader.py:533-566</code></a>). Every quantize method has <code>process_weights_after_loading</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/quantization/base_config.py#L80-L85" target="_blank" rel="noopener" title="vllm/model_executor/layers/quantization/base_config.py:80-85 at 3e44c0d"><code>vllm/model_executor/layers/quantization/base_config.py:80-85</code></a>), so in a BF16 Llama the linear, embedding and head weights are exempt too. The check then covers only parameters such as the norm weights (derived). <code>enable_weights_track</code> in <code>--model-loader-extra-config</code> turns the check on or off.</li>
+</ul></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="flags-and-their-defaults" class="dd-title">Flags and their defaults</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Flag</th><th>Default</th><th>Defined at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--load-format</code></td><td><code>auto</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L30-L61" target="_blank" rel="noopener" title="vllm/config/load.py:30-61 at 3e44c0d"><code>vllm/config/load.py:30-61</code></a></td><td>Loader class and file patterns.</td></tr>
+    <tr><td><code>--download-dir</code></td><td>Hugging Face cache</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L62-L64" target="_blank" rel="noopener" title="vllm/config/load.py:62-64 at 3e44c0d"><code>vllm/config/load.py:62-64</code></a></td><td>Where to download and read the files.</td></tr>
+    <tr><td><code>--safetensors-load-strategy</code></td><td><code>None</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L65-L86" target="_blank" rel="noopener" title="vllm/config/load.py:65-86 at 3e44c0d"><code>vllm/config/load.py:65-86</code></a></td><td><code>lazy</code>, <code>eager</code>, <code>prefetch</code>, <code>torchao</code>; <code>None</code> = lazy with auto-prefetch on NFS/Lustre.</td></tr>
+    <tr><td><code>--safetensors-prefetch-num-threads</code></td><td>8</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L12" target="_blank" rel="noopener" title="vllm/config/load.py:12 at 3e44c0d"><code>vllm/config/load.py:12</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L87-L91" target="_blank" rel="noopener" title="vllm/config/load.py:87-91 at 3e44c0d"><code>vllm/config/load.py:87-91</code></a></td><td>Prefetch threads.</td></tr>
+    <tr><td><code>--safetensors-prefetch-block-size</code></td><td>16 MiB</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L13" target="_blank" rel="noopener" title="vllm/config/load.py:13 at 3e44c0d"><code>vllm/config/load.py:13</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L92-L95" target="_blank" rel="noopener" title="vllm/config/load.py:92-95 at 3e44c0d"><code>vllm/config/load.py:92-95</code></a></td><td>Read size per prefetch call.</td></tr>
+    <tr><td><code>--model-loader-extra-config</code></td><td><code>{}</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L96-L98" target="_blank" rel="noopener" title="vllm/config/load.py:96-98 at 3e44c0d"><code>vllm/config/load.py:96-98</code></a></td><td>For the default loader only <code>enable_multithread_load</code>, <code>num_threads</code>, <code>enable_weights_track</code>; other keys raise (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/default_loader.py#L103-L115" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/default_loader.py:103-115 at 3e44c0d"><code>vllm/model_executor/model_loader/default_loader.py:103-115</code></a>).</td></tr>
+    <tr><td><code>--ignore-patterns</code></td><td><code>["original/**/*"]</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L102-L104" target="_blank" rel="noopener" title="vllm/config/load.py:102-104 at 3e44c0d"><code>vllm/config/load.py:102-104</code></a></td><td>Files not to download, so the extra Llama files in <code>original/</code> are skipped.</td></tr>
+    <tr><td><code>--pt-load-map-location</code></td><td><code>cpu</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L108-L117" target="_blank" rel="noopener" title="vllm/config/load.py:108-117 at 3e44c0d"><code>vllm/config/load.py:108-117</code></a></td><td><code>map_location</code> of <code>torch.load</code> for <code>.bin</code>/<code>.pt</code> files.</td></tr>
+  </tbody>
+</table>
+<p>The flags come from the <code>LoadConfig</code> fields (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L1069-L1094" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:1069-1094 at 3e44c0d"><code>vllm/engine/arg_utils.py:1069-1094</code></a>).</p></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<aside class="callout callout-warning"><p class="callout-title">A checkpoint name that the model does not know stops start-up</p><div class="callout-body"><p>The tree walk raises "There is no module or parameter named ..." for every name it cannot place (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L442-L448" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:442-448 at 3e44c0d"><code>vllm/model_executor/models/utils.py:442-448</code></a>). By default the loader ignores only <code>.bias</code> tensors and the suffixes of the quantization config, and the mapper drops old rotary tables. A fine-tuned checkpoint with extra tensors needs a mapper rule that maps them to <code>None</code>.</p></div></aside>
+<ul>
+  <li><strong>A shape mismatch.</strong> The weight loaders assert that the slice and the parameter have the same shape (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/parameter.py#L197" target="_blank" rel="noopener" title="vllm/model_executor/parameter.py:197 at 3e44c0d"><code>vllm/model_executor/parameter.py:197</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/weight_utils.py#L1538-L1541" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/weight_utils.py:1538-1541 at 3e44c0d"><code>vllm/model_executor/model_loader/weight_utils.py:1538-1541</code></a>). A checkpoint for another config, or a wrong <code>--hf-overrides</code>, fails here.</li>
+  <li><strong>Missing weights.</strong> An unquantized model raises "Following weights were not initialized from checkpoint" for an empty norm weight, or another parameter outside quantize-method modules (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/default_loader.py#L533-L572" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/default_loader.py:533-572 at 3e44c0d"><code>vllm/model_executor/model_loader/default_loader.py:533-572</code></a>). A missing linear weight gives no error here (derived).</li>
+  <li><strong>A dtype mismatch.</strong> A tensor with another dtype is converted by <code>copy_</code>, and the loader logs a warning (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L324-L339" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:324-339 at 3e44c0d"><code>vllm/model_executor/models/utils.py:324-339</code></a>).</li>
+  <li><strong>An unknown format.</strong> <code>--load-format gguf</code> raises "Load format `gguf` is not supported" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/__init__.py#L126-L127" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/__init__.py:126-127 at 3e44c0d"><code>vllm/model_executor/model_loader/__init__.py:126-127</code></a>).</li>
+  <li><strong>Slow loads from network storage.</strong> On NFS, a large model that does not fit in 90% of the free RAM is not prefetched, and vLLM logs a warning (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/weight_utils.py#L1156-L1165" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/weight_utils.py:1156-1165 at 3e44c0d"><code>vllm/model_executor/model_loader/weight_utils.py:1156-1165</code></a>). Try <code>--safetensors-load-strategy eager</code> or <code>prefetch</code>, or a pre-sharded checkpoint.</li>
+</ul>
+<p><strong>Why it matters.</strong> Weight loading is often the longest part of start-up, and its errors are the first errors of a new model or a new checkpoint. When you know the path from file to parameter, you can read the log timers, fix name and shape errors, and choose a faster format.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Which loader class serves the default <code>--load-format auto</code>, and which iterator does it use for a safetensors checkpoint?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>DefaultModelLoader</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/__init__.py#L51" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/__init__.py:51 at 3e44c0d"><code>vllm/model_executor/model_loader/__init__.py:51</code></a>). Without the multi-thread option it uses <code>safetensors_weights_iterator</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/default_loader.py#L337-L349" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/default_loader.py:337-349 at 3e44c0d"><code>vllm/model_executor/model_loader/default_loader.py:337-349</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>How does <code>QKVParallelLinear</code> know that a tensor is the K part?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Llama's mapper renames <code>.k_proj</code> to <code>.qkv_proj</code> with the shard id <code>"k"</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L351-L353" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:351-353 at 3e44c0d"><code>vllm/model_executor/models/llama.py:351-353</code></a>). <code>WeightsMapper.apply()</code> stores it as <code>tensor.shard_id</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L158-L164" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:158-164 at 3e44c0d"><code>vllm/model_executor/models/utils.py:158-164</code></a>), and <code>QKVParallelLinear.load_weights</code> reads it back (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1342-L1354" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1342-1354 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1342-1354</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>For a BF16 model with TP = 4, which dimension of <code>o_proj.weight</code> does each rank cut, and at which offset?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>o_proj</code> is row-parallel, so the loader cuts <code>input_dim</code> = 1 at <code>tp_rank × shard_size</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/parameter.py#L216-L220" target="_blank" rel="noopener" title="vllm/model_executor/parameter.py:216-220 at 3e44c0d"><code>vllm/model_executor/parameter.py:216-220</code></a>). For Llama-3-8B, the parameter is <code>[4096, 1024]</code>, so rank 2 takes columns 2048-3071.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>A model has 8 KV heads and runs with TP = 16. Which rows of <code>k_proj.weight</code> does rank 5 load? Why does rank 4 load the same rows?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>num_kv_heads</code> is 1 and <code>num_kv_head_replicas</code> is 2 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1066-L1068" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1066-1068 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1066-1068</code></a>). The slice index for <code>k</code> is <code>tp_rank // num_heads</code>, where <code>num_heads</code> carries the replica count: 5 // 2 = 2 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/parameter.py#L191" target="_blank" rel="noopener" title="vllm/model_executor/parameter.py:191 at 3e44c0d"><code>vllm/model_executor/parameter.py:191</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1203-L1205" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1203-1205 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1203-1205</code></a>). With a slice size of 128 rows, rank 5 loads rows 256-383 (KV head 2). Rank 4 gives 4 // 2 = 2 too, so both ranks hold a copy of KV head 2.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>A model runs with PP = 2. What happens to the checkpoint tensors of layers 16-31 on stage 0?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The iterator still reads every tensor of every file, because it calls <code>get_tensor</code> for each name (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/weight_utils.py#L1243-L1249" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/weight_utils.py:1243-1249 at 3e44c0d"><code>vllm/model_executor/model_loader/weight_utils.py:1243-1249</code></a>). The tree walk reaches <code>PPMissingLayer</code> objects for those layers and returns without a copy (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L382-L383" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:382-383 at 3e44c0d"><code>vllm/model_executor/models/utils.py:382-383</code></a>). Hand-written loaders use <code>is_pp_missing_parameter()</code> for the same skip (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/minicpm.py#L524-L525" target="_blank" rel="noopener" title="vllm/model_executor/models/minicpm.py:524-525 at 3e44c0d"><code>vllm/model_executor/models/minicpm.py:524-525</code></a>).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/tp-layers.html">The tensor-parallel layers (linear.py and vocab_parallel_embedding.py)</a><span class="rel-sum">vLLM&#x27;s linear and embedding layers know their tensor-parallel rank. They resolve a quantization method per layer, allocate only their slice, cut checkpoint tensors when they load, and call the all-reduce or all-gather in forward. QKVParallelLinear splits by heads and copies KV heads when TP is larger than their count.</span></li><li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a><span class="rel-sum">A quantized checkpoint stores weights, and sometimes activations, in fewer bits with scales. Weight-only schemes (AWQ, GPTQ) save memory; W8A8 and FP4 schemes also make the matrix multiply cheaper. vLLM reads the scheme from config.json and frees the saved memory for the KV cache.</span></li><li><a href="../concepts/quantization-plugins.html">Quantization methods as plugins</a><span class="rel-sum">A quantization method is a QuantizationConfig subclass registered under a name. The front end picks the name from the checkpoint or --quantization and makes one config object; each layer in the worker asks it for a quantize method that makes the weights and runs the forward.</span></li><li><a href="../concepts/engine-hooks.html">Hooks in the engine core and the workers</a><span class="rel-sum">Several extension points of the engine core and the workers are config fields or registries, not entry-point groups - scheduler_cls, worker_cls and worker_extension_cls, logits processors, model loaders, sleep-mode backends and KV cache dtypes. This page shows where each one is read and what your class must do.</span></li><li><a href="../code/model-executor-models-llama.html">&quot;model_executor/models/llama.py: the Llama model&quot;</a><span class="rel-sum">vllm/model_executor/models/llama.py defines LlamaMLP, LlamaAttention, LlamaDecoderLayer, LlamaModel and LlamaForCausalLM from tensor-parallel layers, plus two bidirectional wrappers. It is the reference model file of vLLM; nine registry names and many other model files reuse it.</span></li><li><a href="../code/model-executor-layers-linear.html">&quot;model_executor/layers/linear.py: tensor-parallel linear layers&quot;</a><span class="rel-sum">vllm/model_executor/layers/linear.py holds LinearBase and the replicated, column-parallel, merged-column, QKV and row-parallel linear layers. Each one resolves a quantize method, allocates its per-rank weight through it, cuts checkpoint tensors in weight_loader or weight_loader_v2, and calls the TP all-gather or all-reduce in forward.</span></li><li><a href="../concepts/model-runner.html">The model runner (Model Runner V2)</a><span class="rel-sum">Model Runner V2 keeps every running request in a fixed row of GPU tensors, gathers each step&#x27;s inputs from those rows with GPU kernels, runs the model (CUDA graph or eager), and samples in a second call that returns an AsyncOutput without a GPU wait.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../concepts/model-definition.html"><span class="pn-dir">← Previous</span><span class="pn-title">How a vLLM model file is written (llama.py)</span></a><a class="pn pn-next" href="../concepts/forward-context.html"><span class="pn-dir">Next →</span><span class="pn-title">The forward context: how layers find per-step data</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-the-code">In the code</a></li><li class="toc-l3"><a href="#step-1-the-load-format-picks-the-loader">Step 1: the load format picks the loader</a></li><li class="toc-l3"><a href="#step-2-build-the-model-with-empty-parameters">Step 2: build the model with empty parameters</a></li><li class="toc-l3"><a href="#step-3-choose-the-files-and-stream-the-tensors">Step 3: choose the files and stream the tensors</a></li><li class="toc-l3"><a href="#step-4-map-the-names-weightsmapper-and-autoweightsloader">Step 4: map the names (WeightsMapper and AutoWeightsLoader)</a></li><li class="toc-l3"><a href="#step-5-the-weight-loader-of-each-parameter">Step 5: the weight loader of each parameter</a></li><li class="toc-l3"><a href="#step-6-older-model-files-stacked-params-mapping">Step 6: older model files: stacked_params_mapping</a></li><li class="toc-l3"><a href="#step-7-quantized-weights">Step 7: quantized weights</a></li><li class="toc-l3"><a href="#step-8-the-other-loaders">Step 8: the other loaders</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#worked-example-q-proj-k-proj-and-v-proj-of-layer-0-tp-2">Worked example: q_proj, k_proj and v_proj of layer 0, TP = 2</a></li><li class="toc-l3"><a href="#autoweightsloader-load-weights-line-by-line">AutoWeightsLoader.load_weights, line by line</a></li><li class="toc-l3"><a href="#memory-time-and-the-completeness-check">Memory, time and the completeness check</a></li><li class="toc-l3"><a href="#flags-and-their-defaults">Flags and their defaults</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

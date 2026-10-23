@@ -1,0 +1,717 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>distributed/device_communicators/shm_broadcast.py: MessageQueue · vLLM Explained</title>
+<meta name="description" content="vllm/distributed/device_communicators/shm_broadcast.py implements MessageQueue, a one-writer, many-reader queue. Local readers share a lock-free ring of chunks in /dev/shm with one flag byte per reader; large messages and remote readers use ZMQ XPUB sockets. The executor uses it to send every call to its workers, and each worker uses one to reply.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="code/distributed-device-communicators-shm-broadcast">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a class="current" aria-current="page" href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>Code map</span><span class="sep">›</span><span>Distributed</span><span class="sep">›</span><span aria-current="page">device_communicators/shm_broadcast.py</span></nav>
+<h1 class="page-title">distributed/device_communicators/shm_broadcast.py: MessageQueue</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">Code map</span><span class="meta-time">about 8 min read + 4 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../learn/processes-and-ipc.html">Processes, ZMQ and shared memory</a> <span class="level level-beginner level-sm">Beginner</span></li><li><a href="../concepts/executors-and-workers.html">Executors and workers: from the engine core to the GPUs</a> <span class="level level-intermediate level-sm">Intermediate</span></li></ul></aside>
+<h2 id="purpose">Purpose<a class="h-anchor" href="#purpose" aria-label="Link to this section">#</a></h2>
+<p><code>vllm/distributed/device_communicators/shm_broadcast.py</code> implements the <a class="term" href="../reference/glossary.html#term-message-queue" data-term="MessageQueue" data-def="vLLM&#x27;s one-writer, many-reader queue in shared memory (a ring buffer of chunks). Large messages go over a ZMQ socket instead. The multiproc executor uses it to talk to its workers.">MessageQueue</a>: one process writes a Python object once, and every reader gets a copy. On one node the bytes go through a ring buffer in shared memory, with no lock and no copy per reader; too-large messages and readers on other nodes go through ZMQ.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/distributed/device_communicators/shm_broadcast.py</code>, 1,148 lines of Python.</td></tr>
+    <tr><th>Main classes</th><td><code>MessageQueue</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L483" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:483 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:483</code></a>), <code>ShmRingBuffer</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L265" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:265 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:265</code></a>), <code>SpinCondition</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L116" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:116 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:116</code></a>), <code>Handle</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L465-L474" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:465-474 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:465-474</code></a>).</td></tr>
+    <tr><th>Runs in</th><td>The writer: the engine core process (executor broadcast) or a worker (its reply). The readers: the workers, or the engine core for replies. Main threads, plus a worker's <code>WorkerAsyncOutputCopy</code> thread, which enqueues replies.</td></tr>
+    <tr><th>Called by</th><td><code>MultiprocExecutor</code> and <code>WorkerProc</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L165-L172" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:165-172 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:165-172</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L615-L645" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:615-645 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:615-645</code></a>); <code>GroupCoordinator</code> broadcasters (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L562-L567" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:562-567 at 3e44c0d"><code>vllm/distributed/parallel_state.py:562-567</code></a>); the Ray executor (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/ray_executor_v2.py#L330-L338" target="_blank" rel="noopener" title="vllm/v1/executor/ray_executor_v2.py:330-338 at 3e44c0d"><code>vllm/v1/executor/ray_executor_v2.py:330-338</code></a>).</td></tr>
+    <tr><th>Calls</th><td><code>multiprocessing.shared_memory</code>, <code>pickle</code> (protocol 5 with out-of-band buffers), <code>pyzmq</code> (XPUB/SUB, PUB/SUB, PAIR), <code>torch.distributed</code> to share the handle in a group.</td></tr>
+    <tr><th>Not in this file</th><td>The RPC protocol on top: the message tuple <code>(method, args, kwargs, output_rank)</code> and the reply <code>(status, value)</code> are defined by the executor (<a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py: MultiprocExecutor and WorkerProc</a>). The zero-copy tensor arena is in <code>shm_tensor_arena.py</code> (opt-in, <code>--enable-shm-tensor-arena</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page <a href="../learn/processes-and-ipc.html">Processes, ZMQ and shared memory</a> introduces the queue; this page reads the file.</p>
+
+<h2 id="where-it-sits">Where it sits<a class="h-anchor" href="#where-it-sits" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b8b_shm_ring"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: the shared memory segment of the executor queue with TP = 2: ten data chunks of 16 MiB, chunk 3 marked as the writer&#x27;s current index, and under each chunk its three flag bytes: written, read by worker 0, read by worker 1; chunks 0 and 1 show 111, chunk 2 shows 110, the others 000. The data part is 160 MiB and the metadata 30 bytes. Panel 2: one enqueue: step 1 pickle with protocol 5, CPU tensors become PickleBuffers, buffers below 1 MiB inline, others out of band. Step 2a, if it fits: byte 0 is 0, bytes 1 to 2 the buffer count, then a 4-byte length and the bytes of each buffer. Step 2b, if too large: byte 0 is 1 and all buffers go to the XPUB socket. Panel 3: the flag states of one chunk: 0?? writable, the writer writes to 100 written, worker 0 reads to 110, worker 1 reads to 111, which is writable again."><svg role="img" aria-label="Panel 1: the shared memory segment of the executor queue with TP = 2: ten data chunks of 16 MiB, chunk 3 marked as the writer&#x27;s current index, and under each chunk its three flag bytes: written, read by worker 0, read by worker 1; chunks 0 and 1 show 111, chunk 2 shows 110, the others 000. The data part is 160 MiB and the metadata 30 bytes. Panel 2: one enqueue: step 1 pickle with protocol 5, CPU tensors become PickleBuffers, buffers below 1 MiB inline, others out of band. Step 2a, if it fits: byte 0 is 0, bytes 1 to 2 the buffer count, then a 4-byte length and the bytes of each buffer. Step 2b, if too large: byte 0 is 1 and all buffers go to the XPUB socket. Panel 3: the flag states of one chunk: 0?? writable, the writer writes to 100 written, worker 0 reads to 110, worker 1 reads to 111, which is writable again." xmlns="http://www.w3.org/2000/svg" width="1100" height="812" viewBox="0 0 1100 812">
+<defs><marker id="dg-b8b_shm_ring-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker><marker id="dg-b8b_shm_ring-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#111827"/></marker></defs>
+<rect width="1100" height="812" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">MessageQueue: a lock-free ring of chunks in /dev/shm</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">the executor&#x27;s broadcast queue with TP = 2 on one node  ·  1 writer (engine core), 2 readers (workers)</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">max_chunks = 10  ·  max_chunk_bytes = 16 MiB  ·  metadata = 10 × (1 + 2) bytes</text>
+<rect x="20.0" y="116.0" width="1060.0" height="196.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="142.0" r="13" fill="#111827"/>
+<text x="46.0" y="146.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="147.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What is in the shared memory segment?</text>
+<text x="68.0" y="166.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Ten data chunks, then one flag row per chunk: a written flag and one read flag per reader.</text>
+<rect x="46.0" y="194.0" width="92.0" height="44.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="92.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 0</text>
+<text x="92.0" y="228.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">16 MiB</text>
+<text x="92.0" y="260.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">111</text>
+<rect x="144.0" y="194.0" width="92.0" height="44.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="190.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 1</text>
+<text x="190.0" y="228.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">16 MiB</text>
+<text x="190.0" y="260.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">111</text>
+<rect x="242.0" y="194.0" width="92.0" height="44.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2"/>
+<text x="288.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 2</text>
+<text x="288.0" y="228.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">16 MiB</text>
+<text x="288.0" y="260.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">110</text>
+<rect x="340.0" y="194.0" width="92.0" height="44.0" rx="3" fill="#ffffff" fill-opacity="1.0" stroke="#2563eb" stroke-width="2.6"/>
+<text x="386.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 3</text>
+<text x="386.0" y="228.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">16 MiB</text>
+<text x="386.0" y="260.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">000</text>
+<rect x="438.0" y="194.0" width="92.0" height="44.0" rx="3" fill="#ffffff" fill-opacity="1.0" stroke="#d1d5db" stroke-width="1.2"/>
+<text x="484.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 4</text>
+<text x="484.0" y="228.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">16 MiB</text>
+<text x="484.0" y="260.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">000</text>
+<rect x="536.0" y="194.0" width="92.0" height="44.0" rx="3" fill="#ffffff" fill-opacity="1.0" stroke="#d1d5db" stroke-width="1.2"/>
+<text x="582.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 5</text>
+<text x="582.0" y="228.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">16 MiB</text>
+<text x="582.0" y="260.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">000</text>
+<rect x="634.0" y="194.0" width="92.0" height="44.0" rx="3" fill="#ffffff" fill-opacity="1.0" stroke="#d1d5db" stroke-width="1.2"/>
+<text x="680.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 6</text>
+<text x="680.0" y="228.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">16 MiB</text>
+<text x="680.0" y="260.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">000</text>
+<rect x="732.0" y="194.0" width="92.0" height="44.0" rx="3" fill="#ffffff" fill-opacity="1.0" stroke="#d1d5db" stroke-width="1.2"/>
+<text x="778.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 7</text>
+<text x="778.0" y="228.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">16 MiB</text>
+<text x="778.0" y="260.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">000</text>
+<rect x="830.0" y="194.0" width="92.0" height="44.0" rx="3" fill="#ffffff" fill-opacity="1.0" stroke="#d1d5db" stroke-width="1.2"/>
+<text x="876.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 8</text>
+<text x="876.0" y="228.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">16 MiB</text>
+<text x="876.0" y="260.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">000</text>
+<rect x="928.0" y="194.0" width="92.0" height="44.0" rx="3" fill="#ffffff" fill-opacity="1.0" stroke="#d1d5db" stroke-width="1.2"/>
+<text x="974.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 9</text>
+<text x="974.0" y="228.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">16 MiB</text>
+<text x="974.0" y="260.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">000</text>
+<text x="386.0" y="186.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">▼ writer current_idx</text>
+<text x="46.0" y="286.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre" font-style="italic">flag bytes per chunk: [written, read by worker 0, read by worker 1]   ·   data part = 160 MiB, metadata = 30 bytes</text>
+<rect x="20.0" y="334.0" width="1060.0" height="196.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="360.0" r="13" fill="#111827"/>
+<text x="46.0" y="364.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="365.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What does one enqueue() write?</text>
+<text x="68.0" y="384.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Pickle the object; big CPU buffers go out of band; everything fits in one chunk or goes over ZMQ.</text>
+<rect x="46.0" y="404.0" width="330.0" height="100.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="58.0" y="424.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">1  pickle (protocol 5)</text>
+<text x="58.0" y="442.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">CPU tensors → PickleBuffer</text>
+<text x="58.0" y="457.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">buffers &lt; 1 MiB: inline</text>
+<text x="58.0" y="472.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">buffers ≥ 1 MiB: out of band</text>
+<rect x="385.0" y="404.0" width="330.0" height="100.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="397.0" y="424.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">2a  fits in the chunk</text>
+<text x="397.0" y="442.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[0] = 0 (no overflow)</text>
+<text x="397.0" y="457.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[1:3] = buffer count (big endian)</text>
+<text x="397.0" y="472.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">then [4-byte len][bytes] each</text>
+<rect x="724.0" y="404.0" width="330.0" height="100.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="736.0" y="424.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">2b  too large</text>
+<text x="736.0" y="442.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[0] = 1 (overflow)</text>
+<text x="736.0" y="457.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">all buffers → XPUB socket</text>
+<text x="736.0" y="472.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">readers recv_multipart()</text>
+<line x1="376.0" y1="454.0" x2="383.0" y2="454.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b8b_shm_ring-m0)"/>
+<line x1="715.0" y1="454.0" x2="722.0" y2="454.0" stroke="#7c3aed" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#dg-b8b_shm_ring-m0)"/>
+<rect x="20.0" y="552.0" width="1060.0" height="150.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="578.0" r="13" fill="#111827"/>
+<text x="46.0" y="582.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="583.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">How do the flags of one chunk change?</text>
+<text x="68.0" y="602.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The writer resets the read flags before it sets the written flag, so a reader never sees a half state.</text>
+<rect x="46.0" y="626.0" width="120.0" height="30.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="106.0" y="645.2" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">0??</text>
+<text x="106.0" y="676.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">writable</text>
+<line x1="174.0" y1="641.0" x2="312.0" y2="641.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b8b_shm_ring-m1)"/>
+<text x="243.0" y="631.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">writer writes</text>
+<rect x="322.0" y="626.0" width="120.0" height="30.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="382.0" y="645.2" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">100</text>
+<text x="382.0" y="676.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">written</text>
+<line x1="450.0" y1="641.0" x2="588.0" y2="641.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b8b_shm_ring-m1)"/>
+<text x="519.0" y="631.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">worker 0 reads</text>
+<rect x="598.0" y="626.0" width="120.0" height="30.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="658.0" y="645.2" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">110</text>
+<text x="658.0" y="676.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">worker 0 read</text>
+<line x1="726.0" y1="641.0" x2="864.0" y2="641.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b8b_shm_ring-m1)"/>
+<text x="795.0" y="631.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">worker 1 reads</text>
+<rect x="874.0" y="626.0" width="120.0" height="30.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="934.0" y="645.2" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">111</text>
+<text x="934.0" y="676.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">all read: writable</text>
+<text x="30.0" y="737.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="726.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="737.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">writer side</text>
+<rect x="209.9" y="726.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="230.9" y="737.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">reader side</text>
+<rect x="321.3" y="726.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="342.3" y="737.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">flags / pickling</text>
+<rect x="453.5" y="726.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="474.5" y="737.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ZMQ fallback</text>
+<text x="30.0" y="762.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Flag states as in the ShmRingBuffer docstring (case 1-4). Readers on other nodes never touch the ring: they read</text>
+<text x="30.0" y="780.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  every message from a TCP XPUB socket. Wake-ups use a separate ZMQ PUB/SUB notify socket (SpinCondition).</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the ring buffer of the executor's broadcast queue (panel 1), the bytes of one message (panel 2), and the flag states of one chunk (panel 3).</figcaption><a class="diagram-open" href="../diagrams/b8b_shm_ring.svg" target="_blank">Open full size ↗</a></div></figure>
+
+<h3 id="who-calls-it">Who calls it<a class="h-anchor" href="#who-calls-it" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><strong>Executor broadcast.</strong> On the leader node of a DP rank, <code>MultiprocExecutor</code> makes <code>MessageQueue(world_size, local_world_size, max_chunk_bytes=16 MiB, connect_ip=…)</code> and passes its handle to each worker process (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L148-L172" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:148-172 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:148-172</code></a>). Each call is one <code>enqueue</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L428" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:428 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:428</code></a>).</li>
+  <li><strong>Worker side.</strong> A worker attaches with <code>create_from_handle(handle, rank)</code> and makes its own reply queue <code>MessageQueue(1, 1)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L618-L625" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:618-625 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:618-625</code></a>). When a replica spans nodes, the workers use the inner-DP world group's broadcaster and single-reader queues instead (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L626-L645" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:626-645 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:626-645</code></a>).</li>
+  <li><strong>Busy loops.</strong> Workers block in <code>dequeue(indefinite=True)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1046" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1046 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1046</code></a>); the executor reads replies with <code>dequeue(timeout=…)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L441" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:441 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:441</code></a>); a worker replies with <code>enqueue(result)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1011-L1012" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1011-1012 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1011-1012</code></a>).</li>
+  <li><strong>Process groups.</strong> A <code>GroupCoordinator</code> that asks for a broadcaster (TP, DCP) makes one with 6 chunks of 4 MiB; <code>broadcast_object</code> then uses it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L562-L567" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:562-567 at 3e44c0d"><code>vllm/distributed/parallel_state.py:562-567</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L864-L866" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:864-866 at 3e44c0d"><code>vllm/distributed/parallel_state.py:864-866</code></a>).</li>
+</ul>
+
+<h3 id="what-it-calls">What it calls<a class="h-anchor" href="#what-it-calls" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><code>shared_memory.SharedMemory(create=True, size=…)</code> after a free-space check (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L335-L343" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:335-343 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:335-343</code></a>).</li>
+  <li>ZMQ sockets: XPUB for overflow and remote readers, PUB/SUB for wake-ups, PAIR for cancellation (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L508-L542" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:508-542 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:508-542</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L150-L176" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:150-176 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:150-176</code></a>).</li>
+  <li><code>in_the_same_node_as</code> and <code>broadcast_object_list</code> to spread the handle in a process group (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L1068-L1148" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:1068-1148 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:1068-1148</code></a>).</li>
+</ul>
+
+<h2 id="key-classes-and-functions">Key classes and functions<a class="h-anchor" href="#key-classes-and-functions" aria-label="Link to this section">#</a></h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>memory_fence</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L83-L100" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:83-100 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:83-100</code></a></td><td>Lock acquire/release as a full memory barrier around flag writes.</td></tr>
+    <tr><td><code>SpinCondition</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L116-L224" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:116-224 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:116-224</code></a></td><td>Reader wait: spin for 1 s after a read, then sleep on a ZMQ notify socket.</td></tr>
+    <tr><td><code>check_shm_free_space</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L230-L262" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:230-262 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:230-262</code></a></td><td>Raise if <code>/dev/shm</code> (or the cgroup) cannot hold the segment.</td></tr>
+    <tr><td><code>ShmRingBuffer</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L265-L401" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:265-401 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:265-401</code></a></td><td>The segment: data chunks, then flag bytes; create or attach by name.</td></tr>
+    <tr><td><code>_rebuild_tensor</code>, <code>_reduce_tensor</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L404-L462" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:404-462 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:404-462</code></a></td><td>Pickle CPU tensors as out-of-band buffers instead of copying them into the stream.</td></tr>
+    <tr><td><code>Handle</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L465-L474" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:465-474 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:465-474</code></a></td><td>Picklable description of a queue: buffer name, socket addresses, local reader ranks.</td></tr>
+    <tr><td><code>MessageQueue.__init__</code> / <code>create_from_handle</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L484-L674" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:484-674 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:484-674</code></a></td><td>Writer side and reader side of one queue.</td></tr>
+    <tr><td><code>wait_until_ready</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L676-L707" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:676-707 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:676-707</code></a></td><td>Collective start-up: wait for every subscription, then send <code>READY</code>.</td></tr>
+    <tr><td><code>acquire_write</code> / <code>acquire_read</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L716-L898" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:716-898 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:716-898</code></a></td><td>The lock-free protocol on one chunk.</td></tr>
+    <tr><td><code>enqueue</code> / <code>dequeue</code> / <code>recv</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L900-L1007" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:900-1007 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:900-1007</code></a></td><td>Serialize, write or overflow; read and deserialize.</td></tr>
+    <tr><td><code>broadcast_object</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L1009-L1013" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:1009-1013 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:1009-1013</code></a></td><td>Writer enqueues, readers dequeue.</td></tr>
+    <tr><td><code>create_from_process_group</code>, <code>…_single_reader</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L1015-L1148" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:1015-1148 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:1015-1148</code></a></td><td>Build a queue for a torch process group and share the handle.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="walk-through-the-main-methods">Walk through the main methods<a class="h-anchor" href="#walk-through-the-main-methods" aria-label="Link to this section">#</a></h2>
+
+<h3 id="shmringbuffer-layout-and-the-flag-rules"><code>ShmRingBuffer</code>: layout and the flag rules<a class="h-anchor" href="#shmringbuffer-layout-and-the-flag-rules" aria-label="Link to this section">#</a></h3>
+<p>The docstring is the specification. Data chunks come first, then <code>max_chunks × (1 + n_reader)</code> flag bytes. The first flag of a chunk is "written"; then one "read" flag per reader (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L281-L302" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:281-302 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:281-302</code></a>). The four states:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L291-L315" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/distributed/device_communicators/shm_broadcast.py:291-315</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L291-L315" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">291</span><span class="ln">292</span><span class="ln">293</span><span class="ln">294</span><span class="ln">295</span><span class="ln">296</span><span class="ln">297</span><span class="ln">298</span><span class="ln hl">299</span><span class="ln hl">300</span><span class="ln hl">301</span><span class="ln hl">302</span><span class="ln">303</span><span class="ln">304</span><span class="ln">305</span><span class="ln hl">306</span><span class="ln hl">307</span><span class="ln hl">308</span><span class="ln">309</span><span class="ln">310</span><span class="ln">311</span><span class="ln hl">312</span><span class="ln hl">313</span><span class="ln hl">314</span><span class="ln hl">315</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><pre><code class="language-python">        metadata memory layout: each byte is a flag, the first byte is the written
+        flag, and the rest are reader flags. The flags are set to 0 by default.
+        +--------------+--------------+--------------+-----+--------------+
+        | written_flag | reader0_flag | reader1_flag | ... | readerN_flag |
+        +--------------+--------------+--------------+-----+--------------+
+
+        The state of metadata is as follows:
+
+        (case 1) 0???...???: the block is not written yet, cannot read, can write
+        (case 2) 1000...000: the block is just written, can read, cannot write
+        (case 3) 1???...???: the block is written and read by some readers, can read if not read, cannot write
+        (case 4) 1111...111: the block is written and read by all readers, cannot read, can write
+
+        State transition for readers:
+
+        When a reader finds a block that it can read (case 2 or 3), it can yield the block for caller to read.
+        Only after the caller finishes reading the block, the reader can mark the block as read.
+        Readers only mark the block as read (from 0 to 1), the writer marks the block as ready to read (from 1 to 0).
+
+        State transition for writer:
+
+        When the writer writes to a block (case 1 or 4), it first resets the written flag to 0, converting either case
+        to case 1. Then it can yield the block for caller to write. After the caller finishes writing the block, the writer
+        can reset the reader flags to 0, and mark the block as written (from 0 to 1).
+        NOTE: the order is important here, first reset the reader flags (so that we are still in case 1), then mark the block as written. The state transition is atomic. If we do it in the reverse order, it will go through case 3 and then back to case 2, and readers might read the intermediate case 3, which is not correct.</code></pre></div></div></div></figure>
+<p>The writer creates the segment and zeroes the flags; a reader attaches by name and patches out Python's resource tracker, so a reader process does not unlink a segment it did not create (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L332-L365" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:332-365 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:332-365</code></a>).</p>
+
+<h3 id="acquire-write-the-writer-s-side-of-one-chunk"><code>acquire_write</code>: the writer's side of one chunk<a class="h-anchor" href="#acquire-write-the-writer-s-side-of-one-chunk" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L721-L786" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/distributed/device_communicators/shm_broadcast.py:721-786</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L721-L786" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">721</span><span class="ln">722</span><span class="ln">723</span><span class="ln hl">724</span><span class="ln hl">725</span><span class="ln hl">726</span><span class="ln hl">727</span><span class="ln hl">728</span><span class="ln">729</span><span class="ln">730</span><span class="ln">731</span><span class="ln">732</span><span class="ln hl">733</span><span class="ln hl">734</span><span class="ln hl">735</span><span class="ln hl">736</span><span class="ln hl">737</span><span class="ln hl">738</span><span class="ln hl">739</span><span class="ln hl">740</span><span class="ln hl">741</span><span class="ln hl">742</span><span class="ln hl">743</span><span class="ln hl">744</span><span class="ln hl">745</span><span class="ln hl">746</span><span class="ln hl">747</span><span class="ln hl">748</span><span class="ln hl">749</span><span class="ln hl">750</span><span class="ln hl">751</span><span class="ln hl">752</span><span class="ln hl">753</span><span class="ln hl">754</span><span class="ln">755</span><span class="ln">756</span><span class="ln">757</span><span class="ln">758</span><span class="ln">759</span><span class="ln hl">760</span><span class="ln">761</span><span class="ln hl">762</span><span class="ln hl">763</span><span class="ln">764</span><span class="ln">765</span><span class="ln">766</span><span class="ln">767</span><span class="ln">768</span><span class="ln">769</span><span class="ln hl">770</span><span class="ln hl">771</span><span class="ln hl">772</span><span class="ln">773</span><span class="ln">774</span><span class="ln">775</span><span class="ln">776</span><span class="ln">777</span><span class="ln hl">778</span><span class="ln">779</span><span class="ln hl">780</span><span class="ln">781</span><span class="ln">782</span><span class="ln">783</span><span class="ln hl">784</span><span class="ln hl">785</span><span class="ln">786</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(41 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(42 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(49 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(50 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(51 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(57 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(59 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(63 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(64 * var(--code-lh))"></span><pre><code class="language-python">        while True:
+            with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
+
+                def check():
+                    memory_fence()
+                    read_count = sum(metadata_buffer[1:])
+                    written_flag = metadata_buffer[0]
+                    return not (written_flag and read_count != self.buffer.n_reader)
+
+                if SPINLOOP_EXT_ENABLED and not check():
+                    spinloop(metadata_buffer, check, timeout=SPINLOOP_TIMEOUT_SECONDS)
+
+                if not check():
+                    # this block is written and not read by all readers
+                    # for writers, `self.current_idx` is the next block to write
+                    # if this block is not ready to write,
+                    # we need to wait until it is read by all readers
+
+                    # Release the processor to other threads
+                    sched_yield()
+
+                    # if we time out, raise an exception
+                    elapsed = time.monotonic() - start_time
+                    if timeout is not None and elapsed &gt; timeout:
+                        raise TimeoutError
+
+                    # if we wait for a long time, log a message
+                    if elapsed &gt; VLLM_RINGBUFFER_WARNING_INTERVAL * n_warning:
+                        logger.info(
+                            LONG_WAIT_TIME_LOG_MSG, VLLM_RINGBUFFER_WARNING_INTERVAL
+                        )
+                        n_warning += 1
+
+                    continue
+                # found a block that is either
+                # (1) not written
+                # (2) read by all readers
+
+                # mark the block as not written
+                metadata_buffer[0] = 0
+                # let caller write to the buffer
+                with self.buffer.get_data(self.current_idx) as buf:
+                    yield buf
+
+                # caller has written to the buffer
+                # NOTE: order is important here
+                # first set the read flags to 0
+                # then set the written flag to 1
+                # otherwise, the readers may think they already read the block
+                for i in range(1, self.buffer.n_reader + 1):
+                    # set read flag to 0, meaning it is not read yet
+                    metadata_buffer[i] = 0
+                # Memory fence here ensures the order of the buffer and flag
+                # writes. This guarantees that when `metadata_buffer[0] = 1` is
+                # visible to readers, `buf` can be completely ready. Without
+                # this, some CPU architectures with weak ordering may incur
+                # memory inconsistency.
+                memory_fence()
+                # mark the block as written
+                metadata_buffer[0] = 1
+                # Memory fence ensures the write is visible to readers on other cores
+                # before we proceed. Without this, readers may spin indefinitely
+                # waiting for a write that&#x27;s stuck in our CPU&#x27;s store buffer.
+                memory_fence()
+                self.current_idx = (self.current_idx + 1) % self.buffer.max_chunks
+                break</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 724-728.</strong> A chunk is writable unless it is written and not yet read by all readers.</li>
+  <li><strong>Lines 733-754.</strong> Not writable: yield the CPU and retry. A timeout raises <code>TimeoutError</code>; every <code>VLLM_RINGBUFFER_WARNING_INTERVAL</code> seconds (60) the writer logs "No available shared memory broadcast block found in 60 seconds".</li>
+  <li><strong>Line 760.</strong> Clear "written" first, so no reader starts on a half-written chunk.</li>
+  <li><strong>Lines 770-784.</strong> After the caller wrote: reset all read flags, fence, set "written", fence. The comment explains why this order matters: the other order passes through the "read by some" state.</li>
+  <li><strong>Line 785.</strong> Advance <code>current_idx</code> around the ring.</li>
+</ol>
+
+<h3 id="acquire-read-one-reader"><code>acquire_read</code>: one reader<a class="h-anchor" href="#acquire-read-one-reader" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L870-L898" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/distributed/device_communicators/shm_broadcast.py:870-898</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L870-L898" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">870</span><span class="ln">871</span><span class="ln">872</span><span class="ln">873</span><span class="ln">874</span><span class="ln">875</span><span class="ln hl">876</span><span class="ln hl">877</span><span class="ln hl">878</span><span class="ln">879</span><span class="ln hl">880</span><span class="ln hl">881</span><span class="ln hl">882</span><span class="ln">883</span><span class="ln">884</span><span class="ln">885</span><span class="ln">886</span><span class="ln">887</span><span class="ln">888</span><span class="ln">889</span><span class="ln hl">890</span><span class="ln">891</span><span class="ln">892</span><span class="ln">893</span><span class="ln hl">894</span><span class="ln hl">895</span><span class="ln hl">896</span><span class="ln hl">897</span><span class="ln">898</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><pre><code class="language-python">    def acquire_read(
+        self,
+        timeout: float | None = None,
+        indefinite: bool = False,
+    ):
+        assert self._is_local_reader, &quot;Only readers can acquire read&quot;
+        read_timeout = self.ReadTimeoutWithWarnings(
+            timeout=timeout, should_warn=not indefinite
+        )
+        with self.buffer.get_metadata(self.current_idx) as metadata_buffer:
+            while True:
+                if not self._wait_until_readable(metadata_buffer, read_timeout):
+                    continue
+                # found a block that is not read by this reader
+                # let caller read from the buffer
+                with self.buffer.get_data(self.current_idx) as buf:
+                    try:
+                        yield buf
+                    finally:
+                        # caller has read from the buffer; set the read flag.
+                        metadata_buffer[self.local_reader_rank + 1] = 1
+                        # Memory fence ensures the read flag is visible to the writer.
+                        # Without this, writer may not see our read completion and
+                        # could wait indefinitely for all readers to finish.
+                        memory_fence()
+                        next_idx = self.current_idx + 1
+                        self.current_idx = next_idx % self.buffer.max_chunks
+                        self._spin_condition.record_read()
+                break</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 876-882.</strong> Wait until the current chunk is written and not yet read by this reader. The wait uses <code>SpinCondition</code>: spin with <code>sched_yield</code> for 1 s after the last read, then sleep on the ZMQ notify socket for at most 5 s at a time before it checks the flags again (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L205-L219" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:205-219 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:205-219</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L71" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:71 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:71</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L802-L817" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:802-817 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:802-817</code></a>).</li>
+  <li><strong>Lines 888-894.</strong> After the caller read, set this reader's flag and fence, so the writer sees it.</li>
+  <li><strong>Lines 895-897.</strong> Advance and record the read time (it controls the spin window).</li>
+</ol>
+
+<h3 id="enqueue-serialize-then-write-or-overflow"><code>enqueue</code>: serialize, then write or overflow<a class="h-anchor" href="#enqueue-serialize-then-write-or-overflow" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L900-L966" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/distributed/device_communicators/shm_broadcast.py:900-966</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L900-L966" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">900</span><span class="ln">901</span><span class="ln">902</span><span class="ln">903</span><span class="ln">904</span><span class="ln">905</span><span class="ln hl">906</span><span class="ln hl">907</span><span class="ln hl">908</span><span class="ln hl">909</span><span class="ln hl">910</span><span class="ln hl">911</span><span class="ln hl">912</span><span class="ln hl">913</span><span class="ln hl">914</span><span class="ln">915</span><span class="ln">916</span><span class="ln">917</span><span class="ln">918</span><span class="ln">919</span><span class="ln">920</span><span class="ln">921</span><span class="ln hl">922</span><span class="ln hl">923</span><span class="ln">924</span><span class="ln">925</span><span class="ln">926</span><span class="ln">927</span><span class="ln">928</span><span class="ln">929</span><span class="ln">930</span><span class="ln">931</span><span class="ln">932</span><span class="ln">933</span><span class="ln">934</span><span class="ln">935</span><span class="ln">936</span><span class="ln">937</span><span class="ln">938</span><span class="ln hl">939</span><span class="ln hl">940</span><span class="ln hl">941</span><span class="ln">942</span><span class="ln hl">943</span><span class="ln hl">944</span><span class="ln hl">945</span><span class="ln hl">946</span><span class="ln">947</span><span class="ln">948</span><span class="ln">949</span><span class="ln">950</span><span class="ln">951</span><span class="ln hl">952</span><span class="ln hl">953</span><span class="ln hl">954</span><span class="ln hl">955</span><span class="ln hl">956</span><span class="ln hl">957</span><span class="ln hl">958</span><span class="ln hl">959</span><span class="ln hl">960</span><span class="ln hl">961</span><span class="ln">962</span><span class="ln hl">963</span><span class="ln">964</span><span class="ln hl">965</span><span class="ln hl">966</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(40 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(41 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(43 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(44 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(45 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(46 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(52 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(53 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(54 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(55 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(56 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(57 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(58 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(59 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(60 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(61 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(63 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(65 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(66 * var(--code-lh))"></span><pre><code class="language-python">    def enqueue(self, obj, timeout: float | None = None):
+        &quot;&quot;&quot;Write to message queue with optional timeout (in seconds)&quot;&quot;&quot;
+        assert self._is_writer, &quot;Only writers can enqueue&quot;
+        all_buffers: list[SizedBuffer] = [b&quot;&quot;]
+        total_bytes = 6  # 2 bytes for oob buffer count, 4 for main buffer size
+
+        def oob_callback(buf: PickleBuffer) -&gt; bool:
+            raw_buf = buf.raw()
+            if len(raw_buf) &lt; 1024 * 1024:
+                # In-line buffers smaller than 1MiB.
+                return True
+            all_buffers.append(raw_buf)
+            nonlocal total_bytes
+            total_bytes += len(raw_buf) + 4
+            return False
+
+        # CPU tensors are routed through `_reduce_tensor` so that their
+        # bytes are emitted as out-of-band buffers instead of being
+        # copied into the pickle stream by torch&#x27;s default reducer.
+        # Start from `copyreg.dispatch_table` to preserve globally
+        # registered reducers (e.g. `re.Pattern`); the per-pickler
+        # dispatch table would otherwise shadow them.
+        dispatch_table = dict(copyreg.dispatch_table)
+        dispatch_table[torch.Tensor] = _reduce_tensor
+        arena = self.tensor_arena
+        with io.BytesIO() as bio:
+            pickler: pickle.Pickler
+            if arena is not None:
+                from vllm.distributed.device_communicators.shm_tensor_arena import (
+                    _ArenaPickler,
+                )
+
+                pickler = _ArenaPickler(bio, arena, buffer_callback=oob_callback)
+            else:
+                pickler = pickle.Pickler(
+                    bio,
+                    protocol=pickle.HIGHEST_PROTOCOL,
+                    buffer_callback=oob_callback,
+                )
+            pickler.dispatch_table = dispatch_table
+            pickler.dump(obj)
+            all_buffers[0] = bio.getvalue()
+        if self.n_local_reader &gt; 0:
+            if total_bytes + len(all_buffers[0]) &gt;= self.buffer.max_chunk_bytes:
+                with self.acquire_write(timeout) as buf:
+                    buf[0] = 1  # overflow
+                self.local_socket.send_multipart(all_buffers, copy=False)
+            else:
+                # Byte 0: 0
+                # Bytes 1-2: Count of buffers
+                # Then each buffer follows, preceded by 4 bytes containing its length:
+                # [4 byte int L][L bytes of buffer content] ...
+                with self.acquire_write(timeout) as buf:
+                    buf[0] = 0  # not overflow
+                    offset = 3
+                    buf[1:offset] = to_bytes_big(len(all_buffers), 2)  # oob buf count
+                    for buffer in all_buffers:
+                        buf_len = len(buffer)
+                        # prepend each buffer with 4 bytes containing its size.
+                        buf_offset = offset + 4
+                        buf[offset:buf_offset] = to_bytes_big(buf_len, 4)
+                        buf[buf_offset : (offset := buf_offset + buf_len)] = buffer
+
+            self._spin_condition.notify()
+
+        if self.n_remote_reader &gt; 0:
+            self.remote_socket.send_multipart(all_buffers, copy=False)</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 906-914.</strong> Out-of-band buffers of 1 MiB or more stay outside the pickle stream; smaller ones go inline.</li>
+  <li><strong>Lines 922-923.</strong> CPU tensors are reduced by <code>_reduce_tensor</code>, so their bytes become such buffers instead of a copy inside the pickle (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L433-L462" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:433-462 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:433-462</code></a>).</li>
+  <li><strong>Lines 943-946.</strong> If the total does not fit in one chunk, the chunk carries only the overflow flag, and all buffers go over the local XPUB socket.</li>
+  <li><strong>Lines 952-961.</strong> Otherwise the chunk holds: byte 0 = 0, bytes 1-2 = buffer count (big-endian), then each buffer with a 4-byte length.</li>
+  <li><strong>Line 963.</strong> Wake sleeping readers.</li>
+  <li><strong>Lines 965-966.</strong> Remote readers always get the message over the TCP XPUB socket.</li>
+</ol>
+<p><code>dequeue</code> reverses the steps. It copies each out-of-band buffer into a new <code>bytearray</code>, because the ring slot is reused after the read; on overflow it receives from the SUB socket after it releases the chunk (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L968-L998" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:968-998 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:968-998</code></a>).</p>
+
+<h3 id="create-from-process-group-one-queue-for-a-torch-group"><code>create_from_process_group</code>: one queue for a torch group<a class="h-anchor" href="#create-from-process-group-one-queue-for-a-torch-group" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L1109-L1148" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/distributed/device_communicators/shm_broadcast.py:1109-1148</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L1109-L1148" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1109</span><span class="ln">1110</span><span class="ln hl">1111</span><span class="ln">1112</span><span class="ln">1113</span><span class="ln">1114</span><span class="ln">1115</span><span class="ln">1116</span><span class="ln">1117</span><span class="ln hl">1118</span><span class="ln hl">1119</span><span class="ln hl">1120</span><span class="ln hl">1121</span><span class="ln hl">1122</span><span class="ln hl">1123</span><span class="ln hl">1124</span><span class="ln hl">1125</span><span class="ln hl">1126</span><span class="ln hl">1127</span><span class="ln hl">1128</span><span class="ln hl">1129</span><span class="ln hl">1130</span><span class="ln hl">1131</span><span class="ln hl">1132</span><span class="ln hl">1133</span><span class="ln hl">1134</span><span class="ln hl">1135</span><span class="ln">1136</span><span class="ln">1137</span><span class="ln">1138</span><span class="ln">1139</span><span class="ln">1140</span><span class="ln">1141</span><span class="ln">1142</span><span class="ln">1143</span><span class="ln">1144</span><span class="ln hl">1145</span><span class="ln hl">1146</span><span class="ln hl">1147</span><span class="ln">1148</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(37 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(38 * var(--code-lh))"></span><pre><code class="language-python">        from vllm.distributed.parallel_state import in_the_same_node_as
+
+        status = in_the_same_node_as(pg, source_rank=writer_rank)
+        if group_rank == writer_rank:
+            if external_writer_handle is not None:
+                buffer_io = MessageQueue.create_from_handle(
+                    external_writer_handle, group_rank
+                )
+            else:
+                same_node_ranks = [i for i, s in enumerate(status) if s]
+                n_reader = group_world_size - 1
+                n_local_reader = len(same_node_ranks) - 1
+                local_reader_ranks = [i for i in same_node_ranks if i != writer_rank]
+                buffer_io = MessageQueue(
+                    n_reader=n_reader,
+                    n_local_reader=n_local_reader,
+                    local_reader_ranks=local_reader_ranks,
+                    max_chunk_bytes=max_chunk_bytes,
+                    max_chunks=max_chunks,
+                )
+            handle = buffer_io.export_handle()
+            if isinstance(pg, ProcessGroup):
+                dist.broadcast_object_list(
+                    [handle], src=global_ranks[writer_rank], group=pg
+                )
+            else:
+                pg.broadcast_obj(handle, writer_rank)
+        else:
+            if isinstance(pg, ProcessGroup):
+                recv = [None]
+                dist.broadcast_object_list(
+                    recv, src=global_ranks[writer_rank], group=pg
+                )
+                handle = recv[0]  # type: ignore
+            else:
+                handle = pg.broadcast_obj(None, writer_rank)
+            buffer_io = MessageQueue.create_from_handle(handle, group_rank)
+        if blocking:
+            buffer_io.wait_until_ready()
+        return buffer_io</code></pre></div></div></div></figure>
+<p>The writer counts the ranks on its own node with <code>in_the_same_node_as</code>; those become local readers on the ring, and the others remote readers on TCP. It broadcasts the handle over the gloo group; each reader attaches with it, and <code>wait_until_ready</code> runs the start-up handshake.</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="sizes-of-every-queue-in-a-tp-2-server" class="dd-title">Sizes of every queue in a TP = 2 server</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Queue</th><th>Made at</th><th>Readers</th><th>Chunks × size</th><th>Segment (derived)</th></tr></thead>
+  <tbody>
+    <tr><td>executor broadcast (<code>rpc_broadcast_mq</code>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L165-L171" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:165-171 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:165-171</code></a></td><td>2 local</td><td>10 × 16 MiB</td><td>160 MiB + 30 flag bytes</td></tr>
+    <tr><td>worker 0 reply (<code>worker_response_mq</code>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L625" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:625 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:625</code></a></td><td>1 local (the engine core)</td><td>10 × 24 MiB (the defaults, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L489-L492" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:489-492 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:489-492</code></a>)</td><td>240 MiB + 20 bytes</td></tr>
+    <tr><td>worker 1 reply</td><td>same</td><td>1 local</td><td>10 × 24 MiB</td><td>240 MiB + 20 bytes</td></tr>
+    <tr><td>TP group broadcaster (<code>tp:0</code>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L564-L567" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:564-567 at 3e44c0d"><code>vllm/distributed/parallel_state.py:564-567</code></a></td><td>1 local (rank 1)</td><td>6 × 4 MiB</td><td>24 MiB + 12 bytes</td></tr>
+  </tbody>
+</table>
+<p>Each segment size is <code>(max_chunk_bytes + 1 + n_reader) × max_chunks</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L326-L328" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:326-328 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:326-328</code></a>), and <code>check_shm_free_space</code> raises before it creates one that does not fit (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L248-L262" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:248-262 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:248-262</code></a>). The comment on the 24 MiB default says it is "large enough to accommodate grammar bitmask tensors for large batches (1024 requests)" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L489-L490" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:489-490 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:489-490</code></a>). So a TP = 2 engine asks for about 664 MiB of <code>/dev/shm</code> in total (derived). Docker's default <code>/dev/shm</code> is far smaller; the error text suggests <code>--shm-size</code> or <code>--ipc=host</code>.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-one-execute-model-call-with-tp-2" class="dd-title">Worked example: one execute_model call with TP = 2</h3></summary><div class="dd-body"><ol>
+  <li>The executor calls <code>enqueue(("execute_model", (scheduler_output,), {}, 0))</code>. For a decode step of 64 requests the pickle is small (no tensor of 1 MiB or more), so it fits into one 16 MiB chunk (illustrative size).</li>
+  <li><code>acquire_write</code> finds chunk <em>i</em> in state <code>111</code> (read by both workers in an earlier step), clears the written flag, and the payload is copied in: <code>[0][count=1][len][pickle bytes]</code>.</li>
+  <li>Flags become <code>100</code>; the writer sends one byte on the notify PUB socket and moves to chunk <em>i</em> + 1.</li>
+  <li>Both workers spin in <code>dequeue(indefinite=True)</code>. They read within the 1-second spin window, so they see the flag without the socket. Each unpickles its own copy and sets its read flag: <code>110</code>, then <code>111</code>.</li>
+  <li>Worker 0 (the output rank) later replies on its own <code>MessageQueue(1, 1)</code> with <code>(SUCCESS, None)</code>; worker 1 replies nothing (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1070-L1071" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1070-1071 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1070-1071</code></a>).</li>
+</ol>
+<p>A multimodal request with a 30 MiB image tensor would not fit: the chunk gets the overflow flag, and the pickle plus the image buffer travel over the XPUB socket as separate ZMQ frames, without a copy into the pickle stream (derived from <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L906-L946" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:906-946 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:906-946</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="processes-threads-and-waiting" class="dd-title">Processes, threads and waiting</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Side</th><th>Who</th><th>How it waits</th></tr></thead>
+  <tbody>
+    <tr><td>writer, ring full</td><td>engine core main thread (or a worker's copy thread)</td><td>busy loop with <code>sched_yield</code>; INFO every 60 s; <code>TimeoutError</code> only with a timeout (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L733-L754" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:733-754 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:733-754</code></a>)</td></tr>
+    <tr><td>reader, idle</td><td>worker main thread in <code>dequeue(indefinite=True)</code></td><td>spin 1 s, then <code>poll</code> on the notify SUB socket (<code>CONFLATE</code>, so only one pending ping), rechecking every 5 s; no warnings (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L141-L168" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:141-168 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:141-168</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L788-L827" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:788-827 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:788-827</code></a>)</td></tr>
+    <tr><td>reader, shutdown</td><td>another thread of the reader's process</td><td><code>shutdown()</code> sends on an in-process PAIR socket; the reader raises <code>RuntimeError("cancelled")</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L709-L714" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:709-714 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:709-714</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L861-L862" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:861-862 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:861-862</code></a>)</td></tr>
+  </tbody>
+</table>
+<p>The writer's notify socket has a send high-water mark of 1: under load, extra pings are dropped silently, and the reader's SUB socket keeps only the last one (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L169-L176" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:169-176 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:169-176</code></a>). <code>VLLM_USE_SPINLOOP_EXT=1</code> replaces the Python spin with an optional C extension, when it can be imported (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L48-L58" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:48-58 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:48-58</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="error-paths-what-raises-what-only-logs" class="dd-title">Error paths: what raises, what only logs</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>not enough <code>/dev/shm</code></td><td><code>RuntimeError</code> "Insufficient space in /dev/shm … Increase /dev/shm (e.g. --shm-size or --ipc=host)"</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L248-L258" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:248-258 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:248-258</code></a></td></tr>
+    <tr><td>attach on another node</td><td><code>FileNotFoundError</code> suppressed; the object is unused there</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L361-L365" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:361-365 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:361-365</code></a></td></tr>
+    <tr><td>write timeout</td><td><code>TimeoutError</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L743-L745" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:743-745 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:743-745</code></a></td></tr>
+    <tr><td>read timeout (or ZMQ poll timeout on overflow)</td><td><code>TimeoutError</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L814-L816" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:814-816 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:814-816</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L1001-L1007" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:1001-1007 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:1001-1007</code></a></td></tr>
+    <tr><td>long wait without a timeout</td><td>INFO "No available shared memory broadcast block found in 60 seconds. This typically happens when some processes are hanging or doing some time-consuming work …"</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L107-L113" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:107-113 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:107-113</code></a></td></tr>
+    <tr><td>a non-reader calls <code>dequeue</code></td><td><code>RuntimeError("Only readers can dequeue")</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L996-L998" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:996-998 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:996-998</code></a></td></tr>
+    <tr><td>reader cancelled during shutdown</td><td><code>RuntimeError("cancelled")</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L861-L862" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:861-862 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:861-862</code></a></td></tr>
+  </tbody>
+</table></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="environment-variables" class="dd-title">Environment variables</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_MQ_MAX_CHUNK_BYTES_MB</code></td><td>16 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L1856-L1858" target="_blank" rel="noopener" title="vllm/envs.py:1856-1858 at 3e44c0d"><code>vllm/envs.py:1856-1858</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L152" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:152 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:152</code></a></td><td>Chunk size of the executor's broadcast queue only; replies and group broadcasters use their own sizes.</td></tr>
+    <tr><td><code>VLLM_RINGBUFFER_WARNING_INTERVAL</code></td><td>60 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L745-L747" target="_blank" rel="noopener" title="vllm/envs.py:745-747 at 3e44c0d"><code>vllm/envs.py:745-747</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L67" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:67 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:67</code></a> (at import)</td><td>Seconds between the "No available shared memory broadcast block" messages.</td></tr>
+    <tr><td><code>VLLM_USE_SPINLOOP_EXT</code></td><td>0 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L2260" target="_blank" rel="noopener" title="vllm/envs.py:2260 at 3e44c0d"><code>vllm/envs.py:2260</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L49-L56" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:49-56 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:49-56</code></a> (at import)</td><td>Use the optional <code>vllm.spinloop</code> extension for the flag waits.</td></tr>
+    <tr><td><code>VLLM_HOST_IP</code></td><td>""</td><td>through <code>get_ip()</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L553-L554" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:553-554 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:553-554</code></a>)</td><td>The address that remote readers connect to, when the caller gives no <code>connect_ip</code>.</td></tr>
+  </tbody>
+</table></div></details>
+
+<h2 id="related-concepts">Related concepts<a class="h-anchor" href="#related-concepts" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><a href="../learn/processes-and-ipc.html">Processes, ZMQ and shared memory</a>: the three channels of <code>vllm serve</code>.</li>
+  <li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py: MultiprocExecutor and WorkerProc</a>: the RPC protocol on top of the queue.</li>
+  <li><a href="../concepts/executors-and-workers.html">Executors and workers: from the engine core to the GPUs</a>: why only one worker replies.</li>
+  <li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py: process groups and GroupCoordinator</a>: the group broadcasters.</li>
+</ul>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>In which order does the writer update the flags after it writes a chunk, and why?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>It resets every read flag first, then sets "written". The other order would pass through "written and read by some", and a reader could skip the new message (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L764-L780" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:764-780 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:764-780</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>A message pickles to 3 MiB and has one 20 MiB tensor buffer. How does it travel through the executor's queue?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The 20 MiB buffer is out of band (≥ 1 MiB). The total, 23 MiB plus framing, does not fit in a 16 MiB chunk, so the chunk only carries the overflow flag and both buffers go over the local XPUB socket (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L906-L946" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:906-946 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:906-946</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>Why does an idle worker not print the "No available shared memory broadcast block" message every 60 seconds?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Workers call <code>dequeue(indefinite=True)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1046" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1046 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1046</code></a>), and <code>acquire_read</code> turns warnings off when <code>indefinite</code> is true (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L876-L878" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:876-878 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:876-878</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>How much <code>/dev/shm</code> do the queues of one TP = 4 engine core ask for?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Broadcast: 10 × (16 MiB + 5) ≈ 160 MiB. Four reply queues of 10 × (24 MiB + 2) ≈ 240 MiB each = 960 MiB. The TP group broadcaster: 6 × (4 MiB + 4) ≈ 24 MiB. Total about 1,144 MiB (derived from <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L326-L328" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:326-328 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:326-328</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/shm_broadcast.py#L489-L492" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/shm_broadcast.py:489-492 at 3e44c0d"><code>vllm/distributed/device_communicators/shm_broadcast.py:489-492</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L152" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:152 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:152</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L564-L567" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:564-567 at 3e44c0d"><code>vllm/distributed/parallel_state.py:564-567</code></a>).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py: MultiprocExecutor and WorkerProc</a><span class="rel-sum">vllm/v1/executor/multiproc_executor.py starts one worker process per local GPU, broadcasts every call to them through a shared-memory MessageQueue, reads the reply of one output rank, and watches the processes for failures.</span></li><li><a href="../concepts/executors-and-workers.html">Executors and workers: from the engine core to the GPUs</a><span class="rel-sum">The executor starts the workers and runs each call on all of them. The uni executor calls one worker in the engine core process; the multiproc executor sends calls to one worker process per GPU through a shared-memory queue.</span></li><li><a href="../learn/processes-and-ipc.html">Processes, ZMQ and shared memory</a><span class="rel-sum">vllm serve splits its work over several processes. They talk through three channels - two ZMQ sockets with msgpack between the front end and the engine core, and a shared-memory ring buffer between the engine core and the workers. This page explains the basics of each channel.</span></li><li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py: process groups and GroupCoordinator</a><span class="rel-sum">vllm/distributed/parallel_state.py builds the world group and the model-parallel groups (TP, PP, DP, EP, PCP, DCP, EPLB, ...) of each worker, wraps each in a GroupCoordinator, registers the collectives as torch custom ops, and tears everything down at shutdown.</span></li><li><a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a><span class="rel-sum">Each worker puts all ranks into one grid of shape (DP, PP, PCP, TP) and cuts it into process groups. Each group is a GroupCoordinator with a gloo CPU group, an NCCL device group and, for groups of more than one rank, a device communicator that picks the all-reduce implementation.</span></li><li><a href="../tours/multi-gpu-step.html">Tour: One step across GPUs</a><span class="rel-sum">Follow two requests through vllm serve -tp 2 -dp 2 in 13 stops: the API servers pick an engine each, two independent engine cores schedule, each broadcasts the step to its two workers through shared memory, the workers meet in 65 all-reduces on their TP group, only rank 0 replies, and the coordinator publishes the new load.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../code/distributed-parallel-state.html"><span class="pn-dir">← Previous</span><span class="pn-title">distributed/parallel_state.py: process groups and GroupCoordinator</span></a><a class="pn pn-next" href="../code/distributed-kv-transfer-kv-connector-factory.html"><span class="pn-dir">Next →</span><span class="pn-title">distributed/kv_transfer/kv_connector/factory.py: the KV connector registry</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#purpose">Purpose</a></li><li class="toc-l2"><a href="#where-it-sits">Where it sits</a></li><li class="toc-l3"><a href="#who-calls-it">Who calls it</a></li><li class="toc-l3"><a href="#what-it-calls">What it calls</a></li><li class="toc-l2"><a href="#key-classes-and-functions">Key classes and functions</a></li><li class="toc-l2"><a href="#walk-through-the-main-methods">Walk through the main methods</a></li><li class="toc-l3"><a href="#shmringbuffer-layout-and-the-flag-rules">ShmRingBuffer: layout and the flag rules</a></li><li class="toc-l3"><a href="#acquire-write-the-writer-s-side-of-one-chunk">acquire_write: the writer&#x27;s side of one chunk</a></li><li class="toc-l3"><a href="#acquire-read-one-reader">acquire_read: one reader</a></li><li class="toc-l3"><a href="#enqueue-serialize-then-write-or-overflow">enqueue: serialize, then write or overflow</a></li><li class="toc-l3"><a href="#create-from-process-group-one-queue-for-a-torch-group">create_from_process_group: one queue for a torch group</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#sizes-of-every-queue-in-a-tp-2-server">Sizes of every queue in a TP = 2 server</a></li><li class="toc-l3"><a href="#worked-example-one-execute-model-call-with-tp-2">Worked example: one execute_model call with TP = 2</a></li><li class="toc-l3"><a href="#processes-threads-and-waiting">Processes, threads and waiting</a></li><li class="toc-l3"><a href="#error-paths-what-raises-what-only-logs">Error paths: what raises, what only logs</a></li><li class="toc-l3"><a href="#environment-variables">Environment variables</a></li><li class="toc-l2"><a href="#related-concepts">Related concepts</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

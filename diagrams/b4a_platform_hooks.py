@@ -4,6 +4,9 @@ Used by: src/concepts/platform-interface.html, src/code/platforms-interface.html
 Sources (vLLM at the pinned commit 3e44c0d):
   vllm/engine/arg_utils.py:122            module import of current_platform -> detection (front end)
   vllm/engine/arg_utils.py:3243, :3257    add_cli_args: general plugins, then pre_register_and_update(parser)
+                                          (4 parser builds in the front end: serve, launch render, run-batch
+                                          at cli/main.py:100-110, and setup_server -> log_non_default_args ->
+                                          make_arg_parser at launchers/launcher.py:368, common/startup.py:70-71)
   vllm/engine/arg_utils.py:2246, :2250    create_engine_config: pre_register_and_update(), validate_environ
   vllm/config/vllm.py:1804                VllmConfig.__post_init__: apply_config_platform_defaults
   vllm/config/vllm.py:2046                VllmConfig.__post_init__: check_and_update_config (sets worker_cls)
@@ -19,6 +22,8 @@ Sources (vLLM at the pinned commit 3e44c0d):
   vllm/v1/executor/uniproc_executor.py:75      update_block_size_for_backend (engine core, uni)
   vllm/v1/engine/core.py:311 -> vllm/v1/core/kv_cache_planning.py:1497 -> kv_cache_config_builder.py:101
                                           get_kv_cache_config_builder_cls
+  vllm/v1/engine/core.py:1336-1337        engine core: vllm_config.__post_init__() again after the handshake
+                                          -> apply_config_platform_defaults + check_and_update_config again
 """
 
 import os
@@ -33,13 +38,13 @@ DET, CONF, PICK, KER = AMBER, VIOLET, BLUE, PINK
 d = Diagram(width=1100)
 d.header("When vLLM calls the Platform hooks",
          "vllm serve, TP = 2 (worker processes)  ·  numbers give the order  ·  each process has its own current_platform",
-         params="config hooks run in the front end  ·  component pickers run where the component is built")
+         params="config hooks run in the front end, and again in the engine core  ·  component pickers run where the component is built")
 
 lanes = [
     ("API server (front end)", ["CLI, EngineArgs, VllmConfig"], [
         (1, "detect the platform", "import of arg_utils.py:122", DET),
-        (2, "pre_register_and_update(parser)", "engine/arg_utils.py:3257", CONF),
-        (3, "pre_register_and_update()", "engine/arg_utils.py:2246", CONF),
+        (2, "pre_register_and_update(parser)", "arg_utils.py:3257, 4 times", CONF),
+        (3, "pre_register_and_update()", "arg_utils.py:2246 (the 5th call)", CONF),
         (4, "validate_environ", "engine/arg_utils.py:2250", CONF),
         (5, "apply_config_platform_defaults", "config/vllm.py:1804", CONF),
         (6, "check_and_update_config", "config/vllm.py:2046", CONF),
@@ -49,6 +54,7 @@ lanes = [
         (8, "detect the platform", "import of v1/engine/__init__.py:14", DET),
         (9, "start the workers", "v1/engine/core.py:147", GRAY),
         (16, "get_kv_cache_config_builder_cls", "kv_cache_config_builder.py:101", PICK),
+        (17, "both __post_init__ hooks again", "core.py:1336-1337 (steps 5 and 6)", CONF),
     ]),
     ("Worker process (x 2)", ["one per GPU"], [
         (10, "detect the platform", "import of v1/executor/__init__.py:3", DET),
@@ -66,7 +72,7 @@ n_max = max(len(items) for _, _, items in lanes)
 lane_h = HEAD + 14 + n_max * (ITEM_H + GAP) + 6
 P1_H = 72 + lane_h + 16
 d.panel(y0, P1_H, 1, "Which hook runs where, and in which order?",
-        "Steps 1-7 shape the VllmConfig once. Steps 8-16 repeat in each process that needs the part.")
+        "Steps 1-7 shape the VllmConfig. Steps 8-17 repeat in each process that needs the part.")
 
 LX = [40, 390, 740]
 LW = 320
@@ -86,7 +92,7 @@ for i in range(2):
     d.arrow(xa + 2, ly + 32, LX[i + 1] - 2, ly + 32)
 
 y = y0 + P1_H + 16
-d.callout(30, y, 1040, "TP = 1:", "the uni executor runs steps 11, 13-15 inside the engine core process "
+d.callout(30, y, 1040, "TP = PP = DP = 1:", "the uni executor runs steps 11, 13-15 inside the engine core process "
           "(uniproc_executor.py:68-75); step 12 does not run (one rank).", AMBER, h=36)
 y += 52
 d.legend(30, y, [(DET, "platform detection"), (CONF, "config hook"), (PICK, "component picker"),

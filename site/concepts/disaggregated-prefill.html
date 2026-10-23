@@ -1,0 +1,562 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Disaggregated prefill: prefill and decode on different instances · vLLM Explained</title>
+<meta name="description" content="In P/D disaggregation one vLLM instance computes the prompt, a second one decodes, and a KV connector moves the KV blocks between them. vLLM ships the connectors and the kv_transfer_params plumbing; a router outside vLLM sends each request to both instances.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="concepts/disaggregated-prefill">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a class="current" aria-current="page" href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>vLLM concepts</span><span class="sep">›</span><span>Scale and deployment</span><span class="sep">›</span><span aria-current="page">Disaggregated prefill (P/D)</span></nav>
+<h1 class="page-title">Disaggregated prefill: prefill and decode on different instances</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">vLLM concepts</span><span class="meta-time">about 8 min read + 5 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../concepts/kv-connectors.html">KV connectors</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../concepts/scheduler.html">The V1 scheduler: one token budget, no phases</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../concepts/openai-server.html">The OpenAI-compatible server: launch modes, app, serving classes and streaming</a> <span class="level level-intermediate level-sm">Intermediate</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">A prefill instance computes the prompt's KV cache, a decode instance pulls it and generates; a router outside vLLM joins the two calls.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>Prefill processes the whole prompt in one go and is compute-bound; decode makes one token at a time and is memory-bound (<a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/learn/prefill-decode.html" target="_blank" rel="noopener" title="DeepInfer Explained: Prefill and decode">Prefill and decode<span class="ext-mark" aria-hidden="true">↗</span></a>). In one vLLM instance, both share each step. A long prefill chunk in a step makes that step slow, so every running stream waits longer for its next token. The docs give two reasons to split them: tune time-to-first-token (TTFT) and inter-token latency (ITL) separately, and control the tail ITL. They also say that it "DOES NOT improve throughput" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/features/disagg_prefill.md#L8-L16" target="_blank" rel="noopener" title="docs/features/disagg_prefill.md:8-16 at 3e44c0d"><code>docs/features/disagg_prefill.md:8-16</code></a>).</p>
+<p>In <a class="term" href="../reference/glossary.html#term-pd-disaggregation" data-term="P/D disaggregation" data-def="Running prefill and decode of a request on different vLLM instances, with a KV connector that moves the KV cache between them.">P/D disaggregation</a>, a <a class="term" href="../reference/glossary.html#term-kv-producer" data-term="KV producer" data-def="An instance with kv_role kv_producer: in disaggregated prefill it computes the prompt and keeps the KV blocks until a decode instance has read them.">KV producer</a> instance (P) runs the prefill, and a <a class="term" href="../reference/glossary.html#term-kv-consumer" data-term="KV consumer" data-def="An instance with kv_role kv_consumer: in disaggregated prefill it loads the prompt&#x27;s KV blocks from a producer and then decodes.">KV consumer</a> instance (D) runs the decode. A <a class="term" href="../reference/glossary.html#term-kv-connector" data-term="KV connector" data-def="A plugin class that moves KV cache blocks between a vLLM instance and something outside it: another instance, CPU memory or a storage system.">KV connector</a> moves the KV blocks from P to D. The page <a href="../concepts/kv-connectors.html">KV connectors</a> explains connectors in general; this page follows one request with <code>NixlConnector</code>, the main connector for P/D.</p>
+<p>vLLM does not route requests between instances. Each instance is a normal <code>vllm serve</code>. A router in front sends the request to P first, takes the connector parameters from P's answer, and sends the request again to D. The vLLM repository has only a "toy" router for tests.</p>
+<p><strong>An everyday comparison.</strong> Think of a restaurant with a prep kitchen and a line kitchen. The prep kitchen chops and marinates the whole order and puts it on a labelled shelf. The waiter takes the shelf label to the line kitchen, which picks up the tray and cooks each plate to order. The comparison stops here. The line kitchen pulls the tray itself over a fast link (RDMA). The prep kitchen throws the tray away if nobody picks it up within its lease.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b8b_pd_flow"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: three boxes. The router, which is not part of vLLM: 1 receives POST /v1/chat/completions, 2 sends a copy to P with max_tokens 1, stream false and kv_transfer_params with do_remote_decode true, 4 sends the original body to D with P&#x27;s returned kv_transfer_params, 7 streams D&#x27;s answer to the client. The prefill instance P: 3 computes the 2,000-token prompt, samples 1 token and finishes; request_finished keeps the blocks with a lease of 30 seconds and returns do_remote_prefill true, remote_block_ids, remote_host, remote_port, remote_engine_id. The decode instance D: 5 the connector reports 2000 tokens to load asynchronously, the request goes to WAITING_FOR_REMOTE_KVS, the worker pulls the blocks with a NIXL READ and notifies P, which frees them; 6 finished_recving moves the request to WAITING, the last prompt token is recomputed, and decode continues. Arrows: router to P, P&#x27;s response back to the router, router to D, KV bytes from P to D, a notification from D to P. Panel 2: the states of the request on D: WAITING, WAITING_FOR_REMOTE_KVS, WAITING, RUNNING. A failed load with the default policy fail gives FINISHED_ERROR; with recompute, num_computed_tokens is cut at the first bad block and D prefills the rest. P keeps the blocks until D&#x27;s read notification, or until the lease runs out without a heartbeat."><svg role="img" aria-label="Panel 1: three boxes. The router, which is not part of vLLM: 1 receives POST /v1/chat/completions, 2 sends a copy to P with max_tokens 1, stream false and kv_transfer_params with do_remote_decode true, 4 sends the original body to D with P&#x27;s returned kv_transfer_params, 7 streams D&#x27;s answer to the client. The prefill instance P: 3 computes the 2,000-token prompt, samples 1 token and finishes; request_finished keeps the blocks with a lease of 30 seconds and returns do_remote_prefill true, remote_block_ids, remote_host, remote_port, remote_engine_id. The decode instance D: 5 the connector reports 2000 tokens to load asynchronously, the request goes to WAITING_FOR_REMOTE_KVS, the worker pulls the blocks with a NIXL READ and notifies P, which frees them; 6 finished_recving moves the request to WAITING, the last prompt token is recomputed, and decode continues. Arrows: router to P, P&#x27;s response back to the router, router to D, KV bytes from P to D, a notification from D to P. Panel 2: the states of the request on D: WAITING, WAITING_FOR_REMOTE_KVS, WAITING, RUNNING. A failed load with the default policy fail gives FINISHED_ERROR; with recompute, num_computed_tokens is cut at the first bad block and D prefills the rest. P keeps the blocks until D&#x27;s read notification, or until the lease runs out without a heartbeat." xmlns="http://www.w3.org/2000/svg" width="1100" height="828" viewBox="0 0 1100 828">
+<defs><marker id="dg-b8b_pd_flow-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b8b_pd_flow-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker><marker id="dg-b8b_pd_flow-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#db2777"/></marker><marker id="dg-b8b_pd_flow-m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker><marker id="dg-b8b_pd_flow-m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker></defs>
+<rect width="1100" height="828" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Prefill on one instance, decode on another</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">NixlConnector (pull)  ·  toy router from tests/  ·  one chat request with a 2,000-token prompt</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">P: kv_role &quot;kv_producer&quot;, port 8100  ·  D: kv_role &quot;kv_consumer&quot;, port 8200  ·  router: port 8192</text>
+<rect x="20.0" y="116.0" width="1060.0" height="380.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="142.0" r="13" fill="#111827"/>
+<text x="46.0" y="146.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="147.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Who does what for one request?</text>
+<text x="68.0" y="166.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The router runs the request twice: a 1-token prefill on P, then the real request on D with P&#x27;s KV.</text>
+<rect x="46.0" y="228.0" width="316.0" height="186.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="58.0" y="248.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Router (not part of vLLM)</text>
+<text x="58.0" y="266.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">1  receives POST /v1/chat/completions</text>
+<text x="58.0" y="281.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">2  sends a copy to P: max_tokens 1,</text>
+<text x="58.0" y="296.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   stream false, kv_transfer_params</text>
+<text x="58.0" y="311.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   {do_remote_decode: true}</text>
+<text x="58.0" y="326.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">4  sends the original body to D with</text>
+<text x="58.0" y="341.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   P&#x27;s returned kv_transfer_params</text>
+<text x="58.0" y="356.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">7  streams D&#x27;s answer to the client</text>
+<rect x="392.0" y="228.0" width="316.0" height="186.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="404.0" y="248.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Prefill instance P</text>
+<text x="404.0" y="266.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">3  computes the 2,000-token prompt,</text>
+<text x="404.0" y="281.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   samples 1 token, finishes</text>
+<text x="404.0" y="296.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   request_finished(): keep blocks</text>
+<text x="404.0" y="311.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   (lease 30 s), return params:</text>
+<text x="404.0" y="326.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   do_remote_prefill: true,</text>
+<text x="404.0" y="341.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   remote_block_ids, remote_host,</text>
+<text x="404.0" y="356.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   remote_port, remote_engine_id …</text>
+<rect x="738.0" y="228.0" width="316.0" height="186.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="750.0" y="248.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Decode instance D</text>
+<text x="750.0" y="266.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">5  connector: (2000 tokens, async)</text>
+<text x="750.0" y="281.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   → WAITING_FOR_REMOTE_KVS</text>
+<text x="750.0" y="296.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   worker pulls the blocks (NIXL READ)</text>
+<text x="750.0" y="311.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   and notifies P (P frees them)</text>
+<text x="750.0" y="326.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">6  finished_recving → WAITING;</text>
+<text x="750.0" y="341.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   recompute the last prompt token,</text>
+<text x="750.0" y="356.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   sample, then decode as usual</text>
+<line x1="362.0" y1="278.0" x2="390.0" y2="278.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b8b_pd_flow-m0)"/>
+<text x="376.0" y="270.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<path d="M 550,414 L 550,438 L 204,438 L 204,416" fill="none" stroke="#d97706" stroke-width="1.6" marker-end="url(#dg-b8b_pd_flow-m1)"/>
+<text x="222.0" y="454.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">3  response JSON carries kv_transfer_params</text>
+<path d="M 300,228 L 300,206 L 896,206 L 896,226" fill="none" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b8b_pd_flow-m0)"/>
+<text x="560.0" y="200.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">4  request + P&#x27;s kv_transfer_params</text>
+<line x1="708.0" y1="338.0" x2="736.0" y2="338.0" stroke="#db2777" stroke-width="2" marker-end="url(#dg-b8b_pd_flow-m2)"/>
+<line x1="738.0" y1="378.0" x2="710.0" y2="378.0" stroke="#059669" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#dg-b8b_pd_flow-m3)"/>
+<rect x="20.0" y="518.0" width="1060.0" height="200.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="544.0" r="13" fill="#111827"/>
+<text x="46.0" y="548.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="549.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What states does the request pass on D?</text>
+<text x="68.0" y="568.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The scheduler parks the request until the worker reports finished_recving, then schedules the rest.</text>
+<rect x="46.0" y="594.0" width="140.0" height="30.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="116.0" y="613.2" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">WAITING</text>
+<line x1="186.0" y1="609.0" x2="216.0" y2="609.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b8b_pd_flow-m4)"/>
+<rect x="218.0" y="594.0" width="270.0" height="30.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="353.0" y="613.2" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">WAITING_FOR_REMOTE_KVS</text>
+<line x1="488.0" y1="609.0" x2="518.0" y2="609.0" stroke="#d97706" stroke-width="1.6" marker-end="url(#dg-b8b_pd_flow-m1)"/>
+<rect x="520.0" y="594.0" width="140.0" height="30.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="590.0" y="613.2" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">WAITING</text>
+<line x1="660.0" y1="609.0" x2="690.0" y2="609.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b8b_pd_flow-m4)"/>
+<rect x="692.0" y="594.0" width="140.0" height="30.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="762.0" y="613.2" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">RUNNING</text>
+<text x="46.0" y="648.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#db2777" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">load failed + kv_load_failure_policy &quot;fail&quot; (default)  →  FINISHED_ERROR, the router sees an error</text>
+<text x="46.0" y="670.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">load failed + &quot;recompute&quot;  →  num_computed_tokens cut at the first bad block; D prefills the rest itself</text>
+<text x="46.0" y="692.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">P side: blocks stay until D&#x27;s read notification, or until the lease runs out without a heartbeat</text>
+<text x="30.0" y="753.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="742.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="753.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">router / HTTP</text>
+<rect x="226.8" y="742.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="247.8" y="753.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">prefill instance</text>
+<rect x="361.7" y="742.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="382.7" y="753.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">decode instance</text>
+<rect x="498.6" y="742.0" width="14.0" height="14.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="519.6" y="753.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">KV bytes (RDMA / NIXL)</text>
+<text x="30.0" y="778.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Numbers are an example. The router in vLLM&#x27;s repo is a toy (tests/.../toy_proxy_server.py); production routers are</text>
+<text x="30.0" y="796.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  external projects. The P instance&#x27;s 1 sampled token is discarded by the router.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: one chat request across a router, a prefill instance and a decode instance with NixlConnector (panel 1), and the request states on the decode side (panel 2).</figcaption><a class="diagram-open" href="../diagrams/b8b_pd_flow.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Follow the numbers 1 to 7. The two HTTP calls are ordinary OpenAI requests; only the <code>kv_transfer_params</code> field links them. The KV bytes never pass through the router: D's worker reads them from P's GPU memory.</p>
+
+<h2 id="in-the-code">In the code<a class="h-anchor" href="#in-the-code" aria-label="Link to this section">#</a></h2>
+
+<h3 id="step-1-start-a-producer-and-a-consumer">Step 1: start a producer and a consumer<a class="h-anchor" href="#step-1-start-a-producer-and-a-consumer" aria-label="Link to this section">#</a></h3>
+<p>Each instance gets a <a class="term" href="../reference/glossary.html#term-kv-transfer-config" data-term="KVTransferConfig" data-def="The config that turns on a KV connector: kv_connector (the name), kv_role (kv_producer, kv_consumer or kv_both) and kv_connector_extra_config. Set with --kv-transfer-config.">KVTransferConfig</a> with a role. The docs show a minimal pair on one host (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/features/nixl_connector_usage.md#L68-L96" target="_blank" rel="noopener" title="docs/features/nixl_connector_usage.md:68-96 at 3e44c0d"><code>docs/features/nixl_connector_usage.md:68-96</code></a>):</p>
+<pre><code class="language-bash">CUDA_VISIBLE_DEVICES=0 VLLM_NIXL_SIDE_CHANNEL_PORT=5600 vllm serve Qwen/Qwen3-0.6B --port 8100 \
+  --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_load_failure_policy":"fail"}'
+CUDA_VISIBLE_DEVICES=1 VLLM_NIXL_SIDE_CHANNEL_PORT=5601 vllm serve Qwen/Qwen3-0.6B --port 8200 \
+  --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail"}'
+python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py --port 8192 \
+  --prefiller-hosts localhost --prefiller-ports 8100 --decoder-hosts localhost --decoder-ports 8200</code></pre>
+<p>The roles are <code>kv_producer</code>, <code>kv_consumer</code> and <code>kv_both</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/kv_transfer.py#L11-L12" target="_blank" rel="noopener" title="vllm/config/kv_transfer.py:11-12 at 3e44c0d"><code>vllm/config/kv_transfer.py:11-12</code></a>). For <code>NixlConnector</code>, <code>kv_both</code> is deprecated and logs a warning (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py#L97-L103" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:97-103 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:97-103</code></a>). Note what the role does not do: the NIXL scheduler decides "P or D" per request from <code>kv_transfer_params</code>, not from the role (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py#L212-L213" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:212-213 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:212-213</code></a>). The role still matters in vLLM itself. For example, a consumer with several batches in flight frees blocks later (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L187-L193" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:187-193 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:187-193</code></a>). And a producer counts as a connector that "hands off KV that must be reliably delivered" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/base.py#L197-L207" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/base.py:197-207 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/base.py:197-207</code></a>).</p>
+
+<h3 id="step-2-the-router-calls-p-with-do-remote-decode">Step 2: the router calls P with do_remote_decode<a class="h-anchor" href="#step-2-the-router-calls-p-with-do-remote-decode" aria-label="Link to this section">#</a></h3>
+<p>The toy router copies the client's body and changes it for P:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py#L153-L174" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">tests/v1/kv_connector/nixl_integration/toy_proxy_server.py:153-174</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py#L153-L174" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">153</span><span class="ln">154</span><span class="ln">155</span><span class="ln">156</span><span class="ln">157</span><span class="ln hl">158</span><span class="ln hl">159</span><span class="ln hl">160</span><span class="ln hl">161</span><span class="ln hl">162</span><span class="ln hl">163</span><span class="ln hl">164</span><span class="ln hl">165</span><span class="ln hl">166</span><span class="ln hl">167</span><span class="ln hl">168</span><span class="ln hl">169</span><span class="ln">170</span><span class="ln">171</span><span class="ln">172</span><span class="ln">173</span><span class="ln">174</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><pre><code class="language-python">async def send_request_to_service(
+    client_info: dict, endpoint: str, req_data: dict, request_id: str
+):
+    &quot;&quot;&quot;Send a request to a service using a client from the pool.&quot;&quot;&quot;
+    req_data = req_data.copy()
+    req_data[&quot;kv_transfer_params&quot;] = {
+        &quot;do_remote_decode&quot;: True,
+        &quot;do_remote_prefill&quot;: False,
+        &quot;remote_engine_id&quot;: None,
+        &quot;remote_block_ids&quot;: None,
+        &quot;remote_host&quot;: None,
+        &quot;remote_port&quot;: None,
+    }
+    req_data[&quot;stream&quot;] = False
+    req_data[&quot;max_tokens&quot;] = 1
+    if &quot;max_completion_tokens&quot; in req_data:
+        req_data[&quot;max_completion_tokens&quot;] = 1
+    if &quot;stream_options&quot; in req_data:
+        del req_data[&quot;stream_options&quot;]
+    # These args are not supported for P
+    min_tokens = req_data.pop(&quot;min_tokens&quot;, None)
+    min_completion_tokens = req_data.pop(&quot;min_completion_tokens&quot;, None)</code></pre></div></div></div></figure>
+<p><code>max_tokens</code> becomes 1, streaming is off, and <code>kv_transfer_params</code> says "the decode runs elsewhere". The request field <code>kv_transfer_params</code> exists on the chat and completion requests (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L513-L516" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/protocol.py:513-516 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/protocol.py:513-516</code></a>). The server puts it into <code>SamplingParams.extra_args</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L771-L773" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/protocol.py:771-773 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/protocol.py:771-773</code></a>), and the engine core copies it into <code>Request.kv_transfer_params</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/request.py#L119-L122" target="_blank" rel="noopener" title="vllm/v1/request.py:119-122 at 3e44c0d"><code>vllm/v1/request.py:119-122</code></a>).</p>
+
+<h3 id="step-3-p-finishes-and-keeps-the-blocks">Step 3: P finishes and keeps the blocks<a class="h-anchor" href="#step-3-p-finishes-and-keeps-the-blocks" aria-label="Link to this section">#</a></h3>
+<p>P prefills the prompt and samples one token; with <code>max_tokens</code> 1 the request then finishes. When the scheduler frees it, the connector's <code>request_finished</code> decides what happens to the blocks:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py#L246-L293" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:246-293</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py#L246-L293" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">246</span><span class="ln">247</span><span class="ln hl">248</span><span class="ln">249</span><span class="ln">250</span><span class="ln hl">251</span><span class="ln hl">252</span><span class="ln hl">253</span><span class="ln">254</span><span class="ln">255</span><span class="ln">256</span><span class="ln">257</span><span class="ln">258</span><span class="ln">259</span><span class="ln">260</span><span class="ln">261</span><span class="ln">262</span><span class="ln">263</span><span class="ln hl">264</span><span class="ln hl">265</span><span class="ln hl">266</span><span class="ln">267</span><span class="ln">268</span><span class="ln">269</span><span class="ln">270</span><span class="ln">271</span><span class="ln">272</span><span class="ln">273</span><span class="ln">274</span><span class="ln">275</span><span class="ln">276</span><span class="ln">277</span><span class="ln hl">278</span><span class="ln hl">279</span><span class="ln hl">280</span><span class="ln hl">281</span><span class="ln hl">282</span><span class="ln hl">283</span><span class="ln hl">284</span><span class="ln hl">285</span><span class="ln hl">286</span><span class="ln hl">287</span><span class="ln hl">288</span><span class="ln hl">289</span><span class="ln hl">290</span><span class="ln hl">291</span><span class="ln hl">292</span><span class="ln">293</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(37 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(38 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(40 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(41 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(42 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(43 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(44 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(45 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(46 * var(--code-lh))"></span><pre><code class="language-python">        # TODO: check whether block_ids actually ever be 0. If not we could
+        # remove the conditional below
+        delay_free_blocks = any(len(group) &gt; 0 for group in block_ids)
+        remote_num_tokens = 0
+        blocks_expiry_time = None
+        if delay_free_blocks:
+            # Prefill request on remote. It will be read from D upon completion
+            request_kv_blocks_ttl = self._kv_lease_duration
+            if is_d_node:
+                # For blocks pinned on D, use a simpler timeout for now instead of a
+                # lease mechanism as turn2 request is client-driven.
+                request_kv_blocks_ttl = self.decoder_kv_blocks_ttl
+            logger.debug(
+                &quot;NIXLConnector request_finished(%s) waiting for %d seconds &quot;
+                &quot;before releasing blocks&quot;,
+                request.request_id,
+                request_kv_blocks_ttl,
+            )
+            self._reqs_need_send[request.request_id] = (
+                time.perf_counter() + request_kv_blocks_ttl
+            )
+            if is_d_node:
+                # D blocks expiry time exported for the turn-2 readback.
+                blocks_expiry_time = self._reqs_need_send[request.request_id]
+            # NOTE HMA will &quot;mark&quot; empty/null blocks in groups with 0s (eg SWA ones),
+            # trimming down after allocating for the whole sequence length. Empty
+            # blocks are always at the start of the list.
+            # Here we &quot;unpad&quot; blocks to send the actual remote blocks to be read.
+            block_ids = self.get_exchange_clipped_blocks(block_ids)
+
+            remote_num_tokens = request.num_computed_tokens
+
+        return delay_free_blocks, dict(
+            do_remote_prefill=is_p_node,
+            do_remote_decode=is_d_node,
+            remote_block_ids=block_ids,
+            remote_engine_id=self.engine_id,
+            remote_request_id=request.request_id,
+            remote_host=self.side_channel_host,
+            remote_port=self.side_channel_port,
+            tp_size=self.transfer_tp_size,
+            dcp_size=self.vllm_config.parallel_config.decode_context_parallel_size,
+            pp_size=self.vllm_config.parallel_config.pipeline_parallel_size,
+            remote_num_tokens=remote_num_tokens,
+            remote_blocks_expiry_time=blocks_expiry_time,
+            remote_registration_generation=self._registration_generation,
+            transfer_mode=self._TRANSFER_MODE,
+        )</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 248.</strong> P has blocks, so it delays freeing them.</li>
+  <li><strong>Lines 251-266.</strong> The blocks get an expiry time: the lease, <code>kv_lease_duration</code> in <code>kv_connector_extra_config</code>, 30 s by default (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py#L82-L88" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:82-88 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:82-88</code></a>).</li>
+  <li><strong>Lines 278-292.</strong> The parameters for D: <code>do_remote_prefill</code> true, P's block ids, engine id, request id, and the host and port of P's NIXL side channel.</li>
+</ol>
+<p>The scheduler puts these parameters into the request's last output (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2323-L2334" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2323-2334 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2323-2334</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2376" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2376 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2376</code></a>), and the chat response returns them as a top-level field (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/serving.py#L1203" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/serving.py:1203 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/serving.py:1203</code></a>). The side-channel port is <code>VLLM_NIXL_SIDE_CHANNEL_PORT</code> (default 5600) plus the DP index (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py#L76-L80" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:76-80 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:76-80</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L1719-L1725" target="_blank" rel="noopener" title="vllm/envs.py:1719-1725 at 3e44c0d"><code>vllm/envs.py:1719-1725</code></a>).</p>
+
+<h3 id="step-4-the-router-calls-d-with-p-s-parameters">Step 4: the router calls D with P's parameters<a class="h-anchor" href="#step-4-the-router-calls-d-with-p-s-parameters" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py#L213-L245" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">tests/v1/kv_connector/nixl_integration/toy_proxy_server.py:213-245</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py#L213-L245" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">213</span><span class="ln">214</span><span class="ln">215</span><span class="ln">216</span><span class="ln">217</span><span class="ln">218</span><span class="ln hl">219</span><span class="ln">220</span><span class="ln">221</span><span class="ln hl">222</span><span class="ln hl">223</span><span class="ln hl">224</span><span class="ln">225</span><span class="ln">226</span><span class="ln hl">227</span><span class="ln hl">228</span><span class="ln hl">229</span><span class="ln hl">230</span><span class="ln hl">231</span><span class="ln">232</span><span class="ln">233</span><span class="ln hl">234</span><span class="ln">235</span><span class="ln">236</span><span class="ln">237</span><span class="ln">238</span><span class="ln hl">239</span><span class="ln hl">240</span><span class="ln hl">241</span><span class="ln hl">242</span><span class="ln hl">243</span><span class="ln hl">244</span><span class="ln hl">245</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><pre><code class="language-python">async def _handle_completions(api: str, request: Request):
+    try:
+        req_data = await request.json()
+        request_id = str(uuid.uuid4())
+
+        # Get the next prefill client in round-robin fashion
+        prefill_client_info = get_next_client(request.app, &quot;prefill&quot;)
+
+        # Send request to prefill service
+        response = await send_request_to_service(
+            prefill_client_info, api, req_data, request_id
+        )
+
+        # Extract the needed fields
+        response_json = response.json()
+        await response.aclose()  # CRITICAL: Release connection back to pool
+        kv_transfer_params = response_json.get(&quot;kv_transfer_params&quot;, {})
+        if kv_transfer_params:
+            req_data[&quot;kv_transfer_params&quot;] = kv_transfer_params
+
+        # Get the next decode client in round-robin fashion
+        decode_client_info = get_next_client(request.app, &quot;decode&quot;)
+
+        logger.debug(&quot;Using %s %s&quot;, prefill_client_info, decode_client_info)
+
+        # Stream response from decode service
+        async def generate_stream():
+            async for chunk in stream_service_response(
+                decode_client_info, api, req_data, request_id=request_id
+            ):
+                yield chunk
+
+        return StreamingResponse(generate_stream(), media_type=&quot;application/json&quot;)</code></pre></div></div></div></figure>
+<p>The router reads <code>kv_transfer_params</code> from P's JSON and puts them into the original body. It picks P and D round-robin and streams D's answer back to the client. Both calls use the same <code>X-Request-Id</code> (lines 177 and 202 of the file).</p>
+
+<h3 id="step-5-d-waits-for-the-remote-kv">Step 5: D waits for the remote KV<a class="h-anchor" href="#step-5-d-waits-for-the-remote-kv" aria-label="Link to this section">#</a></h3>
+<p>D's scheduler asks the connector how many tokens it can load. With <code>do_remote_prefill</code>, the answer is the whole prompt, asynchronously:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py#L51-L65" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:51-65</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py#L51-L65" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">51</span><span class="ln">52</span><span class="ln">53</span><span class="ln">54</span><span class="ln">55</span><span class="ln">56</span><span class="ln">57</span><span class="ln">58</span><span class="ln hl">59</span><span class="ln hl">60</span><span class="ln hl">61</span><span class="ln hl">62</span><span class="ln hl">63</span><span class="ln hl">64</span><span class="ln hl">65</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><pre><code class="language-python">        params = request.kv_transfer_params
+        logger.debug(
+            &quot;NIXLConnector get_num_new_matched_tokens: &quot;
+            &quot;num_computed_tokens=%s, kv_transfer_params=%s&quot;,
+            num_computed_tokens,
+            params,
+        )
+
+        if params is not None and params.get(&quot;do_remote_prefill&quot;):
+            # Remote prefill: get all prompt blocks from remote.
+            token_ids = request.prompt_token_ids or []
+            actual = self._get_remote_prefill_token_count(len(token_ids))
+            count = actual - num_computed_tokens
+            if count &gt; 0:
+                return count, True</code></pre></div></div></div></figure>
+<p><code>_get_remote_prefill_token_count</code> keeps a few trailing tokens on D only for Mamba layers, bounded replay or multi-module MTP. For a plain model it returns the prompt length (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py#L385-L410" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:385-410 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:385-410</code></a>). The scheduler then allocates the blocks and parks the request:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L1384-L1411" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/sched/scheduler.py:1384-1411</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L1384-L1411" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1384</span><span class="ln">1385</span><span class="ln">1386</span><span class="ln">1387</span><span class="ln">1388</span><span class="ln">1389</span><span class="ln">1390</span><span class="ln">1391</span><span class="ln">1392</span><span class="ln hl">1393</span><span class="ln">1394</span><span class="ln">1395</span><span class="ln">1396</span><span class="ln">1397</span><span class="ln">1398</span><span class="ln">1399</span><span class="ln">1400</span><span class="ln">1401</span><span class="ln">1402</span><span class="ln">1403</span><span class="ln">1404</span><span class="ln">1405</span><span class="ln">1406</span><span class="ln hl">1407</span><span class="ln">1408</span><span class="ln">1409</span><span class="ln hl">1410</span><span class="ln hl">1411</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><pre><code class="language-python">                if load_kv_async:
+                    # This path deliberately does not reach `prefill_admitted`
+                    # below, so it does not restart the prefill cadence:
+                    # `num_new_tokens` was set to 0 above, so the step carries
+                    # no prefill compute for this request. The interval is
+                    # timed from steps that actually prefilled; refreshing it
+                    # here would start the cadence from a step that did none.
+                    # If loading async, allocate memory and put request
+                    # into the WAITING_FOR_REMOTE_KV state.
+                    request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    # Set num_computed_tokens even though KVs are not yet loaded.
+                    # request.num_computed_tokens will not be used anywhere until
+                    # the request finished the KV transfer.
+                    #
+                    # If a transfer error is reported by the connector,
+                    # request.num_computed_tokens will be re-set accordingly in
+                    # _update_requests_with_invalid_blocks.
+                    #
+                    # When the transfer is finished, either successfully or not,
+                    # request.num_computed_tokens will correctly reflect the number
+                    # of computed tokens.
+                    # _update_waiting_for_remote_kv will then cache
+                    # only the successfully loaded tokens.
+                    request.num_computed_tokens = num_computed_tokens
+                    self._inflight_prefills.add(request)
+                    self._set_kv_fetch_stage(request, KV_FETCH_IN_PROGRESS)
+                    skip_request(request_queue)
+                    continue</code></pre></div></div></div></figure>
+<p>The connector puts the request into its "to receive" list with D's new block ids (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py#L130-L177" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:130-177 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:130-177</code></a>). In the next step, each D worker starts a non-blocking NIXL <code>READ</code> from P's blocks into its own (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py#L49-L77" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:49-77 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:49-77</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py#L554-L567" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:554-567 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:554-567</code></a>). The transfer carries a notification for P. While the request waits, D's workers send heartbeats that extend P's lease (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py#L123-L125" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:123-125 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:123-125</code></a>).</p>
+
+<h3 id="step-6-the-load-finishes-and-d-decodes">Step 6: the load finishes, and D decodes<a class="h-anchor" href="#step-6-the-load-finishes-and-d-decodes" aria-label="Link to this section">#</a></h3>
+<p>When a worker reports <code>finished_recving</code>, the scheduler marks the request ready (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L3324-L3331" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:3324-3331 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:3324-3331</code></a>). The next <code>schedule()</code> caches the loaded blocks and moves the request back to <code>WAITING</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L3255-L3257" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:3255-3257 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:3255-3257</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L3278-L3289" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:3278-3289 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:3278-3289</code></a>). If the whole prompt was loaded, <code>num_computed_tokens</code> becomes the prompt length minus one. D recomputes the last prompt token, so the model can sample the first output token (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L3269-L3272" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:3269-3272 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:3269-3272</code></a>). P's token from Step 3 is not used. On P, the read notification ends the lease, and the scheduler frees the blocks when the worker reports <code>finished_sending</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L3335-L3338" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:3335-3338 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:3335-3338</code></a>).</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="kv-transfer-params-field-by-field" class="dd-title">kv_transfer_params, field by field</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Key</th><th>Router → P</th><th>P → router → D</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>do_remote_decode</code></td><td>true</td><td>false</td><td>"I am P": keep the blocks for a remote reader</td></tr>
+    <tr><td><code>do_remote_prefill</code></td><td>false</td><td>true</td><td>"I am D": load the prompt from remote</td></tr>
+    <tr><td><code>remote_block_ids</code></td><td>None</td><td>P's block ids, per KV cache group</td><td>what D reads</td></tr>
+    <tr><td><code>remote_engine_id</code>, <code>remote_request_id</code></td><td>None</td><td>P's engine id and internal request id</td><td>who to read from, and which request to notify</td></tr>
+    <tr><td><code>remote_host</code>, <code>remote_port</code></td><td>None</td><td>P's side channel</td><td>NIXL handshake address</td></tr>
+    <tr><td><code>tp_size</code>, <code>dcp_size</code>, <code>pp_size</code></td><td>–</td><td>P's sizes</td><td>lets D map P's ranks to its own (P and D may use different TP)</td></tr>
+    <tr><td><code>remote_num_tokens</code>, <code>remote_blocks_expiry_time</code>, <code>remote_registration_generation</code>, <code>transfer_mode</code></td><td>–</td><td>bookkeeping</td><td>used by the multi-turn and bookkeeping paths</td></tr>
+    <tr><td><code>remote_prefill_cached_tokens</code></td><td>–</td><td>P's prefix-cache hits</td><td>so D can report P's cache hits in its usage (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2329-L2334" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2329-2334 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2329-2334</code></a>)</td></tr>
+  </tbody>
+</table>
+<p>Source: <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py#L278-L293" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:278-293 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:278-293</code></a>. D's scheduler accepts the transfer only if the block ids and all four remote fields are present. Otherwise it logs "Got invalid KVTransferParams" and does not use KV transfer for the request (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py#L135-L184" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:135-184 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:135-184</code></a>). After the first transfer, D sets <code>do_remote_prefill</code> to false, so one request triggers one transfer (lines 187-189).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-a-2-000-token-prompt-with-block-size-16" class="dd-title">Worked example: a 2,000-token prompt with block size 16</h3></summary><div class="dd-body"><ol>
+  <li>P: 2,000 prompt tokens fill <code>ceil(2000 / 16)</code> = 125 blocks, all full. P never computes KV for its sampled token, because the request ends before the next step (derived). The request finishes after one token, and <code>request_finished</code> keeps all its blocks for 30 s.</li>
+  <li>The router gets P's JSON with 125 block ids (one KV cache group) and sends D the original body.</li>
+  <li>D: no local prefix hit. The connector returns <code>(2000, True)</code>. D allocates 125 blocks and parks the request in <code>WAITING_FOR_REMOTE_KVS</code> with <code>num_computed_tokens</code> = 2000.</li>
+  <li>D's workers read 125 blocks per layer from P. Note the change of model: the Step 1 command serves Qwen/Qwen3-0.6B. For the byte count, this example assumes Llama-3.1-8B with TP = 1 on both sides. Then each block of one layer is <code>8 KV heads × 16 tokens × (128 + 128) × 2 bytes</code> = 64 KiB. One request moves about 125 × 32 layers × 64 KiB = 250 MiB (derived; layer shape from <a href="../learn/tp-pp-in-practice.html">Tensor and pipeline parallelism in practice</a>).</li>
+  <li>The read finishes. D's next schedule sets <code>num_computed_tokens</code> = 1999, prefills one token, and samples the first output token.</li>
+</ol></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="failures-what-happens-to-a-request-when-the-kv-load-fails" class="dd-title">Failures: what happens to a request when the KV load fails</h3></summary><div class="dd-body"><p><code>kv_load_failure_policy</code> decides (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/kv_transfer.py#L88-L91" target="_blank" rel="noopener" title="vllm/config/kv_transfer.py:88-91 at 3e44c0d"><code>vllm/config/kv_transfer.py:88-91</code></a>):</p>
+<ul>
+  <li><strong><code>"fail"</code> (default).</strong> The scheduler collects the affected requests and finishes them with <code>FINISHED_ERROR</code>. It logs "Failing N request(s) due to KV load failure" and evicts the bad blocks from the prefix cache (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L3513-L3527" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:3513-3527 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:3513-3527</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2404-L2413" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2404-2413 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2404-2413</code></a>). The client sees an error finish.</li>
+  <li><strong><code>"recompute"</code>.</strong> The scheduler cuts <code>num_computed_tokens</code> at the first bad block, keeps the valid prefix, and lets D compute the rest itself (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L3340-L3437" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:3340-3437 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:3340-3437</code></a>). It logs "Recovered from KV load failure" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L3529-L3539" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:3529-3539 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:3529-3539</code></a>). The docs warn that this puts prefill work on a decode-tuned instance (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/features/nixl_connector_usage.md#L389-L397" target="_blank" rel="noopener" title="docs/features/nixl_connector_usage.md:389-397 at 3e44c0d"><code>docs/features/nixl_connector_usage.md:389-397</code></a>).</li>
+</ul>
+<p>Other failure paths:</p>
+<ul>
+  <li><strong>Lease expiry on P.</strong> If no heartbeat or read notification arrives within the lease, P frees the blocks. The docs list the counter <code>vllm:nixl_num_kv_expired_reqs</code> and advise a longer <code>kv_lease_duration</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/features/nixl_connector_usage.md#L125-L128" target="_blank" rel="noopener" title="docs/features/nixl_connector_usage.md:125-128 at 3e44c0d"><code>docs/features/nixl_connector_usage.md:125-128</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/features/nixl_connector_usage.md#L456-L463" target="_blank" rel="noopener" title="docs/features/nixl_connector_usage.md:456-463 at 3e44c0d"><code>docs/features/nixl_connector_usage.md:456-463</code></a>).</li>
+  <li><strong>D rejects the request before the engine sees it.</strong> If the serving layer returns an error, it notifies the connector so P's pinned blocks are freed (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/generate/base/serving.py#L266-L299" target="_blank" rel="noopener" title="vllm/entrypoints/generate/base/serving.py:266-299 at 3e44c0d"><code>vllm/entrypoints/generate/base/serving.py:266-299</code></a>).</li>
+  <li><strong>An aborted request on D</strong> that never reached the transfer still sends an empty notification, so P does not keep the blocks (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py#L219-L230" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:219-230 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:219-230</code></a>).</li>
+</ul></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="what-vllm-ships-and-what-your-router-must-do" class="dd-title">What vLLM ships, and what your router must do</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Piece</th><th>In vLLM</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>KV connectors (NIXL, Mooncake, LMCache, MoRI-IO, …)</td><td>yes, 17 registered names</td><td><a href="../concepts/kv-connectors.html">KV connectors</a></td></tr>
+    <tr><td><code>kv_transfer_params</code> in requests and responses</td><td>yes (chat, completions, Anthropic, Cohere routes)</td><td>Step 2 and Step 3</td></tr>
+    <tr><td>request states, async loads, failure policy</td><td>yes</td><td>Steps 5-6</td></tr>
+    <tr><td>a router that picks P and D and copies the parameters</td><td>only examples and test tools</td><td><code>tests/v1/kv_connector/nixl_integration/toy_proxy_server.py</code>, <code>examples/disaggregated/</code></td></tr>
+  </tbody>
+</table>
+<p>A production router must do at least these things:</p>
+<ol><li>Choose a P and a D instance.</li><li>Send P a 1-token, non-streaming copy with <code>do_remote_decode</code>.</li><li>Copy the returned <code>kv_transfer_params</code> into the D request.</li><li>Stream D's answer, and handle errors of either call.</li></ol>
+<p>The multi-turn mode also needs a stateful router that caches D's parameters per conversation (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/features/nixl_connector_usage.md#L135-L141" target="_blank" rel="noopener" title="docs/features/nixl_connector_usage.md:135-141 at 3e44c0d"><code>docs/features/nixl_connector_usage.md:135-141</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="encoder-disaggregation-e-p-d-with-ec-connectors" class="dd-title">Encoder disaggregation (E/P/D) with EC connectors</h3></summary><div class="dd-body"><p>Multimodal models can split one more stage: the vision encoder. An encoder instance computes the image embeddings, and an <a class="term" href="../reference/glossary.html#term-ec-connector" data-term="EC connector" data-def="An encoder-cache connector. It moves the outputs of a multimodal encoder between vLLM instances, with the same scheduler and worker roles as a KV connector.">EC connector</a> moves them to the prefill or decode instance (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/features/disagg_encoder.md#L1-L8" target="_blank" rel="noopener" title="docs/features/disagg_encoder.md:1-8 at 3e44c0d"><code>docs/features/disagg_encoder.md:1-8</code></a>). The config is <code>--ec-transfer-config</code> with <code>ec_role</code> <code>ec_producer</code>, <code>ec_consumer</code> or <code>ec_both</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/ec_transfer.py#L10-L11" target="_blank" rel="noopener" title="vllm/config/ec_transfer.py:10-11 at 3e44c0d"><code>vllm/config/ec_transfer.py:10-11</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/ec_transfer.py#L41-L43" target="_blank" rel="noopener" title="vllm/config/ec_transfer.py:41-43 at 3e44c0d"><code>vllm/config/ec_transfer.py:41-43</code></a>). The pattern is the same as for KV: a scheduler-side and a worker-side object, and <code>ec_transfer_params</code> in requests and responses (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L518-L523" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/protocol.py:518-523 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/protocol.py:518-523</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L156-L158" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/protocol.py:156-158 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/protocol.py:156-158</code></a>). A consumer instance accepts requests without the image tensors, because it gets the embeddings from the connector (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L2840-L2846" target="_blank" rel="noopener" title="vllm/config/vllm.py:2840-2846 at 3e44c0d"><code>vllm/config/vllm.py:2840-2846</code></a>). The page <a href="../concepts/kv-connectors.html">KV connectors</a> lists the three built-in EC connectors; <code>examples/disaggregated/disaggregated_encoder/disagg_epd_proxy.py</code> is an example router.</p></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><strong>Port clashes on one host.</strong> Each instance needs its own <code>VLLM_NIXL_SIDE_CHANNEL_PORT</code>, and DP ranks add their index to it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py#L77-L80" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:77-80 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:77-80</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/features/nixl_connector_usage.md#L113-L118" target="_blank" rel="noopener" title="docs/features/nixl_connector_usage.md:113-118 at 3e44c0d"><code>docs/features/nixl_connector_usage.md:113-118</code></a>).</li>
+  <li><strong><code>VLLM_NIXL_SIDE_CHANNEL_HOST</code> left at <code>localhost</code></strong> across machines. P reports this host in its parameters, so D cannot reach P (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L1719-L1721" target="_blank" rel="noopener" title="vllm/envs.py:1719-1721 at 3e44c0d"><code>vllm/envs.py:1719-1721</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py#L284-L285" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:284-285 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:284-285</code></a>).</li>
+  <li><strong>Lost blocks under load.</strong> Assume D queues a request for longer than the lease, and its heartbeats do not arrive. Then P frees the blocks, the read fails, and the default policy fails the request.</li>
+  <li><strong>Router forgets <code>max_tokens</code> = 1.</strong> P then decodes the whole answer before D starts, and the split gains nothing (derived from the router in Step 2).</li>
+  <li><strong>Docs drift.</strong> <code>disagg_prefill.md</code> says "Now supports 9 types of connectors"; the registry has 17 names (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/features/disagg_prefill.md#L20" target="_blank" rel="noopener" title="docs/features/disagg_prefill.md:20 at 3e44c0d"><code>docs/features/disagg_prefill.md:20</code></a>, <a href="../concepts/kv-connectors.html">KV connectors</a>).</li>
+</ul>
+<p><strong>Why it matters.</strong> P/D splitting is the main tool when TTFT and ITL targets conflict. Its correctness depends on a few fields of an HTTP body and on two settings, the lease and the load policy. Most production problems come from those.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Which value of <code>kv_transfer_params</code> does the router send to P, and which does P send back for D?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>To P: <code>do_remote_decode: true</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/tests/v1/kv_connector/nixl_integration/toy_proxy_server.py#L158-L165" target="_blank" rel="noopener" title="tests/v1/kv_connector/nixl_integration/toy_proxy_server.py:158-165 at 3e44c0d"><code>tests/v1/kv_connector/nixl_integration/toy_proxy_server.py:158-165</code></a>). Back: <code>do_remote_prefill: true</code> plus P's block ids, engine id, request id, host and port (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py#L278-L292" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:278-292 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:278-292</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>In which request state does D wait while the KV blocks arrive?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>WAITING_FOR_REMOTE_KVS</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L1393" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:1393 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:1393</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>D loaded the whole 2,000-token prompt. Why does it still run one token of prefill?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>To sample the first output token the model needs logits at the last prompt position. The scheduler sets <code>num_computed_tokens</code> to the prompt length minus one when the whole prompt was loaded (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L3269-L3272" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:3269-3272 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:3269-3272</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>The decode instance is overloaded and requests wait 60 s before D schedules them. What happens with the default settings, and what do you change?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>P keeps the blocks for <code>kv_lease_duration</code>, 30 s by default (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py#L82-L86" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:82-86 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:82-86</code></a>). D's heartbeats extend the lease while the request waits (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py#L123-L125" target="_blank" rel="noopener" title="vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:123-125 at 3e44c0d"><code>vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:123-125</code></a>). If they do not arrive, P frees the blocks, D's read fails, and the default policy <code>"fail"</code> finishes the request with an error (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/kv_transfer.py#L88-L91" target="_blank" rel="noopener" title="vllm/config/kv_transfer.py:88-91 at 3e44c0d"><code>vllm/config/kv_transfer.py:88-91</code></a>). Raise <code>kv_lease_duration</code>, add D capacity, and watch <code>vllm:nixl_num_kv_expired_reqs</code>.</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/kv-connectors.html">KV connectors</a><span class="rel-sum">A KV connector moves KV cache blocks between vLLM and something outside it. One connector class runs as two objects - a scheduler-side object in the engine core that plans loads and saves, and a worker-side object in each worker that moves the bytes. KVConnectorFactory finds the class by name.</span></li><li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">distributed/kv_transfer/kv_connector/factory.py: the KV connector registry</a><span class="rel-sum">factory.py holds KVConnectorFactory - a class-level dict from connector name to a lazy loader - the lookup that prefers kv_connector_module_path over the registry, the creation of a connector in one role, the HMA check, and the registration of the 17 built-in connectors.</span></li><li><a href="../concepts/data-parallel-serving.html">Data parallel serving: several engine cores behind one endpoint</a><span class="rel-sum">With --data-parallel-size N, vllm serve runs N engine cores with their own KV caches. API servers pick an engine for each request with a load score; a DP coordinator publishes the load counts. Dense models run independent engines; MoE models step in lockstep, in waves, with dummy batches.</span></li><li><a href="../concepts/prefix-caching.html">Prefix caching in the engine core: hashes, lookup, caching, eviction and KV events</a><span class="rel-sum">The mechanics of prefix caching in the engine core. The input thread hashes each new request, the scheduler looks the hashes up in the block pool and touches the hits, allocate_slots hashes blocks that become full, and the free queue decides what to evict. KV events tell an external router what each engine holds.</span></li><li><a href="../concepts/scheduler.html">The V1 scheduler: one token budget, no phases</a><span class="rel-sum">In each engine step, Scheduler.schedule() shares one token budget: first among the running requests, then among the waiting ones. It has no prefill or decode phase, it preempts the last running request when KV blocks run out, and update_from_output() appends the sampled tokens.</span></li><li><a href="../concepts/metrics-and-observability.html">Metrics and observability: how to watch a vLLM server</a><span class="rel-sum">Where the signals of vllm serve come from and how to read them: the /metrics endpoint and its multiprocess mode, the metrics to watch first with valid PromQL, the periodic log line, per-request metrics in responses, OpenTelemetry traces, stat logger plugins, the profiler routes, and the known gaps.</span></li><li><a href="../concepts/deployment-recipes.html">Deployment recipes: single GPU, TP, DP, multi-node, load balancers and security</a><span class="rel-sum">The deployment shapes of vllm serve with their exact commands and the processes that each one starts: one GPU, tensor parallel on one node, data parallel with internal load balancing, DP+EP for MoE, multi-node, disaggregated prefill, and servers behind a load balancer with /health probes. Then what --api-key protects and what it does not.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../concepts/expert-parallel-moe.html"><span class="pn-dir">← Previous</span><span class="pn-title">Expert parallelism and MoE serving</span></a><a class="pn pn-next" href="../concepts/tuning.html"><span class="pn-dir">Next →</span><span class="pn-title">Tuning vLLM: throughput and latency knobs, their real defaults and what each one does</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-the-code">In the code</a></li><li class="toc-l3"><a href="#step-1-start-a-producer-and-a-consumer">Step 1: start a producer and a consumer</a></li><li class="toc-l3"><a href="#step-2-the-router-calls-p-with-do-remote-decode">Step 2: the router calls P with do_remote_decode</a></li><li class="toc-l3"><a href="#step-3-p-finishes-and-keeps-the-blocks">Step 3: P finishes and keeps the blocks</a></li><li class="toc-l3"><a href="#step-4-the-router-calls-d-with-p-s-parameters">Step 4: the router calls D with P&#x27;s parameters</a></li><li class="toc-l3"><a href="#step-5-d-waits-for-the-remote-kv">Step 5: D waits for the remote KV</a></li><li class="toc-l3"><a href="#step-6-the-load-finishes-and-d-decodes">Step 6: the load finishes, and D decodes</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#kv-transfer-params-field-by-field">kv_transfer_params, field by field</a></li><li class="toc-l3"><a href="#worked-example-a-2-000-token-prompt-with-block-size-16">Worked example: a 2,000-token prompt with block size 16</a></li><li class="toc-l3"><a href="#failures-what-happens-to-a-request-when-the-kv-load-fails">Failures: what happens to a request when the KV load fails</a></li><li class="toc-l3"><a href="#what-vllm-ships-and-what-your-router-must-do">What vLLM ships, and what your router must do</a></li><li class="toc-l3"><a href="#encoder-disaggregation-e-p-d-with-ec-connectors">Encoder disaggregation (E/P/D) with EC connectors</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

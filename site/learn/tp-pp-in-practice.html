@@ -1,0 +1,595 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tensor and pipeline parallelism in practice · vLLM Explained</title>
+<meta name="description" content="Tensor parallelism splits every weight matrix across GPUs and adds the parts with an all-reduce. Pipeline parallelism gives each GPU a range of layers. This page shows the split of one MLP with real shapes, the head limits of attention, and how to choose TP, PP, DP or EP for a deployment.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="learn/tp-pp-in-practice">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec" open><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a class="current" aria-current="page" href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>Learn the basics</span><span class="sep">›</span><span aria-current="page">TP and PP in practice</span></nav>
+<h1 class="page-title">Tensor and pipeline parallelism in practice</h1>
+<div class="page-meta"><span class="level level-intermediate" title="Level">Intermediate</span><span class="meta-sec">Learn the basics</span><span class="meta-time">about 10 min read + 5 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../learn/ml-basics-recap.html">What you need from DeepInfer Explained</a> <span class="level level-beginner level-sm">Beginner</span></li><li><a href="../learn/processes-and-ipc.html">Processes, ZMQ and shared memory</a> <span class="level level-beginner level-sm">Beginner</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">Tensor parallelism splits each layer across GPUs; pipeline parallelism gives each GPU different layers. Use them only when one GPU is too small.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>A model can be too large for one GPU, or too slow on one GPU. Then the model runs on several GPUs. DeepInfer Explained introduces the five kinds: data, tensor, pipeline, context and expert parallelism, with their collectives (<a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/learn/parallelism.html" target="_blank" rel="noopener" title="DeepInfer Explained: Parallelism basics">Parallelism<span class="ext-mark" aria-hidden="true">↗</span></a>). This page shows the two kinds that split one model copy, with small real numbers, and how a serving operator picks one.</p>
+
+<h3 id="tensor-parallelism-split-every-layer">Tensor parallelism: split every layer<a class="h-anchor" href="#tensor-parallelism-split-every-layer" aria-label="Link to this section">#</a></h3>
+<p>With <a class="term" href="../reference/glossary.html#term-tensor-parallel" data-term="tensor parallelism" data-def="Each GPU holds a slice of every weight matrix. The GPUs compute their slices of each layer and then combine the results (TP).">tensor parallelism</a> (TP), each GPU holds a slice of every weight matrix. All GPUs work on the same tokens at the same time. A linear layer computes <code>Y = X W</code>. You can split W in two ways:</p>
+<ul>
+  <li><strong>By output columns</strong> (a <a class="term" href="../reference/glossary.html#term-column-parallel" data-term="column-parallel linear layer" data-def="A linear layer whose output columns are split across the tensor parallel GPUs. Each GPU computes its part of the output from the full input. vLLM class: ColumnParallelLinear.">column-parallel linear layer</a>). Each GPU computes some of the output features from the full input. The result on each GPU is a slice of Y.</li>
+  <li><strong>By input rows</strong> (a <a class="term" href="../reference/glossary.html#term-row-parallel" data-term="row-parallel linear layer" data-def="A linear layer whose input rows are split across the tensor parallel GPUs. Each GPU makes a partial sum of the full output; an all-reduce adds them. vLLM class: RowParallelLinear.">row-parallel linear layer</a>). Each GPU gets a slice of the input features and multiplies it with its rows of W. The result on each GPU is a partial sum of the full Y. An <a class="term" href="../reference/glossary.html#term-all-reduce" data-term="all-reduce" data-def="A collective operation: every GPU in a group gives one tensor, and every GPU gets back the element-wise sum of all of them.">all-reduce</a> adds the partial sums.</li>
+</ul>
+<p>The trick is to put the two splits one after the other. The MLP has two linear layers. The first layer is column-parallel, so each GPU gets a slice of the 14,336 intermediate features. The activation function works on each feature alone, so it needs no data from other GPUs. The second layer is row-parallel, and its input slice is exactly the slice that the GPU already has. So one MLP needs only one all-reduce, at the end.</p>
+
+<h3 id="small-numbers-one-mlp-with-tp-2">Small numbers: one MLP with TP = 2<a class="h-anchor" href="#small-numbers-one-mlp-with-tp-2" aria-label="Link to this section">#</a></h3>
+<p>Take a Llama-3.1-8B-style MLP: hidden size 4,096, intermediate size 14,336, BF16. T is the number of tokens in the step.</p>
+<table>
+  <thead><tr><th>Layer</th><th>Full weight [out, in]</th><th>Weight on each GPU (TP = 2)</th><th>Output on each GPU</th></tr></thead>
+  <tbody>
+    <tr><td>input X</td><td>–</td><td>–</td><td><code>[T, 4096]</code> (same on both)</td></tr>
+    <tr><td><code>gate_up_proj</code> (column-parallel)</td><td><code>[2 × 14336, 4096]</code></td><td><code>[2 × 7168, 4096]</code></td><td><code>[T, 2 × 7168]</code></td></tr>
+    <tr><td>SiLU(gate) × up</td><td>–</td><td>–</td><td><code>[T, 7168]</code></td></tr>
+    <tr><td><code>down_proj</code> (row-parallel)</td><td><code>[4096, 14336]</code></td><td><code>[4096, 7168]</code></td><td>partial sum <code>[T, 4096]</code></td></tr>
+    <tr><td>all-reduce</td><td>–</td><td>–</td><td>full Y <code>[T, 4096]</code> (same on both)</td></tr>
+  </tbody>
+</table>
+<p>Each GPU holds 88.1 million MLP weights (176 MB) instead of 176.2 million (352 MB). It does half of the multiply work. The price is one all-reduce of <code>T × 4096 × 2</code> bytes: 16 MiB for a step of 2,048 tokens.</p>
+
+<h3 id="attention-split-by-heads">Attention: split by heads<a class="h-anchor" href="#attention-split-by-heads" aria-label="Link to this section">#</a></h3>
+<p>Attention heads are independent of each other, so TP gives each GPU a group of heads. The QKV projection is column-parallel: each GPU computes the Q, K and V of its own heads. The output projection is row-parallel, with one all-reduce (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L165-L181" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:165-181 at 3e44c0d"><code>vllm/model_executor/models/llama.py:165-181</code></a>). So one decoder layer has two all-reduces: one after attention and one after the MLP.</p>
+<p>With grouped-query attention, the model has fewer KV heads than query heads (Llama-3.1-8B: 32 query heads, 8 KV heads, head size 128). Two rules follow:</p>
+<ul>
+  <li>The number of query heads must divide by TP. With TP = 3, 32 heads do not divide, and vLLM stops at start-up.</li>
+  <li>If TP is larger than the number of KV heads, vLLM gives one KV head to each GPU and <em>replicates</em> it. With TP = 16, each of the 8 KV heads is on 2 GPUs. TP must then be a multiple of the KV head count.</li>
+</ul>
+<p>The KV cache follows the heads. With TP = 2, each GPU stores 4 KV heads. That is 32 layers × 4 × 128 × 2 (K and V) × 2 bytes = 64 KiB per token, half of 128 KiB. With TP = 16, each GPU stores one replicated head: 16 KiB per token. The 16 GPUs then store 256 KiB per token together, twice the real size.</p>
+
+<h3 id="pipeline-parallelism-split-the-layers">Pipeline parallelism: split the layers<a class="h-anchor" href="#pipeline-parallelism-split-the-layers" aria-label="Link to this section">#</a></h3>
+<p>With <a class="term" href="../reference/glossary.html#term-pipeline-parallel" data-term="pipeline parallelism" data-def="Each GPU holds a different range of layers. The hidden states go from one GPU to the next (PP).">pipeline parallelism</a> (PP), each GPU, or each group of TP GPUs, holds a range of layers. With 32 layers and PP = 2, stage 0 has layers 0 to 15 and stage 1 has layers 16 to 31. Stage 0 also has the embedding. The last stage also has the final norm and the LM head.</p>
+<p>A stage sends its hidden states to the next stage once per step. For Llama, these are two tensors: <code>hidden_states</code> and <code>residual</code>, each <code>[T, 4096]</code>. For T = 2,048 that is 32 MiB per step and stage boundary. TP instead sends 64 all-reduces per step (2 per layer) inside every group. So PP needs much less bandwidth, and it works over a slower network between nodes.</p>
+<p>The cost of PP is the <a class="term" href="../reference/glossary.html#term-pipeline-bubble" data-term="pipeline bubble" data-def="Idle time of a pipeline stage. It waits for the stage before it, because there is not enough work in flight to keep every stage busy.">pipeline bubble</a>. With one batch in flight, stage 1 waits while stage 0 works, and stage 0 waits while stage 1 works. Each GPU is busy only half of the time. vLLM keeps several batches in flight to fill the stages. PP also does not make one step faster: the stages still run one after the other.</p>
+
+<h3 id="data-and-expert-parallelism">Data and expert parallelism<a class="h-anchor" href="#data-and-expert-parallelism" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><strong><a class="term" href="../reference/glossary.html#term-data-parallel" data-term="data parallelism" data-def="Several copies of the model serve different requests at the same time. In vLLM, each data parallel rank has its own engine core (DP).">Data parallelism</a> (DP)</strong> runs full copies of the model. Each copy serves other requests. It adds throughput but does not make one model fit. See <a href="../concepts/data-parallel-serving.html">Data parallel serving: several engine cores behind one endpoint</a>.</li>
+  <li><strong><a class="term" href="../reference/glossary.html#term-expert-parallel" data-term="expert parallelism" data-def="The experts of a MoE layer are split across GPUs. Tokens go to the GPUs of their experts and the results come back (EP).">Expert parallelism</a> (EP)</strong> is for Mixture-of-Experts models (<a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/learn/moe.html" target="_blank" rel="noopener" title="DeepInfer Explained: Mixture of Experts (MoE)">Mixture of Experts<span class="ext-mark" aria-hidden="true">↗</span></a>). It puts different experts on different GPUs, instead of a TP slice of every expert. See <a href="../concepts/expert-parallel-moe.html">Expert parallelism and MoE serving</a>.</li>
+</ul>
+
+<h3 id="a-decision-table-for-a-serving-operator">A decision table for a serving operator<a class="h-anchor" href="#a-decision-table-for-a-serving-operator" aria-label="Link to this section">#</a></h3>
+<table>
+  <thead><tr><th>Situation</th><th>Use</th><th>Example flags</th></tr></thead>
+  <tbody>
+    <tr><td>The model fits on one GPU, with room for the KV cache</td><td>one GPU; add DP copies for more throughput</td><td><code>-dp 4</code></td></tr>
+    <tr><td>The model does not fit on one GPU, but fits on one node</td><td>TP inside the node (fast links between GPUs)</td><td><code>-tp 4</code></td></tr>
+    <tr><td>The model does not fit on one node</td><td>TP inside each node, PP across the nodes</td><td><code>-tp 8 -pp 2</code></td></tr>
+    <tr><td>The GPUs of one node have no fast links, or the GPU count does not divide the heads</td><td>PP inside the node</td><td><code>-pp 4</code></td></tr>
+    <tr><td>A large MoE model</td><td>DP for attention plus EP for the experts</td><td><code>-dp 8 -ep</code></td></tr>
+  </tbody>
+</table>
+<p>The vLLM docs give the same rules for one model replica (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/serving/parallelism_scaling.md#L7-L11" target="_blank" rel="noopener" title="docs/serving/parallelism_scaling.md:7-11 at 3e44c0d"><code>docs/serving/parallelism_scaling.md:7-11</code></a>). They also suggest PP when the GPU count does not divide the model, or when the GPUs have no NVLink (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/serving/parallelism_scaling.md#L23" target="_blank" rel="noopener" title="docs/serving/parallelism_scaling.md:23 at 3e44c0d"><code>docs/serving/parallelism_scaling.md:23</code></a>).</p>
+
+<h3 id="an-everyday-comparison">An everyday comparison<a class="h-anchor" href="#an-everyday-comparison" aria-label="Link to this section">#</a></h3>
+<p>Think of a team that must type a long book. With TP, every typist types a part of every page, and after each page they put the parts together. With PP, typist 1 types chapters 1 to 10 and typist 2 types chapters 11 to 20. Typist 2 can only start a book when typist 1 hands it over. With DP, each typist types a different book.</p>
+<p>The comparison stops here: in TP, the "put together" step is an addition of numbers (an all-reduce), not a join of pages. And in serving, the pipeline gets a new batch every step, so several batches can be in different stages at the same time.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b1b_mlp_split"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: two lanes, GPU 0 and GPU 1. In each lane: step 1, input X of shape [T, 4096], the same copy on both GPUs. Step 2, gate_up_proj, a MergedColumnParallelLinear with weight [2 x 7168, 4096] of the full [2 x 14336, 4096], output [T, 2 x 7168]. Step 3, SiluAndMul, output [T, 7168], local. Step 4, down_proj, a RowParallelLinear with weight [4096, 7168] of the full [4096, 14336], output a partial sum Y0 or Y1 of shape [T, 4096]. Both lanes go into one all-reduce box: Y = Y0 + Y1, [T, 4096], the same result on both GPUs. Panel 2: three boxes. Weights per GPU: 88.1 M parameters, 176 MB in BF16; the full MLP has 176.2 M, 352 MB. Data per all-reduce: T x 4096 x 2 bytes, 16 MiB for T = 2048. All-reduces per decoder layer: 2, after o_proj and after down_proj; 64 per step for 32 layers."><svg role="img" aria-label="Panel 1: two lanes, GPU 0 and GPU 1. In each lane: step 1, input X of shape [T, 4096], the same copy on both GPUs. Step 2, gate_up_proj, a MergedColumnParallelLinear with weight [2 x 7168, 4096] of the full [2 x 14336, 4096], output [T, 2 x 7168]. Step 3, SiluAndMul, output [T, 7168], local. Step 4, down_proj, a RowParallelLinear with weight [4096, 7168] of the full [4096, 14336], output a partial sum Y0 or Y1 of shape [T, 4096]. Both lanes go into one all-reduce box: Y = Y0 + Y1, [T, 4096], the same result on both GPUs. Panel 2: three boxes. Weights per GPU: 88.1 M parameters, 176 MB in BF16; the full MLP has 176.2 M, 352 MB. Data per all-reduce: T x 4096 x 2 bytes, 16 MiB for T = 2048. All-reduces per decoder layer: 2, after o_proj and after down_proj; 64 per step for 32 layers." xmlns="http://www.w3.org/2000/svg" width="1100" height="958" viewBox="0 0 1100 958">
+<defs><marker id="dg-b1b_mlp_split-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#111827"/></marker><marker id="dg-b1b_mlp_split-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b1b_mlp_split-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker><marker id="dg-b1b_mlp_split-m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker></defs>
+<rect width="1100" height="958" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Tensor parallelism in one MLP block: split the columns, then the rows</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">hidden 4096  ·  intermediate 14336  ·  TP = 2  ·  T = tokens in the step  ·  BF16</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Y = down_proj( SiLU(gate(X)) * up(X) )     gate, up: [14336, 4096]     down: [4096, 14336]</text>
+<rect x="20.0" y="116.0" width="1060.0" height="556.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="142.0" r="13" fill="#111827"/>
+<text x="46.0" y="146.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="147.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Each GPU computes half of the MLP, then one all-reduce adds the halves</text>
+<text x="68.0" y="166.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">No communication between the two linear layers: the column split of layer 1 is the row split of layer 2.</text>
+<rect x="46.0" y="182.0" width="500.0" height="402.0" rx="12" fill="#f8fbff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.2" stroke-opacity="0.35" stroke-dasharray="4 4"/>
+<rect x="46.0" y="182.0" width="500.0" height="50.0" rx="12" fill="#2563eb" fill-opacity="1.0" stroke="none"/>
+<rect x="46.0" y="208.0" width="500.0" height="24.0" rx="0" fill="#2563eb" fill-opacity="1.0" stroke="none"/>
+<text x="60.0" y="205.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="15" fill="#fff" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">GPU 0  (TP rank 0)</text>
+<text x="60.0" y="223.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#fff" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">holds rows 0-7167 of gate and up, columns 0-7167 of down</text>
+<rect x="66.0" y="248.0" width="460.0" height="58.0" rx="8" fill="#ffffff" fill-opacity="1.0" stroke="#111827" stroke-width="1.4"/>
+<rect x="66.0" y="248.0" width="6.0" height="58.0" rx="3" fill="#111827" fill-opacity="1.0" stroke="none"/>
+<circle cx="88.0" cy="265.0" r="10" fill="#111827"/>
+<text x="88.0" y="269.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="104.0" y="270.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">input X (same copy on both GPUs)</text>
+<rect x="431.8" y="256.0" width="86.2" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#111827" stroke-width="1"/>
+<text x="474.9" y="269.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">replicated</text>
+<text x="104.0" y="290.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">X</text>
+<text x="138.0" y="290.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[T, 4096]</text>
+<line x1="296.0" y1="306.0" x2="296.0" y2="322.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b1b_mlp_split-m0)"/>
+<rect x="66.0" y="324.0" width="460.0" height="76.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<rect x="66.0" y="324.0" width="6.0" height="76.0" rx="3" fill="#2563eb" fill-opacity="1.0" stroke="none"/>
+<circle cx="88.0" cy="341.0" r="10" fill="#2563eb"/>
+<text x="88.0" y="345.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="104.0" y="346.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">gate_up_proj: column-parallel</text>
+<rect x="325.8" y="332.0" width="192.2" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="421.9" y="345.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">MergedColumnParallelLinear</text>
+<text x="104.0" y="366.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">W</text>
+<text x="138.0" y="366.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[2 x 7168, 4096]   (full: [2 x 14336, 4096])</text>
+<text x="104.0" y="383.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">out</text>
+<text x="138.0" y="383.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[T, 2 x 7168]</text>
+<line x1="296.0" y1="400.0" x2="296.0" y2="416.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b1b_mlp_split-m1)"/>
+<rect x="66.0" y="418.0" width="460.0" height="58.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<rect x="66.0" y="418.0" width="6.0" height="58.0" rx="3" fill="#2563eb" fill-opacity="1.0" stroke="none"/>
+<circle cx="88.0" cy="435.0" r="10" fill="#2563eb"/>
+<text x="88.0" y="439.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="104.0" y="440.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">SiluAndMul: SiLU(gate) * up</text>
+<rect x="464.9" y="426.0" width="53.1" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="491.4" y="439.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">local</text>
+<text x="104.0" y="460.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">out</text>
+<text x="138.0" y="460.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[T, 7168]   (this GPU&#x27;s slice of the 14336)</text>
+<line x1="296.0" y1="476.0" x2="296.0" y2="492.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b1b_mlp_split-m1)"/>
+<rect x="66.0" y="494.0" width="460.0" height="76.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<rect x="66.0" y="494.0" width="6.0" height="76.0" rx="3" fill="#2563eb" fill-opacity="1.0" stroke="none"/>
+<circle cx="88.0" cy="511.0" r="10" fill="#2563eb"/>
+<text x="88.0" y="515.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">4</text>
+<text x="104.0" y="516.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">down_proj: row-parallel</text>
+<rect x="385.4" y="502.0" width="132.6" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="451.7" y="515.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">RowParallelLinear</text>
+<text x="104.0" y="536.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">W</text>
+<text x="138.0" y="536.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[4096, 7168]   (full: [4096, 14336])</text>
+<text x="104.0" y="553.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">out</text>
+<text x="138.0" y="553.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Y0 = partial sum  [T, 4096]</text>
+<rect x="554.0" y="182.0" width="500.0" height="402.0" rx="12" fill="#faf8ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.2" stroke-opacity="0.35" stroke-dasharray="4 4"/>
+<rect x="554.0" y="182.0" width="500.0" height="50.0" rx="12" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<rect x="554.0" y="208.0" width="500.0" height="24.0" rx="0" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<text x="568.0" y="205.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="15" fill="#fff" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">GPU 1  (TP rank 1)</text>
+<text x="568.0" y="223.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#fff" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">holds rows 7168-14335 of gate and up, columns 7168-14335 of down</text>
+<rect x="574.0" y="248.0" width="460.0" height="58.0" rx="8" fill="#ffffff" fill-opacity="1.0" stroke="#111827" stroke-width="1.4"/>
+<rect x="574.0" y="248.0" width="6.0" height="58.0" rx="3" fill="#111827" fill-opacity="1.0" stroke="none"/>
+<circle cx="596.0" cy="265.0" r="10" fill="#111827"/>
+<text x="596.0" y="269.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="612.0" y="270.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">input X (same copy on both GPUs)</text>
+<rect x="939.8" y="256.0" width="86.2" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#111827" stroke-width="1"/>
+<text x="982.9" y="269.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">replicated</text>
+<text x="612.0" y="290.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">X</text>
+<text x="646.0" y="290.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[T, 4096]</text>
+<line x1="804.0" y1="306.0" x2="804.0" y2="322.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b1b_mlp_split-m0)"/>
+<rect x="574.0" y="324.0" width="460.0" height="76.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<rect x="574.0" y="324.0" width="6.0" height="76.0" rx="3" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<circle cx="596.0" cy="341.0" r="10" fill="#7c3aed"/>
+<text x="596.0" y="345.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="612.0" y="346.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">gate_up_proj: column-parallel</text>
+<rect x="833.8" y="332.0" width="192.2" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="929.9" y="345.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">MergedColumnParallelLinear</text>
+<text x="612.0" y="366.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">W</text>
+<text x="646.0" y="366.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[2 x 7168, 4096]   (full: [2 x 14336, 4096])</text>
+<text x="612.0" y="383.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">out</text>
+<text x="646.0" y="383.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[T, 2 x 7168]</text>
+<line x1="804.0" y1="400.0" x2="804.0" y2="416.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b1b_mlp_split-m2)"/>
+<rect x="574.0" y="418.0" width="460.0" height="58.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<rect x="574.0" y="418.0" width="6.0" height="58.0" rx="3" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<circle cx="596.0" cy="435.0" r="10" fill="#7c3aed"/>
+<text x="596.0" y="439.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="612.0" y="440.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">SiluAndMul: SiLU(gate) * up</text>
+<rect x="972.9" y="426.0" width="53.1" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="999.4" y="439.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">local</text>
+<text x="612.0" y="460.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">out</text>
+<text x="646.0" y="460.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[T, 7168]   (this GPU&#x27;s slice of the 14336)</text>
+<line x1="804.0" y1="476.0" x2="804.0" y2="492.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b1b_mlp_split-m2)"/>
+<rect x="574.0" y="494.0" width="460.0" height="76.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<rect x="574.0" y="494.0" width="6.0" height="76.0" rx="3" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<circle cx="596.0" cy="511.0" r="10" fill="#7c3aed"/>
+<text x="596.0" y="515.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">4</text>
+<text x="612.0" y="516.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">down_proj: row-parallel</text>
+<rect x="893.4" y="502.0" width="132.6" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="959.7" y="515.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">RowParallelLinear</text>
+<text x="612.0" y="536.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">W</text>
+<text x="646.0" y="536.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[4096, 7168]   (full: [4096, 14336])</text>
+<text x="612.0" y="553.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">out</text>
+<text x="646.0" y="553.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Y1 = partial sum  [T, 4096]</text>
+<rect x="46.0" y="606.0" width="1008.0" height="50.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="550.0" y="627.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">all-reduce (sum) over the TP group</text>
+<text x="550.0" y="645.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">Y = Y0 + Y1   [T, 4096]   -&gt; the same full result on both GPUs</text>
+<line x1="296.0" y1="584.0" x2="296.0" y2="604.0" stroke="#d97706" stroke-width="2" marker-end="url(#dg-b1b_mlp_split-m3)"/>
+<line x1="804.0" y1="584.0" x2="804.0" y2="604.0" stroke="#d97706" stroke-width="2" marker-end="url(#dg-b1b_mlp_split-m3)"/>
+<rect x="20.0" y="692.0" width="1060.0" height="150.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="718.0" r="13" fill="#111827"/>
+<text x="46.0" y="722.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="723.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What TP = 2 saves and what it costs, per MLP block</text>
+<text x="68.0" y="742.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Half the weights and half the FLOPs on each GPU. In exchange: one all-reduce of the full output.</text>
+<rect x="46.0" y="758.0" width="324.0" height="70.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="208.0" y="778.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">Weights per GPU</text>
+<text x="208.0" y="796.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">88.1 M params = 176 MB (BF16)</text>
+<text x="208.0" y="811.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">full MLP: 176.2 M = 352 MB</text>
+<rect x="388.0" y="758.0" width="324.0" height="70.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="550.0" y="778.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">Data per all-reduce</text>
+<text x="550.0" y="796.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">T x 4096 x 2 B</text>
+<text x="550.0" y="811.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">T = 2048 -&gt; 16 MiB</text>
+<rect x="730.0" y="758.0" width="324.0" height="70.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="892.0" y="778.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">All-reduces per decoder layer</text>
+<text x="892.0" y="796.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">2: after o_proj, after down_proj</text>
+<text x="892.0" y="811.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">32 layers -&gt; 64 per step</text>
+<text x="30.0" y="879.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="868.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="879.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">GPU 0 slice</text>
+<rect x="208.5" y="868.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="229.5" y="879.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">GPU 1 slice</text>
+<rect x="319.7" y="868.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="340.7" y="879.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">communication</text>
+<rect x="451.6" y="868.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="472.6" y="879.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">memory</text>
+<text x="30.0" y="908.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">gate_up_proj is one merged weight: each GPU holds its 7168 rows of gate and its 7168 rows of up, so SiluAndMul needs no data from the other GPU.</text>
+<text x="30.0" y="926.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Not shown: the attention block (also column-parallel qkv_proj, then row-parallel o_proj), custom all-reduce kernels, quantized weights.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: with TP = 2, each GPU computes half of the MLP. The column split of gate_up_proj feeds the row split of down_proj with no communication. One all-reduce at the end adds the two partial sums (panel 1). Panel 2 gives the memory and communication numbers.</figcaption><a class="diagram-open" href="../diagrams/b1b_mlp_split.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read each lane from top to bottom: one GPU and its slice of every weight. The only arrow between the lanes is the all-reduce at the bottom. Panel 2 gives the cost of this split for one MLP block.</p>
+
+<h2 id="in-vllm">In vLLM<a class="h-anchor" href="#in-vllm" aria-label="Link to this section">#</a></h2>
+<p>This is a basics page, so this part gives only pointers. The pages <a href="../concepts/tp-layers.html">The tensor-parallel layers (linear.py and vocab_parallel_embedding.py)</a> and <a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a> explain the code in full.</p>
+<ol>
+  <li><strong>The layers.</strong> <code>LlamaMLP</code> builds <code>gate_up_proj</code> as a <code>MergedColumnParallelLinear</code> and <code>down_proj</code> as a <code>RowParallelLinear</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L95-L111" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:95-111 at 3e44c0d"><code>vllm/model_executor/models/llama.py:95-111</code></a>). <code>RowParallelLinear.forward()</code> calls the all-reduce when <code>reduce_results</code> is true and TP is larger than 1 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1803-L1806" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1803-1806 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1803-1806</code></a>).</li>
+  <li><strong>The pipeline stages.</strong> <code>make_layers()</code> builds only the layers of this PP rank. It fills the other places with <code>PPMissingLayer</code>, an identity module (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L886-L919" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:886-919 at 3e44c0d"><code>vllm/model_executor/models/utils.py:886-919</code></a>). A stage that is not the last returns <code>IntermediateTensors</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L443-L450" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:443-450 at 3e44c0d"><code>vllm/model_executor/models/llama.py:443-450</code></a>).</li>
+  <li><strong>The rank layout.</strong> vLLM numbers all ranks in the order DP × PP × PCP × TP, with TP last (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2157-L2163" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2157-2163 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2157-2163</code></a>). So the ranks of one TP group are neighbours, and they normally sit on one node.</li>
+</ol>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L95-L122" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/models/llama.py:95-122</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L95-L122" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">95</span><span class="ln">96</span><span class="ln">97</span><span class="ln">98</span><span class="ln">99</span><span class="ln">100</span><span class="ln">101</span><span class="ln">102</span><span class="ln hl">103</span><span class="ln">104</span><span class="ln">105</span><span class="ln">106</span><span class="ln">107</span><span class="ln">108</span><span class="ln">109</span><span class="ln">110</span><span class="ln">111</span><span class="ln">112</span><span class="ln">113</span><span class="ln">114</span><span class="ln">115</span><span class="ln">116</span><span class="ln">117</span><span class="ln">118</span><span class="ln hl">119</span><span class="ln hl">120</span><span class="ln hl">121</span><span class="ln">122</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><pre><code class="language-python">        self.gate_up_proj = MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[intermediate_size] * 2,
+            bias=bias,
+            quant_config=quant_config,
+            disable_tp=disable_tp,
+            prefix=f&quot;{prefix}.gate_up_proj&quot;,
+        )
+        self.down_proj = RowParallelLinear(
+            input_size=intermediate_size,
+            output_size=hidden_size,
+            bias=bias,
+            quant_config=quant_config,
+            reduce_results=reduce_results,
+            disable_tp=disable_tp,
+            prefix=f&quot;{prefix}.down_proj&quot;,
+        )
+        if hidden_act != &quot;silu&quot;:
+            raise ValueError(
+                f&quot;Unsupported activation: {hidden_act}. Only silu is supported for now.&quot;
+            )
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x):
+        x, _ = self.gate_up_proj(x)
+        x = maybe_fused_act_quant(self.act_fn, x, self.down_proj)
+        x, _ = self.down_proj(x)
+        return x</code></pre></div></div></div><figcaption class="code-caption">The Llama MLP: column-parallel <code>gate_up_proj</code>, the local activation, and row-parallel <code>down_proj</code>. The model code does not call any collective itself; the linear layers do.</figcaption></figure>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="columnparallellinear-and-rowparallellinear-line-by-line" class="dd-title">ColumnParallelLinear and RowParallelLinear, line by line</h3></summary><div class="dd-body"><p><strong>Column-parallel.</strong> The class comment states the split: <code>A = [A_1, ..., A_p]</code> along the second dimension (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L436-L441" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:436-441 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:436-441</code></a>). The constructor keeps the full input size and divides the output size by the TP size (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L496-L497" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:496-497 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:496-497</code></a>). <code>divide()</code> raises an error when the size does not divide.</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L616-L629" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/layers/linear.py:616-629</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L616-L629" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">616</span><span class="ln">617</span><span class="ln">618</span><span class="ln">619</span><span class="ln">620</span><span class="ln">621</span><span class="ln">622</span><span class="ln">623</span><span class="ln">624</span><span class="ln">625</span><span class="ln">626</span><span class="ln">627</span><span class="ln">628</span><span class="ln">629</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">    def forward(
+        self,
+        input_,
+    ) -&gt; torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        bias = self.bias if not self.skip_bias_add else None
+
+        # Matrix multiply.
+        output_parallel = self.quant_method.apply(self, input_, bias)
+
+        if self.gather_output and self.tp_size &gt; 1:
+            # All-gather across the partitions.
+            output = tensor_model_parallel_all_gather(output_parallel)
+        else:
+            output = output_parallel</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 623.</strong> The quantization method does the matrix multiply on the local slice of the weight. For a BF16 model, this is a plain GEMM.</li>
+  <li><strong>Lines 625-627.</strong> Only with <code>gather_output=True</code> does the layer all-gather the slices. The default is <code>False</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L473" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:473 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:473</code></a>), because the next layer is row-parallel and wants the slice.</li>
+</ol>
+<p><strong>Row-parallel.</strong> The input size is divided, and the output size stays full (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1694-L1695" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1694-1695 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1694-1695</code></a>).</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1785-L1811" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/layers/linear.py:1785-1811</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1785-L1811" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1785</span><span class="ln">1786</span><span class="ln">1787</span><span class="ln">1788</span><span class="ln">1789</span><span class="ln">1790</span><span class="ln">1791</span><span class="ln">1792</span><span class="ln">1793</span><span class="ln">1794</span><span class="ln">1795</span><span class="ln">1796</span><span class="ln">1797</span><span class="ln">1798</span><span class="ln">1799</span><span class="ln">1800</span><span class="ln">1801</span><span class="ln">1802</span><span class="ln">1803</span><span class="ln">1804</span><span class="ln">1805</span><span class="ln">1806</span><span class="ln">1807</span><span class="ln">1808</span><span class="ln">1809</span><span class="ln">1810</span><span class="ln">1811</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">    def forward(
+        self,
+        input_,
+    ) -&gt; torch.Tensor | tuple[torch.Tensor, Parameter | None]:
+        if self.input_is_parallel:
+            input_parallel = input_
+        else:
+            split_input = split_tensor_along_last_dim(
+                input_, num_partitions=self.tp_size
+            )
+            input_parallel = split_input[self.tp_rank].contiguous()
+
+        # Matrix multiply.
+        # Only fuse bias add into GEMM for rank 0 (this ensures that
+        # bias will not get added more than once in TP&gt;1 case)
+        bias_ = None if (self.tp_rank &gt; 0 or self.skip_bias_add) else self.bias
+        output_parallel = self.quant_method.apply(self, input_parallel, bias_)
+
+        if self.reduce_results and self.tp_size &gt; 1:
+            output = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            output = output_parallel
+
+        if not self.return_bias:
+            return output
+        output_bias = self.bias if self.skip_bias_add else None
+        return output, output_bias</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 1789-1795.</strong> Normally the input is already split (<code>input_is_parallel=True</code>). Otherwise the layer splits it and takes its own part.</li>
+  <li><strong>Lines 1798-1801.</strong> Only rank 0 adds the bias. Otherwise the all-reduce would add the bias TP times.</li>
+  <li><strong>Lines 1803-1806.</strong> The all-reduce over the TP group. A model can set <code>reduce_results=False</code> to do the reduction later, in its own code.</li>
+</ol>
+<p><strong>Merged layers.</strong> <code>MergedColumnParallelLinear</code> keeps several output matrices in one weight, for example gate and up. Each part is split on its own, so each GPU gets 7,168 rows of gate and 7,168 rows of up. <code>QKVParallelLinear</code> does the same for Q, K and V (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1011" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1011 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1011</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="attention-heads-and-the-kv-head-limit" class="dd-title">Attention heads and the KV-head limit</h3></summary><div class="dd-body"><p><code>LlamaAttention</code> computes the heads of this GPU (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L143-L156" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:143-156 at 3e44c0d"><code>vllm/model_executor/models/llama.py:143-156</code></a>):</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L143-L156" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/models/llama.py:143-156</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L143-L156" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">143</span><span class="ln">144</span><span class="ln">145</span><span class="ln">146</span><span class="ln">147</span><span class="ln">148</span><span class="ln">149</span><span class="ln">150</span><span class="ln">151</span><span class="ln">152</span><span class="ln">153</span><span class="ln">154</span><span class="ln">155</span><span class="ln">156</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">        tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_heads = num_heads
+        assert self.total_num_heads % tp_size == 0
+        self.num_heads = self.total_num_heads // tp_size
+        self.total_num_kv_heads = num_kv_heads
+        if self.total_num_kv_heads &gt;= tp_size:
+            # Number of KV heads is greater than TP size, so we partition
+            # the KV heads across multiple tensor parallel GPUs.
+            assert self.total_num_kv_heads % tp_size == 0
+        else:
+            # Number of KV heads is less than TP size, so we replicate
+            # the KV heads across multiple tensor parallel GPUs.
+            assert tp_size % self.total_num_kv_heads == 0
+        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)</code></pre></div></div></div></figure>
+<p><code>QKVParallelLinear</code> uses the same rule for the projection sizes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1064-L1071" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1064-1071 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1064-1071</code></a>). Worked out for Llama-3.1-8B (32 query heads, 8 KV heads, head size 128):</p>
+<table>
+  <thead><tr><th>TP</th><th>Query heads per GPU</th><th>KV heads per GPU</th><th>KV replicas</th><th>KV cache per token per GPU (BF16)</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>32</td><td>8</td><td>1</td><td>32 × 8 × 128 × 2 × 2 B = 128 KiB</td></tr>
+    <tr><td>2</td><td>16</td><td>4</td><td>1</td><td>64 KiB</td></tr>
+    <tr><td>8</td><td>4</td><td>1</td><td>1</td><td>16 KiB</td></tr>
+    <tr><td>16</td><td>2</td><td>1</td><td>2</td><td>16 KiB (each head stored twice)</td></tr>
+    <tr><td>3</td><td colspan="4">error: 32 heads do not divide by 3</td></tr>
+  </tbody>
+</table>
+<p>The check for the query heads runs at start-up, in <code>ModelConfig.verify_with_parallel_config()</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/model.py#L1557-L1564" target="_blank" rel="noopener" title="vllm/config/model.py:1557-1564 at 3e44c0d"><code>vllm/config/model.py:1557-1564</code></a>). The same function rejects PP for a model class that does not implement the <code>SupportsPP</code> interface (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/model.py#L1569-L1576" target="_blank" rel="noopener" title="vllm/config/model.py:1569-1576 at 3e44c0d"><code>vllm/config/model.py:1569-1576</code></a>).</p>
+<p><strong>Why the KV cache matters for TP.</strong> TP splits not only the weights but also the KV cache of each token. So TP = 2 on two GPUs gives more than twice the free KV memory of one GPU. The weights shrink by half on each GPU, and each token needs half the KV bytes.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="pipeline-stages-which-layers-which-tensors" class="dd-title">Pipeline stages: which layers, which tensors</h3></summary><div class="dd-body"><p><strong>Which layers.</strong> <code>get_pp_indices()</code> splits the layers evenly. If the split is not even, it adds one extra layer to each stage, from the second-to-last stage toward the first stage. So the last stage never gets an extra layer. The docstring gives the reason: the last stage also has the final norm (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/utils.py#L190-L233" target="_blank" rel="noopener" title="vllm/distributed/utils.py:190-233 at 3e44c0d"><code>vllm/distributed/utils.py:190-233</code></a>). <code>VLLM_PP_LAYER_PARTITION</code> overrides the split, for example <code>"11,11,10"</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/utils.py#L206-L215" target="_blank" rel="noopener" title="vllm/distributed/utils.py:206-215 at 3e44c0d"><code>vllm/distributed/utils.py:206-215</code></a>).</p>
+<table>
+  <thead><tr><th>Layers</th><th>PP</th><th>Split</th></tr></thead>
+  <tbody>
+    <tr><td>32</td><td>2</td><td>16, 16</td></tr>
+    <tr><td>32</td><td>3</td><td>11, 11, 10 (32 // 3 = 10, remainder 2 goes to stages 1 and 0)</td></tr>
+    <tr><td>32</td><td>4</td><td>8, 8, 8, 8</td></tr>
+  </tbody>
+</table>
+<p><strong>Placeholders.</strong> <code>make_layers()</code> makes a list of all layers, but only the layers of this stage are real. The others are <code>PPMissingLayer</code> objects, which return their first input (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/utils.py#L852-L860" target="_blank" rel="noopener" title="vllm/model_executor/models/utils.py:852-860 at 3e44c0d"><code>vllm/model_executor/models/utils.py:852-860</code></a>). So the layer indices stay the same on every stage, and weight names such as <code>model.layers.20.mlp</code> still match. The embedding and the final norm are also <code>PPMissingLayer</code> on the stages that do not need them (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L377-L397" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:377-397 at 3e44c0d"><code>vllm/model_executor/models/llama.py:377-397</code></a>).</p>
+<p><strong>Which tensors.</strong> The first stage starts from the token embeddings. Every other stage reads <code>hidden_states</code> and <code>residual</code> from the <code>IntermediateTensors</code> of the stage before it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L414-L423" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:414-423 at 3e44c0d"><code>vllm/model_executor/models/llama.py:414-423</code></a>). The worker receives them with <code>irecv_tensor_dict()</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L1337-L1347" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:1337-1347 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:1337-1347</code></a>) and sends its own with <code>isend_tensor_dict()</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L1375-L1378" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:1375-1378 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:1375-1378</code></a>).</p>
+<p><strong>Bubbles.</strong> The engine core can keep several batches in flight. With async scheduling and Model Runner V2, <code>max_concurrent_batches</code> is <code>pp_size + 1</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L586-L597" target="_blank" rel="noopener" title="vllm/config/vllm.py:586-597 at 3e44c0d"><code>vllm/config/vllm.py:586-597</code></a>). The code comment gives the reason: PP needs PP-size concurrent batches to fill the pipeline. So with PP = 2, up to 3 batches are in flight, and both stages can work at the same time.</p>
+<aside class="callout callout-simplified"><p class="callout-title">Simplified</p><div class="callout-body"><p>A real step on each stage has a different length (prefill chunks, decode only). So some bubble time stays, even with batches in flight. The page <a href="../concepts/async-scheduling.html">Async scheduling: overlap the CPU and the GPU</a> explains the batch queue.</p></div></aside></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="ranks-groups-and-the-flags" class="dd-title">Ranks, groups and the flags</h3></summary><div class="dd-body"><p><strong>The flags.</strong> <code>--tensor-parallel-size</code> / <code>-tp</code>, <code>--pipeline-parallel-size</code> / <code>-pp</code> and <code>--data-parallel-size</code> / <code>-dp</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L1198-L1200" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:1198-1200 at 3e44c0d"><code>vllm/engine/arg_utils.py:1198-1200</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L1160-L1164" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:1160-1164 at 3e44c0d"><code>vllm/engine/arg_utils.py:1160-1164</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L1230-L1232" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:1230-1232 at 3e44c0d"><code>vllm/engine/arg_utils.py:1230-1232</code></a>). All three default to 1 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L140-L147" target="_blank" rel="noopener" title="vllm/config/parallel.py:140-147 at 3e44c0d"><code>vllm/config/parallel.py:140-147</code></a>). <code>--enable-expert-parallel</code> / <code>-ep</code> is off by default (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L1294-L1298" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:1294-1298 at 3e44c0d"><code>vllm/engine/arg_utils.py:1294-1298</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L190-L191" target="_blank" rel="noopener" title="vllm/config/parallel.py:190-191 at 3e44c0d"><code>vllm/config/parallel.py:190-191</code></a>).</p>
+<p><strong>The layout.</strong> vLLM puts all ranks in a tensor of shape <code>(ExternalDP, DP, PP, PCP, TP)</code>, with <code>reshape(-1, DP, PP, PCP, TP)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2148-L2163" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2148-2163 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2148-2163</code></a>). Each group is one line of this tensor along its dimension:</p>
+<ul>
+  <li>TP groups: <code>all_ranks.view(-1, TP)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2168" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2168 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2168</code></a>).</li>
+  <li>PP groups: move the PP dimension to the end, then reshape (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2278-L2280" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2278-2280 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2278-2280</code></a>).</li>
+  <li>DP groups: the same with the DP dimension (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2295" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2295 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2295</code></a>).</li>
+</ul>
+<p><strong>Worked example: <code>-tp 2 -pp 2</code>.</strong> The world size is 4. The rank tensor is <code>[[[[[0, 1]], [[2, 3]]]]]</code>. The TP groups are <code>[0, 1]</code> and <code>[2, 3]</code>. The PP groups are <code>[0, 2]</code> and <code>[1, 3]</code>.</p>
+<p>Take two nodes of two GPUs. The multiprocess executor gives each node a range of neighbour ranks: global rank = GPUs per node × node rank + local rank (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L179-L192" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:179-192 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:179-192</code></a>). So ranks 0 and 1 are on node 0, and ranks 2 and 3 are on node 1. Then each all-reduce stays inside a node, and only the pipeline sends cross the network (derived).</p>
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-70B-Instruct --tensor-parallel-size 8 --pipeline-parallel-size 2</code></pre></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><strong>Heads do not divide.</strong> 32 query heads with TP = 3 or TP = 6 fail at start-up (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/model.py#L1559-L1564" target="_blank" rel="noopener" title="vllm/config/model.py:1559-1564 at 3e44c0d"><code>vllm/config/model.py:1559-1564</code></a>). Choose a TP that divides the head count, or use PP.</li>
+  <li><strong>The model has no PP support.</strong> PP needs a model class with <code>SupportsPP</code>. Otherwise vLLM raises <code>NotImplementedError</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/model.py#L1569-L1576" target="_blank" rel="noopener" title="vllm/config/model.py:1569-1576 at 3e44c0d"><code>vllm/config/model.py:1569-1576</code></a>).</li>
+  <li><strong>TP across nodes.</strong> Each decoder layer has two all-reduces on the critical path. Over a network between nodes this is slow. Keep TP inside a node; put PP or DP across nodes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/serving/parallelism_scaling.md#L9" target="_blank" rel="noopener" title="docs/serving/parallelism_scaling.md:9 at 3e44c0d"><code>docs/serving/parallelism_scaling.md:9</code></a>).</li>
+  <li><strong>TP larger than the KV heads.</strong> vLLM replicates KV heads (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1066-L1068" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1066-1068 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1066-1068</code></a>). The KV cache then stores each head several times, so the KV capacity grows less than the GPU count.</li>
+  <li><strong>An uneven pipeline.</strong> A stage with more layers is slower, and the other stages wait for it. Check the "unevenly partitioned" log line, or set <code>VLLM_PP_LAYER_PARTITION</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/utils.py#L220-L228" target="_blank" rel="noopener" title="vllm/distributed/utils.py:220-228 at 3e44c0d"><code>vllm/distributed/utils.py:220-228</code></a>).</li>
+  <li><strong>DP when the model does not fit.</strong> DP copies the full model to each rank, so it does not help a model that is too large. Use TP or PP first.</li>
+</ul>
+<p><strong>Why it matters.</strong> The parallel layout decides how much memory is left for the KV cache, and how much time each step spends on communication. A wrong layout can cost more throughput than any other setting.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Which linear layer of the Llama MLP is column-parallel, and which is row-parallel?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>gate_up_proj</code> is a <code>MergedColumnParallelLinear</code>, and <code>down_proj</code> is a <code>RowParallelLinear</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L95-L111" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:95-111 at 3e44c0d"><code>vllm/model_executor/models/llama.py:95-111</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>Why does the MLP need no communication between <code>gate_up_proj</code> and <code>down_proj</code>?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The column split gives each GPU a slice of the intermediate features. SiLU and the multiply work on each feature alone. The row-parallel <code>down_proj</code> wants exactly this slice as its input (<code>input_is_parallel=True</code>), so only its partial outputs need an all-reduce (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1789-L1806" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1789-1806 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1789-1806</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>A model has 8 KV heads. You start it with TP = 16. What happens to the KV heads?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Each GPU gets one KV head, and each KV head is on 16 / 8 = 2 GPUs (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1066-L1068" target="_blank" rel="noopener" title="vllm/model_executor/layers/linear.py:1066-1068 at 3e44c0d"><code>vllm/model_executor/layers/linear.py:1066-1068</code></a>). The start-up check <code>tp_size % total_num_kv_heads == 0</code> passes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L152-L156" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:152-156 at 3e44c0d"><code>vllm/model_executor/models/llama.py:152-156</code></a>). The KV cache stores each head twice.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>With <code>-tp 2 -pp 2</code>, which ranks form the TP groups and which form the PP groups? Why does this order help on two nodes?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The ranks form a tensor of shape (1, 1, 2, 1, 2) in the order DP, PP, PCP, TP (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2157-L2163" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2157-2163 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2157-2163</code></a>). TP groups are rows of the last dimension: [0, 1] and [2, 3]. PP groups take the PP dimension: [0, 2] and [1, 3]. Neighbour ranks share a TP group. When ranks 0-1 run on one node and 2-3 on the other, the frequent all-reduces stay inside a node.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>A model has 32 layers and runs with PP = 3. How many layers does each stage get, and how many batches can be in flight with Model Runner V2 and async scheduling?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>11, 11 and 10 layers. 32 // 3 = 10 with a remainder of 2, and the code adds the extra layers to the stages before the last one (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/utils.py#L217-L222" target="_blank" rel="noopener" title="vllm/distributed/utils.py:217-222 at 3e44c0d"><code>vllm/distributed/utils.py:217-222</code></a>). <code>max_concurrent_batches</code> is <code>pp_size + 1</code> = 4 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L591-L593" target="_blank" rel="noopener" title="vllm/config/vllm.py:591-593 at 3e44c0d"><code>vllm/config/vllm.py:591-593</code></a>).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/tp-layers.html">The tensor-parallel layers (linear.py and vocab_parallel_embedding.py)</a><span class="rel-sum">vLLM&#x27;s linear and embedding layers know their tensor-parallel rank. They resolve a quantization method per layer, allocate only their slice, cut checkpoint tensors when they load, and call the all-reduce or all-gather in forward. QKVParallelLinear splits by heads and copies KV heads when TP is larger than their count.</span></li><li><a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a><span class="rel-sum">Each worker puts all ranks into one grid of shape (DP, PP, PCP, TP) and cuts it into process groups. Each group is a GroupCoordinator with a gloo CPU group, an NCCL device group and, for groups of more than one rank, a device communicator that picks the all-reduce implementation.</span></li><li><a href="../concepts/data-parallel-serving.html">Data parallel serving: several engine cores behind one endpoint</a><span class="rel-sum">With --data-parallel-size N, vllm serve runs N engine cores with their own KV caches. API servers pick an engine for each request with a load score; a DP coordinator publishes the load counts. Dense models run independent engines; MoE models step in lockstep, in waves, with dummy batches.</span></li><li><a href="../concepts/expert-parallel-moe.html">Expert parallelism and MoE serving</a><span class="rel-sum">An MoE layer in vLLM is an MoERunner built by FusedMoEFactory. Its kernel has two exchangeable parts - a prepare/finalize object that dispatches and combines tokens, and an experts object that runs the GEMMs. With --enable-expert-parallel the experts are split over all DP x TP ranks; EPLB moves busy experts, DBO overlaps the communication.</span></li><li><a href="../concepts/executors-and-workers.html">Executors and workers: from the engine core to the GPUs</a><span class="rel-sum">The executor starts the workers and runs each call on all of them. The uni executor calls one worker in the engine core process; the multiproc executor sends calls to one worker process per GPU through a shared-memory queue.</span></li><li><a href="../concepts/deployment-recipes.html">Deployment recipes: single GPU, TP, DP, multi-node, load balancers and security</a><span class="rel-sum">The deployment shapes of vllm serve with their exact commands and the processes that each one starts: one GPU, tensor parallel on one node, data parallel with internal load balancing, DP+EP for MoE, multi-node, disaggregated prefill, and servers behind a load balancer with /health probes. Then what --api-key protects and what it does not.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../learn/prefix-caching.html"><span class="pn-dir">← Previous</span><span class="pn-title">Prefix caching: the idea</span></a><a class="pn pn-next" href="../learn/quantized-checkpoints.html"><span class="pn-dir">Next →</span><span class="pn-title">Quantized checkpoints</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l3"><a href="#tensor-parallelism-split-every-layer">Tensor parallelism: split every layer</a></li><li class="toc-l3"><a href="#small-numbers-one-mlp-with-tp-2">Small numbers: one MLP with TP = 2</a></li><li class="toc-l3"><a href="#attention-split-by-heads">Attention: split by heads</a></li><li class="toc-l3"><a href="#pipeline-parallelism-split-the-layers">Pipeline parallelism: split the layers</a></li><li class="toc-l3"><a href="#data-and-expert-parallelism">Data and expert parallelism</a></li><li class="toc-l3"><a href="#a-decision-table-for-a-serving-operator">A decision table for a serving operator</a></li><li class="toc-l3"><a href="#an-everyday-comparison">An everyday comparison</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-vllm">In vLLM</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#columnparallellinear-and-rowparallellinear-line-by-line">ColumnParallelLinear and RowParallelLinear, line by line</a></li><li class="toc-l3"><a href="#attention-heads-and-the-kv-head-limit">Attention heads and the KV-head limit</a></li><li class="toc-l3"><a href="#pipeline-stages-which-layers-which-tensors">Pipeline stages: which layers, which tensors</a></li><li class="toc-l3"><a href="#ranks-groups-and-the-flags">Ranks, groups and the flags</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

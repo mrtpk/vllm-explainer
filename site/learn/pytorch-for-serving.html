@@ -1,0 +1,535 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PyTorch for serving: custom ops and torch.compile · vLLM Explained</title>
+<meta name="description" content="The PyTorch you need to read vLLM&#x27;s model code - nn.Module and forward, custom operators registered with torch.library, FX graphs, torch.compile (Dynamo for capture, Inductor for code generation), graph breaks, and how vLLM combines them with CUDA graphs.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="learn/pytorch-for-serving">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec" open><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a class="current" aria-current="page" href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>Learn the basics</span><span class="sep">›</span><span aria-current="page">PyTorch for serving</span></nav>
+<h1 class="page-title">PyTorch for serving: custom ops and torch.compile</h1>
+<div class="page-meta"><span class="level level-intermediate" title="Level">Intermediate</span><span class="meta-sec">Learn the basics</span><span class="meta-time">about 8 min read + 7 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../learn/what-is-vllm.html">What vLLM is today</a> <span class="level level-beginner level-sm">Beginner</span></li><li><a href="../learn/ml-basics-recap.html">What you need from DeepInfer Explained</a> <span class="level level-beginner level-sm">Beginner</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">vLLM writes models as PyTorch modules, hides attention in one custom op, and compiles the rest with torch.compile before it replays CUDA graphs.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+
+<h3 id="modules-and-forward">Modules and forward<a class="h-anchor" href="#modules-and-forward" aria-label="Link to this section">#</a></h3>
+<p>A PyTorch model is a tree of <code>nn.Module</code> objects. Each module holds its <strong>parameters</strong> (the weights, <code>nn.Parameter</code> tensors) and its child modules. Its <code>forward()</code> method computes the output from the input. When you call <code>module(x)</code>, PyTorch calls <code>forward(x)</code>. The parameters and some extra tensors (buffers) form the <strong>state</strong> of the module; a checkpoint is a saved copy of that state.</p>
+<p>vLLM models are such trees. For example, <code>LlamaMLP</code> has two linear layers and an activation, and its <code>forward()</code> calls them in order (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L82-L122" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:82-122 at 3e44c0d"><code>vllm/model_executor/models/llama.py:82-122</code></a>). The basics of the transformer layers are on <a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/learn/transformer.html" target="_blank" rel="noopener" title="DeepInfer Explained: Inside a transformer">Inside a transformer<span class="ext-mark" aria-hidden="true">↗</span></a>.</p>
+
+<h3 id="ops-kernels-and-streams">Ops, kernels and streams<a class="h-anchor" href="#ops-kernels-and-streams" aria-label="Link to this section">#</a></h3>
+<p>Each tensor operation (an <em>op</em>, for example a matrix multiply) runs as one or more kernels on the GPU. The CPU only starts (launches) the kernels; the GPU runs them in order on a stream. A program can use several streams and synchronize them with events (<a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/learn/gpus-kernels.html" target="_blank" rel="noopener" title="DeepInfer Explained: GPUs, kernels, and speed">GPUs, kernels, and speed<span class="ext-mark" aria-hidden="true">↗</span></a>). vLLM does this, for example, to copy the sampled tokens to the CPU on a separate copy stream. It records an event after the copy and waits for that event only when it needs the tokens (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/async_utils.py#L134-L140" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/async_utils.py:134-140 at 3e44c0d"><code>vllm/v1/worker/gpu/async_utils.py:134-140</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/async_utils.py#L171-L174" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/async_utils.py:171-174 at 3e44c0d"><code>vllm/v1/worker/gpu/async_utils.py:171-174</code></a>).</p>
+
+<h3 id="custom-ops-one-opaque-box">Custom ops: one opaque box<a class="h-anchor" href="#custom-ops-one-opaque-box" aria-label="Link to this section">#</a></h3>
+<p>Code can register its own operator with <code>torch.library</code>. Then <code>torch.ops.&lt;namespace&gt;.&lt;name&gt;(...)</code> calls it, and PyTorch treats it like a built-in op. vLLM registers its ops in the namespace <code>vllm</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/utils/torch_utils.py#L1056" target="_blank" rel="noopener" title="vllm/utils/torch_utils.py:1056 at 3e44c0d"><code>vllm/utils/torch_utils.py:1056</code></a>). The most important one is attention: <code>torch.ops.vllm.unified_attention_with_output</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/attention.py#L573-L580" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/attention.py:573-580 at 3e44c0d"><code>vllm/model_executor/layers/attention/attention.py:573-580</code></a>). For the compiler, this <a class="term" href="../reference/glossary.html#term-torch-library-op" data-term="torch.library op" data-def="An operator that code registers with PyTorch under a namespace, for example torch.ops.vllm.unified_attention_with_output. torch.compile treats it as one opaque node.">torch.library op</a> is one opaque node. The compiler does not look inside it. The page <a href="../concepts/forward-context.html">The forward context: how layers find per-step data</a> explains how the op finds its KV cache and metadata without arguments for them.</p>
+
+<h3 id="compile-capture-then-generate-code">Compile: capture, then generate code<a class="h-anchor" href="#compile-capture-then-generate-code" aria-label="Link to this section">#</a></h3>
+<p><a class="term" href="../reference/glossary.html#term-torch-compile" data-term="torch.compile" data-def="The PyTorch compiler. It captures a model as a graph and makes faster code for it. vLLM adds its own backend and passes.">torch.compile</a> has two halves:</p>
+<ol>
+  <li><strong><a class="term" href="../reference/glossary.html#term-dynamo" data-term="Dynamo" data-def="The capture part of torch.compile. It reads the Python bytecode of a function as it runs and records the tensor operations as an FX graph.">Dynamo</a></strong> watches the Python code of <code>forward()</code> when it runs, and records the tensor ops as an <a class="term" href="../reference/glossary.html#term-fx-graph" data-term="FX graph" data-def="A PyTorch data structure (torch.fx.GraphModule) that lists the operations of a function as nodes in order. Compiler passes read and change it.">FX graph</a>: a list of nodes, one per op.</li>
+  <li>A <strong>backend</strong> turns the graph into code. The default backend, <strong><a class="term" href="../reference/glossary.html#term-inductor" data-term="Inductor" data-def="The default code generator of torch.compile. It turns an FX graph into fused kernels, for example Triton kernels on NVIDIA GPUs.">Inductor</a></strong>, fuses many small ops into fewer, larger kernels, for example Triton kernels on NVIDIA GPUs.</li>
+</ol>
+<p>Some Python cannot be captured, for example a branch on a tensor value. That place is a <a class="term" href="../reference/glossary.html#term-graph-break" data-term="graph break" data-def="A place where Dynamo cannot capture the Python code. Plain torch.compile then splits the function and runs that part in Python. vLLM compiles with fullgraph=True, so a break is an error.">graph break</a>. Plain <code>torch.compile</code> then splits the function into several graphs and runs the rest in Python. vLLM does not allow this: it compiles with <code>fullgraph=True</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/compilation/wrapper.py#L168-L175" target="_blank" rel="noopener" title="vllm/compilation/wrapper.py:168-175 at 3e44c0d"><code>vllm/compilation/wrapper.py:168-175</code></a>).</p>
+
+<h3 id="cuda-graphs-on-top">CUDA graphs on top<a class="h-anchor" href="#cuda-graphs-on-top" aria-label="Link to this section">#</a></h3>
+<p>A <a class="term" href="../reference/glossary.html#term-cuda-graph" data-term="CUDA graph" data-def="A recorded sequence of GPU kernel launches that the GPU can replay with one launch. It removes CPU launch overhead in small steps.">CUDA graph</a> records a series of kernel launches once and replays them with one call. This removes most of the launch cost of small decode steps (<a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/concepts/cuda-graphs.html" target="_blank" rel="noopener" title="DeepInfer Explained: CUDA graphs">CUDA graphs<span class="ext-mark" aria-hidden="true">↗</span></a>). vLLM captures CUDA graphs for the compiled pieces and, for pure decode batches, for the whole forward pass. The page <a href="../concepts/compile-and-cuda-graphs.html">torch.compile and CUDA graphs in vLLM</a> explains the full design.</p>
+
+<h3 id="an-everyday-comparison">An everyday comparison<a class="h-anchor" href="#an-everyday-comparison" aria-label="Link to this section">#</a></h3>
+<p>Think of a cook who follows a recipe. Eager mode reads the recipe line by line, every time. Compilation rewrites the recipe once: it joins steps that use the same pan. A CUDA graph is a video of the cook; next time, the kitchen plays the video. Attention is one step that the rewrite must not touch, so it stays a sealed box in the recipe.</p>
+<p>The comparison stops here: a video plays the same moves with the same food. A CUDA graph also reads the same memory addresses every time, so vLLM must copy each new input into the same buffers before a replay.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b1a_eager_compiled_replay"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1, eager: Python LlamaAttention.forward calls qkv_proj, rotary_emb, attn and o_proj; the PyTorch dispatcher handles one call per op; the GPU runs many small kernels with gaps. Panel 2, compiled: Dynamo reads the bytecode and records an FX graph with fullgraph=True; the VllmBackend split_graph step splits the graph at splitting ops such as vllm::unified_attention_with_output; Inductor compiles each piece into fused Triton kernels and caches them. Panel 3, graph replay: at start-up vLLM captures PIECEWISE graphs for the pieces and FULL graphs for the whole model; each step a uniform one-token decode batch up to the largest captured size uses FULL, other batches use PIECEWISE, and too large batches run eager; the GPU replays one graph per piece with attention between the pieces."><svg role="img" aria-label="Panel 1, eager: Python LlamaAttention.forward calls qkv_proj, rotary_emb, attn and o_proj; the PyTorch dispatcher handles one call per op; the GPU runs many small kernels with gaps. Panel 2, compiled: Dynamo reads the bytecode and records an FX graph with fullgraph=True; the VllmBackend split_graph step splits the graph at splitting ops such as vllm::unified_attention_with_output; Inductor compiles each piece into fused Triton kernels and caches them. Panel 3, graph replay: at start-up vLLM captures PIECEWISE graphs for the pieces and FULL graphs for the whole model; each step a uniform one-token decode batch up to the largest captured size uses FULL, other batches use PIECEWISE, and too large batches run eager; the GPU replays one graph per piece with attention between the pieces." xmlns="http://www.w3.org/2000/svg" width="1100" height="938" viewBox="0 0 1100 938">
+<defs><marker id="dg-b1a_eager_compiled_replay-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#111827"/></marker><marker id="dg-b1a_eager_compiled_replay-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b1a_eager_compiled_replay-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker><marker id="dg-b1a_eager_compiled_replay-m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker></defs>
+<rect width="1100" height="938" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Three ways to run the same forward pass</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">one decoder layer of a Llama model  ·  CUDA platform  ·  default optimization level O2</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">eager  -&gt;  torch.compile (Dynamo + Inductor, vLLM backend)  -&gt;  CUDA graph replay</text>
+<rect x="20.0" y="116.0" width="1060.0" height="222.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="142.0" r="13" fill="#111827"/>
+<text x="46.0" y="146.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="147.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Eager: Python runs forward() one op at a time</text>
+<text x="68.0" y="166.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Each op goes through the PyTorch dispatcher and starts its own kernel. The CPU work grows with the number of ops.</text>
+<rect x="46.0" y="188.0" width="300.0" height="128.0" rx="8" fill="#ffffff" fill-opacity="1.0" stroke="#111827" stroke-width="1.5"/>
+<text x="58.0" y="208.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Python: LlamaAttention.forward</text>
+<text x="58.0" y="226.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">qkv, _ = self.qkv_proj(h)</text>
+<text x="58.0" y="241.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">q, k = self.rotary_emb(...)</text>
+<text x="58.0" y="256.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">o = self.attn(q, k, v)</text>
+<text x="58.0" y="271.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">out, _ = self.o_proj(o)</text>
+<rect x="400.0" y="188.0" width="300.0" height="128.0" rx="8" fill="#ffffff" fill-opacity="1.0" stroke="#111827" stroke-width="1.5"/>
+<text x="412.0" y="208.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">PyTorch dispatcher</text>
+<text x="412.0" y="226.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">one call per op</text>
+<text x="412.0" y="241.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">picks the CUDA kernel</text>
+<text x="412.0" y="256.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">checks shapes and dtypes</text>
+<text x="412.0" y="271.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">on every forward pass</text>
+<rect x="754.0" y="188.0" width="300.0" height="128.0" rx="8" fill="#ffffff" fill-opacity="1.0" stroke="#111827" stroke-width="1.5"/>
+<text x="766.0" y="208.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">GPU</text>
+<text x="766.0" y="226.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">many small kernels</text>
+<text x="766.0" y="241.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">a gap between two launches</text>
+<text x="766.0" y="256.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">CPU time ~ number of ops</text>
+<line x1="346.0" y1="238.0" x2="398.0" y2="238.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b1a_eager_compiled_replay-m0)"/>
+<line x1="700.0" y1="238.0" x2="752.0" y2="238.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b1a_eager_compiled_replay-m0)"/>
+<text x="373.0" y="228.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">op</text>
+<text x="727.0" y="228.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">launch</text>
+<rect x="20.0" y="358.0" width="1060.0" height="222.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="384.0" r="13" fill="#111827"/>
+<text x="46.0" y="388.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="389.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Compiled: Dynamo captures a graph, Inductor writes the kernels</text>
+<text x="68.0" y="408.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">vLLM compiles with fullgraph=True and splits the graph at the attention custom op. Inductor compiles each piece.</text>
+<rect x="46.0" y="430.0" width="300.0" height="128.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="58.0" y="450.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Dynamo (capture)</text>
+<text x="58.0" y="468.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">reads the Python bytecode</text>
+<text x="58.0" y="483.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">records the ops as an FX graph</text>
+<text x="58.0" y="498.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">fullgraph=True: a graph break</text>
+<text x="58.0" y="513.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  is an error</text>
+<rect x="400.0" y="430.0" width="300.0" height="128.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="412.0" y="450.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">VllmBackend: split_graph()</text>
+<text x="412.0" y="468.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">split at the splitting ops,</text>
+<text x="412.0" y="483.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">for example</text>
+<text x="412.0" y="498.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">vllm::unified_attention_</text>
+<text x="412.0" y="513.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  with_output (opaque)</text>
+<rect x="754.0" y="430.0" width="300.0" height="128.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="766.0" y="450.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Inductor (codegen)</text>
+<text x="766.0" y="468.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">compiles each piece</text>
+<text x="766.0" y="483.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">fuses ops into Triton kernels</text>
+<text x="766.0" y="498.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">fewer, larger kernels</text>
+<text x="766.0" y="513.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">cache: ~/.cache/vllm/torch_compile_cache</text>
+<line x1="346.0" y1="480.0" x2="398.0" y2="480.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b1a_eager_compiled_replay-m1)"/>
+<line x1="700.0" y1="480.0" x2="752.0" y2="480.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b1a_eager_compiled_replay-m2)"/>
+<text x="373.0" y="470.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">FX graph</text>
+<text x="727.0" y="470.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">pieces</text>
+<rect x="20.0" y="600.0" width="1060.0" height="222.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="626.0" r="13" fill="#111827"/>
+<text x="46.0" y="630.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="631.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Graph replay: record the launches once, replay them each step</text>
+<text x="68.0" y="650.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">At start-up vLLM captures CUDA graphs for fixed batch sizes. A step pads its batch to a captured size.</text>
+<rect x="46.0" y="672.0" width="300.0" height="128.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="58.0" y="692.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Capture (start-up)</text>
+<text x="58.0" y="710.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">run each captured size once</text>
+<text x="58.0" y="725.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">record all kernel launches</text>
+<text x="58.0" y="740.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">pieces: PIECEWISE graphs</text>
+<text x="58.0" y="755.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">whole model: FULL graphs</text>
+<rect x="400.0" y="672.0" width="300.0" height="128.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="412.0" y="692.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Dispatch (each step)</text>
+<text x="412.0" y="710.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">uniform 1-token decode batch</text>
+<text x="412.0" y="725.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  &lt;= largest size: FULL</text>
+<text x="412.0" y="740.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">other batches: PIECEWISE</text>
+<text x="412.0" y="755.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">too large: eager</text>
+<rect x="754.0" y="672.0" width="300.0" height="128.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="766.0" y="692.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">GPU</text>
+<text x="766.0" y="710.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">one replay per graph</text>
+<text x="766.0" y="725.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">attention runs between</text>
+<text x="766.0" y="740.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  PIECEWISE pieces</text>
+<text x="766.0" y="755.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">almost no launch overhead</text>
+<line x1="346.0" y1="722.0" x2="398.0" y2="722.0" stroke="#059669" stroke-width="1.6" marker-end="url(#dg-b1a_eager_compiled_replay-m3)"/>
+<line x1="700.0" y1="722.0" x2="752.0" y2="722.0" stroke="#059669" stroke-width="1.6" marker-end="url(#dg-b1a_eager_compiled_replay-m3)"/>
+<text x="373.0" y="712.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">graphs</text>
+<text x="727.0" y="712.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">replay</text>
+<text x="30.0" y="859.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="848.0" width="14.0" height="14.0" rx="3" fill="#ffffff" fill-opacity="1.0" stroke="#111827" stroke-width="1.4"/>
+<text x="118.3" y="859.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">eager PyTorch</text>
+<rect x="226.9" y="848.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="247.9" y="859.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">torch.compile</text>
+<rect x="352.1" y="848.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="373.1" y="859.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">vLLM split at custom ops</text>
+<rect x="545.5" y="848.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="566.5" y="859.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">CUDA graphs</text>
+<text x="30.0" y="888.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Default: optimization level O2 -&gt; compilation mode VLLM_COMPILE and CUDA graph mode FULL_AND_PIECEWISE.</text>
+<text x="30.0" y="906.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">--enforce-eager turns off both compilation and CUDA graphs. The attention backend can lower the graph mode.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the same forward pass in three forms. Eager runs op by op (panel 1). torch.compile captures and fuses the ops, split at attention (panel 2). CUDA graphs replay the recorded launches (panel 3).</figcaption><a class="diagram-open" href="../diagrams/b1a_eager_compiled_replay.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read the panels from top to bottom: each one adds a layer on top of the one before. The violet box in panel 2 is the vLLM part: it cuts the graph at the attention op. That cut is why panel 3 has PIECEWISE graphs, with attention between the pieces.</p>
+
+<h2 id="in-vllm">In vLLM<a class="h-anchor" href="#in-vllm" aria-label="Link to this section">#</a></h2>
+<p>This is a basics page, so this part gives only pointers. The page <a href="../concepts/compile-and-cuda-graphs.html">torch.compile and CUDA graphs in vLLM</a> explains the compile and capture code.</p>
+<ol>
+  <li><strong>The decorator.</strong> <code>@support_torch_compile</code> on a model class marks which <code>forward()</code> arguments have a dynamic first dimension, for example <code>input_ids</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L337-L347" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:337-347 at 3e44c0d"><code>vllm/model_executor/models/llama.py:337-347</code></a>). It adds <code>TorchCompileWithNoGuardsWrapper</code> as a base class (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/compilation/decorators.py#L360-L367" target="_blank" rel="noopener" title="vllm/compilation/decorators.py:360-367 at 3e44c0d"><code>vllm/compilation/decorators.py:360-367</code></a>).</li>
+  <li><strong>The compile call.</strong> The wrapper calls <code>torch.compile(forward, fullgraph=True, dynamic=False, backend=...)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/compilation/wrapper.py#L168-L175" target="_blank" rel="noopener" title="vllm/compilation/wrapper.py:168-175 at 3e44c0d"><code>vllm/compilation/wrapper.py:168-175</code></a>). In the default mode the backend is <code>VllmBackend</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L1123-L1134" target="_blank" rel="noopener" title="vllm/config/compilation.py:1123-1134 at 3e44c0d"><code>vllm/config/compilation.py:1123-1134</code></a>).</li>
+  <li><strong>The custom op helper.</strong> <code>direct_register_custom_op()</code> registers an op in the <code>vllm</code> library (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/utils/torch_utils.py#L1059-L1096" target="_blank" rel="noopener" title="vllm/utils/torch_utils.py:1059-1096 at 3e44c0d"><code>vllm/utils/torch_utils.py:1059-1096</code></a>).</li>
+</ol>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L224-L234" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/models/llama.py:224-234</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L224-L234" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">224</span><span class="ln">225</span><span class="ln">226</span><span class="ln">227</span><span class="ln">228</span><span class="ln">229</span><span class="ln">230</span><span class="ln">231</span><span class="ln">232</span><span class="ln">233</span><span class="ln">234</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -&gt; torch.Tensor:
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        q, k = self.rotary_emb(positions, q, k)
+        attn_output = self.attn(q, k, v)
+        output, _ = self.o_proj(attn_output)
+        return output</code></pre></div></div></div><figcaption class="code-caption"><code>LlamaAttention.forward()</code>: plain PyTorch calls. <code>self.attn(q, k, v)</code> ends in the opaque custom op.</figcaption></figure>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="nn-module-in-vllm-llamamlp-line-by-line" class="dd-title">nn.Module in vLLM: LlamaMLP, line by line</h3></summary><div class="dd-body"><figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L82-L122" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/models/llama.py:82-122</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L82-L122" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">82</span><span class="ln">83</span><span class="ln">84</span><span class="ln">85</span><span class="ln">86</span><span class="ln">87</span><span class="ln">88</span><span class="ln">89</span><span class="ln">90</span><span class="ln">91</span><span class="ln">92</span><span class="ln">93</span><span class="ln">94</span><span class="ln hl">95</span><span class="ln hl">96</span><span class="ln hl">97</span><span class="ln hl">98</span><span class="ln hl">99</span><span class="ln hl">100</span><span class="ln hl">101</span><span class="ln hl">102</span><span class="ln hl">103</span><span class="ln hl">104</span><span class="ln hl">105</span><span class="ln hl">106</span><span class="ln hl">107</span><span class="ln hl">108</span><span class="ln hl">109</span><span class="ln hl">110</span><span class="ln hl">111</span><span class="ln">112</span><span class="ln">113</span><span class="ln">114</span><span class="ln">115</span><span class="ln">116</span><span class="ln">117</span><span class="ln hl">118</span><span class="ln hl">119</span><span class="ln hl">120</span><span class="ln hl">121</span><span class="ln hl">122</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(37 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(38 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(40 * var(--code-lh))"></span><pre><code class="language-python">class LlamaMLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: QuantizationConfig | None = None,
+        bias: bool = False,
+        prefix: str = &quot;&quot;,
+        reduce_results: bool = True,
+        disable_tp: bool = False,
+    ) -&gt; None:
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinear(
+            input_size=hidden_size,
+            output_sizes=[intermediate_size] * 2,
+            bias=bias,
+            quant_config=quant_config,
+            disable_tp=disable_tp,
+            prefix=f&quot;{prefix}.gate_up_proj&quot;,
+        )
+        self.down_proj = RowParallelLinear(
+            input_size=intermediate_size,
+            output_size=hidden_size,
+            bias=bias,
+            quant_config=quant_config,
+            reduce_results=reduce_results,
+            disable_tp=disable_tp,
+            prefix=f&quot;{prefix}.down_proj&quot;,
+        )
+        if hidden_act != &quot;silu&quot;:
+            raise ValueError(
+                f&quot;Unsupported activation: {hidden_act}. Only silu is supported for now.&quot;
+            )
+        self.act_fn = SiluAndMul()
+
+    def forward(self, x):
+        x, _ = self.gate_up_proj(x)
+        x = maybe_fused_act_quant(self.act_fn, x, self.down_proj)
+        x, _ = self.down_proj(x)
+        return x</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 95-101.</strong> <code>gate_up_proj</code> is one linear layer for two matrices, the gate and the up projection. <code>output_sizes=[intermediate_size] * 2</code> stacks them. With tensor parallelism, each rank holds a slice of the columns (<a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/learn/parallelism.html" target="_blank" rel="noopener" title="DeepInfer Explained: Parallelism basics">Parallelism basics<span class="ext-mark" aria-hidden="true">↗</span></a>).</li>
+  <li><strong>Lines 103-110.</strong> <code>down_proj</code> is a row-parallel linear layer. With <code>reduce_results=True</code>, it ends with an all-reduce over the TP ranks.</li>
+  <li><strong>Line 116.</strong> <code>SiluAndMul</code> is a <a class="term" href="../reference/glossary.html#term-custom-op" data-term="CustomOp" data-def="A vLLM layer class with one forward method per platform (forward_cuda, forward_native, ...). It selects one of them when it is made.">CustomOp</a>: a vLLM layer that selects a CUDA kernel or a PyTorch version (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/activation.py#L116" target="_blank" rel="noopener" title="vllm/model_executor/layers/activation.py:116 at 3e44c0d"><code>vllm/model_executor/layers/activation.py:116</code></a>).</li>
+  <li><strong>Lines 118-122.</strong> <code>forward()</code> calls the three layers. The activation goes through <code>maybe_fused_act_quant()</code>: for a quantized <code>down_proj</code>, it can use one kernel for the activation and the input quantization; else it calls <code>SiluAndMul</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fusion/fused_act_quant.py#L196-L205" target="_blank" rel="noopener" title="vllm/model_executor/layers/fusion/fused_act_quant.py:196-205 at 3e44c0d"><code>vllm/model_executor/layers/fusion/fused_act_quant.py:196-205</code></a>). The linear layers return a pair; the second value (an optional bias) is not used here.</li>
+</ol>
+<p><strong>Shapes.</strong> vLLM flattens the batch: the first dimension is the number of tokens in the step, not the number of requests (<a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/learn/batching.html" target="_blank" rel="noopener" title="DeepInfer Explained: Batching">Batching<span class="ext-mark" aria-hidden="true">↗</span></a>).</p>
+<p><strong>Worked example</strong> (sizes from the <code>config.json</code> of Llama-3.1-8B: hidden size 4,096, intermediate size 14,336; inferred, not in the repo). A step has 256 tokens and TP = 1, in BF16:</p>
+<ol>
+  <li><code>x</code>: <code>[256, 4096]</code>.</li>
+  <li><code>gate_up_proj</code>: weight <code>[28672, 4096]</code> (2 × 14,336 rows), output <code>[256, 28672]</code>.</li>
+  <li><code>SiluAndMul</code>: <code>silu(first half) × second half</code>, output <code>[256, 14336]</code>.</li>
+  <li><code>down_proj</code>: weight <code>[4096, 14336]</code>, output <code>[256, 4096]</code>.</li>
+</ol>
+<p>The two weights hold 28,672 × 4,096 + 4,096 × 14,336 = 176,160,768 parameters, which is 352 MB in BF16. With TP = 2, each rank holds half of each weight and computes <code>[256, 14336]</code> after <code>gate_up_proj</code>.</p>
+<p>The weights are not loaded in <code>__init__</code>. vLLM makes the modules first and fills the parameters later from the checkpoint; see <a href="../concepts/weight-loading.html">&quot;Weight loading: from checkpoint files to GPU parameters&quot;</a>.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="custom-ops-with-torch-library-direct-register-custom-op" class="dd-title">Custom ops with torch.library: direct_register_custom_op()</h3></summary><div class="dd-body"><p>PyTorch has the public decorator <code>torch.library.custom_op</code>. vLLM uses its own helper, because the docstring says that <code>custom_op</code> "can have significant overhead" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/utils/torch_utils.py#L1068-L1071" target="_blank" rel="noopener" title="vllm/utils/torch_utils.py:1068-1071 at 3e44c0d"><code>vllm/utils/torch_utils.py:1068-1071</code></a>):</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/utils/torch_utils.py#L1055-L1096" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/utils/torch_utils.py:1055-1096</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/utils/torch_utils.py#L1055-L1096" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1055</span><span class="ln hl">1056</span><span class="ln">1057</span><span class="ln">1058</span><span class="ln">1059</span><span class="ln">1060</span><span class="ln">1061</span><span class="ln">1062</span><span class="ln">1063</span><span class="ln">1064</span><span class="ln">1065</span><span class="ln">1066</span><span class="ln">1067</span><span class="ln">1068</span><span class="ln">1069</span><span class="ln">1070</span><span class="ln">1071</span><span class="ln">1072</span><span class="ln">1073</span><span class="ln">1074</span><span class="ln">1075</span><span class="ln">1076</span><span class="ln">1077</span><span class="ln">1078</span><span class="ln">1079</span><span class="ln">1080</span><span class="ln">1081</span><span class="ln">1082</span><span class="ln">1083</span><span class="ln">1084</span><span class="ln hl">1085</span><span class="ln hl">1086</span><span class="ln hl">1087</span><span class="ln hl">1088</span><span class="ln hl">1089</span><span class="ln hl">1090</span><span class="ln hl">1091</span><span class="ln hl">1092</span><span class="ln hl">1093</span><span class="ln hl">1094</span><span class="ln hl">1095</span><span class="ln hl">1096</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(37 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(38 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(40 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(41 * var(--code-lh))"></span><pre><code class="language-python"># create a library to hold the custom op
+vllm_lib = Library(&quot;vllm&quot;, &quot;FRAGMENT&quot;)  # noqa
+
+
+def direct_register_custom_op(
+    op_name: str,
+    op_func: Callable,
+    mutates_args: list[str] | None = None,
+    fake_impl: Callable | None = None,
+    target_lib: Library | None = None,
+    dispatch_key: str | None = None,
+    tags: tuple[torch.Tag, ...] = (),
+):
+    &quot;&quot;&quot;`torch.library.custom_op` can have significant overhead because it
+    needs to consider complicated dispatching logic. This function
+    directly registers a custom op and dispatches it to the CUDA backend.
+    See https://gist.github.com/youkaichao/ecbea9ec9fc79a45d2adce1784d7a9a5
+    for more details.
+
+    By default, the custom op is registered to the vLLM library. If you
+    want to register it to a different library, you can pass the library
+    object to the `target_lib` argument.
+
+    IMPORTANT: the lifetime of the operator is tied to the lifetime of the
+    library object. If you want to bind the operator to a different library,
+    make sure the library object is alive when the operator is used.
+    &quot;&quot;&quot;
+    if mutates_args is None:
+        mutates_args = []
+
+    if dispatch_key is None:
+        from vllm.platforms import current_platform
+
+        dispatch_key = current_platform.dispatch_key
+
+    schema_str = infer_schema(op_func, mutates_args=mutates_args)
+
+    my_lib = target_lib or vllm_lib
+    my_lib.define(op_name + schema_str, tags=tags)
+    my_lib.impl(op_name, op_func, dispatch_key=dispatch_key)
+    if fake_impl is not None:
+        my_lib._register_fake(op_name, fake_impl)</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 1056.</strong> One <code>Library("vllm", "FRAGMENT")</code> object holds all vLLM ops. "FRAGMENT" means that other code can add ops to the same namespace.</li>
+  <li><strong>Lines 1082-1083.</strong> <code>mutates_args</code> lists the arguments that the op writes into. The compiler must know them, so it does not reorder or remove the op.</li>
+  <li><strong>Lines 1085-1088.</strong> The dispatch key comes from the platform: <code>"CUDA"</code> on NVIDIA (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/platforms/cuda.py#L230" target="_blank" rel="noopener" title="vllm/platforms/cuda.py:230 at 3e44c0d"><code>vllm/platforms/cuda.py:230</code></a>), <code>"CPU"</code> by default (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/platforms/interface.py#L145" target="_blank" rel="noopener" title="vllm/platforms/interface.py:145 at 3e44c0d"><code>vllm/platforms/interface.py:145</code></a>).</li>
+  <li><strong>Line 1090.</strong> <code>infer_schema</code> reads the type hints of the Python function and writes the op schema, for example <code>(Tensor query, Tensor key, ...) -&gt; ()</code>.</li>
+  <li><strong>Lines 1093-1094.</strong> <code>define</code> adds the schema; <code>impl</code> binds the Python function for the dispatch key.</li>
+  <li><strong>Lines 1095-1096.</strong> A <em>fake</em> implementation only makes empty output tensors with the right shapes. Dynamo calls it during capture instead of the real kernel (general PyTorch behaviour). The helper registers it only when the caller gives one.</li>
+</ol>
+<p><strong>Attention as an opaque op.</strong> vLLM registers <code>unified_attention_with_output</code> with <code>mutates_args=["output", "output_block_scale"]</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/attention.py#L799-L803" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/attention.py:799-803 at 3e44c0d"><code>vllm/model_executor/layers/attention/attention.py:799-803</code></a>). It returns nothing; it writes the result into <code>output</code>. Inside, it gets the attention metadata, the layer and the KV cache from the forward context (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/attention.py#L705-L723" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/attention.py:705-723 at 3e44c0d"><code>vllm/model_executor/layers/attention/attention.py:705-723</code></a>). A second op, <code>unified_kv_cache_update</code>, writes the new keys and values into the cache first. It runs only when the attention backend does not write the KV cache in its own forward (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/attention.py#L564-L572" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/attention.py:564-572 at 3e44c0d"><code>vllm/model_executor/layers/attention/attention.py:564-572</code></a>). It returns an empty tensor only to make a data dependency: the attention op takes it as an argument, so the compiler keeps the order (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/attention.py#L726-L732" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/attention.py:726-732 at 3e44c0d"><code>vllm/model_executor/layers/attention/attention.py:726-732</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/attention.py#L777-L782" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/attention.py:777-782 at 3e44c0d"><code>vllm/model_executor/layers/attention/attention.py:777-782</code></a>).</p>
+<p><strong>Which platforms use the opaque op.</strong> The layer calls <code>torch.ops.vllm.*</code> only when <code>current_platform.opaque_attention_op()</code> is true. Otherwise it calls the Python functions directly (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/attention.py#L436-L440" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/attention.py:436-440 at 3e44c0d"><code>vllm/model_executor/layers/attention/attention.py:436-440</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/attention.py#L542-L580" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/attention.py:542-580 at 3e44c0d"><code>vllm/model_executor/layers/attention/attention.py:542-580</code></a>). The base class returns false (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/platforms/interface.py#L1286-L1290" target="_blank" rel="noopener" title="vllm/platforms/interface.py:1286-1290 at 3e44c0d"><code>vllm/platforms/interface.py:1286-1290</code></a>); CUDA, ROCm, CPU and XPU return true (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/platforms/cuda.py#L595-L596" target="_blank" rel="noopener" title="vllm/platforms/cuda.py:595-596 at 3e44c0d"><code>vllm/platforms/cuda.py:595-596</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/platforms/rocm.py#L1231-L1232" target="_blank" rel="noopener" title="vllm/platforms/rocm.py:1231-1232 at 3e44c0d"><code>vllm/platforms/rocm.py:1231-1232</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/platforms/cpu.py#L640-L641" target="_blank" rel="noopener" title="vllm/platforms/cpu.py:640-641 at 3e44c0d"><code>vllm/platforms/cpu.py:640-641</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/platforms/xpu.py#L609-L610" target="_blank" rel="noopener" title="vllm/platforms/xpu.py:609-610 at 3e44c0d"><code>vllm/platforms/xpu.py:609-610</code></a>).</p>
+<aside class="callout callout-note"><p class="callout-title">Two meanings of &#x27;custom op&#x27;</p><div class="callout-body"><p>A <code>torch.library</code> op (this section) is a PyTorch operator. A vLLM <code>CustomOp</code> (for example <code>SiluAndMul</code>) is an <code>nn.Module</code> class that selects a kernel per platform. The page <a href="../concepts/custom-ops.html">CustomOp, out-of-tree ops and IR op providers</a> explains the second kind.</p></div></aside></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="torch-compile-fx-graphs-and-graph-breaks" class="dd-title">torch.compile, FX graphs and graph breaks</h3></summary><div class="dd-body"><p><strong>What Dynamo records.</strong> When the compiled function runs for the first time, Dynamo follows its Python bytecode. It records each tensor op as a node of a <code>torch.fx.Graph</code>. The graph has a placeholder node per input, a <code>call_function</code> node per op, and an output node. vLLM's split code walks these nodes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/compilation/backends.py#L576-L600" target="_blank" rel="noopener" title="vllm/compilation/backends.py:576-600 at 3e44c0d"><code>vllm/compilation/backends.py:576-600</code></a>). Python that does not touch tensors (for example a loop over the layers) runs during capture and leaves only its tensor ops in the graph.</p>
+<p><strong>Guards and dynamic shapes.</strong> Plain <code>torch.compile</code> adds guards: checks that run before each call and compile again when, for example, a shape changes. vLLM drops the guards in its own modes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/compilation/wrapper.py#L126-L146" target="_blank" rel="noopener" title="vllm/compilation/wrapper.py:126-146 at 3e44c0d"><code>vllm/compilation/wrapper.py:126-146</code></a>). It marks the token dimension as dynamic instead, from <code>dynamic_arg_dims</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L337-L346" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:337-346 at 3e44c0d"><code>vllm/model_executor/models/llama.py:337-346</code></a>). So one graph serves every number of tokens.</p>
+<p><strong>A graph break, by example</strong> (plain PyTorch, not vLLM code):</p>
+<pre><code class="language-python">import torch
+
+def f(x):
+    y = x.sin()
+    if y.sum() > 0:        # Python branch on a tensor value
+        return y.cos()
+    return y
+
+torch.compile(f)(torch.randn(8))                  # works: two graphs and a Python branch
+torch.compile(f, fullgraph=True)(torch.randn(8))  # fails: fullgraph does not allow the break</code></pre>
+<p>Dynamo cannot know the value of <code>y.sum()</code> during capture. Without <code>fullgraph</code>, it ends the graph before the branch, runs the branch in Python, and starts a new graph. With <code>fullgraph=True</code>, it raises an error instead. vLLM uses <code>fullgraph=True</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/compilation/wrapper.py#L168-L175" target="_blank" rel="noopener" title="vllm/compilation/wrapper.py:168-175 at 3e44c0d"><code>vllm/compilation/wrapper.py:168-175</code></a>). So model code that vLLM compiles must not branch on tensor values in <code>forward()</code>.</p>
+<p><strong>Where the work goes.</strong> In the default mode, the backend is <code>VllmBackend</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L1123-L1134" target="_blank" rel="noopener" title="vllm/config/compilation.py:1123-1134 at 3e44c0d"><code>vllm/config/compilation.py:1123-1134</code></a>). It splits the FX graph at the splitting ops. By default these are the attention ops in <code>_attention_ops</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L766-L788" target="_blank" rel="noopener" title="vllm/config/compilation.py:766-788 at 3e44c0d"><code>vllm/config/compilation.py:766-788</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L1184" target="_blank" rel="noopener" title="vllm/config/compilation.py:1184 at 3e44c0d"><code>vllm/config/compilation.py:1184</code></a>). When Inductor graph partition is off (the O2 default), they also include the two KV cache update ops (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L1191" target="_blank" rel="noopener" title="vllm/config/compilation.py:1191 at 3e44c0d"><code>vllm/config/compilation.py:1191</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L1212-L1213" target="_blank" rel="noopener" title="vllm/config/compilation.py:1212-1213 at 3e44c0d"><code>vllm/config/compilation.py:1212-1213</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L311" target="_blank" rel="noopener" title="vllm/config/vllm.py:311 at 3e44c0d"><code>vllm/config/vllm.py:311</code></a>). Then Inductor compiles each piece. The design document says that all compilation finishes before the server takes requests, and that vLLM caches the results (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/design/torch_compile.md#L18-L28" target="_blank" rel="noopener" title="docs/design/torch_compile.md:18-28 at 3e44c0d"><code>docs/design/torch_compile.md:18-28</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="compilation-modes-and-cuda-graph-modes-in-vllm" class="dd-title">Compilation modes and CUDA graph modes in vLLM</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>CompilationMode</th><th>Meaning (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L37-L50" target="_blank" rel="noopener" title="vllm/config/compilation.py:37-50 at 3e44c0d"><code>vllm/config/compilation.py:37-50</code></a>)</th></tr></thead>
+  <tbody>
+    <tr><td><code>NONE</code> (0)</td><td>No <code>torch.compile</code>; eager PyTorch.</td></tr>
+    <tr><td><code>STOCK_TORCH_COMPILE</code> (1)</td><td>The standard <code>torch.compile</code> pipeline.</td></tr>
+    <tr><td><code>DYNAMO_TRACE_ONCE</code> (2)</td><td>One Dynamo trace, no compile again.</td></tr>
+    <tr><td><code>VLLM_COMPILE</code> (3)</td><td>vLLM's Inductor-based backend with caching, piecewise compilation and custom passes.</td></tr>
+  </tbody>
+</table>
+<p><strong>Defaults.</strong> The default optimization level is O2 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L434" target="_blank" rel="noopener" title="vllm/config/vllm.py:434 at 3e44c0d"><code>vllm/config/vllm.py:434</code></a>). Above O0, an unset mode becomes <code>VLLM_COMPILE</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L1806-L1810" target="_blank" rel="noopener" title="vllm/config/vllm.py:1806-1810 at 3e44c0d"><code>vllm/config/vllm.py:1806-1810</code></a>). O2 sets the CUDA graph mode <code>FULL_AND_PIECEWISE</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L310" target="_blank" rel="noopener" title="vllm/config/vllm.py:310 at 3e44c0d"><code>vllm/config/vllm.py:310</code></a>). <code>--enforce-eager</code> sets both the compile mode and the CUDA graph mode to <code>NONE</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L1745-L1747" target="_blank" rel="noopener" title="vllm/config/vllm.py:1745-1747 at 3e44c0d"><code>vllm/config/vllm.py:1745-1747</code></a>).</p>
+<p><strong>CUDA graph modes.</strong> <code>NONE</code>, <code>PIECEWISE</code> and <code>FULL</code> are run-time modes. <code>FULL_DECODE_ONLY</code> and <code>FULL_AND_PIECEWISE</code> are pairs: one mode for pure decode batches, one for mixed batches (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L53-L69" target="_blank" rel="noopener" title="vllm/config/compilation.py:53-69 at 3e44c0d"><code>vllm/config/compilation.py:53-69</code></a>). Each step, the model runner looks for a captured graph for the padded token count, and falls back to <code>NONE</code> when none fits (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/cudagraph_utils.py#L523-L553" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/cudagraph_utils.py:523-553 at 3e44c0d"><code>vllm/v1/worker/gpu/cudagraph_utils.py:523-553</code></a>). In the common case (no speculative decoding), a FULL decode graph is captured for batches where each request has 1 new token (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L442-L445" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:442-445 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:442-445</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/cudagraph_utils.py#L333-L339" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/cudagraph_utils.py:333-339 at 3e44c0d"><code>vllm/v1/worker/gpu/cudagraph_utils.py:333-339</code></a>). A batch matches it only with that uniform length and at most the captured token count (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/cudagraph_utils.py#L125-L138" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/cudagraph_utils.py:125-138 at 3e44c0d"><code>vllm/v1/worker/gpu/cudagraph_utils.py:125-138</code></a>). Other batches use PIECEWISE graphs.</p>
+<aside class="callout callout-simplified"><p class="callout-title">Simplified</p><div class="callout-body"><p>With speculative decoding the decode query length is larger, and a "varlen decode" variant accepts mixed lengths (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/cudagraph_utils.py#L302-L317" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/cudagraph_utils.py:302-317 at 3e44c0d"><code>vllm/v1/worker/gpu/cudagraph_utils.py:302-317</code></a>). The page <a href="../concepts/compile-and-cuda-graphs.html">torch.compile and CUDA graphs in vLLM</a> covers these cases.</p></div></aside>
+<p><strong>Worked example</strong> (illustrative numbers). A decode step of a 32-layer model starts about 15 kernels per layer in eager mode: 480 launches. At about 5 µs of CPU time per launch, that is 2.4 ms per step. A step of a small model on a fast GPU can take less than that, so the GPU would wait for the CPU. With a FULL CUDA graph, the CPU starts one replay instead.</p>
+<aside class="callout callout-simplified"><p class="callout-title">Simplified</p><div class="callout-body"><p>The kernel count and the launch time are round numbers for the example, not measured. Fusion in Inductor also lowers the kernel count. The page <a href="../concepts/compile-and-cuda-graphs.html">torch.compile and CUDA graphs in vLLM</a> explains the capture sizes, the padding and the attention backends that lower the graph mode.</p></div></aside></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><strong>Slow first start.</strong> Compilation runs at start-up, before the server takes requests (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/design/torch_compile.md#L28" target="_blank" rel="noopener" title="docs/design/torch_compile.md:28 at 3e44c0d"><code>docs/design/torch_compile.md:28</code></a>). CUDA graph capture also runs at start-up. Later starts reuse the cache. <code>VLLM_DISABLE_COMPILE_CACHE=1</code> turns the cache off (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L375" target="_blank" rel="noopener" title="vllm/envs.py:375 at 3e44c0d"><code>vllm/envs.py:375</code></a>), so every start compiles again.</li>
+  <li><strong>A graph break in your own model.</strong> This applies to a model class with <code>@support_torch_compile</code>. With <code>fullgraph=True</code>, a branch on a tensor value or an unsupported Python call stops compilation with an error (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/compilation/wrapper.py#L168-L175" target="_blank" rel="noopener" title="vllm/compilation/wrapper.py:168-175 at 3e44c0d"><code>vllm/compilation/wrapper.py:168-175</code></a>). Move such logic out of <code>forward()</code>, or run with <code>--enforce-eager</code> to find the problem.</li>
+  <li><strong>A custom op without a fake implementation.</strong> In PyTorch, an op that returns new tensors needs a fake implementation, so that Dynamo knows the output shapes during capture (general PyTorch rule). With the vLLM helper, you give it as <code>fake_impl</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/utils/torch_utils.py#L1095-L1096" target="_blank" rel="noopener" title="vllm/utils/torch_utils.py:1095-1096 at 3e44c0d"><code>vllm/utils/torch_utils.py:1095-1096</code></a>), as for <code>unified_kv_cache_update</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/attention.py#L759-L764" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/attention.py:759-764 at 3e44c0d"><code>vllm/model_executor/layers/attention/attention.py:759-764</code></a>). The attention op is registered without a fake implementation; it returns nothing and writes into <code>output</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/attention.py#L799-L803" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/attention.py:799-803 at 3e44c0d"><code>vllm/model_executor/layers/attention/attention.py:799-803</code></a>).</li>
+  <li><strong>A missing <code>mutates_args</code>.</strong> An op that writes into an argument without saying so can be reordered or removed by the compiler. vLLM lists <code>output</code> for attention (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/attention.py#L802" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/attention.py:802 at 3e44c0d"><code>vllm/model_executor/layers/attention/attention.py:802</code></a>).</li>
+  <li><strong><code>--enforce-eager</code> in production.</strong> It turns off both compilation and CUDA graphs (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L1745-L1747" target="_blank" rel="noopener" title="vllm/config/vllm.py:1745-1747 at 3e44c0d"><code>vllm/config/vllm.py:1745-1747</code></a>). Use it to debug, not to serve: small decode steps become much slower.</li>
+</ul>
+<p><strong>Why it matters.</strong> Every model file in vLLM is written for this pipeline. Know what the compiler sees. Then you can read the model code, write a model plugin that compiles, and explain the start-up time of <code>vllm serve</code>.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>What are the two halves of <code>torch.compile</code>, and what does each do?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Dynamo captures the Python code as an FX graph. A backend, by default Inductor, turns the graph into fused kernels. In vLLM's default mode, the backend is <code>VllmBackend</code>, which splits the graph and then compiles the pieces (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L1123-L1134" target="_blank" rel="noopener" title="vllm/config/compilation.py:1123-1134 at 3e44c0d"><code>vllm/config/compilation.py:1123-1134</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>Which flag turns off both <code>torch.compile</code> and CUDA graphs?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>--enforce-eager</code>. It sets the compile mode and the CUDA graph mode to <code>NONE</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L1745-L1747" target="_blank" rel="noopener" title="vllm/config/vllm.py:1745-1747 at 3e44c0d"><code>vllm/config/vllm.py:1745-1747</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>Why is attention registered as a <code>torch.library</code> op on CUDA, and not left as plain PyTorch code?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The compiler then sees attention as one opaque node. vLLM splits the graph at that node, so the pieces around it can be compiled and captured as PIECEWISE CUDA graphs (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L766-L769" target="_blank" rel="noopener" title="vllm/config/compilation.py:766-769 at 3e44c0d"><code>vllm/config/compilation.py:766-769</code></a>). The op reads its KV cache and metadata from the forward context (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/attention.py#L705-L722" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/attention.py:705-722 at 3e44c0d"><code>vllm/model_executor/layers/attention/attention.py:705-722</code></a>). CUDA returns true for <code>opaque_attention_op()</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/platforms/cuda.py#L595-L596" target="_blank" rel="noopener" title="vllm/platforms/cuda.py:595-596 at 3e44c0d"><code>vllm/platforms/cuda.py:595-596</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>Your model plugin has <code>if positions.max() &gt; 4096:</code> in the <code>forward()</code> of a class with <code>@support_torch_compile</code>. What happens at start-up with default flags, and why?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Compilation fails with an error. The branch depends on a tensor value, so Dynamo cannot capture it: it is a graph break. vLLM compiles with <code>fullgraph=True</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/compilation/wrapper.py#L168-L175" target="_blank" rel="noopener" title="vllm/compilation/wrapper.py:168-175 at 3e44c0d"><code>vllm/compilation/wrapper.py:168-175</code></a>), and <code>VLLM_COMPILE</code> is the default above O0 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L1806-L1810" target="_blank" rel="noopener" title="vllm/config/vllm.py:1806-1810 at 3e44c0d"><code>vllm/config/vllm.py:1806-1810</code></a>). Move the check out of <code>forward()</code>, or use a tensor operation such as <code>torch.where</code>.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>In the <code>LlamaMLP</code> worked example, how many parameters does one rank hold with TP = 4, and what is the shape after <code>gate_up_proj</code> for 256 tokens?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Each rank holds a quarter of each weight: 176,160,768 / 4 = 44,040,192 parameters (88 MB in BF16). After <code>gate_up_proj</code> the shape is <code>[256, 7168]</code>: 2 × 14,336 / 4 columns. The column split comes from <code>MergedColumnParallelLinear</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L95-L101" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:95-101 at 3e44c0d"><code>vllm/model_executor/models/llama.py:95-101</code></a>), and <code>down_proj</code> then reduces the results over the ranks (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/llama.py#L103-L110" target="_blank" rel="noopener" title="vllm/model_executor/models/llama.py:103-110 at 3e44c0d"><code>vllm/model_executor/models/llama.py:103-110</code></a>).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/compile-and-cuda-graphs.html">torch.compile and CUDA graphs in vLLM</a><span class="rel-sum">vLLM compiles the inner model once with torch.compile and its own Inductor backend, splits the graph at the attention ops, caches the result on disk, and captures CUDA graphs at start-up. Each step, Model Runner V2 replays a FULL graph for uniform decode batches, PIECEWISE graphs for other batches up to the largest capture size, and runs eagerly above it.</span></li><li><a href="../concepts/forward-context.html">The forward context: how layers find per-step data</a><span class="rel-sum">Attention layers register themselves by name when the model is built, get their KV cache tensor bound at start-up, and read the per-step metadata from a global forward context that the model runner sets around each forward pass. The attention custom ops take only the layer name, so torch.compile sees them as opaque.</span></li><li><a href="../concepts/custom-ops.html">CustomOp, out-of-tree ops and IR op providers</a><span class="rel-sum">A CustomOp is a layer with one forward method per platform. It picks one method when it is built - forward_native when disabled, the platform&#x27;s method when enabled. Plugins replace whole classes with register_oot, and vllm.ir adds a second, per-op provider choice.</span></li><li><a href="../concepts/model-definition.html">How a vLLM model file is written (llama.py)</a><span class="rel-sum">A vLLM model file rebuilds the Hugging Face architecture from vLLM layers. Every constructor takes vllm_config and a prefix, linear layers are tensor-parallel, attention is an Attention layer object, and pipeline stages use PPMissingLayer and IntermediateTensors. llama.py is the example.</span></li><li><a href="../code/model-executor-models-llama.html">&quot;model_executor/models/llama.py: the Llama model&quot;</a><span class="rel-sum">vllm/model_executor/models/llama.py defines LlamaMLP, LlamaAttention, LlamaDecoderLayer, LlamaModel and LlamaForCausalLM from tensor-parallel layers, plus two bidirectional wrappers. It is the reference model file of vLLM; nine registry names and many other model files reuse it.</span></li><li><a href="../tours/forward-pass.html">Tour: One forward pass</a><span class="rel-sum">Follow one forward pass of Llama-3-8B on one H100 in 14 stops, for a batch of two decodes and one 298-token prompt: Model Runner V2 inputs, the PIECEWISE CUDA graph, one decoder layer with its shapes, FlashAttention, logits and the sampler.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../learn/python-entry-points.html"><span class="pn-dir">← Previous</span><span class="pn-title">Python entry points</span></a><a class="pn pn-next" href="../learn/prefix-caching.html"><span class="pn-dir">Next →</span><span class="pn-title">Prefix caching: the idea</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l3"><a href="#modules-and-forward">Modules and forward</a></li><li class="toc-l3"><a href="#ops-kernels-and-streams">Ops, kernels and streams</a></li><li class="toc-l3"><a href="#custom-ops-one-opaque-box">Custom ops: one opaque box</a></li><li class="toc-l3"><a href="#compile-capture-then-generate-code">Compile: capture, then generate code</a></li><li class="toc-l3"><a href="#cuda-graphs-on-top">CUDA graphs on top</a></li><li class="toc-l3"><a href="#an-everyday-comparison">An everyday comparison</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-vllm">In vLLM</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#nn-module-in-vllm-llamamlp-line-by-line">nn.Module in vLLM: LlamaMLP, line by line</a></li><li class="toc-l3"><a href="#custom-ops-with-torch-library-direct-register-custom-op">Custom ops with torch.library: direct_register_custom_op()</a></li><li class="toc-l3"><a href="#torch-compile-fx-graphs-and-graph-breaks">torch.compile, FX graphs and graph breaks</a></li><li class="toc-l3"><a href="#compilation-modes-and-cuda-graph-modes-in-vllm">Compilation modes and CUDA graph modes in vLLM</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

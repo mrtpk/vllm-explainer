@@ -1,0 +1,593 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Expert parallelism and MoE serving · vLLM Explained</title>
+<meta name="description" content="An MoE layer in vLLM is an MoERunner built by FusedMoEFactory. Its kernel has two exchangeable parts - a prepare/finalize object that dispatches and combines tokens, and an experts object that runs the GEMMs. With --enable-expert-parallel the experts are split over all DP x TP ranks; EPLB moves busy experts, DBO overlaps the communication.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="concepts/expert-parallel-moe">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a class="current" aria-current="page" href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>vLLM concepts</span><span class="sep">›</span><span>Scale and deployment</span><span class="sep">›</span><span aria-current="page">Expert parallel MoE</span></nav>
+<h1 class="page-title">Expert parallelism and MoE serving</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">vLLM concepts</span><span class="meta-time">about 10 min read + 7 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../concepts/data-parallel-serving.html">Data parallel serving: several engine cores behind one endpoint</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../concepts/tp-layers.html">The tensor-parallel layers (linear.py and vocab_parallel_embedding.py)</a> <span class="level level-advanced level-sm">Advanced</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">vLLM runs each MoE layer as router, dispatch, local experts and combine. Expert parallelism spreads the experts over all DP × TP ranks.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>A Mixture-of-Experts layer has many expert MLPs, and a router sends each token to its top-k experts (<a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/learn/moe.html" target="_blank" rel="noopener" title="DeepInfer Explained: Mixture of Experts (MoE)">Mixture of Experts<span class="ext-mark" aria-hidden="true">↗</span></a>). With expert parallelism, each GPU holds only some experts, and tokens travel to the GPUs of their experts and back (<a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/concepts/expert-parallelism.html" target="_blank" rel="noopener" title="DeepInfer Explained: Expert parallelism (dispatch/combine)">Expert parallelism<span class="ext-mark" aria-hidden="true">↗</span></a>). This page shows how vLLM builds such a layer, how it chooses the communication and the kernels, and which flags change it.</p>
+<p>vLLM splits the work of one MoE layer into four parts. The <strong>router</strong> picks the experts. The <strong>dispatch</strong> moves the tokens. The <strong>experts</strong> compute. The <strong>combine</strong> brings the weighted results back. A <a class="term" href="../reference/glossary.html#term-modular-kernel" data-term="modular MoE kernel" data-def="An MoE kernel built from two parts: a prepare/finalize object (quantize and dispatch, then combine) and an experts object (the grouped GEMMs).">modular MoE kernel</a> keeps dispatch and combine in one object and the experts in another, so any communication method can work with any expert kernel. The communication method is the <a class="term" href="../reference/glossary.html#term-all2all-backend" data-term="all2all backend" data-def="The communication method that moves MoE tokens to the ranks of their experts and back. Set with --all2all-backend; the default is allgather_reducescatter.">all2all backend</a>.</p>
+<p>Without <code>--enable-expert-parallel</code>, an MoE model still runs on several GPUs, but each expert is split with tensor parallelism over all DP × TP ranks. With the flag, each rank owns whole experts. A large MoE deployment usually runs data parallel attention plus expert parallel MoE: <code>-dp 8 -ep</code>.</p>
+<p><strong>An everyday comparison.</strong> Think of a hospital with specialists on several floors. At the front desk (the router), each patient gets a list of two specialists. Porters (dispatch) take the patients to the right floors, the specialists see them (experts), and the porters bring the patients back with the reports (combine). The comparison stops here. In vLLM, every patient on every floor moves in the same time slot, so a floor with no patients still joins each slot.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b8b_moe_flow"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: DP = 2, TP = 1, expert parallelism with EP size 2, 8 experts, top-2, rank 0 holds experts 0 to 3 and rank 1 holds experts 4 to 7. Step 1, the router on each rank: rank 0 has 3 tokens and computes logits [3, 8]; tokens t0 to t2 choose experts (1,5), (2,3), (6,7); rank 1 has 2 tokens; t3 and t4 choose (0,4) and (4,5); plus top-2 weights. Step 2, dispatch: the default allgather_reducescatter backend all-gathers over the DP group, so every rank sees all 5 tokens; DeepEP or NIXL-EP send each token only to the ranks of its experts. Step 3, local experts: rank 0 runs experts 0 to 3 on t0, t1 and t3; rank 1 runs experts 4 to 7 on t0, t2, t3 and t4; the expert map turns global ids into local ids. Panel 2: step 4 combine, the default reduce-scatter over DP returns [3, H] to rank 0 and [2, H] to rank 1, each row the weighted sum of expert outputs. Step 5, shared experts, a dense MLP on local tokens that can start before dispatch on a second stream. Step 6, the layer output on each rank. Panel 3: the objects. MoERunner holds the router, RoutedExperts, optional shared experts and gate, and calls torch.ops.vllm.moe_forward. FusedMoEPrepareAndFinalize is the dispatch and combine backend: naive, DeepEP high-throughput, low-latency, v2, NIXL-EP, MoRI, FlashInfer NVLink, MoonEP, passthrough. FusedMoEExperts are the grouped expert GEMMs, picked by an oracle per quantization type."><svg role="img" aria-label="Panel 1: DP = 2, TP = 1, expert parallelism with EP size 2, 8 experts, top-2, rank 0 holds experts 0 to 3 and rank 1 holds experts 4 to 7. Step 1, the router on each rank: rank 0 has 3 tokens and computes logits [3, 8]; tokens t0 to t2 choose experts (1,5), (2,3), (6,7); rank 1 has 2 tokens; t3 and t4 choose (0,4) and (4,5); plus top-2 weights. Step 2, dispatch: the default allgather_reducescatter backend all-gathers over the DP group, so every rank sees all 5 tokens; DeepEP or NIXL-EP send each token only to the ranks of its experts. Step 3, local experts: rank 0 runs experts 0 to 3 on t0, t1 and t3; rank 1 runs experts 4 to 7 on t0, t2, t3 and t4; the expert map turns global ids into local ids. Panel 2: step 4 combine, the default reduce-scatter over DP returns [3, H] to rank 0 and [2, H] to rank 1, each row the weighted sum of expert outputs. Step 5, shared experts, a dense MLP on local tokens that can start before dispatch on a second stream. Step 6, the layer output on each rank. Panel 3: the objects. MoERunner holds the router, RoutedExperts, optional shared experts and gate, and calls torch.ops.vllm.moe_forward. FusedMoEPrepareAndFinalize is the dispatch and combine backend: naive, DeepEP high-throughput, low-latency, v2, NIXL-EP, MoRI, FlashInfer NVLink, MoonEP, passthrough. FusedMoEExperts are the grouped expert GEMMs, picked by an oracle per quantization type." xmlns="http://www.w3.org/2000/svg" width="1100" height="920" viewBox="0 0 1100 920">
+<defs><marker id="dg-b8b_moe_flow-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker><marker id="dg-b8b_moe_flow-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b8b_moe_flow-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#111827"/></marker></defs>
+<rect width="1100" height="920" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">One MoE layer with expert parallelism</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">DP = 2, TP = 1, --enable-expert-parallel  →  EP size 2  ·  8 experts, top_k = 2  ·  linear placement</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rank 0 holds experts 0-3  ·  rank 1 holds experts 4-7  ·  hidden size H  ·  rank 0 has 3 tokens, rank 1 has 2</text>
+<rect x="20.0" y="116.0" width="1060.0" height="236.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="142.0" r="13" fill="#111827"/>
+<text x="46.0" y="146.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="147.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Where do the tokens go?</text>
+<text x="68.0" y="166.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The router picks 2 experts per token; dispatch moves each token to the ranks that own them.</text>
+<rect x="46.0" y="186.0" width="316.0" height="140.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="58.0" y="206.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">1  Router (on each rank)</text>
+<text x="58.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rank 0: x [3, H] → logits [3, 8]</text>
+<text x="58.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">top-2 ids  t0:(1,5) t1:(2,3) t2:(6,7)</text>
+<text x="58.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rank 1: x [2, H]</text>
+<text x="58.0" y="269.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">top-2 ids  t3:(0,4) t4:(4,5)</text>
+<text x="58.0" y="284.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">+ top-2 weights [T, 2]</text>
+<rect x="392.0" y="186.0" width="316.0" height="140.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="404.0" y="206.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">2  Dispatch (prepare)</text>
+<text x="404.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">default allgather_reducescatter:</text>
+<text x="404.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">all-gather over the DP group</text>
+<text x="404.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">→ every rank sees all 5 tokens</text>
+<text x="404.0" y="269.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">DeepEP / NIXL-EP: send each token</text>
+<text x="404.0" y="284.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">only to the ranks of its experts</text>
+<rect x="738.0" y="186.0" width="316.0" height="140.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="750.0" y="206.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">3  Local experts</text>
+<text x="750.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rank 0: experts 0-3 run on</text>
+<text x="750.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  t0(e1) t1(e2,e3) t3(e0)</text>
+<text x="750.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rank 1: experts 4-7 run on</text>
+<text x="750.0" y="269.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  t0(e5) t2(e6,e7) t3(e4) t4(e4,e5)</text>
+<text x="750.0" y="284.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">expert_map: global id → local id</text>
+<line x1="362.0" y1="256.0" x2="390.0" y2="256.0" stroke="#d97706" stroke-width="2" marker-end="url(#dg-b8b_moe_flow-m0)"/>
+<line x1="708.0" y1="256.0" x2="736.0" y2="256.0" stroke="#d97706" stroke-width="2" marker-end="url(#dg-b8b_moe_flow-m0)"/>
+<rect x="20.0" y="374.0" width="1060.0" height="200.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="400.0" r="13" fill="#111827"/>
+<text x="46.0" y="404.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="405.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">How do the results come back?</text>
+<text x="68.0" y="424.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Combine sums the weighted expert outputs of each token and returns them to the token&#x27;s own rank.</text>
+<rect x="46.0" y="444.0" width="316.0" height="104.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="58.0" y="464.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">4  Combine (finalize)</text>
+<text x="58.0" y="482.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">default: reduce-scatter over DP</text>
+<text x="58.0" y="497.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">→ rank 0 gets [3, H], rank 1 [2, H]</text>
+<text x="58.0" y="512.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">each row = Σ weight · expert output</text>
+<rect x="392.0" y="444.0" width="316.0" height="104.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="404.0" y="464.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">5  + shared experts (if any)</text>
+<text x="404.0" y="482.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">dense MLP on the local tokens,</text>
+<text x="404.0" y="497.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">started before dispatch, may run</text>
+<text x="404.0" y="512.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">on a second CUDA stream</text>
+<rect x="738.0" y="444.0" width="316.0" height="104.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="750.0" y="464.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">6  Layer output</text>
+<text x="750.0" y="482.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">rank 0: [3, H]   rank 1: [2, H]</text>
+<text x="750.0" y="497.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">next: attention again, on each</text>
+<text x="750.0" y="512.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">DP rank&#x27;s own tokens only</text>
+<line x1="362.0" y1="496.0" x2="390.0" y2="496.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b8b_moe_flow-m1)"/>
+<line x1="708.0" y1="496.0" x2="736.0" y2="496.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b8b_moe_flow-m1)"/>
+<rect x="20.0" y="596.0" width="1060.0" height="214.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="622.0" r="13" fill="#111827"/>
+<text x="46.0" y="626.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="627.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Which objects does FusedMoEFactory build?</text>
+<text x="68.0" y="646.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">One MoERunner per MoE layer; the kernel is a prepare/finalize object plus an experts object.</text>
+<rect x="46.0" y="666.0" width="316.0" height="116.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="58.0" y="686.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">MoERunner</text>
+<text x="58.0" y="704.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">router: FusedMoERouter</text>
+<text x="58.0" y="719.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">routed_experts: RoutedExperts</text>
+<text x="58.0" y="734.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">shared_experts, gate (optional)</text>
+<text x="58.0" y="749.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">forward → torch.ops.vllm.moe_forward</text>
+<rect x="392.0" y="666.0" width="316.0" height="116.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="404.0" y="686.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">FusedMoEPrepareAndFinalize</text>
+<text x="404.0" y="704.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">= dispatch + combine backend</text>
+<text x="404.0" y="719.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">naive (AG/RS), DeepEP HT / LL / v2,</text>
+<text x="404.0" y="734.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">NIXL-EP, MoRI, FlashInfer NVLink,</text>
+<text x="404.0" y="749.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">MoonEP, passthrough</text>
+<rect x="738.0" y="666.0" width="316.0" height="116.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="750.0" y="686.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">FusedMoEExperts</text>
+<text x="750.0" y="704.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">= the grouped expert GEMMs</text>
+<text x="750.0" y="719.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">picked by an oracle per quant type:</text>
+<text x="750.0" y="734.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">triton, flashinfer, cutlass,</text>
+<text x="750.0" y="749.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">deep_gemm, marlin, aiter, …</text>
+<line x1="362.0" y1="724.0" x2="390.0" y2="724.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b8b_moe_flow-m2)"/>
+<text x="723.0" y="730.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="20" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">+</text>
+<text x="30.0" y="845.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="834.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="845.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">tokens on their own rank</text>
+<rect x="287.0" y="834.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="308.0" y="845.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">communication</text>
+<rect x="418.9" y="834.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="439.9" y="845.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">expert compute</text>
+<rect x="556.0" y="834.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="577.0" y="845.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">layer objects</text>
+<text x="30.0" y="870.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Token ids, expert choices and sizes are an example. Without --enable-expert-parallel, the experts are split with TP</text>
+<text x="30.0" y="888.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  over all DP x TP ranks instead (ep_size = 1). Kernel internals are not shown.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: one MoE layer with DP = 2 and expert parallelism. The token path (panels 1 and 2) and the objects that FusedMoEFactory builds (panel 3).</figcaption><a class="diagram-open" href="../diagrams/b8b_moe_flow.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Follow the token ids. Rank 0's token t0 chose experts 1 and 5. So both ranks compute part of it, and the combine sums the two parts on rank 0. Panel 3 is the code view: the runner owns the layer; the kernel is "prepare/finalize + experts".</p>
+
+<h2 id="in-the-code">In the code<a class="h-anchor" href="#in-the-code" aria-label="Link to this section">#</a></h2>
+
+<h3 id="step-1-fusedmoefactory-builds-the-layer">Step 1: FusedMoEFactory builds the layer<a class="h-anchor" href="#step-1-fusedmoefactory-builds-the-layer" aria-label="Link to this section">#</a></h3>
+<p>A model builds an MoE layer with <code>FusedMoEFactory</code>. It is a function, not a class, and it returns an <code>MoERunner</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/layer.py#L92-L153" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/layer.py:92-153 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/layer.py:92-153</code></a>). It builds the parts in this order:</p>
+<ol>
+  <li>The MoE parallel config from the current TP, DP and PCP sizes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/layer.py#L238-L244" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/layer.py:238-244 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/layer.py:238-244</code></a>).</li>
+  <li>The expert counts: global = model experts + redundant experts (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/layer.py#L76-L89" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/layer.py:76-89 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/layer.py:76-89</code></a>).</li>
+  <li>An EPLB layer state, only with EPLB on. Then the experts must divide evenly over the EP ranks (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/layer.py#L269-L284" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/layer.py:269-284 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/layer.py:269-284</code></a>).</li>
+  <li>An <code>ExpertMapManager</code> that knows which experts are local (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/layer.py#L291-L302" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/layer.py:291-302 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/layer.py:291-302</code></a>).</li>
+  <li>The router, unless the model passes its own (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/layer.py#L306-L346" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/layer.py:306-346 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/layer.py:306-346</code></a>).</li>
+  <li>A <code>FusedMoEConfig</code>, the <code>RoutedExperts</code> object that holds the expert weights, and the <code>MoERunner</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/layer.py#L361-L470" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/layer.py:361-470 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/layer.py:361-470</code></a>).</li>
+</ol>
+<p>The runner calls the layer through a registered custom op: <code>torch.ops.vllm.moe_forward</code>, or <code>moe_forward_shared</code> with shared experts. So <code>torch.compile</code> sees one opaque node (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/runner/moe_runner.py#L309-L327" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/runner/moe_runner.py:309-327 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/runner/moe_runner.py:309-327</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/runner/moe_runner.py#L198-L214" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/runner/moe_runner.py:198-214 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/runner/moe_runner.py:198-214</code></a>).</p>
+
+<h3 id="step-2-does-this-layer-use-expert-parallelism">Step 2: does this layer use expert parallelism?<a class="h-anchor" href="#step-2-does-this-layer-use-expert-parallelism" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/config.py#L1198-L1244" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/layers/fused_moe/config.py:1198-1244</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/config.py#L1198-L1244" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">1198</span><span class="ln hl">1199</span><span class="ln hl">1200</span><span class="ln hl">1201</span><span class="ln">1202</span><span class="ln">1203</span><span class="ln">1204</span><span class="ln">1205</span><span class="ln">1206</span><span class="ln hl">1207</span><span class="ln hl">1208</span><span class="ln hl">1209</span><span class="ln">1210</span><span class="ln hl">1211</span><span class="ln">1212</span><span class="ln">1213</span><span class="ln">1214</span><span class="ln">1215</span><span class="ln">1216</span><span class="ln">1217</span><span class="ln">1218</span><span class="ln">1219</span><span class="ln">1220</span><span class="ln">1221</span><span class="ln">1222</span><span class="ln">1223</span><span class="ln">1224</span><span class="ln">1225</span><span class="ln">1226</span><span class="ln">1227</span><span class="ln">1228</span><span class="ln">1229</span><span class="ln hl">1230</span><span class="ln hl">1231</span><span class="ln">1232</span><span class="ln">1233</span><span class="ln">1234</span><span class="ln">1235</span><span class="ln">1236</span><span class="ln">1237</span><span class="ln">1238</span><span class="ln">1239</span><span class="ln">1240</span><span class="ln">1241</span><span class="ln">1242</span><span class="ln">1243</span><span class="ln">1244</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><pre><code class="language-python">        use_ep = (
+            dp_size_ * pcp_size_ * tp_size_ &gt; 1
+            and vllm_parallel_config.enable_expert_parallel
+        )
+
+        dp_size = dp_size_
+        dp_rank = get_dp_group().rank_in_group if dp_size &gt; 1 else 0
+        pcp_size = pcp_size_
+        pcp_rank = get_pcp_group().rank_in_group if pcp_size &gt; 1 else 0
+        tp_size, tp_rank = FusedMoEParallelConfig.flatten_tp_across_dp_and_pcp(
+            tp_size_, dp_size_, dp_rank, pcp_size_, pcp_rank
+        )
+
+        if not use_ep:
+            return FusedMoEParallelConfig(
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                pcp_size=pcp_size,
+                pcp_rank=pcp_rank,
+                dp_size=dp_size,
+                dp_rank=dp_rank,
+                ep_size=1,
+                ep_rank=0,
+                sp_size=sp_size_,
+                use_ep=False,
+                all2all_backend=vllm_parallel_config.all2all_backend,
+                enable_eplb=vllm_parallel_config.enable_eplb,
+            )
+        # DP + EP / TP + EP / DP + TP + EP
+        assert use_ep
+        # In EP, each device owns a set of experts fully. There is no tensor
+        # parallel update tp_size, tp_rank, ep_size and ep_rank to reflect that.
+        ep_size = tp_size
+        ep_rank = tp_rank
+        return FusedMoEParallelConfig(
+            tp_size=1,
+            tp_rank=0,
+            pcp_size=pcp_size,
+            pcp_rank=pcp_rank,
+            dp_size=dp_size,
+            dp_rank=dp_rank,
+            ep_size=ep_size,
+            ep_rank=ep_rank,
+            sp_size=sp_size_,
+            use_ep=True,
+            all2all_backend=vllm_parallel_config.all2all_backend,
+            enable_eplb=vllm_parallel_config.enable_eplb,</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 1198-1201.</strong> EP is used only when there is more than one rank and <code>--enable-expert-parallel</code> is set. The flag is off by default (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L190-L191" target="_blank" rel="noopener" title="vllm/config/parallel.py:190-191 at 3e44c0d"><code>vllm/config/parallel.py:190-191</code></a>).</li>
+  <li><strong>Lines 1207-1209.</strong> The TP size of the MoE layer is "flattened" over DP and PCP: DP × PCP × TP ranks (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/config.py#L1105-L1114" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/config.py:1105-1114 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/config.py:1105-1114</code></a>).</li>
+  <li><strong>Lines 1211-1226.</strong> Without EP, the experts are split with TP over all those ranks, and <code>ep_size</code> is 1.</li>
+  <li><strong>Lines 1230-1231.</strong> With EP, the flattened TP size becomes the EP size, and the MoE TP size becomes 1: each rank owns whole experts.</li>
+</ol>
+<p>The docstring lists six cases. One is "TP = 2, DP(PCP) = 2 and EP = True … the experts are split between the 4 devices" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/config.py#L1187-L1195" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/config.py:1187-1195 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/config.py:1187-1195</code></a>). The process group behind it is the EP group, built for every MoE model (<a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a>).</p>
+
+<h3 id="step-3-which-experts-live-on-which-rank">Step 3: which experts live on which rank<a class="h-anchor" href="#step-3-which-experts-live-on-which-rank" aria-label="Link to this section">#</a></h3>
+<p><code>--expert-placement-strategy</code> is <code>linear</code> by default: with 4 experts and 2 ranks, rank 0 gets [0, 1] and rank 1 gets [2, 3]. <code>round_robin</code> gives [0, 2] and [1, 3] (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L210-L219" target="_blank" rel="noopener" title="vllm/config/parallel.py:210-219 at 3e44c0d"><code>vllm/config/parallel.py:210-219</code></a>). The <code>expert_map</code> is a tensor of shape <code>[global_num_experts]</code> with the local index of each local expert and −1 for the others. It exists only when <code>ep_size</code> &gt; 1 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/expert_map_manager.py#L152-L180" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/expert_map_manager.py:152-180 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/expert_map_manager.py:152-180</code></a>).</p>
+
+<h3 id="step-4-the-modular-kernel-prepare-finalize-plus-experts">Step 4: the modular kernel: prepare/finalize plus experts<a class="h-anchor" href="#step-4-the-modular-kernel-prepare-finalize-plus-experts" aria-label="Link to this section">#</a></h3>
+<p>The design comment in <code>modular_kernel.py</code> names the four parts: "[Router] → [Quantize-Dispatch] → [Permute-Experts-Unpermute] → [Combine]" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/modular_kernel.py#L51-L84" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/modular_kernel.py:51-84 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/modular_kernel.py:51-84</code></a>). Two abstract classes carry them:</p>
+<ul>
+  <li><code>FusedMoEPrepareAndFinalize</code>: quantize and dispatch the inputs, then combine the outputs. Dispatch and combine sit in one class, because they may use collectives that must match (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/modular_kernel.py#L186-L193" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/modular_kernel.py:186-193 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/modular_kernel.py:186-193</code></a>).</li>
+  <li><code>FusedMoEExperts</code>: the expert GEMMs, with checks such as <code>is_supported_config</code> for the device, quantization, activation and parallel config (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/modular_kernel.py#L487-L526" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/modular_kernel.py:487-526 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/modular_kernel.py:487-526</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/modular_kernel.py#L558-L614" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/modular_kernel.py:558-614 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/modular_kernel.py:558-614</code></a>).</li>
+</ul>
+<p><code>FusedMoEKernel</code> joins one of each; both must be "modular" or both "monolithic". A monolithic pair works on the router logits instead of top-k ids (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/modular_kernel.py#L1678-L1710" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/modular_kernel.py:1678-1710 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/modular_kernel.py:1678-1710</code></a>).</p>
+
+<h3 id="step-5-selecting-the-experts-implementation">Step 5: selecting the experts implementation<a class="h-anchor" href="#step-5-selecting-the-experts-implementation" aria-label="Link to this section">#</a></h3>
+<p>Each quantization type has an "oracle" that picks the experts class (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/oracle/base.py#L1-L20" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/oracle/base.py:1-20 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/oracle/base.py:1-20</code></a>). For BF16 weights on CUDA, the priority list is FlashInfer TRT-LLM, FlashInfer CUTLASS, Triton, batched Triton. On Hopper (compute capability 9.x) both FlashInfer entries move to the back, because they are slower there. With DP &gt; 1 FlashInfer CUTLASS moves back too:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/oracle/unquantized.py#L62-L86" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/layers/fused_moe/oracle/unquantized.py:62-86</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/oracle/unquantized.py#L62-L86" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">62</span><span class="ln">63</span><span class="ln">64</span><span class="ln">65</span><span class="ln">66</span><span class="ln">67</span><span class="ln">68</span><span class="ln hl">69</span><span class="ln hl">70</span><span class="ln hl">71</span><span class="ln hl">72</span><span class="ln hl">73</span><span class="ln hl">74</span><span class="ln">75</span><span class="ln">76</span><span class="ln">77</span><span class="ln hl">78</span><span class="ln hl">79</span><span class="ln hl">80</span><span class="ln">81</span><span class="ln">82</span><span class="ln">83</span><span class="ln">84</span><span class="ln hl">85</span><span class="ln hl">86</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><pre><code class="language-python">    if current_platform.is_rocm():
+        _AVAILABLE_BACKENDS = [
+            UnquantizedMoeBackend.AITER,
+            UnquantizedMoeBackend.TRITON,
+            UnquantizedMoeBackend.BATCHED_TRITON,
+        ]
+    elif current_platform.is_cuda():
+        _AVAILABLE_BACKENDS = [
+            UnquantizedMoeBackend.FLASHINFER_TRTLLM,
+            UnquantizedMoeBackend.FLASHINFER_CUTLASS,
+            UnquantizedMoeBackend.TRITON,
+            UnquantizedMoeBackend.BATCHED_TRITON,
+        ]
+
+        # On Hopper (SM90), the FlashInfer unquantized MoE kernels are slower
+        # than Triton, so prefer Triton by default.
+        if current_platform.is_device_capability_family(90):
+            _move_to_back(_AVAILABLE_BACKENDS, UnquantizedMoeBackend.FLASHINFER_TRTLLM)
+            _move_to_back(_AVAILABLE_BACKENDS, UnquantizedMoeBackend.FLASHINFER_CUTLASS)
+
+        # HACK: Qwen3.5 has crash with FLASHINFER_CUTLASS BF16 if DEP.
+        # Updating the oracle querying logic is out of the scope of this
+        # PR. Need to fix the kernel or update structure in follow up.
+        if moe_config.moe_parallel_config.dp_size &gt; 1:
+            _move_to_back(_AVAILABLE_BACKENDS, UnquantizedMoeBackend.FLASHINFER_CUTLASS)</code></pre></div></div></div></figure>
+<p>The oracle takes the first backend whose kernel class accepts the config, and logs "Using &lt;backend&gt; Unquantized MoE backend out of potential backends: [...]" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/oracle/unquantized.py#L263-L268" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/oracle/unquantized.py:263-268 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/oracle/unquantized.py:263-268</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/oracle/unquantized.py#L359-L372" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/oracle/unquantized.py:359-372 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/oracle/unquantized.py:359-372</code></a>). <code>--moe-backend</code> forces a choice; its default is <code>auto</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/kernel.py#L302-L306" target="_blank" rel="noopener" title="vllm/config/kernel.py:302-306 at 3e44c0d"><code>vllm/config/kernel.py:302-306</code></a>). Then the oracle builds the prepare/finalize object and logs its class name too (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/oracle/unquantized.py#L518-L530" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/oracle/unquantized.py:518-530 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/oracle/unquantized.py:518-530</code></a>). Kernel internals are out of scope for this site.</p>
+
+<h3 id="step-6-selecting-dispatch-and-combine-all2all-backend">Step 6: selecting dispatch and combine: --all2all-backend<a class="h-anchor" href="#step-6-selecting-dispatch-and-combine-all2all-backend" aria-label="Link to this section">#</a></h3>
+<p><code>--all2all-backend</code> defaults to <code>allgather_reducescatter</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L220-L234" target="_blank" rel="noopener" title="vllm/config/parallel.py:220-234 at 3e44c0d"><code>vllm/config/parallel.py:220-234</code></a>). The removed names <code>naive</code> and <code>pplx</code> fall back to it with a warning (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L537-L543" target="_blank" rel="noopener" title="vllm/config/parallel.py:537-543 at 3e44c0d"><code>vllm/config/parallel.py:537-543</code></a>). <code>maybe_make_prepare_finalize</code> maps the choice to a class:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/all2all_utils.py#L182-L232" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/layers/fused_moe/all2all_utils.py:182-232</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/all2all_utils.py#L182-L232" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">182</span><span class="ln">183</span><span class="ln">184</span><span class="ln">185</span><span class="ln">186</span><span class="ln">187</span><span class="ln">188</span><span class="ln">189</span><span class="ln">190</span><span class="ln hl">191</span><span class="ln hl">192</span><span class="ln hl">193</span><span class="ln">194</span><span class="ln hl">195</span><span class="ln">196</span><span class="ln">197</span><span class="ln">198</span><span class="ln">199</span><span class="ln">200</span><span class="ln">201</span><span class="ln">202</span><span class="ln">203</span><span class="ln">204</span><span class="ln">205</span><span class="ln">206</span><span class="ln">207</span><span class="ln">208</span><span class="ln hl">209</span><span class="ln hl">210</span><span class="ln hl">211</span><span class="ln hl">212</span><span class="ln hl">213</span><span class="ln hl">214</span><span class="ln hl">215</span><span class="ln hl">216</span><span class="ln hl">217</span><span class="ln hl">218</span><span class="ln hl">219</span><span class="ln hl">220</span><span class="ln hl">221</span><span class="ln hl">222</span><span class="ln hl">223</span><span class="ln">224</span><span class="ln hl">225</span><span class="ln hl">226</span><span class="ln">227</span><span class="ln">228</span><span class="ln">229</span><span class="ln hl">230</span><span class="ln">231</span><span class="ln">232</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(37 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(38 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(40 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(41 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(43 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(44 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(48 * var(--code-lh))"></span><pre><code class="language-python">def maybe_make_prepare_finalize(
+    moe: FusedMoEConfig,
+    quant_config: FusedMoEQuantConfig | None,
+    routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    allow_new_interface: bool = False,
+    use_monolithic: bool = False,
+    all2all_manager: Any | None = None,
+    input_dtype: torch.dtype | None = None,
+) -&gt; FusedMoEPrepareAndFinalize | None:
+    if moe.moe_parallel_config.use_passthrough_all2all:
+        # The experts dispatch and combine themselves, in every EP topology.
+        return PassThroughPrepareAndFinalize()
+
+    if not moe.moe_parallel_config.use_all2all_kernels:
+        if not allow_new_interface:
+            return None
+
+        # Opt-in XPU batched path: reorganize tokens into E x T x K locally
+        # (no all-to-all) so BatchedTritonExperts (moe_mmk TD) can run.
+        if current_platform.is_xpu() and moe.moe_backend == &quot;batched_triton&quot;:
+            return BatchedPrepareAndFinalize(
+                max_num_tokens=moe.max_num_tokens,
+                num_local_experts=moe.num_local_experts,
+                num_dispatchers=1,
+                rank=moe.moe_parallel_config.ep_rank,
+            )
+
+        # For DP/TP case, fall back to naive P/F.
+        if moe.moe_parallel_config.dp_size &gt; 1:
+            logger.info_once(
+                &quot;Detected DP deployment with no --enable-expert-parallel. &quot;
+                &quot;Falling back to AllGather+ReduceScatter dispatch/combine.&quot;
+            )
+            if all2all_manager is None:
+                all2all_manager = get_ep_all2all_manager()
+            return make_moe_prepare_and_finalize_naive_dp_ep(
+                is_sequence_parallel=moe.moe_parallel_config.is_sequence_parallel,
+                num_dispatchers=all2all_manager.world_size,
+                use_monolithic=use_monolithic,
+            )
+        else:
+            return make_moe_prepare_and_finalize_no_dp_ep(use_monolithic)
+
+    if all2all_manager is None:
+        all2all_manager = get_ep_all2all_manager()
+
+    prepare_finalize: FusedMoEPrepareAndFinalize | None = None
+
+    if moe.use_deepep_ht_kernels:
+        assert moe.dp_size == all2all_manager.dp_world_size
+</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 191-193.</strong> <code>passthrough</code>: the MoE backend dispatches and combines by itself. vLLM binds it automatically for such backends; the CLI does not offer it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L1148-L1151" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:1148-1151 at 3e44c0d"><code>vllm/engine/arg_utils.py:1148-1151</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/kernel.py#L194-L229" target="_blank" rel="noopener" title="vllm/config/kernel.py:194-229 at 3e44c0d"><code>vllm/config/kernel.py:194-229</code></a>).</li>
+  <li><strong>Lines 195-223.</strong> No all2all kernels (no EP, or one rank). With DP &gt; 1 the experts are TP-split over all DP ranks, so each rank still needs every rank's tokens. vLLM logs "Detected DP deployment with no --enable-expert-parallel" and uses the all-gather/reduce-scatter object. Without DP, a local object needs no communication.</li>
+  <li><strong>Lines 225-230 and on.</strong> With EP, the code takes the all2all manager of the EP group's device communicator. Then it builds one class per backend: DeepEP high-throughput, low-latency and v2, MoonEP, MoRI, FlashInfer NVLink, all-gather/reduce-scatter, NIXL-EP (lines 232-420).</li>
+</ol>
+<p>The managers themselves are made by the EP group's <code>CudaCommunicator</code> when <code>use_all2all</code> is true (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/cuda_communicator.py#L202-L283" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/cuda_communicator.py:202-283 at 3e44c0d"><code>vllm/distributed/device_communicators/cuda_communicator.py:202-283</code></a>). The default manager is <code>AgRsAll2AllManager</code>: dispatch is an all-gather, combine a reduce-scatter, over the DP group or, with sequence-parallel MoE, the EP group (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/all2all.py#L67-L173" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/all2all.py:67-173 at 3e44c0d"><code>vllm/distributed/device_communicators/all2all.py:67-173</code></a>).</p>
+
+<h3 id="step-7-what-dp-ep-looks-like-for-a-large-moe">Step 7: what DP + EP looks like for a large MoE<a class="h-anchor" href="#step-7-what-dp-ep-looks-like-for-a-large-moe" aria-label="Link to this section">#</a></h3>
+<pre><code class="language-bash">vllm serve &lt;large MoE model&gt; -dp 8 --enable-expert-parallel      # one node, 8 GPUs, TP = 1</code></pre>
+<ul>
+  <li>Eight engine cores, each a <code>DPEngineCoreProc</code> with one worker (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1534-L1537" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1534-1537 at 3e44c0d"><code>vllm/v1/engine/core.py:1534-1537</code></a>). Each rank runs attention only for its own requests, with its own KV cache.</li>
+  <li>The MoE layers use EP size 8: each GPU owns 1/8 of the experts. The EP group spans all 8 ranks (<a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a>).</li>
+  <li>All ranks step together in waves; an idle rank runs dummy batches, and the workers agree on the padded batch size each step (<a href="../concepts/data-parallel-serving.html">Data parallel serving: several engine cores behind one endpoint</a>).</li>
+  <li>With TP &gt; 1, DP &gt; 1 and EP, the MoE input is sequence parallel for most backends. So TP ranks do not compute the same tokens twice (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L759-L785" target="_blank" rel="noopener" title="vllm/config/parallel.py:759-785 at 3e44c0d"><code>vllm/config/parallel.py:759-785</code></a>). This applies only to models that pass the setting to their MoE layer, for example Qwen3-MoE (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/qwen3_moe.py#L152" target="_blank" rel="noopener" title="vllm/model_executor/models/qwen3_moe.py:152 at 3e44c0d"><code>vllm/model_executor/models/qwen3_moe.py:152</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/layer.py#L59" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/layer.py:59 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/layer.py:59</code></a>).</li>
+</ul>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="the-all2all-backends-at-a-glance" class="dd-title">The all2all backends at a glance</h3></summary><div class="dd-body"><table>
+  <thead><tr><th><code>--all2all-backend</code></th><th>Manager (EP communicator)</th><th>Prepare/finalize</th><th>Notes from the code</th></tr></thead>
+  <tbody>
+    <tr><td><code>allgather_reducescatter</code> (default)</td><td><code>AgRsAll2AllManager</code></td><td>naive DP/EP (all-gather + reduce-scatter)</td><td>works with any EP + DP setup; every rank receives every token</td></tr>
+    <tr><td><code>deepep_high_throughput</code></td><td><code>DeepEPHTAll2AllManager</code></td><td><code>DeepEPHTPrepareAndFinalize</code></td><td>doc string: "deepep high-throughput kernels"</td></tr>
+    <tr><td><code>deepep_low_latency</code></td><td><code>DeepEPLLAll2AllManager</code></td><td><code>DeepEPLLPrepareAndFinalize</code></td><td>batched expert format; FP8 dispatch for block-FP8 models</td></tr>
+    <tr><td><code>deepep_v2</code></td><td><code>DeepEPV2All2AllManager</code></td><td><code>DeepEPV2PrepareAndFinalize</code></td><td>not in the doc list of the field; in the type (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L45-L60" target="_blank" rel="noopener" title="vllm/config/parallel.py:45-60 at 3e44c0d"><code>vllm/config/parallel.py:45-60</code></a>)</td></tr>
+    <tr><td><code>mori_high_throughput</code>, <code>mori_low_latency</code></td><td><code>MoriAll2AllManager</code></td><td><code>MoriPrepareAndFinalize</code></td><td>MoRI EP for multi-node</td></tr>
+    <tr><td><code>moonep</code></td><td><code>MoonEPAll2AllManager</code></td><td><code>MoonEPPrepareAndFinalize</code></td><td>"balanced EP with dynamic redundant experts (NVLink)"</td></tr>
+    <tr><td><code>nixl_ep</code></td><td><code>NixlEPAll2AllManager</code></td><td>NIXL-EP</td><td>batched expert format</td></tr>
+    <tr><td><code>flashinfer_nvlink_one_sided</code>, <code>flashinfer_nvlink_two_sided</code></td><td>FlashInfer managers</td><td>FlashInfer NVLink</td><td><code>flashinfer_all2allv</code> is a deprecated alias of the two-sided one</td></tr>
+    <tr><td><code>passthrough</code></td><td><code>PassThroughAll2AllManager</code></td><td><code>PassThroughPrepareAndFinalize</code></td><td>bound automatically for MoE backends that communicate themselves</td></tr>
+  </tbody>
+</table>
+<p>Sources: managers <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/cuda_communicator.py#L202-L283" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/cuda_communicator.py:202-283 at 3e44c0d"><code>vllm/distributed/device_communicators/cuda_communicator.py:202-283</code></a>; prepare/finalize <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/all2all_utils.py#L182-L420" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/all2all_utils.py:182-420 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/all2all_utils.py:182-420</code></a>; descriptions <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L220-L234" target="_blank" rel="noopener" title="vllm/config/parallel.py:220-234 at 3e44c0d"><code>vllm/config/parallel.py:220-234</code></a>. A backend needs its library to be installed (DeepEP, NIXL, MoRI, FlashInfer); vLLM does not ship them.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-expert-counts-and-memory-with-eplb" class="dd-title">Worked example: expert counts and memory with EPLB</h3></summary><div class="dd-body"><p>The EPLB module docstring gives the example: DeepSeek-R1 has 256 logical experts per MoE layer. With 32 redundant experts there are 288 physical experts, and with 32 EP ranks each GPU holds 288 / 32 = 9 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/eplb/eplb_state.py#L3-L25" target="_blank" rel="noopener" title="vllm/distributed/eplb/eplb_state.py:3-25 at 3e44c0d"><code>vllm/distributed/eplb/eplb_state.py:3-25</code></a>).</p>
+<p>The same model with <code>-dp 8 -ep</code> (EP size 8):</p>
+<ol>
+  <li>No EPLB: 256 / 8 = 32 experts per GPU. <code>num_redundant_experts</code> must stay 0, or the config raises (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L585-L592" target="_blank" rel="noopener" title="vllm/config/parallel.py:585-592 at 3e44c0d"><code>vllm/config/parallel.py:585-592</code></a>).</li>
+  <li><code>--enable-eplb --eplb-config '{"num_redundant_experts": 8}'</code>: global experts = 256 + 8 = 264 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/layer.py#L82" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/layer.py:82 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/layer.py:82</code></a>). 264 / 8 = 33 per GPU; the division must be exact, else <code>ValueError</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/layer.py#L272-L279" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/layer.py:272-279 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/layer.py:272-279</code></a>).</li>
+  <li><code>num_redundant_experts</code> counts the extra experts of the whole model, not per rank (derived from line 82). The docs table says "Additional global experts per EP rank beyond equal distribution", which reads differently (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/serving/expert_parallel_deployment.md#L156" target="_blank" rel="noopener" title="docs/serving/expert_parallel_deployment.md:156 at 3e44c0d"><code>docs/serving/expert_parallel_deployment.md:156</code></a>).</li>
+</ol></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="eplb-when-and-how-the-experts-move" class="dd-title">EPLB: when and how the experts move</h3></summary><div class="dd-body"><p><code>EPLBConfig</code> fields and defaults (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L63-L119" target="_blank" rel="noopener" title="vllm/config/parallel.py:63-119 at 3e44c0d"><code>vllm/config/parallel.py:63-119</code></a>):</p>
+<table>
+  <thead><tr><th>Field</th><th>Default</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>window_size</code></td><td>1000</td><td>steps of expert load that are kept</td></tr>
+    <tr><td><code>step_interval</code></td><td>3000</td><td>steps between two rearrangements</td></tr>
+    <tr><td><code>num_redundant_experts</code></td><td>0</td><td>extra physical copies of popular experts</td></tr>
+    <tr><td><code>log_balancedness</code>, <code>log_balancedness_interval</code></td><td>False, 1</td><td>log average/max load per rank (costs a sync)</td></tr>
+    <tr><td><code>use_async</code></td><td>True</td><td>move weights in the background</td></tr>
+    <tr><td><code>policy</code></td><td><code>default</code></td><td>the rebalancing algorithm (adapted from DeepSeek EPLB, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/eplb/policy/default.py#L3-L11" target="_blank" rel="noopener" title="vllm/distributed/eplb/policy/default.py:3-11 at 3e44c0d"><code>vllm/distributed/eplb/policy/default.py:3-11</code></a>)</td></tr>
+    <tr><td><code>communicator</code></td><td>None: XCCL on XPU, else NIXL if present, else gloo</td><td>how expert weights travel</td></tr>
+  </tbody>
+</table>
+<p>Validation: EPLB needs <code>--enable-expert-parallel</code>, a CUDA, ROCm or XPU platform, and TP × PCP × DP &gt; 1 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L563-L583" target="_blank" rel="noopener" title="vllm/config/parallel.py:563-583 at 3e44c0d"><code>vllm/config/parallel.py:563-583</code></a>). Async EPLB refuses the <code>torch_nccl</code> and <code>pynccl</code> communicators (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L121-L130" target="_blank" rel="noopener" title="vllm/config/parallel.py:121-130 at 3e44c0d"><code>vllm/config/parallel.py:121-130</code></a>).</p>
+<p><strong>How one cycle runs</strong> (Model Runner V2):</p>
+<ol>
+  <li>The router kernels record how many tokens each physical expert got in this step (<code>expert_load_pass</code>).</li>
+  <li>After each <code>sample_tokens</code> (and each dummy run, marked as dummy), a decorator calls <code>EplbState.step()</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/eplb_utils.py#L46-L63" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/eplb_utils.py:46-63 at 3e44c0d"><code>vllm/v1/worker/gpu/eplb_utils.py:46-63</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2113-L2117" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2113-2117 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2113-2117</code></a>).</li>
+  <li><code>step()</code> copies the step's load into a sliding window of <code>window_size</code> slots. It records only in the last <code>window_size</code> steps before a rearrangement (or for the balancedness log), and never for dummy steps (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/eplb/eplb_state.py#L647-L660" target="_blank" rel="noopener" title="vllm/distributed/eplb/eplb_state.py:647-660 at 3e44c0d"><code>vllm/distributed/eplb/eplb_state.py:647-660</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/eplb/eplb_state.py#L697-L717" target="_blank" rel="noopener" title="vllm/distributed/eplb/eplb_state.py:697-717 at 3e44c0d"><code>vllm/distributed/eplb/eplb_state.py:697-717</code></a>). It counts every step, dummy or not, so all ranks stay in sync (lines 662-666).</li>
+  <li>When the counter reaches <code>step_interval</code>, <code>rearrange()</code> runs: it sums the window across the EP ranks, runs the policy, and moves expert weights between GPUs (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/eplb/eplb_state.py#L681-L693" target="_blank" rel="noopener" title="vllm/distributed/eplb/eplb_state.py:681-693 at 3e44c0d"><code>vllm/distributed/eplb/eplb_state.py:681-693</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/eplb/eplb_state.py#L758-L800" target="_blank" rel="noopener" title="vllm/distributed/eplb/eplb_state.py:758-800 at 3e44c0d"><code>vllm/distributed/eplb/eplb_state.py:758-800</code></a>).</li>
+</ol>
+<p>The weight moves use the separate EPLB process group, so they do not deadlock with the MoE collectives of the forward pass (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2347-L2350" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2347-2350 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2347-2350</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="dbo-dual-batch-overlap" class="dd-title">DBO: dual batch overlap</h3></summary><div class="dd-body"><p><a class="term" href="../reference/glossary.html#term-dbo" data-term="DBO (dual batch overlap)" data-def="Splits a batch into two microbatches that run in two threads, so the MoE dispatch and combine of one overlap with the compute of the other.">DBO</a> overlaps the MoE all-to-all with compute. The model runner splits a batch into two microbatches and runs each in its own CPU thread. It switches between them at yield points in the modular kernel. While one microbatch waits for dispatch or combine, the other computes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/design/dbo.md#L5-L11" target="_blank" rel="noopener" title="docs/design/dbo.md:5-11 at 3e44c0d"><code>docs/design/dbo.md:5-11</code></a>). The design doc shows the schedule (lines 15-28).</p>
+<ul>
+  <li><strong>Flags.</strong> <code>--enable-dbo</code> (off), <code>--dbo-decode-token-threshold</code> (32) and <code>--dbo-prefill-token-threshold</code> (512): a batch smaller than the threshold runs as one batch (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L258-L271" target="_blank" rel="noopener" title="vllm/config/parallel.py:258-271 at 3e44c0d"><code>vllm/config/parallel.py:258-271</code></a>).</li>
+  <li><strong>Backends.</strong> On CUDA, microbatching asserts <code>deepep_low_latency</code>, <code>deepep_high_throughput</code> or <code>nixl_ep</code>; ROCm also allows <code>allgather_reducescatter</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L2159-L2181" target="_blank" rel="noopener" title="vllm/config/vllm.py:2159-2181 at 3e44c0d"><code>vllm/config/vllm.py:2159-2181</code></a>). The design doc names only DeepEP (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/design/dbo.md#L37" target="_blank" rel="noopener" title="docs/design/dbo.md:37 at 3e44c0d"><code>docs/design/dbo.md:37</code></a>).</li>
+  <li><strong>Model runner.</strong> Model Runner V2 lists DBO as unsupported unless you set <code>VLLM_USE_V2_MODEL_RUNNER</code> explicitly. So vLLM uses the fallback runner (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L3181-L3194" target="_blank" rel="noopener" title="vllm/config/vllm.py:3181-3194 at 3e44c0d"><code>vllm/config/vllm.py:3181-3194</code></a>, <a href="../concepts/model-runner.html">The model runner (Model Runner V2)</a>). With the variable set, V2 still refuses DBO with LoRA, speculative decoding, PP, context parallelism, multimodal, hybrid models and PIECEWISE CUDA graphs (lines 3196-3218).</li>
+  <li><strong>Lockstep.</strong> All DP ranks must agree to microbatch; the per-step DP sync carries an "allow microbatching" vote (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/dp_utils.py#L69" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/dp_utils.py:69 at 3e44c0d"><code>vllm/v1/worker/gpu/dp_utils.py:69</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/dp_utils.py#L96-L112" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/dp_utils.py:96-112 at 3e44c0d"><code>vllm/v1/worker/gpu/dp_utils.py:96-112</code></a>).</li>
+</ul></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="elastic-ep-in-one-paragraph" class="dd-title">Elastic EP in one paragraph</h3></summary><div class="dd-body"><p><code>--enable-elastic-ep</code> lets a running MoE deployment change its DP (and so EP) size. The config requires EPLB, no PP and no hybrid load balancing; async EPLB then needs NIXL (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L975-L997" target="_blank" rel="noopener" title="vllm/config/parallel.py:975-997 at 3e44c0d"><code>vllm/config/parallel.py:975-997</code></a>). The DP, EP and EPLB groups become stateless groups on a TCP store, so they can be rebuilt (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L2297-L2305" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:2297-2305 at 3e44c0d"><code>vllm/distributed/parallel_state.py:2297-2305</code></a>). Only one API server runs: a larger count is capped to 1 with a warning (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/cli/serve.py#L138-L145" target="_blank" rel="noopener" title="vllm/entrypoints/cli/serve.py:138-145 at 3e44c0d"><code>vllm/entrypoints/cli/serve.py:138-145</code></a>). You scale with <code>POST /scale_elastic_ep</code> and a body <code>{"new_data_parallel_size": N, "drain_timeout": 120}</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/elastic_ep/api_router.py#L28-L66" target="_blank" rel="noopener" title="vllm/entrypoints/serve/elastic_ep/api_router.py:28-66 at 3e44c0d"><code>vllm/entrypoints/serve/elastic_ep/api_router.py:28-66</code></a>). In internal load-balancing mode, the scale-up and scale-down code needs <code>--data-parallel-backend ray</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1920-L1922" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:1920-1922 at 3e44c0d"><code>vllm/v1/engine/core_client.py:1920-1922</code></a>).</p>
+<p>The route is registered for every server of a generative model, also without <code>--enable-elastic-ep</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/launchers/api_server/routers.py#L55-L66" target="_blank" rel="noopener" title="vllm/entrypoints/launchers/api_server/routers.py:55-66 at 3e44c0d"><code>vllm/entrypoints/launchers/api_server/routers.py:55-66</code></a>). Its path is not under the prefixes that <code>--api-key</code> checks (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/middleware/authenticate.py#L11" target="_blank" rel="noopener" title="vllm/entrypoints/serve/middleware/authenticate.py:11 at 3e44c0d"><code>vllm/entrypoints/serve/middleware/authenticate.py:11</code></a>). Without elastic EP, a call gives these results (traced in the code):</p>
+<ul>
+  <li><strong>Missing or invalid body values:</strong> HTTP 400 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/elastic_ep/api_router.py#L44-L61" target="_blank" rel="noopener" title="vllm/entrypoints/serve/elastic_ep/api_router.py:44-61 at 3e44c0d"><code>vllm/entrypoints/serve/elastic_ep/api_router.py:44-61</code></a>).</li>
+  <li><strong>The current DP size:</strong> <code>AsyncLLM</code> logs "Data parallel size is already N, skipping scale" and changes nothing. The route answers 200 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L1301-L1308" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:1301-1308 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:1301-1308</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/elastic_ep/api_router.py#L65-L70" target="_blank" rel="noopener" title="vllm/entrypoints/serve/elastic_ep/api_router.py:65-70 at 3e44c0d"><code>vllm/entrypoints/serve/elastic_ep/api_router.py:65-70</code></a>).</li>
+  <li><strong>Another size, one engine core:</strong> <code>AsyncMPClient</code> keeps the base method, which raises <code>NotImplementedError</code>. The route logs "Scale failed" and answers 500 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L274-L275" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:274-275 at 3e44c0d"><code>vllm/v1/engine/core_client.py:274-275</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/elastic_ep/api_router.py#L79-L81" target="_blank" rel="noopener" title="vllm/entrypoints/serve/elastic_ep/api_router.py:79-81 at 3e44c0d"><code>vllm/entrypoints/serve/elastic_ep/api_router.py:79-81</code></a>).</li>
+  <li><strong>Another size, DP &gt; 1, external load balancing:</strong> <code>NotImplementedError</code> "Elastic EP scaling requires enable_elastic_ep=True.", HTTP 500 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1659-L1664" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:1659-1664 at 3e44c0d"><code>vllm/v1/engine/core_client.py:1659-1664</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1674-L1683" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:1674-1683 at 3e44c0d"><code>vllm/v1/engine/core_client.py:1674-1683</code></a>).</li>
+  <li><strong>Another size, DP &gt; 1, internal load balancing, default <code>mp</code> DP backend:</strong> the assertion "Only ray DP backend supports scaling elastic EP" fails, HTTP 500 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1913-L1922" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:1913-1922 at 3e44c0d"><code>vllm/v1/engine/core_client.py:1913-1922</code></a>).</li>
+  <li><strong>The same with the Ray DP backend:</strong> a larger size gives HTTP 400, because without elastic EP the maximum DP size is the start size (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L1037-L1042" target="_blank" rel="noopener" title="vllm/config/parallel.py:1037-1042 at 3e44c0d"><code>vllm/config/parallel.py:1037-1042</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1924-L1929" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:1924-1929 at 3e44c0d"><code>vllm/v1/engine/core_client.py:1924-1929</code></a>). A smaller size gives HTTP 400 when the experts do not fit on fewer engines, which is always true with no redundant experts (lines 1930-1945).</li>
+</ul>
+<p>In these cases the error comes before <code>set_scaling_elastic_ep(True)</code>, so the server does not hold back new requests (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L1310" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:1310 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:1310</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L1329" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:1329 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:1329</code></a>). The code in this path does not check <code>--enable-elastic-ep</code> itself (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1913-L1952" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:1913-1952 at 3e44c0d"><code>vllm/v1/engine/core_client.py:1913-1952</code></a>). One case remains: the Ray DP backend and a smaller size that passes the expert check. Then the client sends reconfiguration calls to the engines. This site does not trace that case further.</p></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><strong>EP without DP or TP does nothing.</strong> With one rank, <code>use_ep</code> is false even with the flag (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/config.py#L1198-L1201" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/config.py:1198-1201 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/config.py:1198-1201</code></a>).</li>
+  <li><strong>EPLB flags without EP.</strong> <code>--enable-eplb</code> without <code>--enable-expert-parallel</code> raises "enable_expert_parallel must be True to use EPLB." (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L569-L570" target="_blank" rel="noopener" title="vllm/config/parallel.py:569-570 at 3e44c0d"><code>vllm/config/parallel.py:569-570</code></a>).</li>
+  <li><strong>Uneven experts.</strong> With EPLB, global experts must divide by the EP size (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/layer.py#L272-L279" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/layer.py:272-279 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/layer.py:272-279</code></a>). Choose <code>num_redundant_experts</code> to fit.</li>
+  <li><strong>Missing library.</strong> DeepEP, NIXL-EP, MoRI or FlashInfer backends need their packages; an unknown backend name raises "Unknown all2all backend" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/cuda_communicator.py#L277-L278" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/cuda_communicator.py:277-278 at 3e44c0d"><code>vllm/distributed/device_communicators/cuda_communicator.py:277-278</code></a>).</li>
+  <li><strong>The default backend moves every token to every rank.</strong> <code>allgather_reducescatter</code> is simple but sends DP × the tokens of each rank in each layer (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/all2all.py#L128-L161" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/all2all.py:128-161 at 3e44c0d"><code>vllm/distributed/device_communicators/all2all.py:128-161</code></a>). At scale, the DeepEP-style backends send only the needed tokens.</li>
+  <li><strong>Unexpected fallback runner.</strong> <code>--enable-dbo</code> moves the model to the fallback model runner unless <code>VLLM_USE_V2_MODEL_RUNNER</code> is set (DBO deep dive).</li>
+</ul>
+<p><strong>Why it matters.</strong> The largest open models are MoE models. Their throughput depends on how tokens move between GPUs, so the all2all backend, the expert kernel and EPLB are among the most important serving choices.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>What does <code>FusedMoEFactory</code> return?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>An <code>MoERunner</code>, which holds the router and the <code>RoutedExperts</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/layer.py#L447-L470" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/layer.py:447-470 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/layer.py:447-470</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>What is the default <code>--all2all-backend</code>, and how does it dispatch?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>allgather_reducescatter</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L220" target="_blank" rel="noopener" title="vllm/config/parallel.py:220 at 3e44c0d"><code>vllm/config/parallel.py:220</code></a>). Dispatch is an all-gather of all tokens; combine is a reduce-scatter (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/all2all.py#L67-L173" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/all2all.py:67-173 at 3e44c0d"><code>vllm/distributed/device_communicators/all2all.py:67-173</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>With <code>-tp 2 -dp 2 --enable-expert-parallel</code>, what are the MoE TP size and EP size of each layer?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The flattened TP size is DP × PCP × TP = 4. With EP, <code>ep_size</code> = 4 and the MoE TP size = 1 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/config.py#L1105-L1114" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/config.py:1105-1114 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/config.py:1105-1114</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/config.py#L1227-L1244" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/config.py:1227-1244 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/config.py:1227-1244</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>On an H100, which unquantized MoE backend does the oracle try first, and why?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Triton. The CUDA list starts with the two FlashInfer backends. On compute capability 9.x both move to the back, because they are slower than Triton there (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/oracle/unquantized.py#L68-L80" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/oracle/unquantized.py:68-80 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/oracle/unquantized.py:68-80</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>EPLB is on with the defaults. A server runs 2,000 steps per minute. How often are the experts rearranged, and how much history is used?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Every 3,000 steps, so about every 90 seconds, using the load of the last 1,000 recorded steps (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L67-L75" target="_blank" rel="noopener" title="vllm/config/parallel.py:67-75 at 3e44c0d"><code>vllm/config/parallel.py:67-75</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/eplb/eplb_state.py#L681-L693" target="_blank" rel="noopener" title="vllm/distributed/eplb/eplb_state.py:681-693 at 3e44c0d"><code>vllm/distributed/eplb/eplb_state.py:681-693</code></a>). Dummy steps advance the counter but record no load (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/eplb/eplb_state.py#L587-L590" target="_blank" rel="noopener" title="vllm/distributed/eplb/eplb_state.py:587-590 at 3e44c0d"><code>vllm/distributed/eplb/eplb_state.py:587-590</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/eplb/eplb_state.py#L662-L666" target="_blank" rel="noopener" title="vllm/distributed/eplb/eplb_state.py:662-666 at 3e44c0d"><code>vllm/distributed/eplb/eplb_state.py:662-666</code></a>).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/data-parallel-serving.html">Data parallel serving: several engine cores behind one endpoint</a><span class="rel-sum">With --data-parallel-size N, vllm serve runs N engine cores with their own KV caches. API servers pick an engine for each request with a load score; a DP coordinator publishes the load counts. Dense models run independent engines; MoE models step in lockstep, in waves, with dummy batches.</span></li><li><a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a><span class="rel-sum">Each worker puts all ranks into one grid of shape (DP, PP, PCP, TP) and cuts it into process groups. Each group is a GroupCoordinator with a gloo CPU group, an NCCL device group and, for groups of more than one rank, a device communicator that picks the all-reduce implementation.</span></li><li><a href="../concepts/model-definition.html">How a vLLM model file is written (llama.py)</a><span class="rel-sum">A vLLM model file rebuilds the Hugging Face architecture from vLLM layers. Every constructor takes vllm_config and a prefix, linear layers are tensor-parallel, attention is an Attention layer object, and pipeline stages use PPMissingLayer and IntermediateTensors. llama.py is the example.</span></li><li><a href="../concepts/quantization-plugins.html">Quantization methods as plugins</a><span class="rel-sum">A quantization method is a QuantizationConfig subclass registered under a name. The front end picks the name from the checkpoint or --quantization and makes one config object; each layer in the worker asks it for a quantize method that makes the weights and runs the forward.</span></li><li><a href="../concepts/compile-and-cuda-graphs.html">torch.compile and CUDA graphs in vLLM</a><span class="rel-sum">vLLM compiles the inner model once with torch.compile and its own Inductor backend, splits the graph at the attention ops, caches the result on disk, and captures CUDA graphs at start-up. Each step, Model Runner V2 replays a FULL graph for uniform decode batches, PIECEWISE graphs for other batches up to the largest capture size, and runs eagerly above it.</span></li><li><a href="../tours/multi-gpu-step.html">Tour: One step across GPUs</a><span class="rel-sum">Follow two requests through vllm serve -tp 2 -dp 2 in 13 stops: the API servers pick an engine each, two independent engine cores schedule, each broadcasts the step to its two workers through shared memory, the workers meet in 65 all-reduces on their TP group, only rank 0 replies, and the coordinator publishes the new load.</span></li><li><a href="../learn/tp-pp-in-practice.html">Tensor and pipeline parallelism in practice</a><span class="rel-sum">Tensor parallelism splits every weight matrix across GPUs and adds the parts with an all-reduce. Pipeline parallelism gives each GPU a range of layers. This page shows the split of one MLP with real shapes, the head limits of attention, and how to choose TP, PP, DP or EP for a deployment.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../concepts/data-parallel-serving.html"><span class="pn-dir">← Previous</span><span class="pn-title">Data parallel serving: several engine cores behind one endpoint</span></a><a class="pn pn-next" href="../concepts/disaggregated-prefill.html"><span class="pn-dir">Next →</span><span class="pn-title">Disaggregated prefill: prefill and decode on different instances</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-the-code">In the code</a></li><li class="toc-l3"><a href="#step-1-fusedmoefactory-builds-the-layer">Step 1: FusedMoEFactory builds the layer</a></li><li class="toc-l3"><a href="#step-2-does-this-layer-use-expert-parallelism">Step 2: does this layer use expert parallelism?</a></li><li class="toc-l3"><a href="#step-3-which-experts-live-on-which-rank">Step 3: which experts live on which rank</a></li><li class="toc-l3"><a href="#step-4-the-modular-kernel-prepare-finalize-plus-experts">Step 4: the modular kernel: prepare/finalize plus experts</a></li><li class="toc-l3"><a href="#step-5-selecting-the-experts-implementation">Step 5: selecting the experts implementation</a></li><li class="toc-l3"><a href="#step-6-selecting-dispatch-and-combine-all2all-backend">Step 6: selecting dispatch and combine: --all2all-backend</a></li><li class="toc-l3"><a href="#step-7-what-dp-ep-looks-like-for-a-large-moe">Step 7: what DP + EP looks like for a large MoE</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#the-all2all-backends-at-a-glance">The all2all backends at a glance</a></li><li class="toc-l3"><a href="#worked-example-expert-counts-and-memory-with-eplb">Worked example: expert counts and memory with EPLB</a></li><li class="toc-l3"><a href="#eplb-when-and-how-the-experts-move">EPLB: when and how the experts move</a></li><li class="toc-l3"><a href="#dbo-dual-batch-overlap">DBO: dual batch overlap</a></li><li class="toc-l3"><a href="#elastic-ep-in-one-paragraph">Elastic EP in one paragraph</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,208 @@
+---
+title: Frequently asked questions
+nav_title: FAQ
+related: reference/extension-points, reference/vllm-vs-deepinfer, concepts/troubleshooting, concepts/openai-server, concepts/plugin-loading, concepts/custom-ops, concepts/tuning, reference/env-vars
+summary: Short answers with citations - getting started, serving, performance and plugins - then a table of every place where the vLLM docs or code comments disagree with the code, and the open questions that pages of this site still list.
+---
+<x-sentence>Each answer is short and cites the code; follow the link for the full explanation.</x-sentence>
+
+<p>Jump to: <a href="#getting-started">Getting started</a> · <a href="#serving">Serving</a> · <a href="#performance">Performance</a> · <a href="#plugins">Plugins</a> · <a href="#docs-vs-code">Where do docs and code disagree?</a> · <a href="#open-questions">Known open questions</a>.</p>
+
+<h2 id="getting-started">Getting started</h2>
+
+<h3 id="which-runner">Which model runner runs: V1 or V2?</h3>
+<p>Model Runner V2 (<code>vllm/v1/worker/gpu/</code>), in most cases. With <code>VLLM_USE_V2_MODEL_RUNNER</code> unset, <code>use_v2_model_runner</code> is true when Triton is installed and no unsupported feature is set ({{cite vllm/config/vllm.py:730-749}}). The worker then builds the V2 runner; else it builds the V1 runner, the fallback ({{cite vllm/v1/worker/gpu_worker.py:567-583}}). A fallback logs "Model Runner V2 does not yet support ..." ({{cite vllm/config/vllm.py:740-747}}). HiSparse and watermarking always use V2 ({{cite vllm/config/vllm.py:714-728}}). See {{link concepts/model-runner}}.</p>
+
+<h3 id="where-is-v0">Where is V0?</h3>
+<p>Gone. Only two aliases remain: <code>vllm.engine.llm_engine.LLMEngine</code> is the V1 <code>LLMEngine</code> ({{cite vllm/engine/llm_engine.py:4-6}}), and <code>AsyncLLMEngine</code> is <code>AsyncLLM</code> ({{cite vllm/engine/async_llm_engine.py:4-6}}). The engine code is in <code>vllm/v1/</code>. See {{link learn/what-is-vllm}}.</p>
+
+<h3 id="how-many-processes">How many processes does <code>vllm serve</code> start?</h3>
+<p>Two with the defaults: the API server and one engine core. With TP = PP = DP = 1, the executor is <code>uni</code> and the worker runs inside the engine core ({{cite vllm/config/parallel.py:1099-1100}}). When the world size across DP is more than 1, the executor is <code>mp</code>, with one worker process per GPU ({{cite vllm/config/parallel.py:1055}}). <code>AsyncLLM</code> always starts the engine core in its own process ({{cite vllm/v1/engine/async_llm.py:188-193}}), so <code>VLLM_ENABLE_V1_MULTIPROCESSING=0</code> does not change this. See {{link concepts/architecture-overview}}.</p>
+
+<h3 id="default-model">What does <code>vllm serve</code> serve with no model argument?</h3>
+<p><code>Qwen/Qwen3-0.6B</code> ({{cite vllm/config/model.py:155}}, {{cite vllm/entrypoints/cli/serve.py:39-40}}).</p>
+
+<h2 id="serving">Serving</h2>
+
+<h3 id="stream-200-fails">Why does my request get HTTP 200, and then the stream fails?</h3>
+<p>The route returns the streaming response before the engine has seen the request. <code>generate()</code> only builds an async generator; the request reaches <code>AsyncLLM.add_request</code> when the stream starts ({{cite vllm/entrypoints/openai/chat_completion/serving.py:396-426}}). An error after that point cannot change the status. It comes as a <code>data:</code> chunk with an error object, then <code>data: [DONE]</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:937-943}}, {{cite vllm/entrypoints/openai/chat_completion/serving.py:504-508}}). Check every chunk for <code>error</code>. See {{link concepts/openai-server}}.</p>
+
+<h3 id="max-tokens-lowered">Why is my <code>max_tokens</code> lowered?</h3>
+<p>The server uses the smallest of four values: <code>max_model_len</code> minus the prompt length, your value (or the server default), the <code>--override-generation-config</code> value, and a platform limit ({{cite vllm/entrypoints/serve/utils/api_utils.py:253-270}}). It does not report the change. A prompt longer than <code>max_model_len</code> raises instead ({{cite vllm/entrypoints/serve/utils/api_utils.py:248-252}}).</p>
+
+<h3 id="tool-parser-ignored">Why is <code>--tool-call-parser</code> ignored?</h3>
+<p>The parser is used only together with <code>--enable-auto-tool-choice</code>. Without it, <code>get_tool_parser</code> returns <code>None</code> ({{cite vllm/parser/parser_manager.py:33-35}}). See {{link concepts/tool-and-reasoning-parsers}}.</p>
+
+<h3 id="guided-ignored">Why are my <code>guided_*</code> fields ignored?</h3>
+<p>These fields were removed. The request models accept unknown fields, so a request with <code>guided_json</code> and the other <code>guided_*</code> fields gets HTTP 200 with unconstrained output. The server logs one WARNING ({{cite vllm/entrypoints/serve/engine/protocol.py:21-34}}, {{cite vllm/entrypoints/serve/engine/protocol.py:61-71}}). Use <code>structured_outputs</code> or <code>response_format</code>. See {{link concepts/structured-outputs}}.</p>
+
+<h3 id="api-key-routes">Which routes does <code>--api-key</code> protect?</h3>
+<p>Only paths that start with <code>/v1</code>, <code>/v2</code>, <code>/inference</code> or <code>/cohere</code> ({{cite vllm/entrypoints/serve/middleware/authenticate.py:11}}, {{cite vllm/entrypoints/serve/middleware/authenticate.py:59-61}}). Other routes answer without a key. Some of them run the model:</p>
+<ul>
+  <li><code>/invocations</code> on every server (next question);</li>
+  <li><code>POST /generative_scoring</code> on every generative server ({{cite vllm/entrypoints/generate/api_router.py:52-54}}, {{cite vllm/entrypoints/generate/generative_scoring/api_router.py:28-29}});</li>
+  <li><code>/pooling</code>, <code>/classify</code>, <code>/score</code> and <code>/rerank</code> on a pooling server ({{cite vllm/entrypoints/pooling/pooling/api_router.py:26-28}}, {{cite vllm/entrypoints/pooling/classify/api_router.py:26}}, {{cite vllm/entrypoints/pooling/scoring/api_router.py:37-38}}, {{cite vllm/entrypoints/pooling/scoring/api_router.py:69-70}}).</li>
+</ul>
+<p><code>/health</code>, <code>/ping</code>, <code>/metrics</code>, <code>/tokenize</code> and <code>/scale_elastic_ep</code> are also open. Put a proxy in front of the server and let it pass only the routes your clients need. See {{link concepts/deployment-recipes#security}}.</p>
+
+<h3 id="invocations">What is <code>/invocations</code>?</h3>
+<p>A SageMaker route. Every server registers <code>/ping</code> and <code>/invocations</code> ({{cite vllm/entrypoints/launchers/api_server/routers.py:40-44}}, {{cite vllm/entrypoints/serve/sagemaker/api_router.py:91-99}}). <code>/invocations</code> picks a handler by the shape of the body and runs the same serving objects as the <code>/v1</code> routes ({{cite vllm/entrypoints/serve/sagemaker/api_router.py:98-132}}). The help text of <code>--api-key</code> warns about it ({{cite vllm/entrypoints/common/cli_args.py:330-336}}).</p>
+
+<h3 id="scale-elastic-ep">What does <code>/scale_elastic_ep</code> do when elastic EP is off?</h3>
+<p>The route exists on every generative server, also without <code>--enable-elastic-ep</code> ({{cite vllm/entrypoints/launchers/api_server/routers.py:62-66}}), and outside the <code>--api-key</code> prefixes. The traced results:</p>
+<table>
+  <thead><tr><th>Call</th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td>missing or invalid body values</td><td>HTTP 400 ({{cite vllm/entrypoints/serve/elastic_ep/api_router.py:44-61}})</td></tr>
+    <tr><td>the current DP size</td><td>a log line "already N, skipping scale", no change, HTTP 200 ({{cite vllm/v1/engine/async_llm.py:1301-1308}})</td></tr>
+    <tr><td>another size, one engine core (the default)</td><td><code>NotImplementedError</code>, HTTP 500 ({{cite vllm/v1/engine/core_client.py:274-275}})</td></tr>
+    <tr><td>another size, DP &gt; 1, external load balancing</td><td><code>NotImplementedError</code>, HTTP 500 ({{cite vllm/v1/engine/core_client.py:1659-1664}})</td></tr>
+    <tr><td>another size, DP &gt; 1, internal load balancing, <code>mp</code> DP backend</td><td>an assertion fails, HTTP 500 ({{cite vllm/v1/engine/core_client.py:1913-1922}})</td></tr>
+    <tr><td>Ray DP backend, larger size</td><td>HTTP 400 ({{cite vllm/v1/engine/core_client.py:1924-1929}})</td></tr>
+  </tbody>
+</table>
+<p>So on a default deployment it cannot change the number of engines. One case is not traced on this site: the Ray DP backend with a smaller size that passes the expert check (see <a href="#open-questions">open questions</a>). See {{link concepts/expert-parallel-moe}}.</p>
+
+<h3 id="bad-env-api-server">Why does the API server stop before any engine starts?</h3>
+<p>One cause is an environment variable with a value that does not parse. Some modules read a variable when Python imports them. For example, the engine core client imports <code>VLLM_ENGINE_READY_TIMEOUT_S</code> at module level ({{cite vllm/v1/engine/core_client.py:29}}), and the lambda calls <code>int()</code> on the text ({{cite vllm/envs.py:812-814}}). A bad value raises in the API server. Other bad values raise later, in the engine core, when it caches all variables ({{cite vllm/v1/engine/core.py:241-243}}). See {{link concepts/troubleshooting}}.</p>
+
+<h3 id="ready-timeout">Why does <code>VLLM_ENGINE_READY_TIMEOUT_S</code> not stop a slow start?</h3>
+<p>With one API server, the start-up wait has no time limit. The loop only logs at DEBUG and continues until the engines are ready or a process dies ({{cite vllm/v1/engine/utils.py:1434-1446}}). The timeout is used afterwards, and while API servers wait for engines that start after them ({{cite vllm/v1/engine/core_client.py:757-768}}). See {{link tours/serve-startup}}.</p>
+
+<h3 id="engine-000">Why does each stats line start with "Engine 000:"?</h3>
+<p>The periodic log line always has the engine index as a prefix, also with one engine ({{cite vllm/v1/metrics/loggers.py:176-178}}, {{cite vllm/v1/metrics/loggers.py:334-337}}). See {{link concepts/metrics-and-observability}}.</p>
+
+<h2 id="performance">Performance</h2>
+
+<h3 id="custom-ops-off">Why are custom ops off?</h3>
+<p>With the default <code>torch.compile</code> mode and the Inductor backend, vLLM adds <code>"none"</code> to the custom-op list. With compile mode <code>NONE</code>, for example with <code>--enforce-eager</code>, it adds <code>"all"</code> ({{cite vllm/config/vllm.py:1819-1826}}). A disabled op runs <code>forward_native</code>, which Inductor compiles ({{cite vllm/model_executor/custom_op.py:189-192}}). vLLM and the platform can still turn single ops on with <code>+name</code>. See {{link concepts/custom-ops}}.</p>
+
+<h3 id="first-request-slow">Why is my first request slow?</h3>
+<p>Not because of model compilation: the engine core compiles, profiles and captures CUDA graphs before it reports ready ({{cite vllm/v1/engine/core.py:394-400}}, {{cite vllm/v1/worker/gpu_worker.py:983-985}}). Costs that the first requests can still pay:</p>
+<ul>
+  <li>A request with structured output waits until its grammar is compiled ({{cite vllm/v1/request.py:116-117}}). xgrammar caches compiled grammars ({{cite vllm/v1/structured_output/backend_xgrammar.py:220-223}}), so a repeated grammar is faster.</li>
+  <li>The prefix cache starts empty, so no request gets a hit until earlier requests fill it.</li>
+  <li><code>vllm bench serve</code> sends no warm-up requests by default ({{cite vllm/benchmarks/serve.py:1780-1785}}).</li>
+</ul>
+<p>Cold start-up is a separate question: a cold <code>torch.compile</code> cache makes start-up longer, not the first request. See {{link concepts/compile-and-cuda-graphs}} and {{link concepts/benchmarking}}.</p>
+
+<h3 id="performance-mode">What does <code>--performance-mode</code> do?</h3>
+<p>Two things at this commit. <code>throughput</code> doubles the default <code>max_num_batched_tokens</code> and <code>max_num_seqs</code>, but only when you did not set them ({{cite vllm/engine/arg_utils.py:3170-3175}}). <code>interactivity</code> captures CUDA graphs for every size from 1 to 32 ({{cite vllm/config/vllm.py:2552-2556}}). The docstring also names "latency-oriented kernels" and "throughput-oriented kernels" ({{cite vllm/config/vllm.py:441-445}}); no other code reads the field. See {{link concepts/tuning}}.</p>
+
+<h3 id="lora-graphs">Why does LoRA double the CUDA graph captures?</h3>
+<p>With LoRA on, the runner captures each size for each LoRA case ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:305-306}}). With the defaults (<code>cudagraph_specialize_lora</code> true, <code>specialize_active_lora</code> false) the cases are 0 and <code>max_loras + 1</code> ({{cite vllm/config/compilation.py:663}}, {{cite vllm/v1/worker/gpu/lora_utils.py:31-34}}, {{cite vllm/lora/utils.py:64-65}}). Two cases double the graphs. See {{link concepts/lora-serving}}.</p>
+
+<h3 id="recompile">Why does a new <code>--max-num-batched-tokens</code> compile again?</h3>
+<p>The value is part of the scheduler config hash, which is part of the compile cache key. The comment gives two reasons: LoRA buffer sizes and the Inductor index width ({{cite vllm/config/scheduler.py:271-284}}). <code>max_num_seqs</code> is in the hash too. See {{link concepts/compile-and-cuda-graphs}}.</p>
+
+<h2 id="plugins">Plugins</h2>
+
+<h3 id="plugin-not-loaded">Why is my plugin not loaded?</h3>
+<p>Check these causes in order:</p>
+<ol>
+  <li><strong><code>VLLM_PLUGINS</code> does not name it.</strong> The list filters five groups by entry-point name ({{cite vllm/plugins/__init__.py:64}}). It does not strip spaces.</li>
+  <li><strong>It is an endpoint plugin.</strong> Endpoint plugins load only when <code>VLLM_PLUGINS</code> names them ({{cite vllm/plugins/__init__.py:122-131}}).</li>
+  <li><strong>The import failed.</strong> The loader logs the exception and goes on ({{cite vllm/plugins/__init__.py:71-72}}).</li>
+  <li><strong>The log level hides it.</strong> The general group logs its list at DEBUG ({{cite vllm/plugins/__init__.py:48-54}}). Set <code>VLLM_LOGGING_LEVEL=DEBUG</code>.</li>
+  <li><strong>It is a platform plugin and <code>VLLM_TARGET_DEVICE=cpu</code>.</strong> The group is skipped ({{cite vllm/platforms/__init__.py:244-248}}).</li>
+  <li><strong>Your registration ran in the wrong process.</strong> A register call in a launch script reaches only that process. Put it in a general plugin.</li>
+</ol>
+<p>See {{link concepts/plugin-loading}} and {{link reference/extension-points}}.</p>
+
+<h3 id="rms-norm-name">Why does <code>+rms_norm</code> not enable my out-of-tree op?</h3>
+<p><code>register_oot</code> gives your class the in-tree <em>class</em> name, for example <code>"RMSNorm"</code> ({{cite vllm/model_executor/custom_op.py:337-339}}). <code>enabled()</code> builds the switch from that name ({{cite vllm/model_executor/custom_op.py:282-283}}). The in-tree class registered <code>"rms_norm"</code> ({{cite vllm/model_executor/layers/layernorm.py:38-39}}), so <code>+rms_norm</code> matches nothing and vLLM warns that it "has no effect" ({{cite vllm/config/compilation.py:1341-1361}}). Use <code>+RMSNorm</code>. See {{link tours/build-a-toy-plugin}}.</p>
+
+<h3 id="pre-register-count">How many times does <code>pre_register_and_update</code> run?</h3>
+<p>5 times in the <code>vllm serve</code> front end. Four calls pass a parser: one for each serve-type parser that the CLI builds at start ({{cite vllm/entrypoints/cli/main.py:100-109}}), and one more when <code>setup_server</code> logs the non-default arguments ({{cite vllm/entrypoints/launchers/launcher.py:368}}, {{cite vllm/entrypoints/common/startup.py:70-71}}). Each goes through <code>add_cli_args</code> ({{cite vllm/engine/arg_utils.py:3257}}). The fifth call has no parser, in <code>create_engine_config</code> ({{cite vllm/engine/arg_utils.py:2246}}). Make the hook safe to run again. See {{link reference/extension-points#platform-hooks}}.</p>
+
+<h3 id="register-oot-typeerror">Why does <code>@CustomOp.register_oot("MyOp")</code> raise <code>TypeError</code>?</h3>
+<p>The first positional argument must be a class. A string reaches the last branch and raises "Decorator can only be applied to classes." ({{cite vllm/model_executor/custom_op.py:336-356}}). Write <code>@InTreeOp.register_oot</code> or <code>@CustomOp.register_oot(name="InTreeOp")</code>. The design doc shows the string form (table below).</p>
+
+<h2 id="docs-vs-code">Where do docs and code disagree?</h2>
+<p>Each row was checked again at the pinned commit. The pages of this site describe the code. The table states what each side says, not which one is intended.</p>
+<table>
+  <thead><tr><th>#</th><th>Docs or comment says</th><th>The code does</th><th>Page</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><code>@CustomOp.register_oot("op_name")</code> ({{cite docs/design/custom_op.md:11}}, {{cite docs/design/custom_op.md:285}})</td><td>a string argument raises <code>TypeError</code> ({{cite vllm/model_executor/custom_op.py:350-356}}); the keyword form at {{cite docs/design/custom_op.md:315}} works</td><td>{{link concepts/custom-ops}}</td></tr>
+    <tr><td>2</td><td>the final fallback of the dispatch is <code>forward_native()</code> ({{cite docs/design/custom_op.md:21}})</td><td>an enabled op on no listed platform calls <code>forward_cuda</code> ({{cite vllm/model_executor/custom_op.py:204-205}})</td><td>{{link concepts/custom-ops}}</td></tr>
+    <tr><td>3</td><td><code>'["all,-op1"]'</code> enables all ops except op1 ({{cite docs/design/custom_op.md:46}})</td><td>one string <code>"all,-op1"</code> is not a valid entry and raises <code>ValueError</code> "Invalid syntax" ({{cite vllm/config/compilation.py:1013-1019}})</td><td>{{link concepts/custom-ops}}</td></tr>
+    <tr><td>4</td><td>-O0 also gives <code>custom_ops=["none"]</code> ({{cite docs/design/optimization_levels.md:38}})</td><td>with compile mode <code>NONE</code> the base entry is <code>"all"</code> ({{cite vllm/config/vllm.py:1819-1826}})</td><td>{{link code/config-vllm}}</td></tr>
+    <tr><td>5</td><td>every process created by vLLM loads the plugin ({{cite docs/design/plugin_system.md:7}})</td><td>only the general and platform groups load in every process; IO processor, stat logger and endpoint groups are front-end only ({{cite vllm/plugins/__init__.py:16-30}})</td><td>{{link concepts/plugin-loading}}</td></tr>
+    <tr><td>6</td><td>set <code>VLLM_PLUGINS</code> to a name to load only that plugin ({{cite docs/design/plugin_system.md:43}}); the doc lists five groups (lines 47-55)</td><td>the list filters five groups at once ({{cite vllm/plugins/__init__.py:64}}); a sixth group, <code>vllm.logits_processors</code>, exists and ignores it ({{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:34}}, {{cite vllm/v1/worker/gpu/sample/logits_processor/loader.py:46}})</td><td>{{link concepts/plugin-loading}}</td></tr>
+    <tr><td>7</td><td>a plugin function "might be called multiple times in some processes" ({{cite docs/design/plugin_system.md:60}})</td><td>a guard runs general plugins at most once per process ({{cite vllm/plugins/__init__.py:82-85}})</td><td>{{link tours/build-a-toy-plugin}}</td></tr>
+    <tr><td>8</td><td><code>check_and_update_config</code> is called "very early" ({{cite docs/design/plugin_system.md:105}})</td><td>it runs late in <code>VllmConfig.__post_init__</code> ({{cite vllm/config/vllm.py:2046}}), in the front end and again in each engine core ({{cite vllm/v1/engine/core.py:1336-1337}})</td><td>{{link concepts/platform-interface}}</td></tr>
+    <tr><td>9</td><td>the custom way does not work for Triton ops "now" ({{cite docs/design/plugin_system.md:143-144}})</td><td><code>register_triton_kernel_overrides</code> lets a platform replace core Triton kernels ({{cite vllm/platforms/interface.py:375-386}})</td><td>{{link concepts/platform-interface}}</td></tr>
+    <tr><td>10</td><td><code>VLLM_PLUGINS</code> "must include" the resolver plugins ({{cite docs/design/lora_resolver_plugins.md:28}})</td><td>unset loads all plugins ({{cite vllm/plugins/__init__.py:56-64}}); the same doc says so at line 40</td><td>{{link concepts/frontend-plugins}}</td></tr>
+    <tr><td>11</td><td>an endpoint plugin "must not" reach the engine through <code>EngineClient</code>, for example <code>collective_rpc</code> ({{cite vllm/plugins/endpoint_plugins/interface.py:5-9}})</td><td>the <code>init_state</code> docstring suggests <code>collective_rpc</code> ({{cite vllm/plugins/endpoint_plugins/interface.py:83-85}}), and the test plugin calls it ({{cite tests/plugins/vllm_add_dummy_endpoint_plugin/vllm_add_dummy_endpoint_plugin/__init__.py:33}})</td><td>{{link concepts/frontend-plugins}}</td></tr>
+    <tr><td>12</td><td><code>pre_register_and_update</code> runs before the CLI arguments are parsed ({{cite vllm/platforms/interface.py:644-645}})</td><td>true for the parser calls; the call in <code>create_engine_config</code> runs after parsing ({{cite vllm/engine/arg_utils.py:2246}})</td><td>{{link concepts/platform-interface}}</td></tr>
+    <tr><td>13</td><td>the tool-calling example registers <code>module_path="vllm.tool_parsers.example"</code> ({{cite docs/features/tool_calling.md:677-681}})</td><td>no such module exists in <code>vllm/tool_parsers/</code>; the decorator records your own module ({{cite vllm/tool_parsers/abstract_tool_parser.py:353-366}})</td><td>{{link concepts/frontend-plugins}}</td></tr>
+    <tr><td>14</td><td>"Now supports 9 types of connectors" ({{cite docs/features/disagg_prefill.md:20}})</td><td>17 names are registered ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:153-249}})</td><td>{{link concepts/kv-connectors}}</td></tr>
+    <tr><td>15</td><td>the state tensors have 1024 rows "by default on most platforms" ({{cite docs/design/model_runner_v2.md:35}})</td><td>the rows are <code>max_num_seqs</code>; for <code>vllm serve</code> on a GPU that is 1024 or 256 by GPU memory ({{cite vllm/engine/arg_utils.py:2960-2993}})</td><td>{{link concepts/model-runner}}</td></tr>
+    <tr><td>16</td><td>large state tensors "are mostly stored on GPU memory" ({{cite docs/design/model_runner_v2.md:39}})</td><td>the largest, <code>all_token_ids</code>, uses pinned CPU memory (UVA) by default ({{cite vllm/v1/worker/gpu/states.py:32-42}})</td><td>{{link concepts/model-runner}}</td></tr>
+    <tr><td>17</td><td>the compile cache folder is <code>torch_compile_cache/1517964802/rank_0_0</code> ({{cite docs/design/torch_compile.md:15}})</td><td>10 hex digits, then <code>rank_r_d</code>, then a prefix folder ({{cite vllm/compilation/backends.py:1094-1105}})</td><td>{{link concepts/compile-and-cuda-graphs}}</td></tr>
+    <tr><td>18</td><td><code>CudagraphDispatcher</code> chooses the graph ({{cite docs/design/cuda_graphs.md:98-118}})</td><td>that is the Model Runner V1 path; Model Runner V2 uses its own <code>dispatch</code> ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:523-530}})</td><td>{{link concepts/compile-and-cuda-graphs}}</td></tr>
+    <tr><td>19</td><td><code>seq_lens</code> is "the number of computed tokens" ({{cite vllm/v1/attention/backend.py:401-402}})</td><td>Model Runner V2 writes computed tokens plus the query length ({{cite vllm/v1/worker/gpu/input_batch.py:375-376}})</td><td>{{link concepts/attention-backends}}</td></tr>
+    <tr><td>20</td><td><code>no_compile_layers</code> is a "copy" ({{cite vllm/forward_context.py:142}})</td><td>the context gets the same dict object ({{cite vllm/forward_context.py:248}})</td><td>{{link code/forward-context}}</td></tr>
+    <tr><td>21</td><td>"we use synchronous scheduling right now" ({{cite vllm/forward_context.py:365-367}})</td><td>async scheduling is on by default ({{cite vllm/config/vllm.py:1664-1698}})</td><td>{{link concepts/forward-context}}</td></tr>
+    <tr><td>22</td><td><code>slot_mapping</code> "is not padded" ({{cite vllm/v1/attention/backends/flash_attn.py:1450-1454}})</td><td>Model Runner V2 pads it with <code>-1</code> to the padded token count ({{cite vllm/v1/worker/gpu/block_table.py:257-260}})</td><td>{{link tours/forward-pass}}</td></tr>
+    <tr><td>23</td><td>the "auto" KV cache dtype "is normally resolved upstream" ({{cite vllm/model_executor/layers/attention/attention.py:284-286}})</td><td>the upstream function reads the checkpoint KV scheme only for <code>modelopt</code> methods ({{cite vllm/utils/torch_utils.py:457-458}}); for other checkpoints this layer code is where <code>fp8</code> is set ({{cite vllm/model_executor/layers/attention/attention.py:287-291}})</td><td>{{link learn/quantized-checkpoints}}</td></tr>
+    <tr><td>24</td><td>"No selected backend or the selected backend is invalid, so we try finding a valid backend" ({{cite vllm/platforms/cuda.py:451-452}})</td><td>an invalid selected backend raises <code>ValueError</code> before that line ({{cite vllm/platforms/cuda.py:442-446}})</td><td>{{link concepts/attention-backend-selection}}</td></tr>
+    <tr><td>25</td><td>"1 worker process per GPU" ({{cite docs/design/arch_overview.md:89-91}})</td><td>with TP = PP = DP = 1 the worker runs inside the engine core ({{cite vllm/config/parallel.py:1099-1100}})</td><td>{{link concepts/architecture-overview}}</td></tr>
+    <tr><td>26</td><td>a DP coordinator runs when DP &gt; 1 ({{cite docs/design/arch_overview.md:97-99}})</td><td>only for MoE models, or without external load balancing ({{cite vllm/config/vllm.py:855-874}})</td><td>{{link concepts/architecture-overview}}</td></tr>
+    <tr><td>27</td><td><code>-tp=2 -dp=4</code> gives 17 processes ({{cite docs/design/arch_overview.md:123-125}})</td><td>with more than one API server, the CLI process stays alive as a supervisor ({{cite vllm/entrypoints/cli/serve.py:151-152}}, {{cite vllm/entrypoints/cli/serve.py:384-390}}), so 18 (derived)</td><td>{{link concepts/architecture-overview}}</td></tr>
+    <tr><td>28</td><td>the API server uses <code>AsyncLLMEngine</code> ({{cite docs/design/arch_overview.md:166}})</td><td><code>AsyncLLMEngine</code> is only an alias of <code>AsyncLLM</code> ({{cite vllm/engine/async_llm_engine.py:4-6}})</td><td>{{link concepts/engine-client}}</td></tr>
+    <tr><td>29</td><td>"Current State (v0)" and "Prior State in v1": multiprocessing off by default ({{cite docs/design/multiprocessing.md:59-98}})</td><td><code>VLLM_ENABLE_V1_MULTIPROCESSING</code> defaults to 1 ({{cite vllm/envs.py:1442-1444}}), and <code>vllm serve</code> always uses a separate engine core process</td><td>{{link learn/processes-and-ipc}}</td></tr>
+    <tr><td>30</td><td>the coordinator collects "currently just waiting and running queue lengths" ({{cite vllm/v1/engine/coordinator.py:29-31}})</td><td>engines also send the KV cache usage ({{cite vllm/v1/engine/core.py:1630-1632}})</td><td>{{link concepts/data-parallel-serving}}</td></tr>
+    <tr><td>31</td><td>internal DP load balancing uses the running and waiting queues; KV cache aware logic could come later ({{cite docs/serving/data_parallel_deployment.md:77}})</td><td>the score already adds a penalty from the KV cache usage ({{cite vllm/v1/engine/core_client.py:1779-1786}})</td><td>{{link concepts/data-parallel-serving}}</td></tr>
+    <tr><td>32</td><td><code>num_redundant_experts</code> is "per EP rank" ({{cite docs/serving/expert_parallel_deployment.md:156}})</td><td>it is added once to the global expert count ({{cite vllm/model_executor/layers/fused_moe/layer.py:82}})</td><td>{{link concepts/expert-parallel-moe}}</td></tr>
+    <tr><td>33</td><td>DBO is only supported with DeepEP ({{cite docs/design/dbo.md:37}})</td><td>CUDA also accepts <code>nixl_ep</code>; ROCm also accepts <code>allgather_reducescatter</code> ({{cite vllm/config/vllm.py:2159-2181}})</td><td>{{link concepts/expert-parallel-moe}}</td></tr>
+    <tr><td>34</td><td>the message-queue broadcaster "is only used in tensor model parallel group" ({{cite vllm/distributed/parallel_state.py:2173}})</td><td>the DCP group also gets one ({{cite vllm/distributed/parallel_state.py:2248-2253}}), and so does the inner DP world group on more than one node ({{cite vllm/distributed/parallel_state.py:2022-2034}})</td><td>{{link concepts/distributed-groups}}</td></tr>
+    <tr><td>35</td><td>the start-up log lists the all-reduce backends "in dispatch order", with NCCL symmetric memory after FlashInfer ({{cite vllm/distributed/device_communicators/cuda_communicator.py:307-337}})</td><td><code>all_reduce</code> tries NCCL symmetric memory first ({{cite vllm/distributed/device_communicators/cuda_communicator.py:372-379}})</td><td>{{link concepts/distributed-groups}}</td></tr>
+    <tr><td>36</td><td>the hybrid prefix-cache search supports exactly two attention types, full plus one other ({{cite docs/design/hybrid_kv_cache_manager.md:201}}, {{cite docs/design/hybrid_kv_cache_manager.md:221}}, {{cite vllm/v1/core/kv_cache_planning.py:464-469}})</td><td>the coordinator handles any number of groups and models without full attention ({{cite vllm/v1/core/kv_cache_coordinator.py:746-759}})</td><td>{{link concepts/hybrid-kv-cache}}</td></tr>
+    <tr><td>37</td><td><code>auto</code> loads safetensors and falls back to PyTorch bin ({{cite docs/design/huggingface_integration.md:26}}, {{cite vllm/config/load.py:34-35}}); the <code>LoadConfig</code> list has no <code>fastsafetensors</code> ({{cite vllm/config/load.py:31-61}})</td><td><code>auto</code> first checks for Mistral <code>consolidated*.safetensors</code> files ({{cite vllm/model_executor/model_loader/default_loader.py:169-182}}) and can also fall back to <code>*.pt</code> ({{cite vllm/model_executor/model_loader/default_loader.py:205-208}}); <code>fastsafetensors</code> is a load format ({{cite vllm/model_executor/model_loader/__init__.py:54}})</td><td>{{link concepts/weight-loading}}</td></tr>
+    <tr><td>38</td><td>ITL is the wall-clock gap between streamed outputs; TPOT is (E2E − TTFT) / (n − 1) ({{cite docs/design/metrics.md:69-72}})</td><td>ITL is the gap between engine-core timestamps ({{cite vllm/v1/metrics/stats.py:551-556}}); TPOT is decode time / (n − 1) ({{cite vllm/v1/metrics/stats.py:603-616}})</td><td>{{link learn/serving-metrics}}</td></tr>
+    <tr><td>39</td><td>the queue interval ends at the "most recent SCHEDULED" ({{cite docs/design/metrics.md:212}})</td><td>only the first SCHEDULED event counts ({{cite vllm/v1/metrics/stats.py:576-578}})</td><td>{{link learn/serving-metrics}}</td></tr>
+    <tr><td>40</td><td><code>arrival_time</code> "starts when tokenization begins" ({{cite docs/design/metrics.md:262-263}})</td><td>it is set before the chat template ({{cite vllm/renderers/base.py:1380}}, {{cite vllm/renderers/base.py:1385-1396}})</td><td>{{link learn/serving-metrics}}</td></tr>
+    <tr><td>41</td><td>deprecated metrics are hidden and come back with <code>--show-hidden-metrics-for-version</code> ({{cite docs/usage/metrics.md:134-136}})</td><td>the logger stores the flag ({{cite vllm/v1/metrics/loggers.py:494}}) and no code reads it</td><td>{{link reference/metrics}}</td></tr>
+    <tr><td>42</td><td>pass <code>--kv-cache-memory</code> to skip profiling ({{cite docs/configuration/optimization.md:24}}); the start-up log prints the same name ({{cite vllm/v1/worker/gpu_worker.py:1047-1051}})</td><td>the flag is <code>--kv-cache-memory-bytes</code> ({{cite vllm/engine/arg_utils.py:1385}}); argparse accepts the shorter name as an unambiguous prefix (derived)</td><td>{{link concepts/troubleshooting}}</td></tr>
+    <tr><td>43</td><td>a preemption logs "Sequence group 0 is preempted by PreemptionMode.RECOMPUTE" ({{cite docs/configuration/optimization.md:33-35}})</td><td>no log per preemption; the periodic stats line shows "Preemptions: N" ({{cite vllm/v1/metrics/loggers.py:310-312}})</td><td>{{link concepts/scheduler}}</td></tr>
+    <tr><td>44</td><td>N GPUs mean at least 2 + N processes ({{cite docs/configuration/optimization.md:432-436}})</td><td>with one GPU the worker runs inside the engine core: 2 processes ({{cite vllm/config/parallel.py:1099-1100}})</td><td>{{link concepts/deployment-recipes}}</td></tr>
+    <tr><td>45</td><td>the <code>--api-key</code> help names <code>/v1</code>, <code>/v2</code> and <code>/inference</code> ({{cite vllm/entrypoints/common/cli_args.py:330-331}})</td><td><code>/cohere</code> is guarded too ({{cite vllm/entrypoints/serve/middleware/authenticate.py:11}})</td><td>{{link concepts/deployment-recipes}}</td></tr>
+    <tr><td>46</td><td>a non-zero <code>priority</code> "will raise an error" without priority scheduling ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:398-400}})</td><td>the FCFS queue appends the request and ignores the priority ({{cite vllm/v1/core/sched/request_queue.py:78-80}})</td><td>{{link concepts/scheduler}}</td></tr>
+    <tr><td>47</td><td><code>cache_salt</code> allows up to 1024 characters ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:499-502}})</td><td>the validator allows at most 128 ({{cite vllm/entrypoints/generate/base/protocol.py:39}}, {{cite vllm/entrypoints/generate/base/protocol.py:51-58}})</td><td>{{link learn/prefix-caching}}</td></tr>
+    <tr><td>48</td><td>sleep level 2 "discard[s] all GPU memory" ({{cite vllm/v1/engine/core.py:989}})</td><td>the runtime and CUDA graph pools are kept at every level ({{cite vllm/device_allocator/sleep_mode_backend.py:132-137}})</td><td>{{link code/v1-worker-gpu-worker}}</td></tr>
+    <tr><td>49</td><td>sleep mode: "only cuda and hip platforms" ({{cite vllm/config/model.py:371-372}})</td><td>XPU is accepted too ({{cite vllm/platforms/interface.py:231-236}})</td><td>{{link concepts/engine-hooks}}</td></tr>
+    <tr><td>50</td><td><code>VLLM_ENGINE_READY_TIMEOUT_S</code>: the timeout "for waiting for engine cores to become ready during startup" ({{cite vllm/envs.py:810-811}})</td><td>with one API server the start-up wait has no limit ({{cite vllm/v1/engine/utils.py:1434-1446}})</td><td>{{link tours/serve-startup}}</td></tr>
+    <tr><td>51</td><td><code>VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS</code> "only applies when TP &gt; 1" ({{cite vllm/envs.py:1859-1860}})</td><td>the multiprocessing executor uses it ({{cite vllm/v1/executor/multiproc_executor.py:350}}), and that executor runs whenever the world size across DP is more than 1, for example DP = 2 with TP = 1 ({{cite vllm/config/parallel.py:1055}})</td><td>{{link concepts/executors-and-workers}}</td></tr>
+    <tr><td>52</td><td><code>interactivity</code> and <code>throughput</code> select latency- or throughput-oriented kernels ({{cite vllm/config/vllm.py:441-445}})</td><td>the field is read for the batch defaults and the capture sizes only ({{cite vllm/engine/arg_utils.py:3171}}, {{cite vllm/config/vllm.py:2552}})</td><td>{{link concepts/tuning}}</td></tr>
+    <tr><td>53</td><td>type hints: <code>VLLM_SKIP_P2P_CHECK</code> <code>False</code>, <code>VLLM_DP_MASTER_IP</code> <code>""</code>, <code>VLLM_XGRAMMAR_CACHE_MB</code> <code>0</code> ({{cite vllm/envs.py:128}}, {{cite vllm/envs.py:182}}, {{cite vllm/envs.py:226}})</td><td>the reads fall back to <code>True</code>, <code>"127.0.0.1"</code> and 512 ({{cite vllm/envs.py:1207}}, {{cite vllm/envs.py:1503}}, {{cite vllm/envs.py:1689}})</td><td>{{link reference/env-vars#known-issues}}</td></tr>
+    <tr><td>54</td><td>a test platform plugin imports <code>vllm.attention.backends.placeholder_attn</code> ({{cite tests/plugins/vllm_add_dummy_platform/vllm_add_dummy_platform/dummy_attention_backend.py:4}})</td><td>there is no <code>vllm/attention/</code> package at this commit; the design doc says <code>vllm.attention</code> was removed ({{cite docs/design/plugin_system.md:158}})</td><td>{{link concepts/platform-plugins}}</td></tr>
+  </tbody>
+</table>
+<p>Each <code>{{cite}}</code> on the left is a doc, a docstring or a comment; each one on the right is the code that runs. "Derived" means that the result follows from the cited lines, but no test shows it.</p>
+
+<h2 id="open-questions">Known open questions</h2>
+<p>These questions are still open on the pages of this site. The code that the pages cite does not answer them.</p>
+<table>
+  <thead><tr><th>Question</th><th>Page</th></tr></thead>
+  <tbody>
+    <tr><td>Does any in-tree code read <code>final_usage_info</code>, which the chat handler stores on <code>raw_request.state</code> for middleware?</td><td>{{link code/entrypoints-openai-chat-completion-serving}}</td></tr>
+    <tr><td>Does a <code>MultiConnector</code> child that comes from a module path (not the registry) send its stats as a dict, which the name lookup cannot rebuild?</td><td>{{link code/distributed-kv-transfer-kv-connector-factory}}</td></tr>
+    <tr><td>Does an attention backend name added with <code>register_backend("MY_NAME", ...)</code> survive the pickled <code>VllmConfig</code> in the engine core and the workers?</td><td>{{link concepts/attention-backend-selection}}</td></tr>
+    <tr><td>What does <code>/scale_elastic_ep</code> do with the Ray DP backend and a smaller size that passes the expert check?</td><td>{{link concepts/expert-parallel-moe}}</td></tr>
+    <tr><td>Will later commits read <code>performance_mode</code> in more places? At this commit, only two readers exist.</td><td>{{link concepts/tuning}}</td></tr>
+    <tr><td>Why are the parser plugin values imported only when they are longer than 3 characters? The code does not say.</td><td>{{link concepts/frontend-plugins}}, {{link concepts/plugin-map}}</td></tr>
+  </tbody>
+</table>
+
+<x-quiz>
+  <x-q level="easy">A client sends <code>guided_json</code> in a chat request. What status does it get, and is the output constrained?
+    <x-a><p>HTTP 200 with unconstrained output; the server logs one WARNING ({{cite vllm/entrypoints/serve/engine/protocol.py:21-34}}, {{cite vllm/entrypoints/serve/engine/protocol.py:61-71}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">You set <code>--api-key</code>. Which two of these paths need the key: <code>/v1/chat/completions</code>, <code>/invocations</code>, <code>/cohere/v2/chat</code>, <code>/generative_scoring</code>?
+    <x-a><p><code>/v1/chat/completions</code> and <code>/cohere/v2/chat</code>. The middleware checks only the prefixes <code>/v1</code>, <code>/v2</code>, <code>/inference</code> and <code>/cohere</code> ({{cite vllm/entrypoints/serve/middleware/authenticate.py:11}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Your platform hook <code>pre_register_and_update</code> registers a quantization method with <code>@register_quantization_config</code>. The hook runs 5 times. Does the registration fail on the second run?
+    <x-a><p>No. A name that exists only gives a DEBUG log, and the class is stored again ({{cite vllm/model_executor/layers/quantization/__init__.py:89-95}}, {{cite vllm/model_executor/layers/quantization/__init__.py:106}}). A KV connector registration in the same hook would raise <code>ValueError</code> on the second run ({{cite vllm/distributed/kv_transfer/kv_connector/factory.py:33-34}}).</p></x-a>
+  </x-q>
+</x-quiz>

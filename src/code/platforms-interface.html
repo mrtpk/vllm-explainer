@@ -22,11 +22,11 @@ summary: vllm/platforms/interface.py defines Platform, the base class of every h
 <p>The page {{link concepts/platform-interface}} explains the hooks in start-up order. This page maps the file and reads its most important methods.</p>
 
 <h2>Where it sits</h2>
-<x-diagram name="b4a_platform_hooks" alt="Three columns for vllm serve with TP = 2, with numbered Platform hook calls: in the API server, platform detection, pre_register_and_update twice, validate_environ, apply_config_platform_defaults, check_and_update_config, then the start of the engine core; in the engine core, detection, the start of the workers and get_kv_cache_config_builder_cls; in each worker, detection, register_triton_kernel_overrides, get_device_communicator_cls, get_attn_backend_cls, opaque_attention_op and update_block_size_for_backend." caption="Figure: where the methods of this file are called during a <code>vllm serve</code> start-up with TP = 2." />
+<x-diagram name="b4a_platform_hooks" alt="Three columns for vllm serve with TP = 2, with numbered Platform hook calls: in the API server, platform detection, pre_register_and_update five times (four parsers, then create_engine_config), validate_environ, apply_config_platform_defaults, check_and_update_config, then the start of the engine core; in the engine core, detection, the start of the workers, get_kv_cache_config_builder_cls, and apply_config_platform_defaults and check_and_update_config again after the handshake; in each worker, detection, register_triton_kernel_overrides, get_device_communicator_cls, get_attn_backend_cls, opaque_attention_op and update_block_size_for_backend." caption="Figure: where the methods of this file are called during a <code>vllm serve</code> start-up with TP = 2." />
 
 <h3>Who calls it</h3>
 <ul>
-  <li><strong>The config code (front end).</strong> <code>EngineArgs</code> calls <code>pre_register_and_update</code> and <code>validate_environ</code> ({{cite vllm/engine/arg_utils.py:2246-2250}}). <code>VllmConfig.__post_init__</code> calls <code>apply_config_platform_defaults</code> and <code>check_and_update_config</code> ({{cite vllm/config/vllm.py:1804}}, {{cite vllm/config/vllm.py:2046}}).</li>
+  <li><strong>The config code (front end).</strong> <code>EngineArgs</code> calls <code>pre_register_and_update</code> and <code>validate_environ</code> ({{cite vllm/engine/arg_utils.py:2246-2250}}). <code>add_cli_args</code> also calls <code>pre_register_and_update</code>, once for each parser that the front end builds ({{cite vllm/engine/arg_utils.py:3257}}). <code>VllmConfig.__post_init__</code> calls <code>apply_config_platform_defaults</code> and <code>check_and_update_config</code> ({{cite vllm/config/vllm.py:1804}}, {{cite vllm/config/vllm.py:2046}}). Each engine core runs <code>__post_init__</code> again after its handshake, so these two hooks run there too ({{cite vllm/v1/engine/core.py:1336-1337}}).</li>
   <li><strong>The executors.</strong> They call <code>update_block_size_for_backend</code> after the model is loaded ({{cite vllm/v1/executor/multiproc_executor.py:702}}, {{cite vllm/v1/executor/uniproc_executor.py:75}}).</li>
   <li><strong>Component builders.</strong> The attention selector ({{cite vllm/v1/attention/selector.py:218}}), the process groups ({{cite vllm/distributed/parallel_state.py:551}}), the LoRA wrapper selector ({{cite vllm/lora/punica_wrapper/punica_selector.py:14}}), the compiler ({{cite vllm/compilation/backends.py:691}}, {{cite vllm/compilation/backends.py:876}}) and the KV cache planner ({{cite vllm/v1/core/kv_cache_config_builder.py:101}}).</li>
   <li><strong>Subclasses.</strong> Vendor classes call <code>super()</code> for some methods, for example ROCm for <code>import_kernels</code> ({{cite vllm/platforms/rocm.py:654}}) and XPU for <code>update_block_size_for_backend</code> ({{cite vllm/platforms/xpu.py:477}}).</li>
@@ -113,7 +113,7 @@ summary: vllm/platforms/interface.py defines Platform, the base class of every h
     <tr><td><code>inference_mode</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:619-626}}</td><td>Context manager; default <code>torch.inference_mode(True)</code>.</td></tr>
     <tr><td><code>set_device</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:629-631}}</td><td>Sets the current device; base raises <code>NotImplementedError</code>.</td></tr>
     <tr><td><code>manual_seed_all</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:634-636}}</td><td>Seeds all devices; base raises <code>NotImplementedError</code>.</td></tr>
-    <tr><td><code>pre_register_and_update</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:639-651}}</td><td>Config hook: before the flags are parsed (and again in <code>create_engine_config</code>).</td></tr>
+    <tr><td><code>pre_register_and_update</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:639-651}}</td><td>Config hook: each time the front end builds a parser (four times), and again in <code>create_engine_config</code>.</td></tr>
     <tr><td><code>apply_config_platform_defaults</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:654-664}}</td><td>Config hook: platform defaults in <code>VllmConfig.__post_init__</code>.</td></tr>
     <tr><td><code>check_and_update_config</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:667-676}}</td><td>Config hook: check or change <code>VllmConfig</code>; sets <code>worker_cls</code>.</td></tr>
     <tr><td><code>update_block_size_for_backend</code></td><td>classmethod</td><td>{{cite vllm/platforms/interface.py:750-794}}</td><td>Config hook after model load: a block size that all attention backends accept.</td></tr>
@@ -167,7 +167,7 @@ summary: vllm/platforms/interface.py defines Platform, the base class of every h
 <h3>The three config hooks</h3>
 <x-code file="vllm/platforms/interface.py" lines="638-676" highlight="644-646,656-660,669-674" />
 <ol>
-  <li><strong>Lines 639-651.</strong> <code>pre_register_and_update</code> gets the CLI parser, or <code>None</code>. The docstring names the use case: an out-of-tree quantization config. It is called twice by <code>vllm serve</code> ({{cite vllm/engine/arg_utils.py:3257}}, {{cite vllm/engine/arg_utils.py:2246}}).</li>
+  <li><strong>Lines 639-651.</strong> <code>pre_register_and_update</code> gets the CLI parser, or <code>None</code>. The docstring names the use case: an out-of-tree quantization config. <code>vllm serve</code> calls it five times in the front end: four times with a parser ({{cite vllm/engine/arg_utils.py:3257}}) and once without ({{cite vllm/engine/arg_utils.py:2246}}).</li>
   <li><strong>Lines 654-664.</strong> <code>apply_config_platform_defaults</code> runs "after parsing cli arguments" and can change defaults, for example <code>custom_ops</code>.</li>
   <li><strong>Lines 667-676.</strong> <code>check_and_update_config</code> can raise or change the config "in place". All three return <code>None</code>; their effect is the change to the object.</li>
 </ol>
@@ -264,7 +264,7 @@ summary: vllm/platforms/interface.py defines Platform, the base class of every h
   <li><code>_global_graph_pool</code>: a class attribute, so one pool per platform class and process ({{cite vllm/platforms/interface.py:1321-1326}}).</li>
   <li><code>supported_quantization</code>: a class-level list. <code>register_quantization_config</code> appends to it when it is not empty ({{cite vllm/model_executor/layers/quantization/__init__.py:98-100}}). The base list is one object shared by every subclass that does not set its own. (Derived.)</li>
 </ul>
-<p>Which process calls which method is in the hook table of {{link concepts/platform-interface}}: config hooks in the front end, pickers in the workers and the engine core.</p>
+<p>Which process calls which method is in the hook table of {{link concepts/platform-interface}}: config hooks in the front end (the two <code>__post_init__</code> hooks also in each engine core), pickers in the workers and the engine core.</p>
 </x-deepdive>
 
 <x-deepdive title="Error paths: what raises, what only logs">

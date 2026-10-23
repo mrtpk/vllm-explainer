@@ -1,0 +1,782 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hooks in the engine core and the workers · vLLM Explained</title>
+<meta name="description" content="Several extension points of the engine core and the workers are config fields or registries, not entry-point groups - scheduler_cls, worker_cls and worker_extension_cls, logits processors, model loaders, sleep-mode backends and KV cache dtypes. This page shows where each one is read and what your class must do.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="concepts/engine-hooks">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a class="current" aria-current="page" href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>vLLM concepts</span><span class="sep">›</span><span>Plugins and extensibility</span><span class="sep">›</span><span aria-current="page">Engine hooks</span></nav>
+<h1 class="page-title">Hooks in the engine core and the workers</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">vLLM concepts</span><span class="meta-time">about 10 min read + 2 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../concepts/plugin-map.html">All the ways to extend vLLM</a> <span class="level level-intermediate level-sm">Intermediate</span></li><li><a href="../concepts/executors-and-workers.html">Executors and workers: from the engine core to the GPUs</a> <span class="level level-intermediate level-sm">Intermediate</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">The engine core and the workers read class names from config fields and registries. That is how you replace the scheduler, the worker or the loader.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>The <a class="term" href="../reference/glossary.html#term-engine-core" data-term="EngineCore" data-def="The inner loop of vLLM. It owns the scheduler (which holds the KV cache manager) and the executor, and it runs steps on the workers. vllm serve runs it in its own process.">EngineCore</a> process runs the scheduler. Each <a class="term" href="../reference/glossary.html#term-worker" data-term="worker" data-def="The process or object that owns one GPU. It sets up the device and the process groups, and it holds the model runner.">worker</a> owns one GPU, builds the model and runs it (<a href="../concepts/executors-and-workers.html">Executors and workers: from the engine core to the GPUs</a>). These parts have extension points of two kinds:</p>
+<ul>
+  <li><strong>Config hooks.</strong> A field of <code>VllmConfig</code> holds a class name, for example <code>--scheduler-cls my_pkg.sched.MyScheduler</code>. The front end parses it, the other processes get it inside the pickled config, and each process imports the class itself. No registration is needed.</li>
+  <li><strong>Registries.</strong> A module-level table maps a name to a class, for example <code>--load-format</code> values to model loaders. A <a class="term" href="../reference/glossary.html#term-general-plugin" data-term="general plugin" data-def="A function in the entry-point group vllm.general_plugins. vLLM calls it with no arguments, at most once in each process, usually to register something.">general plugin</a> fills it in every process.</li>
+</ul>
+<p>One more extension point is an entry-point group: <code>vllm.logits_processors</code>. vLLM loads it in the workers, and in the front end for a request check.</p>
+<p><strong>An everyday comparison.</strong> Think of a theatre production. The director's script names the actors for the main roles: the scheduler, the worker, an extra helper. Every theatre that plays the script hires these actors itself. The prop room has labelled shelves (registries) that a stage manager fills before the show. The comparison stops here: in vLLM each process is its own theatre, and a shelf filled in one process is empty in the next.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b5_engine_hooks"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1, engine core process, EngineCore.__init__: 1 general plugins run, so registries are filled before anything reads them (core.py 132); 2 the executor starts the workers and the KV cache is planned (core.py 147 and 160); 3 scheduler_cls: unset gives AsyncScheduler or Scheduler, a string goes through resolve_obj_by_qualname, and a class outside vllm. gives a WARNING (core.py 164). Panel 2, worker: 4 general plugins and register_triton_kernel_overrides (worker_base.py 284); 5 worker_cls must be a dotted string, set by the platform when it is auto (worker_base.py 292); 6 worker_extension_cls is added to the worker class bases, an assert stops shared names, and init_worker_extension runs (worker_base.py 304); 7 the model loader is chosen by load_config.load_format, filled by register_model_loader (model_runner.py 398); 8 logits processors from the vllm.logits_processors group plus the logits_processors list, which must be V2 LogitsProcessor subclasses (model_runner.py 463); 9 register_kv_cache_dtype, a registry with no caller in vllm/ (cache.py 111). Panel 3, run time: 10 collective_rpc with a method name from LLM, AsyncLLM or the dev route POST /collective_rpc; 11 run_method in each worker uses getattr on the worker and raises NotImplementedError when the method is missing; 12 the sleep-mode backend, keyed by model_config.sleep_mode_backend, default cumem, made by SleepModeBackendFactory on first use (gpu_worker.py 250)."><svg role="img" aria-label="Panel 1, engine core process, EngineCore.__init__: 1 general plugins run, so registries are filled before anything reads them (core.py 132); 2 the executor starts the workers and the KV cache is planned (core.py 147 and 160); 3 scheduler_cls: unset gives AsyncScheduler or Scheduler, a string goes through resolve_obj_by_qualname, and a class outside vllm. gives a WARNING (core.py 164). Panel 2, worker: 4 general plugins and register_triton_kernel_overrides (worker_base.py 284); 5 worker_cls must be a dotted string, set by the platform when it is auto (worker_base.py 292); 6 worker_extension_cls is added to the worker class bases, an assert stops shared names, and init_worker_extension runs (worker_base.py 304); 7 the model loader is chosen by load_config.load_format, filled by register_model_loader (model_runner.py 398); 8 logits processors from the vllm.logits_processors group plus the logits_processors list, which must be V2 LogitsProcessor subclasses (model_runner.py 463); 9 register_kv_cache_dtype, a registry with no caller in vllm/ (cache.py 111). Panel 3, run time: 10 collective_rpc with a method name from LLM, AsyncLLM or the dev route POST /collective_rpc; 11 run_method in each worker uses getattr on the worker and raises NotImplementedError when the method is missing; 12 the sleep-mode backend, keyed by model_config.sleep_mode_backend, default cumem, made by SleepModeBackendFactory on first use (gpu_worker.py 250)." xmlns="http://www.w3.org/2000/svg" width="1100" height="978" viewBox="0 0 1100 978">
+<defs><marker id="dg-b5_engine_hooks-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#111827"/></marker><marker id="dg-b5_engine_hooks-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker></defs>
+<rect width="1100" height="978" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Engine hooks: where each one plugs in</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Config fields, registries and one plugin group, read in the engine core and the workers</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">violet = config field (class name)  ·  blue = registry  ·  green = entry-point group</text>
+<rect x="20.0" y="120.0" width="1060.0" height="196.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="146.0" r="13" fill="#111827"/>
+<text x="46.0" y="150.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="151.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Engine core process: EngineCore.__init__</text>
+<text x="68.0" y="170.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The scheduler class is picked last, after the workers exist and the KV cache is planned.</text>
+<rect x="40.0" y="190.0" width="320.0" height="104.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<rect x="40.0" y="190.0" width="6.0" height="104.0" rx="3" fill="#059669" fill-opacity="1.0" stroke="none"/>
+<circle cx="62.0" cy="207.0" r="10" fill="#059669"/>
+<text x="62.0" y="211.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="78.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">general plugins</text>
+<rect x="259.2" y="198.0" width="92.8" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#059669" stroke-width="1"/>
+<text x="305.6" y="211.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">core.py:132</text>
+<text x="78.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">run</text>
+<text x="108.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">load_general_plugins()</text>
+<text x="78.0" y="249.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">so</text>
+<text x="108.0" y="249.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">registries are filled here</text>
+<text x="78.0" y="266.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre"></text>
+<text x="108.0" y="266.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">before anything reads them</text>
+<rect x="390.0" y="190.0" width="320.0" height="104.0" rx="8" fill="#f3f4f6" fill-opacity="1.0" stroke="#4b5563" stroke-width="1.4"/>
+<rect x="390.0" y="190.0" width="6.0" height="104.0" rx="3" fill="#4b5563" fill-opacity="1.0" stroke="none"/>
+<circle cx="412.0" cy="207.0" r="10" fill="#4b5563"/>
+<text x="412.0" y="211.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="428.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">executor + KV caches</text>
+<rect x="582.7" y="198.0" width="119.3" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#4b5563" stroke-width="1"/>
+<text x="642.3" y="211.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#4b5563" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">core.py:147,160</text>
+<text x="428.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">start</text>
+<text x="470.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">workers (panel 2)</text>
+<text x="428.0" y="249.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">plan</text>
+<text x="470.0" y="249.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">KV cache config</text>
+<text x="428.0" y="266.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre"></text>
+<text x="470.0" y="266.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre"></text>
+<rect x="740.0" y="190.0" width="320.0" height="104.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<rect x="740.0" y="190.0" width="6.0" height="104.0" rx="3" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<circle cx="762.0" cy="207.0" r="10" fill="#7c3aed"/>
+<text x="762.0" y="211.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="778.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">scheduler_cls</text>
+<rect x="959.2" y="198.0" width="92.8" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="1005.6" y="211.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">core.py:164</text>
+<text x="778.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">unset</text>
+<text x="820.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">AsyncScheduler / Scheduler</text>
+<text x="778.0" y="249.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">str</text>
+<text x="820.0" y="249.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">resolve_obj_by_qualname</text>
+<text x="778.0" y="266.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">warn</text>
+<text x="820.0" y="266.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">not under vllm.: WARNING</text>
+<line x1="362.0" y1="242.0" x2="388.0" y2="242.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b5_engine_hooks-m0)"/>
+<line x1="712.0" y1="242.0" x2="738.0" y2="242.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b5_engine_hooks-m0)"/>
+<rect x="20.0" y="334.0" width="1060.0" height="318.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="360.0" r="13" fill="#111827"/>
+<text x="46.0" y="364.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="365.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Worker: init_worker, init_device, load_model</text>
+<text x="68.0" y="384.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The worker class and its extension are fixed first; the loader and logits processors come with the model.</text>
+<rect x="40.0" y="404.0" width="320.0" height="104.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<rect x="40.0" y="404.0" width="6.0" height="104.0" rx="3" fill="#059669" fill-opacity="1.0" stroke="none"/>
+<circle cx="62.0" cy="421.0" r="10" fill="#059669"/>
+<text x="62.0" y="425.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">4</text>
+<text x="78.0" y="426.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">general plugins</text>
+<rect x="212.8" y="412.0" width="139.2" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#059669" stroke-width="1"/>
+<text x="282.4" y="425.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">worker_base.py:284</text>
+<text x="78.0" y="446.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">run</text>
+<text x="112.0" y="446.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">load_general_plugins()</text>
+<text x="78.0" y="463.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">then</text>
+<text x="112.0" y="463.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">register_triton_kernel_</text>
+<text x="78.0" y="480.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre"></text>
+<text x="112.0" y="480.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  overrides()</text>
+<rect x="390.0" y="404.0" width="320.0" height="104.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<rect x="390.0" y="404.0" width="6.0" height="104.0" rx="3" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<circle cx="412.0" cy="421.0" r="10" fill="#7c3aed"/>
+<text x="412.0" y="425.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">5</text>
+<text x="428.0" y="426.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">worker_cls</text>
+<rect x="562.8" y="412.0" width="139.2" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="632.4" y="425.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">worker_base.py:292</text>
+<text x="428.0" y="446.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">str</text>
+<text x="462.0" y="446.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">dotted name, must be a str</text>
+<text x="428.0" y="463.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">auto</text>
+<text x="462.0" y="463.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">platform sets it earlier</text>
+<text x="428.0" y="480.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre"></text>
+<text x="462.0" y="480.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">(check_and_update_config)</text>
+<rect x="740.0" y="404.0" width="320.0" height="104.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<rect x="740.0" y="404.0" width="6.0" height="104.0" rx="3" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<circle cx="762.0" cy="421.0" r="10" fill="#7c3aed"/>
+<text x="762.0" y="425.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">6</text>
+<text x="778.0" y="426.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">worker_extension_cls</text>
+<rect x="1005.5" y="412.0" width="46.5" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1"/>
+<text x="1028.8" y="425.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">:304</text>
+<text x="778.0" y="446.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">add</text>
+<text x="820.0" y="446.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">class to worker __bases__</text>
+<text x="778.0" y="463.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">clash</text>
+<text x="820.0" y="463.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">assert: no shared names</text>
+<text x="778.0" y="480.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">hook</text>
+<text x="820.0" y="480.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">init_worker_extension(w)</text>
+<rect x="40.0" y="526.0" width="320.0" height="104.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<rect x="40.0" y="526.0" width="6.0" height="104.0" rx="3" fill="#2563eb" fill-opacity="1.0" stroke="none"/>
+<circle cx="62.0" cy="543.0" r="10" fill="#2563eb"/>
+<text x="62.0" y="547.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">7</text>
+<text x="78.0" y="548.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">model loader</text>
+<rect x="206.2" y="534.0" width="145.8" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="279.1" y="547.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">model_runner.py:398</text>
+<text x="78.0" y="568.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">key</text>
+<text x="108.0" y="568.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">load_config.load_format</text>
+<text x="78.0" y="585.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">reg</text>
+<text x="108.0" y="585.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">register_model_loader(...)</text>
+<text x="78.0" y="602.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">call</text>
+<text x="108.0" y="602.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">loader.load_model(...)</text>
+<rect x="390.0" y="526.0" width="320.0" height="104.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<rect x="390.0" y="526.0" width="6.0" height="104.0" rx="3" fill="#059669" fill-opacity="1.0" stroke="none"/>
+<circle cx="412.0" cy="543.0" r="10" fill="#059669"/>
+<text x="412.0" y="547.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">8</text>
+<text x="428.0" y="548.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">logits processors</text>
+<rect x="556.2" y="534.0" width="145.8" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#059669" stroke-width="1"/>
+<text x="629.1" y="547.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">model_runner.py:463</text>
+<text x="428.0" y="568.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">grp</text>
+<text x="458.0" y="568.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">vllm.logits_processors</text>
+<text x="428.0" y="585.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">cfg</text>
+<text x="458.0" y="585.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">+ logits_processors= list</text>
+<text x="428.0" y="602.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">V2</text>
+<text x="458.0" y="602.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">LogitsProcessor subclasses</text>
+<rect x="740.0" y="526.0" width="320.0" height="104.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<rect x="740.0" y="526.0" width="6.0" height="104.0" rx="3" fill="#2563eb" fill-opacity="1.0" stroke="none"/>
+<circle cx="762.0" cy="543.0" r="10" fill="#2563eb"/>
+<text x="762.0" y="547.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">9</text>
+<text x="778.0" y="548.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">KV cache dtype</text>
+<rect x="952.5" y="534.0" width="99.5" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="1002.3" y="547.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">cache.py:111</text>
+<text x="778.0" y="568.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">reg</text>
+<text x="812.0" y="568.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">register_kv_cache_dtype</text>
+<text x="778.0" y="585.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">note</text>
+<text x="812.0" y="585.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">no caller in vllm/</text>
+<text x="778.0" y="602.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre"></text>
+<text x="812.0" y="602.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">(tests only)</text>
+<line x1="362.0" y1="456.0" x2="388.0" y2="456.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b5_engine_hooks-m0)"/>
+<line x1="712.0" y1="456.0" x2="738.0" y2="456.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b5_engine_hooks-m0)"/>
+<line x1="362.0" y1="578.0" x2="388.0" y2="578.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b5_engine_hooks-m0)"/>
+<path d="M 900,510 L 900,517 L 200,517 L 200,524" fill="none" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b5_engine_hooks-m0)"/>
+<rect x="20.0" y="670.0" width="1060.0" height="196.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="696.0" r="13" fill="#111827"/>
+<text x="46.0" y="700.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="701.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">At run time</text>
+<text x="68.0" y="720.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Extension methods are reached by name; the sleep-mode backend is made on first use.</text>
+<rect x="40.0" y="740.0" width="320.0" height="104.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<rect x="40.0" y="740.0" width="6.0" height="104.0" rx="3" fill="#d97706" fill-opacity="1.0" stroke="none"/>
+<circle cx="62.0" cy="757.0" r="10" fill="#d97706"/>
+<text x="62.0" y="761.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">10</text>
+<text x="78.0" y="762.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">collective_rpc(&quot;my_method&quot;)</text>
+<text x="78.0" y="782.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">from</text>
+<text x="112.0" y="782.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">LLM, AsyncLLM, or POST</text>
+<text x="78.0" y="799.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre"></text>
+<text x="112.0" y="799.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">/collective_rpc (dev mode)</text>
+<rect x="390.0" y="740.0" width="320.0" height="104.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<rect x="390.0" y="740.0" width="6.0" height="104.0" rx="3" fill="#d97706" fill-opacity="1.0" stroke="none"/>
+<circle cx="412.0" cy="757.0" r="10" fill="#d97706"/>
+<text x="412.0" y="761.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">11</text>
+<text x="428.0" y="762.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">run_method (each worker)</text>
+<rect x="655.5" y="748.0" width="46.5" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#d97706" stroke-width="1"/>
+<text x="678.8" y="761.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">:485</text>
+<text x="428.0" y="782.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">get</text>
+<text x="462.0" y="782.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">getattr(worker, name)</text>
+<text x="428.0" y="799.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">miss</text>
+<text x="462.0" y="799.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">NotImplementedError</text>
+<text x="428.0" y="816.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre"></text>
+<text x="462.0" y="816.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">via the wrapper __getattr__</text>
+<rect x="740.0" y="740.0" width="320.0" height="104.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<rect x="740.0" y="740.0" width="6.0" height="104.0" rx="3" fill="#2563eb" fill-opacity="1.0" stroke="none"/>
+<circle cx="762.0" cy="757.0" r="10" fill="#2563eb"/>
+<text x="762.0" y="761.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">12</text>
+<text x="778.0" y="762.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">sleep mode backend</text>
+<rect x="919.4" y="748.0" width="132.6" height="19.0" rx="9.5" fill="#ffffff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1"/>
+<text x="985.7" y="761.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">gpu_worker.py:250</text>
+<text x="778.0" y="782.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">key</text>
+<text x="808.0" y="782.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">model_config.sleep_mode_</text>
+<text x="778.0" y="799.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre"></text>
+<text x="808.0" y="799.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  backend (&quot;cumem&quot;)</text>
+<text x="778.0" y="816.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">reg</text>
+<text x="808.0" y="816.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">SleepModeBackendFactory</text>
+<line x1="362.0" y1="792.0" x2="388.0" y2="792.0" stroke="#d97706" stroke-width="1.6" marker-end="url(#dg-b5_engine_hooks-m1)"/>
+<text x="30.0" y="893.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="882.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="118.3" y="893.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">config field</text>
+<rect x="209.6" y="882.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="230.6" y="893.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">registry</text>
+<rect x="304.7" y="882.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="325.7" y="893.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">entry-point group</text>
+<rect x="454.3" y="882.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="475.3" y="893.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">run-time call</text>
+<text x="30.0" y="916.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">With TP = 1 (uni executor) panel 2 runs inside the engine core process.</text>
+<text x="30.0" y="934.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The front end also loads vllm.logits_processors, to check request parameters (not shown).</text>
+<text x="30.0" y="952.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">serial_utils.py:485 = vllm/v1/serial_utils.py. Card 9 is a registry with no caller at this commit, not a start-up step.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the hooks of the engine core (panel 1), of the worker start-up (panel 2) and at run time (panel 3).</figcaption><a class="diagram-open" href="../diagrams/b5_engine_hooks.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read the numbers in order. Violet items are config fields, blue items are registries, green items load plugins. With one GPU, the uni executor runs panel 2 inside the engine core process.</p>
+
+<h2 id="in-the-code">In the code<a class="h-anchor" href="#in-the-code" aria-label="Link to this section">#</a></h2>
+
+<h3 id="step-1-scheduler-cls">Step 1: scheduler_cls<a class="h-anchor" href="#step-1-scheduler-cls" aria-label="Link to this section">#</a></h3>
+<p>The field takes a class or a dotted name (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/scheduler.py#L175-L180" target="_blank" rel="noopener" title="vllm/config/scheduler.py:175-180 at 3e44c0d"><code>vllm/config/scheduler.py:175-180</code></a>). The engine core resolves it after the KV cache plan (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L160-L164" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:160-164 at 3e44c0d"><code>vllm/v1/engine/core.py:160-164</code></a>):</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/scheduler.py#L231-L256" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/config/scheduler.py:231-256</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/scheduler.py#L231-L256" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">231</span><span class="ln hl">232</span><span class="ln hl">233</span><span class="ln hl">234</span><span class="ln hl">235</span><span class="ln hl">236</span><span class="ln hl">237</span><span class="ln hl">238</span><span class="ln hl">239</span><span class="ln">240</span><span class="ln">241</span><span class="ln">242</span><span class="ln hl">243</span><span class="ln hl">244</span><span class="ln hl">245</span><span class="ln hl">246</span><span class="ln hl">247</span><span class="ln hl">248</span><span class="ln hl">249</span><span class="ln hl">250</span><span class="ln hl">251</span><span class="ln hl">252</span><span class="ln hl">253</span><span class="ln hl">254</span><span class="ln hl">255</span><span class="ln hl">256</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><pre><code class="language-python">    def get_scheduler_cls(self) -&gt; type[&quot;SchedulerInterface&quot;]:
+        if self.scheduler_cls is None:
+            if self.async_scheduling:
+                from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+
+                return AsyncScheduler
+            from vllm.v1.core.sched.scheduler import Scheduler
+
+            return Scheduler
+
+        # The first half of this warning can be removed once the Scheduler interface is
+        # finalized and we can maintain support for scheduler classes that implement it
+        if not (
+            isinstance(self.scheduler_cls, str)
+            and self.scheduler_cls.startswith(&quot;vllm.&quot;)
+        ):
+            logger.warning_once(
+                &quot;Using custom scheduler class %s. This scheduler interface is not &quot;
+                &quot;public and compatibility may not be maintained. If you have &quot;
+                &quot;subclassed Scheduler instead of AsyncScheduler, you will see &quot;
+                &quot;degraded performance due to async scheduling being disabled.&quot;,
+                self.scheduler_cls,  # type: ignore[arg-type]
+            )
+        if not isinstance(self.scheduler_cls, str):
+            return cast(type[&quot;SchedulerInterface&quot;], self.scheduler_cls)
+        return resolve_obj_by_qualname(self.scheduler_cls)</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 232-239.</strong> Not set: <code>AsyncScheduler</code> when async scheduling is on, else <code>Scheduler</code>. <code>VllmConfig</code> turns async scheduling on when no option conflicts with it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L1664-L1698" target="_blank" rel="noopener" title="vllm/config/vllm.py:1664-1698 at 3e44c0d"><code>vllm/config/vllm.py:1664-1698</code></a>).</li>
+  <li><strong>Lines 243-253.</strong> A class object, or a string that does not start with <code>vllm.</code>, logs a WARNING once. It says that the interface "is not public", and that a subclass of <code>Scheduler</code> instead of <code>AsyncScheduler</code> turns async scheduling off.</li>
+  <li><strong>Lines 254-256.</strong> A class object is used as it is; a string is split at the last dot (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/utils/import_utils.py#L119-L123" target="_blank" rel="noopener" title="vllm/utils/import_utils.py:119-123 at 3e44c0d"><code>vllm/utils/import_utils.py:119-123</code></a>). From the CLI the value is always a string, so write <code>pkg.module.Class</code>, not <code>pkg.module:Class</code>.</li>
+</ol>
+<p>The test passes a class object, because it builds the engine in the same process:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/tests/plugins_tests/test_scheduler_plugins.py#L12-L36" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">tests/plugins_tests/test_scheduler_plugins.py:12-36</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/tests/plugins_tests/test_scheduler_plugins.py#L12-L36" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">12</span><span class="ln hl">13</span><span class="ln hl">14</span><span class="ln">15</span><span class="ln">16</span><span class="ln">17</span><span class="ln">18</span><span class="ln">19</span><span class="ln">20</span><span class="ln hl">21</span><span class="ln">22</span><span class="ln">23</span><span class="ln">24</span><span class="ln">25</span><span class="ln">26</span><span class="ln hl">27</span><span class="ln">28</span><span class="ln">29</span><span class="ln">30</span><span class="ln">31</span><span class="ln">32</span><span class="ln">33</span><span class="ln">34</span><span class="ln">35</span><span class="ln">36</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><pre><code class="language-python">class DummyV1Scheduler(Scheduler):
+    def schedule(self, throttle_prefills: bool = False):
+        raise Exception(&quot;Exception raised by DummyV1Scheduler&quot;)
+
+
+def test_scheduler_plugins_v1(monkeypatch: pytest.MonkeyPatch):
+    with monkeypatch.context() as m:
+        # Explicitly turn off engine multiprocessing so
+        # that the scheduler runs in this process
+        m.setenv(&quot;VLLM_ENABLE_V1_MULTIPROCESSING&quot;, &quot;0&quot;)
+
+        with pytest.raises(Exception) as exception_info:
+            engine_args = EngineArgs(
+                model=&quot;facebook/opt-125m&quot;,
+                enforce_eager=True,  # reduce test time
+                scheduler_cls=DummyV1Scheduler,
+            )
+
+            engine = LLMEngine.from_engine_args(engine_args=engine_args)
+
+            sampling_params = SamplingParams(max_tokens=1)
+            engine.add_request(&quot;0&quot;, &quot;foo&quot;, sampling_params)
+            engine.step()
+
+        assert str(exception_info.value) == &quot;Exception raised by DummyV1Scheduler&quot;</code></pre></div></div></div></figure>
+<p>With <code>vllm serve</code>, the engine core is a separate process, so pass a dotted name that the engine core can import.</p>
+
+<h3 id="step-2-worker-cls-and-worker-extension-cls">Step 2: worker_cls and worker_extension_cls<a class="h-anchor" href="#step-2-worker-cls-and-worker-extension-cls" aria-label="Link to this section">#</a></h3>
+<p>Both are strings in <code>ParallelConfig</code>; <code>worker_cls</code> defaults to <code>"auto"</code>, which the platform replaces (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L306-L312" target="_blank" rel="noopener" title="vllm/config/parallel.py:306-312 at 3e44c0d"><code>vllm/config/parallel.py:306-312</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/platforms/cuda.py#L330-L331" target="_blank" rel="noopener" title="vllm/platforms/cuda.py:330-331 at 3e44c0d"><code>vllm/platforms/cuda.py:330-331</code></a>). The worker wrapper resolves both in <code>init_worker</code>:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/worker_base.py#L292-L331" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/worker_base.py:292-331</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/worker_base.py#L292-L331" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">292</span><span class="ln hl">293</span><span class="ln hl">294</span><span class="ln hl">295</span><span class="ln hl">296</span><span class="ln hl">297</span><span class="ln hl">298</span><span class="ln hl">299</span><span class="ln hl">300</span><span class="ln hl">301</span><span class="ln hl">302</span><span class="ln">303</span><span class="ln">304</span><span class="ln hl">305</span><span class="ln hl">306</span><span class="ln hl">307</span><span class="ln hl">308</span><span class="ln">309</span><span class="ln hl">310</span><span class="ln hl">311</span><span class="ln hl">312</span><span class="ln hl">313</span><span class="ln hl">314</span><span class="ln hl">315</span><span class="ln hl">316</span><span class="ln hl">317</span><span class="ln hl">318</span><span class="ln hl">319</span><span class="ln hl">320</span><span class="ln hl">321</span><span class="ln">322</span><span class="ln hl">323</span><span class="ln hl">324</span><span class="ln hl">325</span><span class="ln">326</span><span class="ln">327</span><span class="ln">328</span><span class="ln">329</span><span class="ln">330</span><span class="ln">331</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><pre><code class="language-python">        parallel_config = vllm_config.parallel_config
+        if isinstance(parallel_config.worker_cls, str):
+            worker_class: type[WorkerBase] = resolve_obj_by_qualname(
+                parallel_config.worker_cls
+            )
+        else:
+            raise ValueError(
+                &quot;passing worker_cls is no longer supported. &quot;
+                &quot;Please pass keep the class in a separate module &quot;
+                &quot;and pass the qualified name of the class as a string.&quot;
+            )
+
+        worker_extension_cls: type | None = None
+        if parallel_config.worker_extension_cls:
+            worker_extension_cls = resolve_obj_by_qualname(
+                parallel_config.worker_extension_cls
+            )
+            extended_calls = []
+            if worker_extension_cls not in worker_class.__bases__:
+                # check any conflicts between worker and worker_extension_cls
+                for attr in dir(worker_extension_cls):
+                    if attr.startswith(&quot;__&quot;):
+                        continue
+                    assert not hasattr(worker_class, attr), (
+                        f&quot;Worker class {worker_class} already has an attribute&quot;
+                        f&quot; {attr}, which conflicts with the worker&quot;
+                        f&quot; extension class {worker_extension_cls}.&quot;
+                    )
+                    if callable(getattr(worker_extension_cls, attr)):
+                        extended_calls.append(attr)
+                # dynamically inherit the worker extension class
+                worker_class.__bases__ = worker_class.__bases__ + (
+                    worker_extension_cls,
+                )
+                logger.info(
+                    &quot;Injected %s into %s for extended collective_rpc calls %s&quot;,
+                    worker_extension_cls,
+                    worker_class,
+                    extended_calls,
+                )</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 293-302.</strong> <code>worker_cls</code> must be a string. A class object raises <code>ValueError</code> "passing worker_cls is no longer supported".</li>
+  <li><strong>Lines 310-321.</strong> Each attribute of the extension must be new, except names that start with <code>__</code>. An <code>assert</code> stops start-up when the worker class has it already. Callable attributes are listed as "extended collective_rpc calls".</li>
+  <li><strong>Lines 323-325.</strong> The extension becomes an extra base class of the worker class. The worker object made at line 347 has its methods.</li>
+</ol>
+<p>The wrapper also calls an optional hook <code>init_worker_extension(worker)</code> after <code>init_device</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/worker_base.py#L356-L363" target="_blank" rel="noopener" title="vllm/v1/worker/worker_base.py:356-363 at 3e44c0d"><code>vllm/v1/worker/worker_base.py:356-363</code></a>).</p>
+<p>The extension's methods are reached with <a class="term" href="../reference/glossary.html#term-collective-rpc" data-term="collective_rpc" data-def="The executor method that runs one worker method (by name, or a pickled function) on every worker and collects the results. execute_model and sample_tokens use it too.">collective_rpc</a> by name. In each worker, <code>run_method</code> looks the name up on the wrapper, which forwards unknown names to the worker (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/serial_utils.py#L485-L508" target="_blank" rel="noopener" title="vllm/v1/serial_utils.py:485-508 at 3e44c0d"><code>vllm/v1/serial_utils.py:485-508</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/worker_base.py#L365-L366" target="_blank" rel="noopener" title="vllm/v1/worker/worker_base.py:365-366 at 3e44c0d"><code>vllm/v1/worker/worker_base.py:365-366</code></a>). <code>AsyncLLM</code> has <code>collective_rpc</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L1247" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:1247 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:1247</code></a>). Over HTTP, the route <code>POST /collective_rpc</code> exists only with <code>VLLM_SERVER_DEV_MODE</code>, and its comment says that it passes only serialized string arguments (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/launchers/api_server/routers.py#L46-L49" target="_blank" rel="noopener" title="vllm/entrypoints/launchers/api_server/routers.py:46-49 at 3e44c0d"><code>vllm/entrypoints/launchers/api_server/routers.py:46-49</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/dev/rpc/api_router.py#L43-L50" target="_blank" rel="noopener" title="vllm/entrypoints/serve/dev/rpc/api_router.py:43-50 at 3e44c0d"><code>vllm/entrypoints/serve/dev/rpc/api_router.py:43-50</code></a>). An endpoint plugin is the normal way to expose such a method (<a href="../concepts/frontend-plugins.html">Plugins in the API server</a>).</p>
+<pre><code class="language-bash">vllm serve Qwen/Qwen3-0.6B --worker-extension-cls my_pkg.ext.WeightSync
+# an endpoint plugin, or code with the engine client, then calls:
+#   await engine_client.collective_rpc("update_weights_from", args=("s3://...",))</code></pre>
+
+<h3 id="step-3-logits-processors">Step 3: logits processors<a class="h-anchor" href="#step-3-logits-processors" aria-label="Link to this section">#</a></h3>
+<p>A logits processor changes the logits of the batch before sampling. Two sources feed Model Runner V2, and the loader combines them:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/sample/logits_processor/loader.py#L136-L146" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/sample/logits_processor/loader.py:136-146</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/sample/logits_processor/loader.py#L136-L146" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">136</span><span class="ln">137</span><span class="ln">138</span><span class="ln">139</span><span class="ln">140</span><span class="ln">141</span><span class="ln">142</span><span class="ln">143</span><span class="ln">144</span><span class="ln">145</span><span class="ln">146</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">def _load_v2_logitsprocs(
+    logits_processors: Sequence[str | type] | None,
+) -&gt; list[type[LogitsProcessor]]:
+    &quot;&quot;&quot;Load all custom logits processors for the V2 model runner.
+
+    Combines installed plugins (validated as V2 processors) with the
+    user-specified list of processor types and FQCN strings.
+    &quot;&quot;&quot;
+    return _load_v2_logitsprocs_plugins() + _load_v2_logitsprocs_by_fqcns(
+        logits_processors or ()
+    )</code></pre></div></div></div></figure>
+<ul>
+  <li><strong>The group <code>vllm.logits_processors</code>.</strong> The loader calls <code>entry_points()</code> directly, so <code>VLLM_PLUGINS</code> does not filter it. A failed import raises <code>RuntimeError</code>; a class that is not a V2 <code>LogitsProcessor</code> raises <code>ValueError</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/sample/logits_processor/loader.py#L37-L74" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/sample/logits_processor/loader.py:37-74 at 3e44c0d"><code>vllm/v1/worker/gpu/sample/logits_processor/loader.py:37-74</code></a>).</li>
+  <li><strong>The field <code>logits_processors</code></strong> (<code>--logits-processors</code>): classes or <code>"module:Class"</code> strings, with exactly one colon (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/model.py#L407-L409" target="_blank" rel="noopener" title="vllm/config/model.py:407-409 at 3e44c0d"><code>vllm/config/model.py:407-409</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/sample/logits_processor/loader.py#L99-L104" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/sample/logits_processor/loader.py:99-104 at 3e44c0d"><code>vllm/v1/worker/gpu/sample/logits_processor/loader.py:99-104</code></a>).</li>
+</ul>
+<p>The model runner builds them in <code>load_model</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L463-L466" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:463-466 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:463-466</code></a>). A pooling model with custom processors raises (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/sample/logits_processor/loader.py#L172-L179" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/sample/logits_processor/loader.py:172-179 at 3e44c0d"><code>vllm/v1/worker/gpu/sample/logits_processor/loader.py:172-179</code></a>). The front end loads the same classes once, to call <code>validate_params</code> for each request (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/input_processor.py#L93-L107" target="_blank" rel="noopener" title="vllm/v1/engine/input_processor.py:93-107 at 3e44c0d"><code>vllm/v1/engine/input_processor.py:93-107</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/sample/logits_processor/loader.py#L186-L211" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/sample/logits_processor/loader.py:186-211 at 3e44c0d"><code>vllm/v1/worker/gpu/sample/logits_processor/loader.py:186-211</code></a>).</p>
+<p>The V2 interface has five methods:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/sample/logits_processor/interface.py#L109-L158" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/sample/logits_processor/interface.py:109-158</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/sample/logits_processor/interface.py#L109-L158" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">109</span><span class="ln hl">110</span><span class="ln">111</span><span class="ln">112</span><span class="ln">113</span><span class="ln">114</span><span class="ln">115</span><span class="ln">116</span><span class="ln">117</span><span class="ln hl">118</span><span class="ln hl">119</span><span class="ln">120</span><span class="ln">121</span><span class="ln">122</span><span class="ln">123</span><span class="ln">124</span><span class="ln">125</span><span class="ln hl">126</span><span class="ln">127</span><span class="ln">128</span><span class="ln">129</span><span class="ln">130</span><span class="ln">131</span><span class="ln">132</span><span class="ln">133</span><span class="ln">134</span><span class="ln">135</span><span class="ln hl">136</span><span class="ln">137</span><span class="ln">138</span><span class="ln">139</span><span class="ln">140</span><span class="ln">141</span><span class="ln">142</span><span class="ln">143</span><span class="ln hl">144</span><span class="ln hl">145</span><span class="ln">146</span><span class="ln">147</span><span class="ln">148</span><span class="ln">149</span><span class="ln">150</span><span class="ln">151</span><span class="ln">152</span><span class="ln">153</span><span class="ln">154</span><span class="ln">155</span><span class="ln">156</span><span class="ln">157</span><span class="ln">158</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><pre><code class="language-python">    def __init__(  # noqa: B027
+        self, vllm_config: VllmConfig, req_states: LogitsProcRequestState
+    ):
+        &quot;&quot;&quot;Capture what stays constant for the processor&#x27;s lifetime.
+
+        ``req_states`` exposes the on-device token history and batch constants a
+        processor may read. Treat it as read-only.
+        &quot;&quot;&quot;
+
+    @classmethod  # noqa: B027
+    def validate_params(cls, sampling_params: SamplingParams) -&gt; None:
+        &quot;&quot;&quot;Raise ``ValueError`` for invalid per-request arguments.
+
+        Runs at request admission, so invalid arguments fail the request
+        with an error instead of reaching the sampler.
+        &quot;&quot;&quot;
+
+    def add_request(self, req_idx: int, sampling_params: SamplingParams) -&gt; bool:
+        &quot;&quot;&quot;Initialize per-slot state for a request entering the batch.
+
+        The slot may hold a previous occupant&#x27;s state; overwrite or
+        neutralize all of it here.
+
+        Returns whether this processor modifies logits for the request.
+        &quot;&quot;&quot;
+        return True
+
+    def apply_staged_writes(self) -&gt; None:  # noqa: B027
+        &quot;&quot;&quot;Flush any host-side writes staged by ``add_request()`` to the device.
+
+        Called once per step before the forward pass, after the model runner
+        has flushed ``req_states``, so a processor that stages writes here can
+        read the request&#x27;s tokens back on device.
+        &quot;&quot;&quot;
+
+    @abstractmethod
+    def apply(self, logits: torch.Tensor, ctx: LogitsContext) -&gt; torch.Tensor:
+        &quot;&quot;&quot;Modify logits in place or return a new tensor. In-place modification
+        is preferred for efficiency.
+
+        ``apply()`` is called once for the whole batch, including rows of
+        requests this processor declined in ``add_request()``, so filter rows
+        via ``ctx.expanded_idx_mapping``.
+
+        Args:
+            logits: [num_logits_rows, vocab_size] float32 tensor.
+            ctx: this step&#x27;s batch layout.
+
+        &quot;&quot;&quot;
+        raise NotImplementedError</code></pre></div></div></div></figure>
+<aside class="callout callout-note"><p class="callout-title">BatchUpdate belongs to the V1 interface</p><div class="callout-body"><p><code>BatchUpdate</code> is part of the older interface in <code>vllm/v1/sample/logits_processor/</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/sample/logits_processor/interface.py#L37" target="_blank" rel="noopener" title="vllm/v1/sample/logits_processor/interface.py:37 at 3e44c0d"><code>vllm/v1/sample/logits_processor/interface.py:37</code></a>). Model Runner V2 does not use it. A processor sees each new request in <code>add_request</code>, keyed by a recycled slot index. It sees the batch layout in <code>apply</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/sample/logits_processor/interface.py#L92-L107" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/sample/logits_processor/interface.py:92-107 at 3e44c0d"><code>vllm/v1/worker/gpu/sample/logits_processor/interface.py:92-107</code></a>). A plugin written for the V1 interface is rejected at load (loader lines 67-72). The page <a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors in Model Runner V2</a> explains where <code>apply</code> runs in the sampler.</p></div></aside>
+
+<h3 id="step-4-model-loaders">Step 4: model loaders<a class="h-anchor" href="#step-4-model-loaders" aria-label="Link to this section">#</a></h3>
+<p>A <a class="term" href="../reference/glossary.html#term-model-loader" data-term="model loader" data-def="A class that builds the model and loads its weights for one --load-format, for example safetensors, dummy or tensorizer.">model loader</a> builds the model and loads its weights for one <code>--load-format</code>. The table and the register function:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/__init__.py#L100-L128" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/model_loader/__init__.py:100-128</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/__init__.py#L100-L128" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">100</span><span class="ln hl">101</span><span class="ln hl">102</span><span class="ln hl">103</span><span class="ln hl">104</span><span class="ln hl">105</span><span class="ln hl">106</span><span class="ln hl">107</span><span class="ln hl">108</span><span class="ln hl">109</span><span class="ln hl">110</span><span class="ln hl">111</span><span class="ln hl">112</span><span class="ln">113</span><span class="ln">114</span><span class="ln">115</span><span class="ln">116</span><span class="ln">117</span><span class="ln">118</span><span class="ln">119</span><span class="ln">120</span><span class="ln">121</span><span class="ln">122</span><span class="ln">123</span><span class="ln">124</span><span class="ln hl">125</span><span class="ln hl">126</span><span class="ln hl">127</span><span class="ln hl">128</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><pre><code class="language-python">    def _wrapper(model_loader_cls):
+        if load_format in _LOAD_FORMAT_TO_MODEL_LOADER:
+            logger.warning(
+                &quot;Load format `%s` is already registered, and will be &quot;
+                &quot;overwritten by the new loader class `%s`.&quot;,
+                load_format,
+                model_loader_cls,
+            )
+        if not issubclass(model_loader_cls, BaseModelLoader):
+            raise ValueError(
+                &quot;The model loader must be a subclass of `BaseModelLoader`.&quot;
+            )
+        _LOAD_FORMAT_TO_MODEL_LOADER[load_format] = model_loader_cls
+        logger.info(
+            &quot;Registered model loader `%s` with load format `%s`&quot;,
+            model_loader_cls,
+            load_format,
+        )
+        return model_loader_cls
+
+    return _wrapper
+
+
+def get_model_loader(load_config: LoadConfig) -&gt; BaseModelLoader:
+    &quot;&quot;&quot;Get a model loader based on the load format.&quot;&quot;&quot;
+    load_format = load_config.load_format
+    if load_format not in _LOAD_FORMAT_TO_MODEL_LOADER:
+        raise ValueError(f&quot;Load format `{load_format}` is not supported&quot;)
+    return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)</code></pre></div></div></div></figure>
+<p>A taken name logs a WARNING and is overwritten; a class that is not a <code>BaseModelLoader</code> raises <code>ValueError</code>. <code>load_format</code> accepts any string and is lower-cased (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L30" target="_blank" rel="noopener" title="vllm/config/load.py:30 at 3e44c0d"><code>vllm/config/load.py:30</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L136-L138" target="_blank" rel="noopener" title="vllm/config/load.py:136-138 at 3e44c0d"><code>vllm/config/load.py:136-138</code></a>). The worker calls <code>get_model_loader</code> in <code>load_model</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L398-L406" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:398-406 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:398-406</code></a>). A loader implements <code>download_model</code> and <code>load_weights</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/base_loader.py#L38-L47" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/base_loader.py:38-47 at 3e44c0d"><code>vllm/model_executor/model_loader/base_loader.py:38-47</code></a>); the test is a minimal one (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/tests/model_executor/model_loader/test_registry.py#L19-L33" target="_blank" rel="noopener" title="tests/model_executor/model_loader/test_registry.py:19-33 at 3e44c0d"><code>tests/model_executor/model_loader/test_registry.py:19-33</code></a>). The page <a href="../concepts/weight-loading.html">&quot;Weight loading: from checkpoint files to GPU parameters&quot;</a> explains the default loader.</p>
+
+<h3 id="step-5-sleep-mode-backends">Step 5: sleep-mode backends<a class="h-anchor" href="#step-5-sleep-mode-backends" aria-label="Link to this section">#</a></h3>
+<p><a class="term" href="../reference/glossary.html#term-sleep-mode" data-term="sleep mode" data-def="A feature that frees most GPU memory of an idle engine and restores it later. A sleep-mode backend does the work; the built-in one is cumem.">Sleep mode</a> frees GPU memory of an idle engine. <code>--enable-sleep-mode</code> turns it on (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/model.py#L370-L372" target="_blank" rel="noopener" title="vllm/config/model.py:370-372 at 3e44c0d"><code>vllm/config/model.py:370-372</code></a>). The field docstring says "only cuda and hip", but the platform check also accepts XPU (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/model.py#L666-L668" target="_blank" rel="noopener" title="vllm/config/model.py:666-668 at 3e44c0d"><code>vllm/config/model.py:666-668</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/platforms/interface.py#L231-L236" target="_blank" rel="noopener" title="vllm/platforms/interface.py:231-236 at 3e44c0d"><code>vllm/platforms/interface.py:231-236</code></a>). The mechanism is a backend class with <code>suspend(level)</code> and <code>resume(tags)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/device_allocator/sleep_mode_backend.py#L37-L69" target="_blank" rel="noopener" title="vllm/device_allocator/sleep_mode_backend.py:37-69 at 3e44c0d"><code>vllm/device_allocator/sleep_mode_backend.py:37-69</code></a>). The factory mirrors the KV connector factory:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/device_allocator/sleep_mode_backend.py#L160-L214" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/device_allocator/sleep_mode_backend.py:160-214</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/device_allocator/sleep_mode_backend.py#L160-L214" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">160</span><span class="ln">161</span><span class="ln">162</span><span class="ln">163</span><span class="ln">164</span><span class="ln">165</span><span class="ln">166</span><span class="ln">167</span><span class="ln">168</span><span class="ln">169</span><span class="ln">170</span><span class="ln hl">171</span><span class="ln hl">172</span><span class="ln hl">173</span><span class="ln hl">174</span><span class="ln hl">175</span><span class="ln hl">176</span><span class="ln hl">177</span><span class="ln hl">178</span><span class="ln hl">179</span><span class="ln hl">180</span><span class="ln">181</span><span class="ln">182</span><span class="ln">183</span><span class="ln">184</span><span class="ln">185</span><span class="ln">186</span><span class="ln">187</span><span class="ln">188</span><span class="ln">189</span><span class="ln">190</span><span class="ln">191</span><span class="ln">192</span><span class="ln">193</span><span class="ln hl">194</span><span class="ln hl">195</span><span class="ln hl">196</span><span class="ln hl">197</span><span class="ln hl">198</span><span class="ln hl">199</span><span class="ln hl">200</span><span class="ln hl">201</span><span class="ln hl">202</span><span class="ln hl">203</span><span class="ln">204</span><span class="ln">205</span><span class="ln">206</span><span class="ln">207</span><span class="ln">208</span><span class="ln">209</span><span class="ln hl">210</span><span class="ln hl">211</span><span class="ln hl">212</span><span class="ln hl">213</span><span class="ln hl">214</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(37 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(38 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(40 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(41 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(42 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(43 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(50 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(51 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(52 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(53 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(54 * var(--code-lh))"></span><pre><code class="language-python">class SleepModeBackendFactory:
+    &quot;&quot;&quot;Registry and resolver for sleep-mode backends.
+
+    Mirrors ``KVConnectorFactory``: lazy module/class registration and a
+    built-in registry populated at import time. Third-party backends register
+    the same way from a ``vllm.general_plugins`` entry point.
+    &quot;&quot;&quot;
+
+    _registry: dict[str, Callable[[], type[SleepModeBackend]]] = {}
+
+    @classmethod
+    def register_backend(cls, name: str, module_path: str, class_name: str) -&gt; None:
+        &quot;&quot;&quot;Register a backend with a lazy-loading module and class name.&quot;&quot;&quot;
+        if name in cls._registry:
+            raise ValueError(f&quot;Sleep-mode backend &#x27;{name}&#x27; is already registered.&quot;)
+
+        def loader() -&gt; type[SleepModeBackend]:
+            module = importlib.import_module(module_path)
+            return getattr(module, class_name)
+
+        cls._registry[name] = loader
+
+    @classmethod
+    def get_backend_class(cls, name: str) -&gt; type[SleepModeBackend]:
+        &quot;&quot;&quot;Resolve a registered backend class by name.&quot;&quot;&quot;
+        if name not in cls._registry:
+            available = &quot;, &quot;.join(sorted(cls._registry)) or &quot;&lt;none&gt;&quot;
+            raise ValueError(
+                f&quot;Unsupported sleep-mode backend &#x27;{name}&#x27;. &quot;
+                f&quot;Registered backends: {available}.&quot;
+            )
+        return cls._registry[name]()
+
+    @classmethod
+    def create_backend(cls, model_config: ModelConfig) -&gt; SleepModeBackend:
+        &quot;&quot;&quot;Instantiate the backend selected by ``model_config``.&quot;&quot;&quot;
+        name = model_config.sleep_mode_backend
+        backend_cls = cls.get_backend_class(name)
+        if not backend_cls.is_supported():
+            raise ValueError(
+                f&quot;Sleep-mode backend &#x27;{name}&#x27; is not supported on this platform.&quot;
+            )
+        logger.info(&quot;Using sleep-mode backend: %s&quot;, name)
+        return backend_cls()
+
+
+# Register built-in backends here. Registration is lazy: only the module for the
+# selected backend is imported. Third-party backends (CUDA checkpoint, CRIU,
+# durable snapshot) register the same way through a vllm.general_plugins entry
+# point, without changes to vLLM core.
+SleepModeBackendFactory.register_backend(
+    &quot;cumem&quot;,
+    &quot;vllm.device_allocator.sleep_mode_backend&quot;,
+    &quot;CuMemBackend&quot;,
+)</code></pre></div></div></div></figure>
+<p>The worker makes the backend on first use, from <code>model_config.sleep_mode_backend</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L249-L259" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:249-259 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:249-259</code></a>), and calls <code>suspend</code> and <code>resume</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L317" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:317 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:317</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L339" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:339 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:339</code></a>). The field defaults to <code>"cumem"</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/model.py#L379-L383" target="_blank" rel="noopener" title="vllm/config/model.py:379-383 at 3e44c0d"><code>vllm/config/model.py:379-383</code></a>).</p>
+<aside class="callout callout-warning"><p class="callout-title">No CLI flag selects the sleep-mode backend</p><div class="callout-body"><p><code>EngineArgs</code> passes <code>enable_sleep_mode</code> and the other sleep fields to <code>ModelConfig</code>, but not <code>sleep_mode_backend</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L2039-L2043" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:2039-2043 at 3e44c0d"><code>vllm/engine/arg_utils.py:2039-2043</code></a>). At this commit no other line in <code>vllm/</code> sets the field. So <code>vllm serve</code> always uses <code>cumem</code>, unless your code changes <code>model_config.sleep_mode_backend</code>, for example a platform in <code>check_and_update_config</code>. A plugin also cannot replace <code>"cumem"</code>: the factory raises <code>ValueError</code> for a taken name (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/device_allocator/sleep_mode_backend.py#L173-L174" target="_blank" rel="noopener" title="vllm/device_allocator/sleep_mode_backend.py:173-174 at 3e44c0d"><code>vllm/device_allocator/sleep_mode_backend.py:173-174</code></a>). (Derived from a search of the repository.)</p></div></aside>
+
+<h3 id="step-6-register-kv-cache-dtype">Step 6: register_kv_cache_dtype<a class="h-anchor" href="#step-6-register-kv-cache-dtype" aria-label="Link to this section">#</a></h3>
+<p>A new <code>--kv-cache-dtype</code> value needs a handler with a name, a <code>torch_dtype()</code> and a <code>quant_mode()</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/cache.py#L73-L103" target="_blank" rel="noopener" title="vllm/config/cache.py:73-103 at 3e44c0d"><code>vllm/config/cache.py:73-103</code></a>). The decorator adds the name to the mutable list <code>KV_CACHE_DTYPES</code> and writes the torch dtype into the shared dtype table:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/cache.py#L138-L155" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/config/cache.py:138-155</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/cache.py#L138-L155" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">138</span><span class="ln hl">139</span><span class="ln hl">140</span><span class="ln hl">141</span><span class="ln hl">142</span><span class="ln hl">143</span><span class="ln hl">144</span><span class="ln hl">145</span><span class="ln hl">146</span><span class="ln hl">147</span><span class="ln hl">148</span><span class="ln hl">149</span><span class="ln hl">150</span><span class="ln hl">151</span><span class="ln hl">152</span><span class="ln">153</span><span class="ln">154</span><span class="ln">155</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><pre><code class="language-python">    def _decorate(cls):
+        if name in KV_CACHE_DTYPES:
+            logger.warning(
+                &quot;The kv-cache-dtype &#x27;%s&#x27; already exists and will be &quot;
+                &quot;overwritten by handler %s.&quot;,
+                name,
+                cls,
+            )
+        else:
+            KV_CACHE_DTYPES.append(name)
+        inst = cls()
+        # Inject into the shared dtype dict in-place so every existing
+        # direct [] / `in` access site sees the new entry.
+        STR_DTYPE_TO_TORCH_DTYPE[name] = inst.torch_dtype()
+        _KV_CACHE_DTYPE_HANDLERS[name] = inst
+        return cls
+
+    return _decorate</code></pre></div></div></div></figure>
+<p>The docstring says that it "Runs at platform activation time (first <code>current_platform</code> access)" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/cache.py#L112-L116" target="_blank" rel="noopener" title="vllm/config/cache.py:112-116 at 3e44c0d"><code>vllm/config/cache.py:112-116</code></a>). No code in <code>vllm/</code> calls it at this commit; only a test does (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/tests/config/test_kv_cache_dtype.py#L35" target="_blank" rel="noopener" title="tests/config/test_kv_cache_dtype.py:35 at 3e44c0d"><code>tests/config/test_kv_cache_dtype.py:35</code></a>). The KV cache code reads the handlers through <code>get_kv_cache_dtype_handler</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/kv_cache_interface.py#L110-L112" target="_blank" rel="noopener" title="vllm/v1/kv_cache_interface.py:110-112 at 3e44c0d"><code>vllm/v1/kv_cache_interface.py:110-112</code></a>). A platform plugin or a general plugin would have to call it in every process that parses or uses the dtype. (Derived.)</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="all-engine-hooks-in-one-table" class="dd-title">All engine hooks in one table</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Hook</th><th>Kind</th><th>Flag or API</th><th>Read at</th><th>Process</th><th>Duplicate</th></tr></thead>
+  <tbody>
+    <tr><td>scheduler</td><td>config field</td><td><code>--scheduler-cls</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L1785" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:1785 at 3e44c0d"><code>vllm/engine/arg_utils.py:1785</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L164" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:164 at 3e44c0d"><code>vllm/v1/engine/core.py:164</code></a></td><td>engine core</td><td>-</td></tr>
+    <tr><td>worker class</td><td>config field</td><td><code>--worker-cls</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L1360" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:1360 at 3e44c0d"><code>vllm/engine/arg_utils.py:1360</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/worker_base.py#L293-L296" target="_blank" rel="noopener" title="vllm/v1/worker/worker_base.py:293-296 at 3e44c0d"><code>vllm/v1/worker/worker_base.py:293-296</code></a></td><td>workers</td><td>-</td></tr>
+    <tr><td>worker extension</td><td>config field</td><td><code>--worker-extension-cls</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L1361-L1363" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:1361-1363 at 3e44c0d"><code>vllm/engine/arg_utils.py:1361-1363</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/worker_base.py#L304-L331" target="_blank" rel="noopener" title="vllm/v1/worker/worker_base.py:304-331 at 3e44c0d"><code>vllm/v1/worker/worker_base.py:304-331</code></a></td><td>workers</td><td>assert on shared names</td></tr>
+    <tr><td>logits processors</td><td>group + field</td><td><code>vllm.logits_processors</code>, <code>--logits-processors</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L1058-L1060" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:1058-1060 at 3e44c0d"><code>vllm/engine/arg_utils.py:1058-1060</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L463-L466" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:463-466 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:463-466</code></a></td><td>workers, front end (check)</td><td>-</td></tr>
+    <tr><td>model loader</td><td>registry</td><td><code>@register_model_loader</code>, <code>--load-format</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L398" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:398 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:398</code></a></td><td>workers</td><td>WARNING, overwrite</td></tr>
+    <tr><td>sleep backend</td><td>registry</td><td><code>SleepModeBackendFactory.register_backend</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L256-L258" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:256-258 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:256-258</code></a></td><td>workers</td><td><code>ValueError</code></td></tr>
+    <tr><td>KV cache dtype</td><td>registry</td><td><code>@register_kv_cache_dtype</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/kv_cache_interface.py#L110-L112" target="_blank" rel="noopener" title="vllm/v1/kv_cache_interface.py:110-112 at 3e44c0d"><code>vllm/v1/kv_cache_interface.py:110-112</code></a></td><td>every process that reads the dtype</td><td>WARNING, overwrite</td></tr>
+  </tbody>
+</table>
+<p>The table on <a href="../concepts/plugin-map.html">All the ways to extend vLLM</a> puts these hooks next to the other extension points.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-a-worker-extension-for-weight-sync-with-tp-2" class="dd-title">Worked example: a worker extension for weight sync, with TP = 2</h3></summary><div class="dd-body"><p>You start <code>vllm serve ... --tensor-parallel-size 2 --worker-extension-cls my_pkg.ext.WeightSync</code>. <code>WeightSync</code> defines <code>update_weights_from(path)</code> and <code>init_worker_extension(worker)</code>.</p>
+<ol>
+  <li>The front end stores the string in <code>parallel_config.worker_extension_cls</code>. The workers get it in the pickled <code>VllmConfig</code>.</li>
+  <li>Each of the 2 worker processes runs <code>init_worker</code>: it imports <code>my_pkg.ext</code>, checks that <code>Worker</code> has no attribute <code>update_weights_from</code>, and adds <code>WeightSync</code> to <code>Worker.__bases__</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/worker_base.py#L304-L331" target="_blank" rel="noopener" title="vllm/v1/worker/worker_base.py:304-331 at 3e44c0d"><code>vllm/v1/worker/worker_base.py:304-331</code></a>). It logs "Injected ... for extended collective_rpc calls ['init_worker_extension', 'update_weights_from']". (The list holds every callable name that does not start with <code>__</code>.)</li>
+  <li>After <code>init_device</code>, the wrapper calls <code>WeightSync.init_worker_extension(worker)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/worker_base.py#L361-L363" target="_blank" rel="noopener" title="vllm/v1/worker/worker_base.py:361-363 at 3e44c0d"><code>vllm/v1/worker/worker_base.py:361-363</code></a>).</li>
+  <li>Later, <code>collective_rpc("update_weights_from", args=(path,))</code> runs the method in both workers and returns a list of 2 results. With TP = 1 the uni executor calls <code>run_method</code> on its one in-process worker (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/uniproc_executor.py#L103" target="_blank" rel="noopener" title="vllm/v1/executor/uniproc_executor.py:103 at 3e44c0d"><code>vllm/v1/executor/uniproc_executor.py:103</code></a>).</li>
+</ol>
+<p>Note that line 323 changes the class <code>Worker</code> itself, not one object. Every worker object of that process gets the methods. (Derived.)</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="edge-cases" class="dd-title">Edge cases</h3></summary><div class="dd-body"><ul>
+  <li><strong>Extension already a base.</strong> If the extension class is already in <code>worker_class.__bases__</code>, the injection and the clash check are skipped (line 310).</li>
+  <li><strong>Unknown RPC method.</strong> <code>run_method</code> raises <code>NotImplementedError("Method ... is not implemented.")</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/serial_utils.py#L499-L505" target="_blank" rel="noopener" title="vllm/v1/serial_utils.py:499-505 at 3e44c0d"><code>vllm/v1/serial_utils.py:499-505</code></a>).</li>
+  <li><strong>Mixed-case load format.</strong> <code>load_format</code> is lower-cased (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L136-L138" target="_blank" rel="noopener" title="vllm/config/load.py:136-138 at 3e44c0d"><code>vllm/config/load.py:136-138</code></a>), but <code>register_model_loader</code> stores the name as given. A loader registered as <code>"My_Format"</code> is never found. (Derived.)</li>
+  <li><strong>Logits processors and <code>VLLM_PLUGINS</code>.</strong> An allowlist does not stop a logits processor plugin. To keep one out, uninstall its package.</li>
+  <li><strong>Unsupported sleep backend.</strong> A backend whose <code>is_supported()</code> is false raises "Sleep-mode backend ... is not supported on this platform." on first use (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/device_allocator/sleep_mode_backend.py#L198-L201" target="_blank" rel="noopener" title="vllm/device_allocator/sleep_mode_backend.py:198-201 at 3e44c0d"><code>vllm/device_allocator/sleep_mode_backend.py:198-201</code></a>).</li>
+</ul></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<aside class="callout callout-warning"><p class="callout-title">A custom scheduler can switch async scheduling off</p><div class="callout-body"><p>vLLM's default is <code>AsyncScheduler</code>. For a class that subclasses <code>Scheduler</code>, vLLM only warns of "degraded performance due to async scheduling being disabled" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/scheduler.py#L247-L253" target="_blank" rel="noopener" title="vllm/config/scheduler.py:247-253 at 3e44c0d"><code>vllm/config/scheduler.py:247-253</code></a>). Subclass <code>AsyncScheduler</code> unless you need the synchronous behaviour.</p></div></aside>
+<ul>
+  <li><strong>The class does not import in the child process.</strong> Config hooks are imported in the engine core or the workers. A class that exists only in your launch script fails there. Put it in an installed package.</li>
+  <li><strong>Colon instead of dot.</strong> <code>scheduler_cls</code>, <code>worker_cls</code> and <code>worker_extension_cls</code> need <code>pkg.module.Class</code>; <code>logits_processors</code> strings need <code>pkg.module:Class</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/utils/import_utils.py#L119-L123" target="_blank" rel="noopener" title="vllm/utils/import_utils.py:119-123 at 3e44c0d"><code>vllm/utils/import_utils.py:119-123</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/sample/logits_processor/loader.py#L99-L104" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/sample/logits_processor/loader.py:99-104 at 3e44c0d"><code>vllm/v1/worker/gpu/sample/logits_processor/loader.py:99-104</code></a>).</li>
+  <li><strong>A name clash in the extension.</strong> An attribute that the worker class has already stops start-up with an <code>AssertionError</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/worker_base.py#L315-L319" target="_blank" rel="noopener" title="vllm/v1/worker/worker_base.py:315-319 at 3e44c0d"><code>vllm/v1/worker/worker_base.py:315-319</code></a>).</li>
+  <li><strong>A V1 logits processor.</strong> Model Runner V2 rejects it with <code>ValueError</code> at model load (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/sample/logits_processor/loader.py#L67-L72" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/sample/logits_processor/loader.py:67-72 at 3e44c0d"><code>vllm/v1/worker/gpu/sample/logits_processor/loader.py:67-72</code></a>).</li>
+</ul>
+<p><strong>Why it matters.</strong> These hooks change the engine itself: the scheduling policy, the worker code, the sampler input and the weight source. They are powerful, and most of them are not public, stable interfaces. Read the code of the version that you run before you rely on one.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Which class does the engine core use when <code>--scheduler-cls</code> is not set and async scheduling is on?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>AsyncScheduler</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/scheduler.py#L232-L236" target="_blank" rel="noopener" title="vllm/config/scheduler.py:232-236 at 3e44c0d"><code>vllm/config/scheduler.py:232-236</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>How do the methods of a worker extension class become callable with <code>collective_rpc</code>?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>init_worker</code> adds the extension class to the bases of the worker class (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/worker_base.py#L323-L325" target="_blank" rel="noopener" title="vllm/v1/worker/worker_base.py:323-325 at 3e44c0d"><code>vllm/v1/worker/worker_base.py:323-325</code></a>). <code>run_method</code> then finds the method by name with <code>getattr</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/serial_utils.py#L499-L501" target="_blank" rel="noopener" title="vllm/v1/serial_utils.py:499-501 at 3e44c0d"><code>vllm/v1/serial_utils.py:499-501</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>You set <code>VLLM_PLUGINS=acme_admin</code>. Does an installed <code>vllm.logits_processors</code> plugin still load in the workers?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Yes. The Model Runner V2 loader calls <code>entry_points(group=...)</code> directly and does not read <code>VLLM_PLUGINS</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/sample/logits_processor/loader.py#L46" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/sample/logits_processor/loader.py:46 at 3e44c0d"><code>vllm/v1/worker/gpu/sample/logits_processor/loader.py:46</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>A general plugin calls <code>SleepModeBackendFactory.register_backend("cumem", ...)</code> to replace the built-in backend. What happens?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The factory raises <code>ValueError</code> "Sleep-mode backend 'cumem' is already registered." because vLLM registered <code>cumem</code> at import (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/device_allocator/sleep_mode_backend.py#L173-L174" target="_blank" rel="noopener" title="vllm/device_allocator/sleep_mode_backend.py:173-174 at 3e44c0d"><code>vllm/device_allocator/sleep_mode_backend.py:173-174</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/device_allocator/sleep_mode_backend.py#L210-L214" target="_blank" rel="noopener" title="vllm/device_allocator/sleep_mode_backend.py:210-214 at 3e44c0d"><code>vllm/device_allocator/sleep_mode_backend.py:210-214</code></a>). The general plugin does not catch it, so start-up stops (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/plugins/__init__.py#L89-L90" target="_blank" rel="noopener" title="vllm/plugins/__init__.py:89-90 at 3e44c0d"><code>vllm/plugins/__init__.py:89-90</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>You register a model loader with <code>@register_model_loader("Fast_Load")</code> and start with <code>--load-format Fast_Load</code>. What happens, and why?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Start-up fails with "Load format `fast_load` is not supported". The config lower-cases <code>load_format</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/load.py#L136-L138" target="_blank" rel="noopener" title="vllm/config/load.py:136-138 at 3e44c0d"><code>vllm/config/load.py:136-138</code></a>), but the table stores <code>"Fast_Load"</code> as given (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/__init__.py#L112" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/__init__.py:112 at 3e44c0d"><code>vllm/model_executor/model_loader/__init__.py:112</code></a>), so <code>get_model_loader</code> does not find it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/model_loader/__init__.py#L126-L127" target="_blank" rel="noopener" title="vllm/model_executor/model_loader/__init__.py:126-127 at 3e44c0d"><code>vllm/model_executor/model_loader/__init__.py:126-127</code></a>). Register lower-case names. (Derived from these lines.)</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/plugin-map.html">All the ways to extend vLLM</a><span class="rel-sum">vLLM has about twenty extension points of three kinds - six entry-point groups, a dozen registries that a general plugin fills, and config fields that name your class. This page maps each one to its process and its page.</span></li><li><a href="../concepts/executors-and-workers.html">Executors and workers: from the engine core to the GPUs</a><span class="rel-sum">The executor starts the workers and runs each call on all of them. The uni executor calls one worker in the engine core process; the multiproc executor sends calls to one worker process per GPU through a shared-memory queue.</span></li><li><a href="../concepts/scheduler.html">The V1 scheduler: one token budget, no phases</a><span class="rel-sum">In each engine step, Scheduler.schedule() shares one token budget: first among the running requests, then among the waiting ones. It has no prefill or decode phase, it preempts the last running request when KV blocks run out, and update_from_output() appends the sampled tokens.</span></li><li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors in Model Runner V2</a><span class="rel-sum">How the Model Runner V2 sampler turns logits into tokens - the order of the built-in stages, where custom logits processors plug in, when the fused FlashInfer sampler runs and when the Gumbel sampler runs, how seeds work, and what logprobs and prompt_logprobs cost.</span></li><li><a href="../concepts/weight-loading.html">&quot;Weight loading: from checkpoint files to GPU parameters&quot;</a><span class="rel-sum">Each worker picks a model loader by --load-format, builds the model with empty per-rank parameters on its GPU, streams every checkpoint tensor once, renames it with a WeightsMapper, and lets the parameter&#x27;s weight_loader copy only this rank&#x27;s slice.</span></li><li><a href="../concepts/platform-interface.html">The Platform interface</a><span class="rel-sum">The Platform class is the contract between vLLM and a hardware vendor. Identity attributes describe the device; config hooks change VllmConfig in the front end; component pickers name the classes to use; kernel hooks load kernels. CudaPlatform is the reference implementation.</span></li><li><a href="../concepts/quantization-plugins.html">Quantization methods as plugins</a><span class="rel-sum">A quantization method is a QuantizationConfig subclass registered under a name. The front end picks the name from the checkpoint or --quantization and makes one config object; each layer in the worker asks it for a quantize method that makes the weights and runs the forward.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../concepts/frontend-plugins.html"><span class="pn-dir">← Previous</span><span class="pn-title">Plugins in the API server</span></a><a class="pn pn-next" href="../concepts/model-definition.html"><span class="pn-dir">Next →</span><span class="pn-title">How a vLLM model file is written (llama.py)</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-the-code">In the code</a></li><li class="toc-l3"><a href="#step-1-scheduler-cls">Step 1: scheduler_cls</a></li><li class="toc-l3"><a href="#step-2-worker-cls-and-worker-extension-cls">Step 2: worker_cls and worker_extension_cls</a></li><li class="toc-l3"><a href="#step-3-logits-processors">Step 3: logits processors</a></li><li class="toc-l3"><a href="#step-4-model-loaders">Step 4: model loaders</a></li><li class="toc-l3"><a href="#step-5-sleep-mode-backends">Step 5: sleep-mode backends</a></li><li class="toc-l3"><a href="#step-6-register-kv-cache-dtype">Step 6: register_kv_cache_dtype</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#all-engine-hooks-in-one-table">All engine hooks in one table</a></li><li class="toc-l3"><a href="#worked-example-a-worker-extension-for-weight-sync-with-tp-2">Worked example: a worker extension for weight sync, with TP = 2</a></li><li class="toc-l3"><a href="#edge-cases">Edge cases</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

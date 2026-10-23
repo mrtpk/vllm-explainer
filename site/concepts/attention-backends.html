@@ -1,0 +1,608 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Attention backends: backend, metadata builder and implementation · vLLM Explained</title>
+<meta name="description" content="An attention backend is three classes. The backend class describes what it supports, the metadata builder turns the common batch description of a KV cache group into backend metadata once per step, and the implementation writes the KV cache and runs the kernel for one layer. The builders also report how much CUDA graph capture they allow.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="concepts/attention-backends">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a class="current" aria-current="page" href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>vLLM concepts</span><span class="sep">›</span><span>Model execution</span><span class="sep">›</span><span aria-current="page">Attention backends</span></nav>
+<h1 class="page-title">Attention backends: backend, metadata builder and implementation</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">vLLM concepts</span><span class="meta-time">about 11 min read + 4 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../concepts/attention-backend-selection.html">How vLLM chooses an attention backend</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../concepts/forward-context.html">The forward context: how layers find per-step data</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../concepts/hybrid-kv-cache.html">The hybrid KV cache: specs, groups and one manager per layer type</a> <span class="level level-advanced level-sm">Advanced</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">An attention backend is three classes: a description, a metadata builder that runs once per step and group, and an implementation that runs per layer.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>Attention computes softmax(QK<sup>T</sup>)V over the cached keys and values of each request (<a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/learn/attention.html" target="_blank" rel="noopener" title="DeepInfer Explained: Attention, step by step">Attention basics<span class="ext-mark" aria-hidden="true">↗</span></a>). vLLM has many <a class="term" href="../reference/glossary.html#term-attention-backend" data-term="attention backend" data-def="A set of classes that implement attention on a platform, for example FlashAttention or FlashInfer. vLLM selects one per layer type.">attention backends</a>: FlashAttention, FlashInfer, Triton, FlashMLA and more. Which one a layer gets is decided when the model is built (<a href="../concepts/attention-backend-selection.html">How vLLM chooses an attention backend</a>). This page explains what a backend is made of, and how vLLM calls it each step. Kernel code is out of scope.</p>
+<p>Each backend has three classes, with three lifetimes:</p>
+<ul>
+  <li><strong><code>AttentionBackend</code></strong>, a class with only static and class methods. It names the other two classes and answers questions: which head sizes, data types, block sizes and features it supports.</li>
+  <li><strong><code>AttentionMetadataBuilder</code></strong>, the <a class="term" href="../reference/glossary.html#term-metadata-builder" data-term="metadata builder" data-def="The AttentionMetadataBuilder of a backend. It turns the common batch description into the backend&#x27;s own attention metadata, once per step for each group of layers.">metadata builder</a>. The runner makes one per group of layers at start-up. Each step it turns the <a class="term" href="../reference/glossary.html#term-common-attention-metadata" data-term="CommonAttentionMetadata" data-def="The backend-neutral description of one step&#x27;s batch for one KV cache group: query_start_loc, seq_lens, block table, slot mapping, token and request counts.">CommonAttentionMetadata</a> into the backend's own <a class="term" href="../reference/glossary.html#term-attention-metadata" data-term="attention metadata" data-def="The per-step object that an attention backend needs to run its kernel for a group of layers: query offsets, sequence lengths, block table, slot mapping and backend-specific fields.">attention metadata</a>.</li>
+  <li><strong><code>AttentionImpl</code></strong>, one object per attention layer, made in the layer's constructor. Each step it writes the new keys and values into the KV cache and runs the kernel.</li>
+</ul>
+<p>The split saves work. Metadata depends on the batch, not on the layer. So a 32-layer model builds it once per group and step, and all 32 layers use the same object.</p>
+<p><strong>An everyday comparison.</strong> Think of a train line. The timetable office (the builder) prints one timetable for all trains each day. Each driver (the impl) reads the same timetable and drives one train. The rule book (the backend class) says which trains and tracks the line can use. The comparison stops here: a builder can also say that a CUDA graph cannot replay some batches. Then vLLM changes the whole run plan at start-up.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b6b_attn_triad"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1, at start-up: the Attention constructor gets a backend class from the selector and calls backend.get_impl_cls() to make one impl per layer. init_attn_backend groups the layers of each KV cache group by backend, KV cache spec and head count into attention groups, calls get_builder_cls() and makes the builders; it asks each builder for its AttentionCGSupport, takes the minimum, and resolve_cudagraph_mode_and_sizes may lower the CUDA graph mode. Panel 2, every step, for KV cache group 0 of Llama-3-8B: build_attn_metadata makes one CommonAttentionMetadata with query_start_loc, seq_lens, block_table_tensor, slot_mapping, num_reqs, num_actual_tokens and max_query_len; the FlashAttention builder.build turns it into FlashAttentionMetadata; the same object goes into the attn_metadata dict for all 32 layer names. Panel 3, every layer: the unified ops get the metadata from the forward context and call impl.do_kv_cache_update with the slot mapping, then impl.forward with q, k, v, the KV cache view [num_blocks, 8, 16, 256] and the metadata."><svg role="img" aria-label="Panel 1, at start-up: the Attention constructor gets a backend class from the selector and calls backend.get_impl_cls() to make one impl per layer. init_attn_backend groups the layers of each KV cache group by backend, KV cache spec and head count into attention groups, calls get_builder_cls() and makes the builders; it asks each builder for its AttentionCGSupport, takes the minimum, and resolve_cudagraph_mode_and_sizes may lower the CUDA graph mode. Panel 2, every step, for KV cache group 0 of Llama-3-8B: build_attn_metadata makes one CommonAttentionMetadata with query_start_loc, seq_lens, block_table_tensor, slot_mapping, num_reqs, num_actual_tokens and max_query_len; the FlashAttention builder.build turns it into FlashAttentionMetadata; the same object goes into the attn_metadata dict for all 32 layer names. Panel 3, every layer: the unified ops get the metadata from the forward context and call impl.do_kv_cache_update with the slot mapping, then impl.forward with q, k, v, the KV cache view [num_blocks, 8, 16, 256] and the metadata." xmlns="http://www.w3.org/2000/svg" width="1100" height="936" viewBox="0 0 1100 936">
+<defs><marker id="dg-b6b_attn_triad-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker><marker id="dg-b6b_attn_triad-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b6b_attn_triad-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker><marker id="dg-b6b_attn_triad-m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker></defs>
+<rect width="1100" height="936" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">An attention backend: description, metadata builder, implementation</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Llama-3-8B, TP = 1, BF16, block size 16, FlashAttention  ·  one KV cache group, one attention group</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">backend class: static  ·  builder: one per attention group  ·  impl: one per layer (32)</text>
+<rect x="20.0" y="118.0" width="1060.0" height="244.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="144.0" r="13" fill="#111827"/>
+<text x="46.0" y="148.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="149.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What is made at start-up?</text>
+<text x="68.0" y="168.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The layer makes its impl; the runner groups layers, makes one builder per group, and checks CUDA graph support.</text>
+<rect x="46.0" y="188.0" width="300.0" height="124.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="58.0" y="208.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">FlashAttentionBackend</text>
+<text x="58.0" y="226.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">get_name() -&gt; FLASH_ATTN</text>
+<text x="58.0" y="241.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">get_impl_cls()</text>
+<text x="58.0" y="256.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">get_builder_cls()</text>
+<text x="58.0" y="271.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">supports_*, validate_*</text>
+<text x="58.0" y="286.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">forward_includes_kv_cache_</text>
+<text x="58.0" y="301.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  update = False</text>
+<rect x="400.0" y="188.0" width="300.0" height="124.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="412.0" y="208.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Attention.__init__ (x 32)</text>
+<text x="412.0" y="226.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">impl = impl_cls(num_heads,</text>
+<text x="412.0" y="241.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  head_size, scale,</text>
+<text x="412.0" y="256.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  num_kv_heads, ...)</text>
+<text x="412.0" y="271.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">FlashAttentionImpl</text>
+<text x="412.0" y="286.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  one per layer</text>
+<rect x="754.0" y="188.0" width="300.0" height="124.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="766.0" y="208.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">init_attn_backend</text>
+<text x="766.0" y="226.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">group: (backend, spec, heads)</text>
+<text x="766.0" y="241.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">-&gt; 1 AttentionGroup</text>
+<text x="766.0" y="256.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">builder = builder_cls(spec,</text>
+<text x="766.0" y="271.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  layer_names, config, dev)</text>
+<text x="766.0" y="286.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">min CG support: ALWAYS (FA3)</text>
+<text x="766.0" y="301.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">-&gt; mode stays as set</text>
+<line x1="346.0" y1="228.0" x2="398.0" y2="228.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b6b_attn_triad-m0)"/>
+<text x="373.0" y="218.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">impl</text>
+<path d="M 196.0,312.0 L 196.0,338.0 L 904.0,338.0 L 904.0,314.0" fill="none" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b6b_attn_triad-m0)"/>
+<text x="550.0" y="333.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">builder class</text>
+<rect x="20.0" y="384.0" width="1060.0" height="220.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="410.0" r="13" fill="#111827"/>
+<text x="46.0" y="414.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="415.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What runs once per step and KV cache group?</text>
+<text x="68.0" y="434.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">build_attn_metadata makes the common description; the builder turns it into backend metadata.</text>
+<rect x="46.0" y="454.0" width="300.0" height="124.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="58.0" y="474.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">CommonAttentionMetadata</text>
+<text x="58.0" y="492.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">query_start_loc [R+1]</text>
+<text x="58.0" y="507.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">seq_lens [R]</text>
+<text x="58.0" y="522.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">block_table_tensor [R, nb]</text>
+<text x="58.0" y="537.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">slot_mapping [T]</text>
+<text x="58.0" y="552.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">num_reqs, num_actual_tokens</text>
+<text x="58.0" y="567.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">max_query_len, max_seq_len</text>
+<rect x="400.0" y="454.0" width="300.0" height="124.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="412.0" y="474.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">builder.build(0, common)</text>
+<text x="412.0" y="492.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">FlashAttentionMetadata</text>
+<text x="412.0" y="507.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  copies the common fields</text>
+<text x="412.0" y="522.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  + scheduler_metadata</text>
+<text x="412.0" y="537.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  + causal, DCP fields</text>
+<text x="412.0" y="552.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">one object per group</text>
+<rect x="754.0" y="454.0" width="300.0" height="124.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="766.0" y="474.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">attn_metadata dict</text>
+<text x="766.0" y="492.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">model.layers.0.self_attn.attn -&gt; m</text>
+<text x="766.0" y="507.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">model.layers.1.self_attn.attn -&gt; m</text>
+<text x="766.0" y="522.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">...</text>
+<text x="766.0" y="537.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">model.layers.31.self_attn.attn -&gt; m</text>
+<text x="766.0" y="552.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">(the same object m)</text>
+<line x1="346.0" y1="513.0" x2="398.0" y2="513.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b6b_attn_triad-m1)"/>
+<line x1="700.0" y1="513.0" x2="752.0" y2="513.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b6b_attn_triad-m1)"/>
+<rect x="20.0" y="626.0" width="1060.0" height="196.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="652.0" r="13" fill="#111827"/>
+<text x="46.0" y="656.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="657.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What runs once per layer, inside the forward pass?</text>
+<text x="68.0" y="676.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The two custom ops look up the metadata by name and call the layer&#x27;s impl.</text>
+<rect x="46.0" y="696.0" width="300.0" height="100.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="58.0" y="716.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">KV cache view (this layer)</text>
+<text x="58.0" y="734.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[num_blocks, 8, 16, 256] bf16</text>
+<text x="58.0" y="749.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  blocks, KV heads, tokens,</text>
+<text x="58.0" y="764.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  key (128) + value (128)</text>
+<text x="58.0" y="779.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">bound once as layer.kv_cache</text>
+<rect x="400.0" y="696.0" width="300.0" height="100.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="412.0" y="716.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">impl.do_kv_cache_update</text>
+<text x="412.0" y="734.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">(layer, k, v, kv_cache,</text>
+<text x="412.0" y="749.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  slot_mapping)</text>
+<text x="412.0" y="764.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">scatter new K/V by slot</text>
+<text x="412.0" y="779.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">unified_kv_cache_update</text>
+<rect x="754.0" y="696.0" width="300.0" height="100.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="766.0" y="716.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">impl.forward</text>
+<text x="766.0" y="734.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">(layer, q, k, v, kv_cache,</text>
+<text x="766.0" y="749.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  m, output=out)</text>
+<text x="766.0" y="764.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">kernel writes into out</text>
+<text x="766.0" y="779.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">unified_attention_with_output</text>
+<line x1="346.0" y1="746.0" x2="398.0" y2="746.0" stroke="#d97706" stroke-width="1.6" marker-end="url(#dg-b6b_attn_triad-m2)"/>
+<line x1="700.0" y1="746.0" x2="752.0" y2="746.0" stroke="#059669" stroke-width="1.6" marker-end="url(#dg-b6b_attn_triad-m3)"/>
+<text x="30.0" y="857.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="846.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="118.3" y="857.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">backend class (static)</text>
+<rect x="267.7" y="846.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="288.7" y="857.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">builder and metadata</text>
+<rect x="434.7" y="846.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="455.7" y="857.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">impl, per layer</text>
+<rect x="564.4" y="846.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="585.4" y="857.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">KV cache memory</text>
+<text x="30.0" y="886.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">R = requests, T = tokens, nb = blocks per request. Models with several KV cache groups repeat panel 2 per group.</text>
+<text x="30.0" y="904.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">FA3/FA4 builders report ALWAYS; FA2 reports UNIFORM_BATCH. Kernel internals are not shown.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the three classes of an attention backend and when each one runs. The example is Llama-3-8B with FlashAttention, BF16, block size 16 and TP = 1.</figcaption><a class="diagram-open" href="../diagrams/b6b_attn_triad.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read the diagram from top to bottom. Panel 1 runs once at start-up. Panel 2 runs once per KV cache group in every step. Panel 3 runs once per layer in every step, inside the forward pass.</p>
+
+<h2 id="in-the-code">In the code<a class="h-anchor" href="#in-the-code" aria-label="Link to this section">#</a></h2>
+
+<h3 id="step-1-the-backend-class-names-the-two-other-classes">Step 1: the backend class names the two other classes<a class="h-anchor" href="#step-1-the-backend-class-names-the-two-other-classes" aria-label="Link to this section">#</a></h3>
+<p>Every backend implements three abstract static methods (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L81-L94" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:81-94 at 3e44c0d"><code>vllm/v1/attention/backend.py:81-94</code></a>). FlashAttention, for example:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L379-L381" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/attention/backends/flash_attn.py:379-381</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L379-L381" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">379</span><span class="ln">380</span><span class="ln">381</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">    @staticmethod
+    def get_name() -&gt; str:
+        return &quot;FLASH_ATTN&quot;</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L414-L420" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/attention/backends/flash_attn.py:414-420</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L414-L420" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">414</span><span class="ln">415</span><span class="ln">416</span><span class="ln">417</span><span class="ln">418</span><span class="ln">419</span><span class="ln">420</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">    @staticmethod
+    def get_impl_cls() -&gt; type[&quot;FlashAttentionImpl&quot;]:
+        return FlashAttentionImpl
+
+    @staticmethod
+    def get_builder_cls() -&gt; type[&quot;FlashAttentionMetadataBuilder&quot;]:
+        return FlashAttentionMetadataBuilder</code></pre></div></div></div></figure>
+<p>The rest of the class answers questions. The <code>supports_*</code> class methods and <code>validate_configuration</code> are used during selection (<a href="../concepts/attention-backend-selection.html">How vLLM chooses an attention backend</a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L279-L370" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:279-370 at 3e44c0d"><code>vllm/v1/attention/backend.py:279-370</code></a>). Four more members matter at run time:</p>
+<table>
+  <thead><tr><th>Member</th><th>Default</th><th>Used for</th></tr></thead>
+  <tbody>
+    <tr><td><code>forward_includes_kv_cache_update</code></td><td><code>True</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L69-L70" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:69-70 at 3e44c0d"><code>vllm/v1/attention/backend.py:69-70</code></a>)</td><td><code>False</code> means the layer calls the separate KV cache update op first (<a href="../concepts/forward-context.html">The forward context: how layers find per-step data</a>). FlashAttention, FlashInfer and Triton set <code>False</code>.</td></tr>
+    <tr><td><code>get_supported_kernel_block_sizes()</code></td><td><code>[MultipleOf(1)]</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L75-L80" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:75-80 at 3e44c0d"><code>vllm/v1/attention/backend.py:75-80</code></a>)</td><td>Block sizes the kernel can use; the default block size and the kernel block size come from it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L155-L163" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:155-163 at 3e44c0d"><code>vllm/v1/attention/backend.py:155-163</code></a>).</td></tr>
+    <tr><td><code>customize_spec()</code></td><td>no change (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L140-L152" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:140-152 at 3e44c0d"><code>vllm/v1/attention/backend.py:140-152</code></a>)</td><td>Lets a backend pack its KV cache in another way. The comment calls it a "temporary compatibility API".</td></tr>
+    <tr><td><code>supported_kv_cache_layouts()</code></td><td><code>None</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L371-L375" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:371-375 at 3e44c0d"><code>vllm/v1/attention/backend.py:371-375</code></a>)</td><td>Physical memory layouts the kernels can read, most preferred first (Deep dive).</td></tr>
+  </tbody>
+</table>
+
+<h3 id="step-2-one-impl-per-layer">Step 2: one impl per layer<a class="h-anchor" href="#step-2-one-impl-per-layer" aria-label="Link to this section">#</a></h3>
+<p>The <code>Attention</code> constructor makes the impl right after the backend is selected (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/attention.py#L419-L432" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/attention.py:419-432 at 3e44c0d"><code>vllm/model_executor/layers/attention/attention.py:419-432</code></a>). The impl gets the per-rank head counts, the head size, the scale, the sliding window and the KV cache data type. The abstract forward has this signature:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L916-L929" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/attention/backend.py:916-929</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L916-L929" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">916</span><span class="ln">917</span><span class="ln">918</span><span class="ln">919</span><span class="ln">920</span><span class="ln">921</span><span class="ln">922</span><span class="ln">923</span><span class="ln">924</span><span class="ln">925</span><span class="ln">926</span><span class="ln">927</span><span class="ln">928</span><span class="ln">929</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">    @abstractmethod
+    def forward(
+        self,
+        layer: AttentionLayer,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: T,
+        output: torch.Tensor,
+        output_scale: torch.Tensor | None = None,
+        output_block_scale: torch.Tensor | None = None,
+    ) -&gt; torch.Tensor:
+        raise NotImplementedError</code></pre></div></div></div></figure>
+<p><code>query</code> is <code>[num_tokens, num_heads, head_size]</code>; the layer reshapes q, k and v before the op (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/attention.py#L533-L540" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/attention.py:533-540 at 3e44c0d"><code>vllm/model_executor/layers/attention/attention.py:533-540</code></a>). The impl writes into <code>output</code>; it does not return a new tensor. Some backends set <code>forward_includes_kv_cache_update = False</code>. They also implement <code>do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)</code>, which writes the keys and values of the new tokens into their slots. For FlashAttention it is a scatter by slot (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L1430-L1464" target="_blank" rel="noopener" title="vllm/v1/attention/backends/flash_attn.py:1430-1464 at 3e44c0d"><code>vllm/v1/attention/backends/flash_attn.py:1430-1464</code></a>).</p>
+<p>In the profile run there is no metadata. FlashAttention then only fills the output with zeros (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L1224-L1226" target="_blank" rel="noopener" title="vllm/v1/attention/backends/flash_attn.py:1224-1226 at 3e44c0d"><code>vllm/v1/attention/backends/flash_attn.py:1224-1226</code></a>).</p>
+
+<h3 id="step-3-attention-groups-and-builders-at-start-up">Step 3: attention groups and builders, at start-up<a class="h-anchor" href="#step-3-attention-groups-and-builders-at-start-up" aria-label="Link to this section">#</a></h3>
+<p>When the KV cache is initialized, <code>init_attn_backend</code> groups the layers. Inside each <a class="term" href="../reference/glossary.html#term-kv-cache-group" data-term="KV cache group" data-def="A set of layers that use the same KV cache layout and share one block table, for example all full-attention layers.">KV cache group</a>, layers with the same backend class, the same KV cache spec and the same number of query heads form one <code>AttentionGroup</code>:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/attn_utils.py#L248-L265" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/attn_utils.py:248-265</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/attn_utils.py#L248-L265" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">248</span><span class="ln">249</span><span class="ln">250</span><span class="ln">251</span><span class="ln">252</span><span class="ln">253</span><span class="ln">254</span><span class="ln hl">255</span><span class="ln hl">256</span><span class="ln hl">257</span><span class="ln hl">258</span><span class="ln hl">259</span><span class="ln hl">260</span><span class="ln hl">261</span><span class="ln hl">262</span><span class="ln hl">263</span><span class="ln">264</span><span class="ln">265</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><pre><code class="language-python">            layer_kv_cache_spec: KVCacheSpec = kv_cache_group_spec.kv_cache_spec
+            if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
+                layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
+
+            # Split on per-rank num_heads_q so layers with different Q-head
+            # counts (e.g. a spec-decode draft head and its target) get separate
+            # metadata builders.
+            num_heads_q = getattr(attn_layers[layer_name], &quot;num_heads&quot;, 0)
+            key = (attn_backend.full_cls_name(), layer_kv_cache_spec, num_heads_q)
+            if key not in group_map:
+                group_map[key] = AttentionGroup(
+                    attn_backend, [layer_name], layer_kv_cache_spec, kv_cache_group_id
+                )
+                group_order.append(key)
+            else:
+                group_map[key].layer_names.append(layer_name)
+
+        attn_groups.append([group_map[key] for key in group_order])</code></pre></div></div></div></figure>
+<p>Then each group makes its builders. It passes the KV cache spec (with the kernel block size), the layer names, the config and the device (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/attn_utils.py#L291-L300" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/attn_utils.py:291-300 at 3e44c0d"><code>vllm/v1/worker/gpu/attn_utils.py:291-300</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/utils.py#L330-L339" target="_blank" rel="noopener" title="vllm/v1/worker/utils.py:330-339 at 3e44c0d"><code>vllm/v1/worker/utils.py:330-339</code></a>). Normally there is one builder per group; with dual-batch overlap there is one per micro-batch, because "some builders keep the prepared metadata on themselves" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/attn_utils.py#L296-L299" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/attn_utils.py:296-299 at 3e44c0d"><code>vllm/v1/worker/gpu/attn_utils.py:296-299</code></a>).</p>
+
+<h3 id="step-4-commonattentionmetadata-once-per-kv-cache-group-and-step">Step 4: CommonAttentionMetadata, once per KV cache group and step<a class="h-anchor" href="#step-4-commonattentionmetadata-once-per-kv-cache-group-and-step" aria-label="Link to this section">#</a></h3>
+<p><code>build_attn_metadata</code> loops over the KV cache groups. For each group it makes one <a class="term" href="../reference/glossary.html#term-common-attention-metadata" data-term="CommonAttentionMetadata" data-def="The backend-neutral description of one step&#x27;s batch for one KV cache group: query_start_loc, seq_lens, block table, slot mapping, token and request counts.">CommonAttentionMetadata</a> from the step's input tensors (<a href="../concepts/model-runner.html">The model runner (Model Runner V2)</a>):</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/attn_utils.py#L527-L548" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/attn_utils.py:527-548</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/attn_utils.py#L527-L548" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">527</span><span class="ln hl">528</span><span class="ln hl">529</span><span class="ln hl">530</span><span class="ln hl">531</span><span class="ln hl">532</span><span class="ln hl">533</span><span class="ln hl">534</span><span class="ln hl">535</span><span class="ln hl">536</span><span class="ln hl">537</span><span class="ln">538</span><span class="ln">539</span><span class="ln">540</span><span class="ln">541</span><span class="ln">542</span><span class="ln">543</span><span class="ln">544</span><span class="ln">545</span><span class="ln">546</span><span class="ln">547</span><span class="ln">548</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><pre><code class="language-python">        common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=query_start_loc_gpu,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+            max_seq_len=max_seq_len,
+            num_reqs=num_reqs,
+            num_actual_tokens=num_tokens,
+            max_query_len=max_query_len,
+            block_table_tensor=block_table,
+            slot_mapping=slot_mapping,
+            causal=group_causal,
+            dcp_local_seq_lens=dcp_local_seq_lens,
+            dcp_local_seq_lens_cpu_upper_bound=dcp_local_seq_lens_cpu_upper_bound,
+            positions=positions,
+            is_prefilling=group_is_prefilling,
+            mm_req_doc_ranges=mm_req_doc_ranges,
+            rswa_prefix_lens=rswa_prefix_lens,
+            req_idx=req_idx,
+            _token_to_req_indices_cache=token_to_req_indices,
+            **common_attn_metadata_extra_kwargs,
+        )</code></pre></div></div></div></figure>
+<p>Mainly the block table and the slot mapping differ between groups: each group has its own block table and its own row of slot mappings (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/attn_utils.py#L504-L505" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/attn_utils.py:504-505 at 3e44c0d"><code>vllm/v1/worker/gpu/attn_utils.py:504-505</code></a>). A hybrid drafter can also set a causal flag per group, and a model state can add its own fields (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/attn_utils.py#L506-L520" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/attn_utils.py:506-520 at 3e44c0d"><code>vllm/v1/worker/gpu/attn_utils.py:506-520</code></a>). The main fields:</p>
+<table>
+  <thead><tr><th>Field</th><th>Type, shape</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>query_start_loc</code>, <code>query_start_loc_cpu</code></td><td>int32 <code>[num_reqs + 1]</code>, GPU and CPU</td><td>where each request's tokens start in the flat batch</td></tr>
+    <tr><td><code>seq_lens</code></td><td>int32 <code>[num_reqs]</code></td><td>computed tokens plus this step's tokens (see the warning below)</td></tr>
+    <tr><td><code>num_reqs</code>, <code>num_actual_tokens</code></td><td><code>int</code></td><td>batch size; token count, which may be padded</td></tr>
+    <tr><td><code>max_query_len</code>, <code>max_seq_len</code></td><td><code>int</code></td><td>longest query; longest context, maybe an upper bound</td></tr>
+    <tr><td><code>block_table_tensor</code></td><td>int32 <code>[num_reqs, max_num_blocks]</code></td><td>this group's block ids per request, in batch order</td></tr>
+    <tr><td><code>slot_mapping</code></td><td>int64 <code>[num_tokens]</code></td><td>KV cache slot of each new token; -1 for padding</td></tr>
+    <tr><td><code>causal</code></td><td><code>bool</code> or tensor</td><td>causal mask; per request for some models</td></tr>
+    <tr><td><code>is_prefilling</code>, <code>positions</code>, <code>seq_lens_cpu_upper_bound</code></td><td>optional</td><td>extras that some backends read</td></tr>
+  </tbody>
+</table>
+<p>Definitions: <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L389-L475" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:389-475 at 3e44c0d"><code>vllm/v1/attention/backend.py:389-475</code></a>.</p>
+<aside class="callout callout-warning"><p class="callout-title">The seq_lens docstring is misleading</p><div class="callout-body"><p>The docstring says <code>seq_lens</code> is "the number of computed tokens for each request" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L401-L402" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:401-402 at 3e44c0d"><code>vllm/v1/attention/backend.py:401-402</code></a>). Model Runner V2 writes <code>num_computed_tokens + query_len</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/input_batch.py#L375-L376" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/input_batch.py:375-376 at 3e44c0d"><code>vllm/v1/worker/gpu/input_batch.py:375-376</code></a>), and <code>compute_num_computed_tokens()</code> subtracts the query lengths again to get the computed count (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L489-L494" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:489-494 at 3e44c0d"><code>vllm/v1/attention/backend.py:489-494</code></a>).</p></div></aside>
+
+<h3 id="step-5-builder-build-and-one-metadata-object-for-many-layers">Step 5: builder.build, and one metadata object for many layers<a class="h-anchor" href="#step-5-builder-build-and-one-metadata-object-for-many-layers" aria-label="Link to this section">#</a></h3>
+<p>For each attention group of the KV cache group, the runner calls the builder and stores the result under every layer name of the group:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/attn_utils.py#L550-L580" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/attn_utils.py:550-580</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/attn_utils.py#L550-L580" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">550</span><span class="ln">551</span><span class="ln">552</span><span class="ln">553</span><span class="ln">554</span><span class="ln">555</span><span class="ln">556</span><span class="ln">557</span><span class="ln">558</span><span class="ln">559</span><span class="ln">560</span><span class="ln hl">561</span><span class="ln hl">562</span><span class="ln hl">563</span><span class="ln hl">564</span><span class="ln">565</span><span class="ln">566</span><span class="ln">567</span><span class="ln">568</span><span class="ln">569</span><span class="ln">570</span><span class="ln">571</span><span class="ln">572</span><span class="ln">573</span><span class="ln hl">574</span><span class="ln hl">575</span><span class="ln hl">576</span><span class="ln">577</span><span class="ln">578</span><span class="ln hl">579</span><span class="ln hl">580</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><pre><code class="language-python">        for attn_group in attn_groups[i]:
+            attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
+            reuse_key = None
+            if attn_metadata_builder.supports_update_block_table and isinstance(
+                attn_group.kv_cache_spec, MambaSpec
+            ):
+                reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
+            if reuse_key in cached_metadata:
+                metadata = attn_metadata_builder.update_block_table(
+                    cached_metadata[reuse_key], block_table, slot_mapping
+                )
+            elif for_cudagraph_capture:
+                metadata = attn_group.build_metadata_for_cudagraph_capture(
+                    common_attn_metadata, ubatch_idx
+                )
+            else:
+                attn_metadata_extra_kwargs = (
+                    model_specific_attn_metadata.get_extra_attn_kwargs(
+                        attn_metadata_builder,
+                        num_reqs,
+                    )
+                    if model_specific_attn_metadata is not None
+                    else {}
+                )
+                metadata = attn_group.build_metadata(
+                    common_attn_metadata, ubatch_idx, **attn_metadata_extra_kwargs
+                )
+            if reuse_key is not None and reuse_key not in cached_metadata:
+                cached_metadata[reuse_key] = metadata
+            for layer_name in attn_group.layer_names:
+                attn_metadata[layer_name] = metadata</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 553-560.</strong> Mamba groups with the same spec and builder reuse the first metadata and only swap the block table, through <code>update_block_table</code>.</li>
+  <li><strong>Lines 561-564.</strong> During CUDA graph capture, <code>build_for_cudagraph_capture</code> is called instead. Its default just calls <code>build</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L720-L729" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:720-729 at 3e44c0d"><code>vllm/v1/attention/backend.py:720-729</code></a>).</li>
+  <li><strong>Lines 574-576.</strong> The normal path: <code>AttentionGroup.build_metadata</code> calls <code>build(common_prefix_len=0, common_attn_metadata)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/utils.py#L341-L352" target="_blank" rel="noopener" title="vllm/v1/worker/utils.py:341-352 at 3e44c0d"><code>vllm/v1/worker/utils.py:341-352</code></a>). The <code>common_prefix_len</code> argument is "Deprecated and always 0" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L686-L704" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:686-704 at 3e44c0d"><code>vllm/v1/attention/backend.py:686-704</code></a>).</li>
+  <li><strong>Lines 579-580.</strong> The same object goes under every layer name of the group.</li>
+</ol>
+<p>If the backend's kernel uses smaller blocks than the KV cache manager, the attention group first rewrites the block table into kernel blocks (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/utils.py#L368-L378" target="_blank" rel="noopener" title="vllm/v1/worker/utils.py:368-378 at 3e44c0d"><code>vllm/v1/worker/utils.py:368-378</code></a>).</p>
+
+<h3 id="step-6-cuda-graph-support-and-how-it-lowers-the-mode">Step 6: CUDA graph support, and how it lowers the mode<a class="h-anchor" href="#step-6-cuda-graph-support-and-how-it-lowers-the-mode" aria-label="Link to this section">#</a></h3>
+<p>A builder reports how much <a class="term" href="../reference/glossary.html#term-cuda-graph" data-term="CUDA graph" data-def="A recorded sequence of GPU kernel launches that the GPU can replay with one launch. It removes CPU launch overhead in small steps.">CUDA graph</a> capture it allows, with <a class="term" href="../reference/glossary.html#term-cudagraph-support" data-term="AttentionCGSupport" data-def="How much CUDA graph capture a metadata builder allows: ALWAYS, UNIFORM_BATCH, UNIFORM_SINGLE_TOKEN_DECODE or NEVER. The weakest level in the model can lower the CUDA graph mode.">AttentionCGSupport</a>:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L557-L569" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/attention/backend.py:557-569</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L557-L569" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">557</span><span class="ln">558</span><span class="ln">559</span><span class="ln">560</span><span class="ln">561</span><span class="ln">562</span><span class="ln">563</span><span class="ln">564</span><span class="ln">565</span><span class="ln">566</span><span class="ln">567</span><span class="ln">568</span><span class="ln">569</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">class AttentionCGSupport(Enum):
+    &quot;&quot;&quot;Constants for the cudagraph support of the attention backend&quot;&quot;&quot;
+
+    ALWAYS = 3
+    &quot;&quot;&quot;Cudagraph always supported; supports mixed-prefill-decode&quot;&quot;&quot;
+    UNIFORM_BATCH = 2
+    &quot;&quot;&quot;Cudagraph supported for batches the only contain query lengths that are
+    the same, this can be used for spec-decode
+        i.e. &quot;decodes&quot; are 1 + num_speculative_tokens&quot;&quot;&quot;
+    UNIFORM_SINGLE_TOKEN_DECODE = 1
+    &quot;&quot;&quot;Cudagraph supported for batches the only contain query_len==1 decodes&quot;&quot;&quot;
+    NEVER = 0
+    &quot;&quot;&quot;NO cudagraph support&quot;&quot;&quot;</code></pre></div></div></div></figure>
+<p>The default is <code>NEVER</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L593-L595" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:593-595 at 3e44c0d"><code>vllm/v1/attention/backend.py:593-595</code></a>). The runner asks every group and keeps the weakest answer (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/attn_utils.py#L314-L341" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/attn_utils.py:314-341 at 3e44c0d"><code>vllm/v1/worker/gpu/attn_utils.py:314-341</code></a>). Then <code>resolve_cudagraph_mode_and_sizes</code> may lower the configured mode (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L754-L763" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:754-763 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:754-763</code></a>):</p>
+<ol>
+  <li><strong>FULL for mixed batches, but support below <code>ALWAYS</code>.</strong> <code>NEVER</code> raises <code>ValueError</code>. Otherwise the mode becomes <code>FULL_AND_PIECEWISE</code> if attention is a splitting op, else <code>FULL_DECODE_ONLY</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L1394-L1418" target="_blank" rel="noopener" title="vllm/config/compilation.py:1394-1418 at 3e44c0d"><code>vllm/config/compilation.py:1394-1418</code></a>).</li>
+  <li><strong>FULL decode graphs, but support <code>NEVER</code>.</strong> The mode becomes <code>PIECEWISE</code> if attention is compiled piecewise, else <code>NONE</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L1421-L1445" target="_blank" rel="noopener" title="vllm/config/compilation.py:1421-1445 at 3e44c0d"><code>vllm/config/compilation.py:1421-1445</code></a>).</li>
+  <li><strong>FULL decode graphs with speculative decoding</strong> (decode query length above 1), but support below <code>UNIFORM_BATCH</code>. The mode becomes <code>PIECEWISE</code> or <code>NONE</code> in the same way (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L1448-L1465" target="_blank" rel="noopener" title="vllm/config/compilation.py:1448-1465 at 3e44c0d"><code>vllm/config/compilation.py:1448-1465</code></a>).</li>
+  <li>Last check: a mode with FULL graphs and support <code>NEVER</code> raises (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L1482-L1493" target="_blank" rel="noopener" title="vllm/config/compilation.py:1482-1493 at 3e44c0d"><code>vllm/config/compilation.py:1482-1493</code></a>).</li>
+</ol>
+<p>Each change logs a warning that names the backend. <a href="../concepts/compile-and-cuda-graphs.html">torch.compile and CUDA graphs in vLLM</a> explains the modes.</p>
+
+<h3 id="step-7-the-mla-variant">Step 7: the MLA variant<a class="h-anchor" href="#step-7-the-mla-variant" aria-label="Link to this section">#</a></h3>
+<p>Models with multi-head latent attention, such as DeepSeek-V3, use the layer <code>MLAAttention</code> and an impl based on <code>MLAAttentionImpl</code>. Its constructor gets the MLA dimensions and the <code>kv_b_proj</code> layer (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L1034-L1064" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:1034-1064 at 3e44c0d"><code>vllm/v1/attention/backend.py:1034-1064</code></a>). The impl has two paths instead of one <code>forward</code>:</p>
+<ul>
+  <li><code>forward_mqa</code> for decode tokens, over the compressed latent cache (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L1080-L1089" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:1080-1089 at 3e44c0d"><code>vllm/v1/attention/backend.py:1080-1089</code></a>);</li>
+  <li><code>forward_mha</code> for prefill tokens, "MHA-style" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L1066-L1079" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:1066-1079 at 3e44c0d"><code>vllm/v1/attention/backend.py:1066-1079</code></a>).</li>
+</ul>
+<p>The layer sends the first <code>num_decode_tokens</code> rows to <code>forward_mqa</code> and the rest to <code>forward_mha</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/mla_attention.py#L984-L985" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/mla_attention.py:984-985 at 3e44c0d"><code>vllm/model_executor/layers/attention/mla_attention.py:984-985</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/mla_attention.py#L1017-L1020" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/mla_attention.py:1017-1020 at 3e44c0d"><code>vllm/model_executor/layers/attention/mla_attention.py:1017-1020</code></a>). The MLA builder finds the split with <code>split_decodes_and_prefills</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/mla_attention.py#L2605-L2612" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/mla_attention.py:2605-2612 at 3e44c0d"><code>vllm/model_executor/layers/attention/mla_attention.py:2605-2612</code></a>). This is why Model Runner V2 puts the decodes first in the batch (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2476-L2483" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2476-2483 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2476-2483</code></a>). The cache write is one shared method, <code>do_kv_cache_update</code>, which calls the <code>concat_and_cache_mla</code> op (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L1108-L1128" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:1108-1128 at 3e44c0d"><code>vllm/v1/attention/backend.py:1108-1128</code></a>). The custom ops are <code>unified_mla_kv_cache_update</code> and <code>unified_mla_attention_with_output</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/mla_attention.py#L1475-L1479" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/mla_attention.py:1475-1479 at 3e44c0d"><code>vllm/model_executor/layers/attention/mla_attention.py:1475-1479</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/mla_attention.py#L1524-L1530" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/mla_attention.py:1524-1530 at 3e44c0d"><code>vllm/model_executor/layers/attention/mla_attention.py:1524-1530</code></a>).</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="where-get-kv-cache-shape-went-the-kv-cache-layout" class="dd-title">Where get_kv_cache_shape went: the KV cache layout</h3></summary><div class="dd-body"><p>Older code and many guides use <code>AttentionBackend.get_kv_cache_shape()</code>. At this commit the base class has no such method; only one MLA backend still defines it (<code>git grep</code>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py#L227" target="_blank" rel="noopener" title="vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py:227 at 3e44c0d"><code>vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py:227</code></a>). The shape now comes from the KV cache spec and a layout descriptor:</p>
+<ol>
+  <li><strong>Logical shape per layer.</strong> <code>[B, H, N, C]</code>: blocks, head slots, states (tokens) per block, and C bytes of content (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/kv_cache_interface.py#L345-L361" target="_blank" rel="noopener" title="vllm/v1/kv_cache_interface.py:345-361 at 3e44c0d"><code>vllm/v1/kv_cache_interface.py:345-361</code></a>). For normal attention, C is <code>(head_size + head_size_v) × dtype bytes</code>: key and value of one token and head (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/kv_cache_interface.py#L570-L575" target="_blank" rel="noopener" title="vllm/v1/kv_cache_interface.py:570-575 at 3e44c0d"><code>vllm/v1/kv_cache_interface.py:570-575</code></a>).</li>
+  <li><strong>Physical order.</strong> A <code>KVCacheLayout</code> member is a permutation of <code>[L, B, H, N, C]</code>, where L is the layer inside a shared allocation (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/kv_cache_layout.py#L11-L28" target="_blank" rel="noopener" title="vllm/v1/kv_cache_layout.py:11-28 at 3e44c0d"><code>vllm/v1/kv_cache_layout.py:11-28</code></a>).</li>
+  <li><strong>Choice.</strong> The engine core resolves one layout for the whole model. A backend lists the layouts it can read with <code>supported_kv_cache_layouts()</code>; with no list from any backend, the default preference starts with <code>LBNHC</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/utils.py#L228-L235" target="_blank" rel="noopener" title="vllm/v1/attention/backends/utils.py:228-235 at 3e44c0d"><code>vllm/v1/attention/backends/utils.py:228-235</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/utils.py#L240-L276" target="_blank" rel="noopener" title="vllm/v1/attention/backends/utils.py:240-276 at 3e44c0d"><code>vllm/v1/attention/backends/utils.py:240-276</code></a>). <code>VLLM_KV_CACHE_LAYOUT</code> can force a layout that every backend supports (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/utils.py#L361-L367" target="_blank" rel="noopener" title="vllm/v1/attention/backends/utils.py:361-367 at 3e44c0d"><code>vllm/v1/attention/backends/utils.py:361-367</code></a>).</li>
+  <li><strong>Views.</strong> <code>allocate_kv_cache</code> allocates one int8 buffer and makes a strided view per layer, then casts it to the KV dtype (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/utils.py#L564-L625" target="_blank" rel="noopener" title="vllm/v1/worker/utils.py:564-625 at 3e44c0d"><code>vllm/v1/worker/utils.py:564-625</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/kv_cache_interface.py#L461-L466" target="_blank" rel="noopener" title="vllm/v1/kv_cache_interface.py:461-466 at 3e44c0d"><code>vllm/v1/kv_cache_interface.py:461-466</code></a>).</li>
+</ol>
+<p><strong>FlashAttention, traced.</strong> FlashAttention declares no layout list (it does not override the method), so a model with only FlashAttention layers gets <code>LBNHC</code>. Its forward docstring gives the view: <code>[num_blocks, num_kv_heads, block_size, 2 * head_size]</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L1199-L1200" target="_blank" rel="noopener" title="vllm/v1/attention/backends/flash_attn.py:1199-1200 at 3e44c0d"><code>vllm/v1/attention/backends/flash_attn.py:1199-1200</code></a>). The cache write transposes it to <code>(B, N, H, 2D)</code> and splits the last dimension into a key half and a value half (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L1445-L1446" target="_blank" rel="noopener" title="vllm/v1/attention/backends/flash_attn.py:1445-1446 at 3e44c0d"><code>vllm/v1/attention/backends/flash_attn.py:1445-1446</code></a>). With <code>LBNHC</code>, the N axis is outside the H axis in memory (derived). <strong>FlashInfer</strong> on compute capability 10 lists <code>LBHNC</code> first, because "the trtllm-gen kernels consume head-major block interiors" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flashinfer.py#L700-L706" target="_blank" rel="noopener" title="vllm/v1/attention/backends/flashinfer.py:700-706 at 3e44c0d"><code>vllm/v1/attention/backends/flashinfer.py:700-706</code></a>).</p>
+<p>Worked example: Llama-3-8B with TP = 1, BF16 and block size 16. The view of one layer is <code>[num_blocks, 8, 16, 256]</code> bfloat16. So one block of one layer is 8 × 16 × 256 × 2 = 65,536 bytes (derived from the formula above). <a href="../concepts/hybrid-kv-cache.html">The hybrid KV cache: specs, groups and one manager per layer type</a> explains page sizes across groups.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="flashattention-metadata-field-by-field" class="dd-title">FlashAttention metadata, field by field</h3></summary><div class="dd-body"><figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L516-L548" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/attention/backends/flash_attn.py:516-548</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L516-L548" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">516</span><span class="ln">517</span><span class="ln">518</span><span class="ln">519</span><span class="ln">520</span><span class="ln">521</span><span class="ln">522</span><span class="ln">523</span><span class="ln">524</span><span class="ln">525</span><span class="ln">526</span><span class="ln">527</span><span class="ln">528</span><span class="ln">529</span><span class="ln">530</span><span class="ln">531</span><span class="ln">532</span><span class="ln">533</span><span class="ln">534</span><span class="ln">535</span><span class="ln">536</span><span class="ln">537</span><span class="ln">538</span><span class="ln">539</span><span class="ln">540</span><span class="ln">541</span><span class="ln">542</span><span class="ln">543</span><span class="ln">544</span><span class="ln">545</span><span class="ln">546</span><span class="ln">547</span><span class="ln">548</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">class FlashAttentionMetadata:
+    # NOTE(sang): Definition of context_len, query_len, and seq_len.
+    # |---------- N-1 iteration --------|
+    # |---------------- N iteration ---------------------|
+    # |- tokenA -|......................|-- newTokens ---|
+    # |---------- context_len ----------|
+    # |-------------------- seq_len ---------------------|
+    #                                   |-- query_len ---|
+
+    num_actual_tokens: int  # Number of tokens excluding padding.
+    max_query_len: int
+    query_start_loc: torch.Tensor
+    max_seq_len: int
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    slot_mapping: torch.Tensor
+
+    # For GQA DCP
+    max_dcp_context_kv_len: int | None = None
+    dcp_context_kv_lens: torch.Tensor | None = None
+
+    # Split counts for FA2 DCP context attention. num_prefill_* tracks
+    # context-bearing extend rows; pure prefills do not attend to DCP context.
+    num_decode_reqs: int = 0
+    num_prefill_reqs: int = 0
+    num_decode_tokens: int = 0
+    num_prefill_tokens: int = 0
+
+    # Optional aot scheduling
+    scheduler_metadata: torch.Tensor | None = None
+    max_num_splits: int = 0
+
+    causal: bool | torch.Tensor = True</code></pre></div></div></div></figure>
+<p>The builder copies most fields straight from the common metadata (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L821-L829" target="_blank" rel="noopener" title="vllm/v1/attention/backends/flash_attn.py:821-829 at 3e44c0d"><code>vllm/v1/attention/backends/flash_attn.py:821-829</code></a>). It adds backend-only fields, for example <code>scheduler_metadata</code> for ahead-of-time scheduling and the DCP context lengths. The <code>fast_build</code> flag "disables AOT scheduling, used when there will be few iterations i.e. spec-decode" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L818-L820" target="_blank" rel="noopener" title="vllm/v1/attention/backends/flash_attn.py:818-820 at 3e44c0d"><code>vllm/v1/attention/backends/flash_attn.py:818-820</code></a>). Its CUDA graph support is <code>ALWAYS</code> with FlashAttention 3 or 4 (or on XPU), else <code>UNIFORM_BATCH</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L612-L621" target="_blank" rel="noopener" title="vllm/v1/attention/backends/flash_attn.py:612-621 at 3e44c0d"><code>vllm/v1/attention/backends/flash_attn.py:612-621</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="attentioncgsupport-of-common-backends" class="dd-title">AttentionCGSupport of common backends</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Builder</th><th>Support</th><th>Source</th></tr></thead>
+  <tbody>
+    <tr><td>FlashAttention</td><td><code>ALWAYS</code> with FA3/FA4 or XPU, else <code>UNIFORM_BATCH</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L617-L621" target="_blank" rel="noopener" title="vllm/v1/attention/backends/flash_attn.py:617-621 at 3e44c0d"><code>vllm/v1/attention/backends/flash_attn.py:617-621</code></a></td></tr>
+    <tr><td>FlashInfer</td><td><code>UNIFORM_BATCH</code> when every layer can use the TRT-LLM decode path (with extra rules on SM90 and SM12x), else <code>UNIFORM_SINGLE_TOKEN_DECODE</code>; always the latter with DCP</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flashinfer.py#L1145-L1189" target="_blank" rel="noopener" title="vllm/v1/attention/backends/flashinfer.py:1145-1189 at 3e44c0d"><code>vllm/v1/attention/backends/flashinfer.py:1145-1189</code></a></td></tr>
+    <tr><td>Triton</td><td><code>ALWAYS</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/triton_attn.py#L96" target="_blank" rel="noopener" title="vllm/v1/attention/backends/triton_attn.py:96 at 3e44c0d"><code>vllm/v1/attention/backends/triton_attn.py:96</code></a></td></tr>
+    <tr><td>FlashAttention MLA</td><td><code>UNIFORM_BATCH</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/mla/flashattn_mla.py#L127" target="_blank" rel="noopener" title="vllm/v1/attention/backends/mla/flashattn_mla.py:127 at 3e44c0d"><code>vllm/v1/attention/backends/mla/flashattn_mla.py:127</code></a></td></tr>
+    <tr><td>FlashMLA</td><td><code>UNIFORM_BATCH</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/mla/flashmla.py#L110" target="_blank" rel="noopener" title="vllm/v1/attention/backends/mla/flashmla.py:110 at 3e44c0d"><code>vllm/v1/attention/backends/mla/flashmla.py:110</code></a></td></tr>
+    <tr><td>base class</td><td><code>NEVER</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L593-L595" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:593-595 at 3e44c0d"><code>vllm/v1/attention/backend.py:593-595</code></a></td></tr>
+  </tbody>
+</table>
+<p>Example: Llama-3-8B on an H100 with FlashAttention 3 reports <code>ALWAYS</code>, so the default <code>FULL_AND_PIECEWISE</code> stays. With FlashInfer at <code>UNIFORM_SINGLE_TOKEN_DECODE</code> and EAGLE drafts (decode query length 1 + k), rule 3 of Step 6 lowers the mode to <code>PIECEWISE</code> (derived). The design document has a similar table (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/design/cuda_graphs.md#L173-L187" target="_blank" rel="noopener" title="docs/design/cuda_graphs.md:173-187 at 3e44c0d"><code>docs/design/cuda_graphs.md:173-187</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="other-builder-hooks" class="dd-title">Other builder hooks</h3></summary><div class="dd-body"><ul>
+  <li><code>reorder_batch_threshold</code>: the query length up to which the builder treats a request as a decode. <code>_init_reorder_batch_threshold</code> raises it to <code>1 + num_speculative_tokens</code> for backends that run speculative verification as decodes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L658-L684" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:658-684 at 3e44c0d"><code>vllm/v1/attention/backend.py:658-684</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L572-L589" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:572-589 at 3e44c0d"><code>vllm/v1/attention/backend.py:572-589</code></a>).</li>
+  <li><code>update_block_table</code>: reuse metadata with another block table; only when <code>supports_update_block_table</code> is true (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L706-L718" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:706-718 at 3e44c0d"><code>vllm/v1/attention/backend.py:706-718</code></a>).</li>
+  <li><code>build_for_drafting</code>: metadata for a draft model, with <code>fast_build=True</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L731-L751" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:731-751 at 3e44c0d"><code>vllm/v1/attention/backend.py:731-751</code></a>).</li>
+  <li><code>update_draft_decode_metadata</code>: capture-safe update between draft steps, for the fused multi-step draft graph (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L753-L761" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:753-761 at 3e44c0d"><code>vllm/v1/attention/backend.py:753-761</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/design/model_runner_v2.md#L194-L200" target="_blank" rel="noopener" title="docs/design/model_runner_v2.md:194-200 at 3e44c0d"><code>docs/design/model_runner_v2.md:194-200</code></a>).</li>
+  <li><code>get_varlen_cudagraph_max_query_len</code>: the largest per-request query length that a FULL graph of this builder can replay in a variable-length decode batch (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L635-L656" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:635-656 at 3e44c0d"><code>vllm/v1/attention/backend.py:635-656</code></a>).</li>
+</ul></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><strong>A backend with no CUDA graph support and <code>-cc.cudagraph_mode=FULL</code>.</strong> Start-up stops with "CUDAGraphMode.FULL is not supported with ... backend (support: NEVER); please try cudagraph_mode=PIECEWISE" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L1400-L1410" target="_blank" rel="noopener" title="vllm/config/compilation.py:1400-1410 at 3e44c0d"><code>vllm/config/compilation.py:1400-1410</code></a>).</li>
+  <li><strong>Silent mode changes.</strong> A weaker backend lowers <code>FULL_AND_PIECEWISE</code> to <code>PIECEWISE</code> or <code>NONE</code> with only a warning. Decode then loses its full graph and gets slower. Look for "is not supported with" in the log.</li>
+  <li><strong>Batch invariance.</strong> With <code>VLLM_BATCH_INVARIANT=1</code>, a backend without <code>supports_batch_invariance()</code> raises <code>RuntimeError</code> in <code>init_attn_backend</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/attn_utils.py#L235-L242" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/attn_utils.py:235-242 at 3e44c0d"><code>vllm/v1/worker/gpu/attn_utils.py:235-242</code></a>).</li>
+  <li><strong>A layout that some backend cannot read.</strong> <code>VLLM_KV_CACHE_LAYOUT</code> outside the supported set raises <code>ValueError</code>; backends with no common layout raise too (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/utils.py#L361-L367" target="_blank" rel="noopener" title="vllm/v1/attention/backends/utils.py:361-367 at 3e44c0d"><code>vllm/v1/attention/backends/utils.py:361-367</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/utils.py#L271-L276" target="_blank" rel="noopener" title="vllm/v1/attention/backends/utils.py:271-276 at 3e44c0d"><code>vllm/v1/attention/backends/utils.py:271-276</code></a>).</li>
+  <li><strong>Fused output quantization on FlashAttention.</strong> Its forward raises <code>NotImplementedError</code> when it gets an output scale (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L1219-L1222" target="_blank" rel="noopener" title="vllm/v1/attention/backends/flash_attn.py:1219-1222 at 3e44c0d"><code>vllm/v1/attention/backends/flash_attn.py:1219-1222</code></a>).</li>
+</ul>
+<p><strong>Why it matters.</strong> A backend plugin implements these three classes. The builder decides the CPU cost of each step and whether decode can use a FULL CUDA graph; the impl decides the GPU cost. When a deployment is slower than expected, check which backend each layer got and which CUDA graph mode survived start-up.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>How many FlashAttention metadata objects does Llama-3-8B build per step, and how many impl objects exist?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>One metadata object per step: one KV cache group, one attention group, stored under all 32 layer names (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/attn_utils.py#L579-L580" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/attn_utils.py:579-580 at 3e44c0d"><code>vllm/v1/worker/gpu/attn_utils.py:579-580</code></a>). There are 32 impl objects, one per <code>Attention</code> layer (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/attention/attention.py#L419-L432" target="_blank" rel="noopener" title="vllm/model_executor/layers/attention/attention.py:419-432 at 3e44c0d"><code>vllm/model_executor/layers/attention/attention.py:419-432</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>Which class decides which CUDA graph modes are possible, and through which method?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The metadata builder, through <code>get_cudagraph_support()</code>, which returns an <code>AttentionCGSupport</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L626-L633" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:626-633 at 3e44c0d"><code>vllm/v1/attention/backend.py:626-633</code></a>). The runner takes the minimum over all groups and passes it to <code>resolve_cudagraph_mode_and_sizes</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L754-L763" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:754-763 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:754-763</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>What is in <code>seq_lens</code> of <code>CommonAttentionMetadata</code> for a decode request with 40 computed tokens?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>41: computed tokens plus the 1 new query token. Model Runner V2 writes <code>num_computed_tokens + query_len</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/input_batch.py#L375-L376" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/input_batch.py:375-376 at 3e44c0d"><code>vllm/v1/worker/gpu/input_batch.py:375-376</code></a>), although the docstring says "computed tokens" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backend.py#L401-L402" target="_blank" rel="noopener" title="vllm/v1/attention/backend.py:401-402 at 3e44c0d"><code>vllm/v1/attention/backend.py:401-402</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>A model runs FlashInfer with support <code>UNIFORM_SINGLE_TOKEN_DECODE</code>, with EAGLE and 3 speculative tokens, at the default O2. Which CUDA graph mode does it get, and why?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>PIECEWISE</code>. O2 sets <code>FULL_AND_PIECEWISE</code>, whose decode mode is FULL. The decode query length is 1 + 3 = 4 &gt; 1, and the support is below <code>UNIFORM_BATCH</code>. Attention is a splitting op by default, so the mode becomes <code>PIECEWISE</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L1448-L1465" target="_blank" rel="noopener" title="vllm/config/compilation.py:1448-1465 at 3e44c0d"><code>vllm/config/compilation.py:1448-1465</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>Where does FlashAttention write the new keys, and what memory layout does it see?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>In <code>do_kv_cache_update</code>, called by the separate update op because <code>forward_includes_kv_cache_update = False</code>. It views the cache <code>[B, H, N, 2D]</code> as <code>(B, N, H, 2D)</code> and splits it into a key half and a value half. Then it scatters the new rows by slot mapping (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/attention/backends/flash_attn.py#L1430-L1464" target="_blank" rel="noopener" title="vllm/v1/attention/backends/flash_attn.py:1430-1464 at 3e44c0d"><code>vllm/v1/attention/backends/flash_attn.py:1430-1464</code></a>).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../code/v1-attention-backend.html">&quot;v1/attention/backend.py and selector.py: the backend interfaces and the selector&quot;</a><span class="rel-sum">vllm/v1/attention/backend.py defines the abstract classes of every attention backend (AttentionBackend, AttentionMetadataBuilder, AttentionImpl, MLAAttentionImpl), CommonAttentionMetadata and AttentionCGSupport. vllm/v1/attention/selector.py turns a layer&#x27;s facts into one backend class through the platform, with a cache.</span></li><li><a href="../concepts/attention-backend-selection.html">How vLLM chooses an attention backend</a><span class="rel-sum">Each attention layer asks the selector for a backend class when the worker builds the model. The selector asks current_platform. CUDA validates a priority list for the GPU generation and takes the first valid backend; an explicit --attention-backend is validated alone.</span></li><li><a href="../concepts/forward-context.html">The forward context: how layers find per-step data</a><span class="rel-sum">Attention layers register themselves by name when the model is built, get their KV cache tensor bound at start-up, and read the per-step metadata from a global forward context that the model runner sets around each forward pass. The attention custom ops take only the layer name, so torch.compile sees them as opaque.</span></li><li><a href="../concepts/compile-and-cuda-graphs.html">torch.compile and CUDA graphs in vLLM</a><span class="rel-sum">vLLM compiles the inner model once with torch.compile and its own Inductor backend, splits the graph at the attention ops, caches the result on disk, and captures CUDA graphs at start-up. Each step, Model Runner V2 replays a FULL graph for uniform decode batches, PIECEWISE graphs for other batches up to the largest capture size, and runs eagerly above it.</span></li><li><a href="../concepts/model-runner.html">The model runner (Model Runner V2)</a><span class="rel-sum">Model Runner V2 keeps every running request in a fixed row of GPU tensors, gathers each step&#x27;s inputs from those rows with GPU kernels, runs the model (CUDA graph or eager), and samples in a second call that returns an AsyncOutput without a GPU wait.</span></li><li><a href="../concepts/hybrid-kv-cache.html">The hybrid KV cache: specs, groups and one manager per layer type</a><span class="rel-sum">Models that mix full attention with sliding-window, chunked-local or Mamba layers get one KV cache group per layer type. Each group has its own block table and single-type manager, all groups share one block pool, and so every group must use the same page size. Prefix caching finds one hit length that is valid for all groups.</span></li><li><a href="../code/model-executor-layers-attention-attention.html">&quot;model_executor/layers/attention/attention.py: the Attention layer and its custom ops&quot;</a><span class="rel-sum">vllm/model_executor/layers/attention/attention.py defines the Attention layer that model files use for standard attention, the two custom ops unified_kv_cache_update and unified_attention_with_output, and get_attention_context, which resolves a layer name to its metadata, layer object, KV cache and slot mapping.</span></li><li><a href="../tours/forward-pass.html">Tour: One forward pass</a><span class="rel-sum">Follow one forward pass of Llama-3-8B on one H100 in 14 stops, for a batch of two decodes and one 298-token prompt: Model Runner V2 inputs, the PIECEWISE CUDA graph, one decoder layer with its shapes, FlashAttention, logits and the sampler.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../concepts/forward-context.html"><span class="pn-dir">← Previous</span><span class="pn-title">The forward context: how layers find per-step data</span></a><a class="pn pn-next" href="../concepts/compile-and-cuda-graphs.html"><span class="pn-dir">Next →</span><span class="pn-title">torch.compile and CUDA graphs in vLLM</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-the-code">In the code</a></li><li class="toc-l3"><a href="#step-1-the-backend-class-names-the-two-other-classes">Step 1: the backend class names the two other classes</a></li><li class="toc-l3"><a href="#step-2-one-impl-per-layer">Step 2: one impl per layer</a></li><li class="toc-l3"><a href="#step-3-attention-groups-and-builders-at-start-up">Step 3: attention groups and builders, at start-up</a></li><li class="toc-l3"><a href="#step-4-commonattentionmetadata-once-per-kv-cache-group-and-step">Step 4: CommonAttentionMetadata, once per KV cache group and step</a></li><li class="toc-l3"><a href="#step-5-builder-build-and-one-metadata-object-for-many-layers">Step 5: builder.build, and one metadata object for many layers</a></li><li class="toc-l3"><a href="#step-6-cuda-graph-support-and-how-it-lowers-the-mode">Step 6: CUDA graph support, and how it lowers the mode</a></li><li class="toc-l3"><a href="#step-7-the-mla-variant">Step 7: the MLA variant</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#where-get-kv-cache-shape-went-the-kv-cache-layout">Where get_kv_cache_shape went: the KV cache layout</a></li><li class="toc-l3"><a href="#flashattention-metadata-field-by-field">FlashAttention metadata, field by field</a></li><li class="toc-l3"><a href="#attentioncgsupport-of-common-backends">AttentionCGSupport of common backends</a></li><li class="toc-l3"><a href="#other-builder-hooks">Other builder hooks</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

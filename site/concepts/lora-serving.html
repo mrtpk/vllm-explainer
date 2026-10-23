@@ -1,0 +1,575 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Serving LoRA adapters: from the model name to the wrapped layer · vLLM Explained</title>
+<meta name="description" content="The mechanics of multi-LoRA serving in vLLM - the LoRARequest of a request, the max_loras check in the scheduler, the worker&#x27;s CPU and GPU adapter caches, the wrapped layers and the Punica kernels, token_lora_mapping in Model Runner V2, CUDA graphs per LoRA count, and the limits of runtime loading.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="concepts/lora-serving">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a class="current" aria-current="page" href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>vLLM concepts</span><span class="sep">›</span><span>Serving features</span><span class="sep">›</span><span aria-current="page">Serving LoRA adapters</span></nav>
+<h1 class="page-title">Serving LoRA adapters: from the model name to the wrapped layer</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">vLLM concepts</span><span class="meta-time">about 10 min read + 4 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../learn/lora-adapters.html">LoRA adapters</a> <span class="level level-intermediate level-sm">Intermediate</span></li><li><a href="../concepts/scheduler.html">The V1 scheduler: one token budget, no phases</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../concepts/model-runner.html">The model runner (Model Runner V2)</a> <span class="level level-advanced level-sm">Advanced</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">A request names an adapter, and the scheduler limits adapters per step. The worker puts each adapter into a GPU slot, and wrapped layers add its update.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p><a href="../learn/lora-adapters.html">LoRA adapters</a> explains what a <a class="term" href="../reference/glossary.html#term-lora-adapter" data-term="LoRA adapter" data-def="A small set of extra low-rank weights that changes a base model for one task. One server can apply different adapters to different requests.">LoRA adapter</a> is, why vLLM keeps adapters unmerged, and the flags with their real defaults (<code>--enable-lora</code> off, <code>--max-loras</code> 1, <code>--max-lora-rank</code> 16). This page follows one adapter through the processes of <code>vllm serve</code>.</p>
+<p>Four parts work together. The API server turns the <code>model</code> field into a <a class="term" href="../reference/glossary.html#term-lora-request" data-term="LoRARequest" data-def="The small object that names one LoRA adapter for a request: lora_name, lora_int_id and lora_path.">LoRARequest</a>. The scheduler admits a request only if the step does not exceed <code>max_loras</code> adapters. The worker keeps adapters in two LRU caches: one in CPU memory, and a fixed number of <a class="term" href="../reference/glossary.html#term-lora-slot" data-term="LoRA slot" data-def="One of max_loras GPU positions in the stacked LoRA buffers. An active adapter is copied into a free slot.">GPU slots</a>. At model load, vLLM replaces each supported layer with a LoRA wrapper. The wrapper runs the base layer once for the batch and then calls the <a class="term" href="../reference/glossary.html#term-punica" data-term="Punica wrapper" data-def="The object that runs the batched LoRA kernels (shrink and expand) for a batch in which each token can use a different adapter.">Punica wrapper</a> kernels, which add each token's own adapter update.</p>
+<p><strong>An everyday comparison.</strong> Think of a print shop with one press and a rack of three stencil holders. The front desk writes the customer's stencil name on each order. The planner never puts more than three stencils into one run. The stock room keeps stencils on shelves and moves one into a holder when a run needs it. The comparison stops being true in one place: the shop moves a stencil into a holder only when a run needs it. vLLM also activates an adapter at once when you load it through the API.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b7b_lora_slots"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Three panels for one step with three adapters and max_loras 3. Panel 1: the API server turns model sql into a LoRARequest with lora_name sql, lora_int_id 1 and lora_path; the base model name gives None; an unknown name gives 404 or goes to a resolver. The scheduler sees running adapters 1, 2 and 3, equal to max_loras, so a waiting request for adapter 4 is skipped, while a request for a running adapter is admitted. The worker&#x27;s _apply_adapters loads adapters that are not in the CPU cache from disk or the Hugging Face Hub and activates each one into a GPU slot, with LRU eviction. Panel 2: the GPU slots hold ids 1, 3 and 2 in slots 0, 1 and 2; LoraState repeats the per-request ids 1, 2, 0, 3 by the tokens per request 3, 1, 1, 2 into the token_lora_mapping 1,1,1,2,0,3,3; Punica update_metadata maps ids to slot indices 0,0,0,2,-1,1,1, where -1 means no adapter, and recomputes only when the mapping or the slot layout changes. Panel 3: the base layer computes y equal to x W for all 7 tokens with one GEMM; add_shrink computes an FP32 buffer of shape slices by 7 by 16 from x and the A matrix of each token&#x27;s slot; add_expand adds the buffer times B of the slot to y; the scale is 1.0 because alpha over r was merged into B at load time."><svg role="img" aria-label="Three panels for one step with three adapters and max_loras 3. Panel 1: the API server turns model sql into a LoRARequest with lora_name sql, lora_int_id 1 and lora_path; the base model name gives None; an unknown name gives 404 or goes to a resolver. The scheduler sees running adapters 1, 2 and 3, equal to max_loras, so a waiting request for adapter 4 is skipped, while a request for a running adapter is admitted. The worker&#x27;s _apply_adapters loads adapters that are not in the CPU cache from disk or the Hugging Face Hub and activates each one into a GPU slot, with LRU eviction. Panel 2: the GPU slots hold ids 1, 3 and 2 in slots 0, 1 and 2; LoraState repeats the per-request ids 1, 2, 0, 3 by the tokens per request 3, 1, 1, 2 into the token_lora_mapping 1,1,1,2,0,3,3; Punica update_metadata maps ids to slot indices 0,0,0,2,-1,1,1, where -1 means no adapter, and recomputes only when the mapping or the slot layout changes. Panel 3: the base layer computes y equal to x W for all 7 tokens with one GEMM; add_shrink computes an FP32 buffer of shape slices by 7 by 16 from x and the A matrix of each token&#x27;s slot; add_expand adds the buffer times B of the slot to y; the scale is 1.0 because alpha over r was merged into B at load time." xmlns="http://www.w3.org/2000/svg" width="1100" height="990" viewBox="0 0 1100 990">
+<defs><marker id="dg-b7b_lora_slots-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b7b_lora_slots-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker><marker id="dg-b7b_lora_slots-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker><marker id="dg-b7b_lora_slots-m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#0d9488"/></marker><marker id="dg-b7b_lora_slots-m4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker></defs>
+<rect width="1100" height="990" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Multi-LoRA serving: from the model field to the wrapped layer</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">vllm serve --enable-lora --max-loras 3  ·  Model Runner V2  ·  one step with 4 requests and 7 tokens</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">requests: sql (id 1), chat-de (id 2), base (none), legal (id 3)  ·  GPU slots: 3  ·  rank r = 16</text>
+<rect x="20.0" y="124.0" width="1060.0" height="236.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="150.0" r="13" fill="#111827"/>
+<text x="46.0" y="154.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="155.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Which adapter does each request use, and may it run?</text>
+<text x="68.0" y="174.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The API server maps the model name to a LoRARequest; the scheduler allows at most max_loras adapters.</text>
+<rect x="46.0" y="194.0" width="300.0" height="136.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="58.0" y="214.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">API server</text>
+<text x="58.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">model: &quot;sql&quot; → LoRARequest(</text>
+<text x="58.0" y="247.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  lora_name &quot;sql&quot;, lora_int_id 1,</text>
+<text x="58.0" y="262.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  lora_path &quot;/adapters/sql&quot;)</text>
+<text x="58.0" y="277.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">base model name → None</text>
+<text x="58.0" y="292.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">unknown name → 404 (or resolver)</text>
+<text x="58.0" y="307.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">serve/engine/serving.py:194-200</text>
+<rect x="400.0" y="194.0" width="300.0" height="136.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="412.0" y="214.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Scheduler (engine core)</text>
+<text x="412.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">running adapters {1, 2, 3}</text>
+<text x="412.0" y="247.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  = max_loras (3)</text>
+<text x="412.0" y="262.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">waiting request for id 4:</text>
+<text x="412.0" y="277.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  skipped this step</text>
+<text x="412.0" y="292.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">id already running: admitted</text>
+<text x="412.0" y="307.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">scheduler.py:945-954, 998-1008</text>
+<rect x="754.0" y="194.0" width="300.0" height="136.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="766.0" y="214.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Worker: _apply_adapters</text>
+<text x="766.0" y="232.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">for each adapter in the batch:</text>
+<text x="766.0" y="247.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">not in CPU cache → load from</text>
+<text x="766.0" y="262.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  disk or HF Hub (max_cpu_loras)</text>
+<text x="766.0" y="277.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">activate_adapter → GPU slot</text>
+<text x="766.0" y="292.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  (LRU evicts if all slots used)</text>
+<text x="766.0" y="307.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">worker_manager.py:273-324</text>
+<line x1="346.0" y1="262.0" x2="398.0" y2="262.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b7b_lora_slots-m0)"/>
+<line x1="700.0" y1="262.0" x2="752.0" y2="262.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b7b_lora_slots-m1)"/>
+<rect x="20.0" y="382.0" width="1060.0" height="236.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="408.0" r="13" fill="#111827"/>
+<text x="46.0" y="412.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="413.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">How does each token find its adapter on the GPU?</text>
+<text x="68.0" y="432.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Each request gives its LoRA id to all its tokens; Punica turns ids into slot indices.</text>
+<rect x="46.0" y="452.0" width="300.0" height="136.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="58.0" y="472.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">GPU slots</text>
+<text x="58.0" y="490.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">lora_index_to_id = [1, 3, 2]</text>
+<text x="58.0" y="505.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  slot 0: sql      (id 1)</text>
+<text x="58.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  slot 1: legal    (id 3)</text>
+<text x="58.0" y="535.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  slot 2: chat-de  (id 2)</text>
+<text x="58.0" y="550.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">stacked A/B buffers [3, 1, ...]</text>
+<text x="58.0" y="565.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">model_manager.py:355-412</text>
+<rect x="400.0" y="452.0" width="300.0" height="136.0" rx="8" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.5"/>
+<text x="412.0" y="472.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#0d9488" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">token_lora_mapping (MRV2)</text>
+<text x="412.0" y="490.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">lora_ids per request: [1, 2, 0, 3]</text>
+<text x="412.0" y="505.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">tokens per request:   [3, 1, 1, 2]</text>
+<text x="412.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">repeat → (1,1,1, 2, 0, 3,3)</text>
+<text x="412.0" y="535.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">prompt mapping: (1, 2, 0, 3)</text>
+<text x="412.0" y="550.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">0 = no LoRA</text>
+<text x="412.0" y="565.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">gpu/lora_utils.py:94-104</text>
+<rect x="754.0" y="452.0" width="300.0" height="136.0" rx="8" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.5"/>
+<text x="766.0" y="472.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#0d9488" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Punica update_metadata</text>
+<text x="766.0" y="490.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">LoRA id → slot index:</text>
+<text x="766.0" y="505.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  (0,0,0, 2, -1, 1,1)</text>
+<text x="766.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">-1 = no adapter for the token</text>
+<text x="766.0" y="535.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">recomputed only when the mapping</text>
+<text x="766.0" y="550.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  or the slot layout changes</text>
+<text x="766.0" y="565.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">punica_wrapper/utils.py:87-111</text>
+<line x1="346.0" y1="520.0" x2="398.0" y2="520.0" stroke="#d97706" stroke-width="1.6" marker-end="url(#dg-b7b_lora_slots-m2)"/>
+<line x1="700.0" y1="520.0" x2="752.0" y2="520.0" stroke="#0d9488" stroke-width="1.6" marker-end="url(#dg-b7b_lora_slots-m3)"/>
+<rect x="20.0" y="640.0" width="1060.0" height="236.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="666.0" r="13" fill="#111827"/>
+<text x="46.0" y="670.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="671.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What does one wrapped linear layer compute?</text>
+<text x="68.0" y="690.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">One base GEMM for all 7 tokens, then a batched shrink and expand that pick A and B per token by slot.</text>
+<rect x="46.0" y="710.0" width="300.0" height="136.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="58.0" y="730.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Base layer (unchanged)</text>
+<text x="58.0" y="748.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">y = quant_method.apply(x)</text>
+<text x="58.0" y="763.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">x [7, 4096] → y [7, 4096]</text>
+<text x="58.0" y="778.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">one GEMM, all tokens</text>
+<text x="58.0" y="793.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">wrapper: e.g. QKV/Column/Row</text>
+<text x="58.0" y="808.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  ParallelLinearWithLoRA</text>
+<text x="58.0" y="823.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">base_linear.py:210-213</text>
+<rect x="400.0" y="710.0" width="300.0" height="136.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="412.0" y="730.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">add_shrink</text>
+<text x="412.0" y="748.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">buf = x @ A[slot of token]</text>
+<text x="412.0" y="763.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">buf FP32 [slices, 7, r=16]</text>
+<text x="412.0" y="778.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">slot -1: no LoRA update</text>
+<text x="412.0" y="793.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">A stacked [3, 1, 16, 4096]</text>
+<text x="412.0" y="808.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  (max_loras, 1, r, in)</text>
+<text x="412.0" y="823.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">punica_gpu.py:247-262</text>
+<rect x="754.0" y="710.0" width="300.0" height="136.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="766.0" y="730.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">add_expand</text>
+<text x="766.0" y="748.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">y += buf @ B[slot of token]</text>
+<text x="766.0" y="763.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">B stacked [3, 1, 4096, 16]</text>
+<text x="766.0" y="778.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  (max_loras, 1, out, r)</text>
+<text x="766.0" y="793.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">scale 1.0: alpha / r is</text>
+<text x="766.0" y="808.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  merged into B at load</text>
+<text x="766.0" y="823.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">lora_weights.py:37-42</text>
+<line x1="346.0" y1="778.0" x2="398.0" y2="778.0" stroke="#059669" stroke-width="1.6" marker-end="url(#dg-b7b_lora_slots-m4)"/>
+<line x1="700.0" y1="778.0" x2="752.0" y2="778.0" stroke="#059669" stroke-width="1.6" marker-end="url(#dg-b7b_lora_slots-m4)"/>
+<text x="30.0" y="911.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="900.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="911.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">API server</text>
+<rect x="209.1" y="900.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="230.1" y="911.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">scheduler</text>
+<rect x="310.6" y="900.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="331.6" y="911.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">adapter memory</text>
+<rect x="451.6" y="900.0" width="14.0" height="14.0" rx="3" fill="#f0fdfa" fill-opacity="1.0" stroke="#0d9488" stroke-width="1.4"/>
+<text x="472.6" y="911.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">per-step mapping</text>
+<rect x="598.7" y="900.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="619.7" y="911.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">forward pass</text>
+<text x="30.0" y="940.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Slot order depends on the order of activation; [1, 3, 2] is one possible layout. Shapes are for a 4096 x 4096 projection at TP = 1.</text>
+<text x="30.0" y="958.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Shrink and expand are Triton kernels (out of scope); the page explains only how vLLM calls them.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the per-request adapter choice becomes a per-token slot index (panels 1-2). One base GEMM serves all tokens; shrink and expand pick A and B per token (panel 3).</figcaption><a class="diagram-open" href="../diagrams/b7b_lora_slots.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read the panels from top to bottom. Panel 1 runs in three processes: the API server, the engine core and the worker. Panels 2 and 3 run in the worker in every step. The slot layout <code>[1, 3, 2]</code> is one possible order, for example after an LRU eviction; it depends on when each adapter was activated. The worked example in the deep dive gets <code>[1, 2, 3]</code> from its start-up order.</p>
+
+<h2 id="in-the-code">In the code<a class="h-anchor" href="#in-the-code" aria-label="Link to this section">#</a></h2>
+
+<h3 id="step-1-the-request-gets-a-lorarequest">Step 1: the request gets a LoRARequest<a class="h-anchor" href="#step-1-the-request-gets-a-lorarequest" aria-label="Link to this section">#</a></h3>
+<p>The <code>model</code> field of a request selects the base model or an adapter; <code>_maybe_get_adapters</code> looks the name up (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/engine/serving.py#L194-L200" target="_blank" rel="noopener" title="vllm/entrypoints/serve/engine/serving.py:194-200 at 3e44c0d"><code>vllm/entrypoints/serve/engine/serving.py:194-200</code></a>). The result is a small msgspec struct:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/request.py#L8-L29" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/lora/request.py:8-29</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/request.py#L8-L29" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">8</span><span class="ln">9</span><span class="ln">10</span><span class="ln">11</span><span class="ln">12</span><span class="ln">13</span><span class="ln">14</span><span class="ln">15</span><span class="ln">16</span><span class="ln">17</span><span class="ln">18</span><span class="ln">19</span><span class="ln">20</span><span class="ln">21</span><span class="ln">22</span><span class="ln">23</span><span class="ln">24</span><span class="ln">25</span><span class="ln">26</span><span class="ln">27</span><span class="ln">28</span><span class="ln">29</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">class LoRARequest(
+    msgspec.Struct,
+    omit_defaults=True,  # type: ignore[call-arg]
+    array_like=True,
+):  # type: ignore[call-arg]
+    &quot;&quot;&quot;Request for a LoRA adapter.
+
+    lora_int_id must be globally unique for a given adapter.
+    This is currently not enforced in vLLM.
+
+    load_inplace: If True, forces reloading the adapter even if one
+        with the same lora_int_id already exists in the cache. This replaces
+        the existing adapter in-place. If False (default), only loads if the
+        adapter is not already loaded.
+    &quot;&quot;&quot;
+
+    lora_name: str
+    lora_int_id: int
+    lora_path: str = &quot;&quot;
+    base_model_name: str | None = msgspec.field(default=None)
+    load_inplace: bool = False
+    is_3d_lora_weight: bool = False</code></pre></div></div></div></figure>
+<p><code>lora_int_id</code> must be above 0 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/request.py#L37-L39" target="_blank" rel="noopener" title="vllm/lora/request.py:37-39 at 3e44c0d"><code>vllm/lora/request.py:37-39</code></a>). Two LoRA requests are equal when their names are equal; the hash also uses only the name (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/request.py#L56-L69" target="_blank" rel="noopener" title="vllm/lora/request.py:56-69 at 3e44c0d"><code>vllm/lora/request.py:56-69</code></a>). An unknown name gives HTTP 404. Only with <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code> does the server first ask the <a class="term" href="../reference/glossary.html#term-lora-resolver" data-term="LoRA resolver" data-def="An object that finds a LoRA adapter by name when a request asks for an adapter that the server does not know yet, for example in a local folder.">LoRA resolvers</a> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/engine/serving.py#L62-L66" target="_blank" rel="noopener" title="vllm/entrypoints/serve/engine/serving.py:62-66 at 3e44c0d"><code>vllm/entrypoints/serve/engine/serving.py:62-66</code></a>; <a href="../concepts/frontend-plugins.html">Plugins in the API server</a>, Step 4).</p>
+
+<h3 id="step-2-the-scheduler-limits-adapters-per-step">Step 2: the scheduler limits adapters per step<a class="h-anchor" href="#step-2-the-scheduler-limits-adapters-per-step" aria-label="Link to this section">#</a></h3>
+<p>At the start of the waiting pass, the scheduler collects the adapter ids of all running requests. This includes requests that are not scheduled in this step (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L945-L954" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:945-954 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:945-954</code></a>). A waiting request with a new adapter is skipped when that set already has <code>max_loras</code> entries:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L998-L1008" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/sched/scheduler.py:998-1008</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L998-L1008" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">998</span><span class="ln">999</span><span class="ln">1000</span><span class="ln">1001</span><span class="ln">1002</span><span class="ln">1003</span><span class="ln">1004</span><span class="ln">1005</span><span class="ln">1006</span><span class="ln">1007</span><span class="ln">1008</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">                # Check that adding the request still respects the max_loras constraint.
+                if (
+                    self.lora_config
+                    and request.lora_request
+                    and (
+                        len(scheduled_loras) == self.lora_config.max_loras
+                        and request.lora_request.lora_int_id not in scheduled_loras
+                    )
+                ):
+                    # Scheduling would exceed max_loras, skip.
+                    skip_request(request_queue)</code></pre></div></div></div></figure>
+<p>The skipped request goes back to the front of the queue and tries again in the next step. The gauge <code>vllm:lora_requests_info</code> shows <code>max_lora</code> and the waiting and running adapters as labels (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/metrics/loggers.py#L1099-L1112" target="_blank" rel="noopener" title="vllm/v1/metrics/loggers.py:1099-1112 at 3e44c0d"><code>vllm/v1/metrics/loggers.py:1099-1112</code></a>).</p>
+
+<h3 id="step-3-the-worker-loads-and-activates-adapters">Step 3: the worker loads and activates adapters<a class="h-anchor" href="#step-3-the-worker-loads-and-activates-adapters" aria-label="Link to this section">#</a></h3>
+<p>The LoRA manager exists only with <code>--enable-lora</code>. <code>load_lora_model</code> checks that the model supports LoRA, builds an <code>LRUCacheWorkerLoRAManager</code>, and wraps the model (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/lora_model_runner_mixin.py#L43-L66" target="_blank" rel="noopener" title="vllm/v1/worker/lora_model_runner_mixin.py:43-66 at 3e44c0d"><code>vllm/v1/worker/lora_model_runner_mixin.py:43-66</code></a>). In each step with LoRA requests, the model runner passes the active <code>LoRARequest</code>s to the manager (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/lora_model_runner_mixin.py#L68-L87" target="_blank" rel="noopener" title="vllm/v1/worker/lora_model_runner_mixin.py:68-87 at 3e44c0d"><code>vllm/v1/worker/lora_model_runner_mixin.py:68-87</code></a>):</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/worker_manager.py#L273-L324" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/lora/worker_manager.py:273-324</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/worker_manager.py#L273-L324" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">273</span><span class="ln">274</span><span class="ln">275</span><span class="ln">276</span><span class="ln">277</span><span class="ln">278</span><span class="ln hl">279</span><span class="ln hl">280</span><span class="ln hl">281</span><span class="ln hl">282</span><span class="ln hl">283</span><span class="ln hl">284</span><span class="ln">285</span><span class="ln">286</span><span class="ln">287</span><span class="ln">288</span><span class="ln">289</span><span class="ln">290</span><span class="ln">291</span><span class="ln">292</span><span class="ln">293</span><span class="ln">294</span><span class="ln hl">295</span><span class="ln hl">296</span><span class="ln hl">297</span><span class="ln hl">298</span><span class="ln hl">299</span><span class="ln hl">300</span><span class="ln hl">301</span><span class="ln hl">302</span><span class="ln hl">303</span><span class="ln">304</span><span class="ln">305</span><span class="ln">306</span><span class="ln">307</span><span class="ln">308</span><span class="ln hl">309</span><span class="ln hl">310</span><span class="ln hl">311</span><span class="ln hl">312</span><span class="ln hl">313</span><span class="ln">314</span><span class="ln">315</span><span class="ln">316</span><span class="ln">317</span><span class="ln">318</span><span class="ln">319</span><span class="ln">320</span><span class="ln">321</span><span class="ln">322</span><span class="ln hl">323</span><span class="ln">324</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(37 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(38 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(40 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(50 * var(--code-lh))"></span><pre><code class="language-python">    def _apply_adapters(self, lora_requests: set[LoRARequest]) -&gt; None:
+        loras_map = {
+            lora_request.lora_int_id: lora_request
+            for lora_request in lora_requests
+            if lora_request
+        }
+        if len(loras_map) &gt; self._adapter_manager.lora_slots:
+            raise RuntimeError(
+                f&quot;Number of requested LoRAs ({len(loras_map)}) is greater &quot;
+                &quot;than the number of GPU LoRA slots &quot;
+                f&quot;({self._adapter_manager.lora_slots}).&quot;
+            )
+        for lora in loras_map.values():
+            self.add_adapter(lora)
+
+    def add_adapter(self, lora_request: LoRARequest) -&gt; bool:
+        # Note that this method is not thread-safe. It may be invoked multiple
+        # times for the same adapter when using multiple API servers.
+        # This is ok because it&#x27;s currently only called from
+        # the single-threaded core engine loop.
+
+        with gpu_sync_allowed():
+            if (
+                lora_request.lora_int_id not in self.list_adapters()
+                or lora_request.load_inplace
+            ):
+                # Load the new adapter first to ensure it is actually valid, before
+                # evicting any existing adapters.
+                # This may cause the # of loaded lora adapters to very temporarily
+                # exceed `--max-cpu-loras`.
+                lora = self._load_adapter(lora_request)
+
+                # Remove the existing adapter if it exists
+                # Use case for LoRA inplace
+                self._adapter_manager.remove_adapter(lora.id)
+
+                # Loading succeeded, now check if we will exceed cache capacity and
+                # evict if the oldest adapter if so
+                if len(self._adapter_manager) + 1 &gt; self._adapter_manager.capacity:
+                    assert isinstance(self._adapter_manager, LRUCacheLoRAModelManager)
+                    self._adapter_manager.remove_oldest_adapter()
+                # Then add the new adapter to the cache
+                loaded = self._adapter_manager.add_adapter(lora)
+            else:
+                # If the lora is already loaded, just touch it to
+                # update its position in the caches
+                loaded = (
+                    self._adapter_manager.get_adapter(lora_request.lora_int_id)
+                    is not None
+                )
+            self._adapter_manager.activate_adapter(lora_request.lora_int_id)
+        return loaded</code></pre></div></div></div></figure>
+<ol>
+  <li>Lines 279-284: more adapters than GPU slots in one batch raises <code>RuntimeError</code>. The scheduler check of Step 2 prevents this.</li>
+  <li>Lines 295-303: an adapter that is not in the CPU cache is loaded from disk first.</li>
+  <li>Lines 309-313: when the CPU cache is full (<code>max_cpu_loras</code>), the oldest adapter is removed.</li>
+  <li>Line 323: <code>activate_adapter</code> puts the adapter into a GPU slot.</li>
+</ol>
+<p><strong>Loading.</strong> <code>_load_adapter</code> resolves the path. An absolute path is used as is. A path that does not exist locally is a Hugging Face Hub repository, and vLLM downloads it. With <code>VLLM_USE_MODELSCOPE</code>, it is a ModelScope repository (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/utils.py#L358-L385" target="_blank" rel="noopener" title="vllm/lora/utils.py:358-385 at 3e44c0d"><code>vllm/lora/utils.py:358-385</code></a>). Then it checks the rank against <code>max_lora_rank</code> and loads the weights to CPU memory in the LoRA dtype (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/worker_manager.py#L119-L150" target="_blank" rel="noopener" title="vllm/lora/worker_manager.py:119-150 at 3e44c0d"><code>vllm/lora/worker_manager.py:119-150</code></a>). When the adapter enters the cache, <code>alpha / r</code> is merged into B, so the kernels use scale 1.0 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/model_manager.py#L907-L908" target="_blank" rel="noopener" title="vllm/lora/model_manager.py:907-908 at 3e44c0d"><code>vllm/lora/model_manager.py:907-908</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/lora_weights.py#L37-L42" target="_blank" rel="noopener" title="vllm/lora/lora_weights.py:37-42 at 3e44c0d"><code>vllm/lora/lora_weights.py:37-42</code></a>).</p>
+<aside class="callout callout-warning"><p class="callout-title">Loading an adapter stalls the engine loop</p><div class="callout-body"><p>In <code>vllm serve</code>, the front end loads a new adapter with <code>add_lora</code> before a request uses it: for <code>--lora-modules</code>, the load route and the resolvers (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/models/serving.py#L194-L197" target="_blank" rel="noopener" title="vllm/entrypoints/openai/models/serving.py:194-197 at 3e44c0d"><code>vllm/entrypoints/openai/models/serving.py:194-197</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/models/serving.py#L333-L334" target="_blank" rel="noopener" title="vllm/entrypoints/openai/models/serving.py:333-334 at 3e44c0d"><code>vllm/entrypoints/openai/models/serving.py:333-334</code></a>). The engine core runs this call in its loop, between two steps (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1661-L1664" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1661-1664 at 3e44c0d"><code>vllm/v1/engine/core.py:1661-1664</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1752-L1765" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1752-1765 at 3e44c0d"><code>vllm/v1/engine/core.py:1752-1765</code></a>). An adapter that the CPU cache evicted loads again inside the step, in <code>add_adapter</code>, with a GPU sync allowed (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/worker_manager.py#L294-L303" target="_blank" rel="noopener" title="vllm/lora/worker_manager.py:294-303 at 3e44c0d"><code>vllm/lora/worker_manager.py:294-303</code></a>). In both cases, a download from the Hub or a slow disk delays every running request (derived). Preload the adapters, and set <code>--max-cpu-loras</code> high enough for all the adapters that you serve.</p></div></aside>
+<p><strong>Activation.</strong> <code>activate_adapter</code> takes the first free slot and copies each module's A and B into the stacked buffers at that index (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/model_manager.py#L355-L412" target="_blank" rel="noopener" title="vllm/lora/model_manager.py:355-412 at 3e44c0d"><code>vllm/lora/model_manager.py:355-412</code></a>). The LRU manager first deactivates the oldest active adapter when all slots are used (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/model_manager.py#L1440-L1452" target="_blank" rel="noopener" title="vllm/lora/model_manager.py:1440-1452 at 3e44c0d"><code>vllm/lora/model_manager.py:1440-1452</code></a>). A module without weights in the adapter gets its slot zeroed (<code>reset_lora</code>).</p>
+
+<h3 id="step-4-the-wrapped-layers">Step 4: the wrapped layers<a class="h-anchor" href="#step-4-the-wrapped-layers" aria-label="Link to this section">#</a></h3>
+<p>At model load, the LoRA model manager walks over all modules. Without <code>--lora-target-modules</code>, it wraps every supported module (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/model_manager.py#L476-L500" target="_blank" rel="noopener" title="vllm/lora/model_manager.py:476-500 at 3e44c0d"><code>vllm/lora/model_manager.py:476-500</code></a>). <code>from_layer</code> picks the first LoRA class whose <code>can_replace_layer</code> accepts the layer, and allocates its buffers for <code>max_loras</code> slots (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/utils.py#L113-L131" target="_blank" rel="noopener" title="vllm/lora/utils.py:113-131 at 3e44c0d"><code>vllm/lora/utils.py:113-131</code></a>). A <code>BaseLayerWithLoRA</code> keeps the original layer as <code>base_layer</code> and forwards unknown attributes to it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/layers/base.py#L17-L34" target="_blank" rel="noopener" title="vllm/lora/layers/base.py:17-34 at 3e44c0d"><code>vllm/lora/layers/base.py:17-34</code></a>). The linear wrappers run the base layer, then add the LoRA output:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/layers/base_linear.py#L208-L233" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/lora/layers/base_linear.py:208-233</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/layers/base_linear.py#L208-L233" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">208</span><span class="ln">209</span><span class="ln">210</span><span class="ln hl">211</span><span class="ln">212</span><span class="ln">213</span><span class="ln">214</span><span class="ln">215</span><span class="ln">216</span><span class="ln">217</span><span class="ln">218</span><span class="ln">219</span><span class="ln">220</span><span class="ln">221</span><span class="ln">222</span><span class="ln">223</span><span class="ln">224</span><span class="ln">225</span><span class="ln">226</span><span class="ln">227</span><span class="ln">228</span><span class="ln">229</span><span class="ln">230</span><span class="ln hl">231</span><span class="ln hl">232</span><span class="ln">233</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><pre><code class="language-python">    def _apply_sync(
+        self, x: torch.Tensor, bias: torch.Tensor | None = None
+    ) -&gt; torch.Tensor:
+        output = self._get_quant_method().apply(self.base_layer, x, bias)
+        return self._apply_lora_to_output(x, output)
+
+    def _apply_base_forward(self, x: torch.Tensor) -&gt; torch.Tensor:
+        base_output = self.base_layer(x)
+        output = base_output[0] if isinstance(base_output, tuple) else base_output
+        return self._apply_lora_to_output(x, output)
+
+    def _apply_lora_to_output(
+        self, x: torch.Tensor, output: torch.Tensor
+    ) -&gt; torch.Tensor:
+        original_shape = output.shape if output.ndim == 3 else None
+
+        # In transformers backend, x and output have extra batch dimension like
+        # (1, seq_len, hidden_dim), while punica expects (seq_len, hidden_dim),
+        # therefore we need to flatten the batch dimensions.
+        if x.ndim == 3 and output.ndim == 3:
+            output = output.flatten(0, 1)
+            x = x.flatten(0, 1)
+
+        lora_output: torch.Tensor | None = self.punica_wrapper.add_lora_linear(
+            output, x, self.lora_a_stacked, self.lora_b_stacked, 1.0, self.output_slices
+        )</code></pre></div></div></div></figure>
+<p>The <a class="term" href="../reference/glossary.html#term-punica" data-term="Punica wrapper" data-def="The object that runs the batched LoRA kernels (shrink and expand) for a batch in which each token can use a different adapter.">Punica wrapper</a> wrapper class comes from the platform: <code>PunicaWrapperGPU</code> on CUDA (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/platforms/cuda.py#L577-L578" target="_blank" rel="noopener" title="vllm/platforms/cuda.py:577-578 at 3e44c0d"><code>vllm/platforms/cuda.py:577-578</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/punica_wrapper/punica_selector.py#L13-L21" target="_blank" rel="noopener" title="vllm/lora/punica_wrapper/punica_selector.py:13-21 at 3e44c0d"><code>vllm/lora/punica_wrapper/punica_selector.py:13-21</code></a>). <code>add_lora_linear</code> first runs a "shrink" (<code>x @ A</code>, into an FP32 buffer of rank width) and then an "expand" (<code>buffer @ B</code>, added to the output) (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/punica_wrapper/punica_gpu.py#L218-L262" target="_blank" rel="noopener" title="vllm/lora/punica_wrapper/punica_gpu.py:218-262 at 3e44c0d"><code>vllm/lora/punica_wrapper/punica_gpu.py:218-262</code></a>). The kernels themselves are Triton code and out of scope.</p>
+
+<h3 id="step-5-token-lora-mapping-in-model-runner-v2">Step 5: token_lora_mapping in Model Runner V2<a class="h-anchor" href="#step-5-token-lora-mapping-in-model-runner-v2" aria-label="Link to this section">#</a></h3>
+<p><code>LoraState</code> keeps one LoRA id per request slot; 0 means no adapter (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/lora_utils.py#L75-L89" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/lora_utils.py:75-89 at 3e44c0d"><code>vllm/v1/worker/gpu/lora_utils.py:75-89</code></a>). In <code>execute_model</code>, it builds the per-token map and activates the adapters:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/lora_utils.py#L94-L104" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/lora_utils.py:94-104</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/lora_utils.py#L94-L104" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">94</span><span class="ln">95</span><span class="ln">96</span><span class="ln">97</span><span class="ln">98</span><span class="ln">99</span><span class="ln">100</span><span class="ln">101</span><span class="ln">102</span><span class="ln">103</span><span class="ln">104</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">    def make_lora_inputs(
+        self,
+        req_ids: list[str],
+        idx_mapping: np.ndarray,
+        num_scheduled_tokens: np.ndarray,
+    ) -&gt; tuple[tuple[int, ...], tuple[int, ...], set[LoRARequest]]:
+        lora_ids = self.lora_ids[idx_mapping]
+        prompt_lora_mapping = tuple(lora_ids)
+        token_lora_mapping = tuple(lora_ids.repeat(num_scheduled_tokens))
+        active_lora_requests: set[LoRARequest] = self.get_activate_loras(req_ids)
+        return prompt_lora_mapping, token_lora_mapping, active_lora_requests</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1850-L1857" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/model_runner.py:1850-1857</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1850-L1857" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1850</span><span class="ln">1851</span><span class="ln">1852</span><span class="ln">1853</span><span class="ln">1854</span><span class="ln">1855</span><span class="ln">1856</span><span class="ln">1857</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">            if self.lora_config:
+                # Activate LoRA adapters.
+                lora_inputs = self.lora_state.make_lora_inputs(
+                    input_batch.req_ids,
+                    input_batch.idx_mapping_np,
+                    input_batch.num_scheduled_tokens,
+                )
+                self._set_active_loras(*lora_inputs)</code></pre></div></div></div></figure>
+<p>Punica turns LoRA ids into slot indices; a token without an adapter gets -1 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/punica_wrapper/utils.py#L87-L111" target="_blank" rel="noopener" title="vllm/lora/punica_wrapper/utils.py:87-111 at 3e44c0d"><code>vllm/lora/punica_wrapper/utils.py:87-111</code></a>). <code>set_adapter_mapping</code> rebuilds the metadata only when the mapping or the slot layout changed since the last step (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/model_manager.py#L1401-L1409" target="_blank" rel="noopener" title="vllm/lora/model_manager.py:1401-1409 at 3e44c0d"><code>vllm/lora/model_manager.py:1401-1409</code></a>).</p>
+
+<h3 id="step-6-cuda-graphs-with-lora">Step 6: CUDA graphs with LoRA<a class="h-anchor" href="#step-6-cuda-graphs-with-lora" aria-label="Link to this section">#</a></h3>
+<p>A CUDA graph fixes the number of active adapters it was captured with. So Model Runner V2 captures every capture size once per "LoRA case" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/cudagraph_utils.py#L305-L307" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/cudagraph_utils.py:305-307 at 3e44c0d"><code>vllm/v1/worker/gpu/cudagraph_utils.py:305-307</code></a>), and a graph matches a batch only with the same case (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/cudagraph_utils.py#L136" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/cudagraph_utils.py:136 at 3e44c0d"><code>vllm/v1/worker/gpu/cudagraph_utils.py:136</code></a>):</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/lora_utils.py#L20-L35" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/lora_utils.py:20-35</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/lora_utils.py#L20-L35" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">20</span><span class="ln">21</span><span class="ln">22</span><span class="ln">23</span><span class="ln">24</span><span class="ln">25</span><span class="ln">26</span><span class="ln">27</span><span class="ln">28</span><span class="ln">29</span><span class="ln">30</span><span class="ln">31</span><span class="ln">32</span><span class="ln">33</span><span class="ln">34</span><span class="ln">35</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">def get_lora_capture_cases(
+    lora_config: &quot;LoRAConfig | None&quot;,
+    compilation_config: &quot;CompilationConfig&quot;,
+) -&gt; list[int]:
+    &quot;&quot;&quot;Return num_active_loras values for cudagraph capture.
+
+    When cudagraph_specialize_lora=True: powers of 2 up to max_loras, plus
+    max_loras+1. When False: [0, max_loras+1]. When LoRA disabled: [0].
+    &quot;&quot;&quot;
+    if lora_config is None:
+        return [0]
+    if compilation_config.cudagraph_specialize_lora:
+        specialize = getattr(lora_config, &quot;specialize_active_lora&quot;, False)
+        captured = get_captured_lora_counts(lora_config.max_loras, specialize)
+        return [0] + [c for c in captured if c &gt; 0]
+    return [0, lora_config.max_loras + 1]</code></pre></div></div></div></figure>
+<ul>
+  <li>Default: <code>cudagraph_specialize_lora</code> is on, <code>specialize_active_lora</code> is off (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/compilation.py#L663-L669" target="_blank" rel="noopener" title="vllm/config/compilation.py:663-669 at 3e44c0d"><code>vllm/config/compilation.py:663-669</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/lora.py#L66-L72" target="_blank" rel="noopener" title="vllm/config/lora.py:66-72 at 3e44c0d"><code>vllm/config/lora.py:66-72</code></a>). So the cases are <code>[0, max_loras + 1]</code>: one graph set for batches without adapters, one for batches with any adapters. LoRA start-up captures twice as many graphs.</li>
+  <li>With <code>--specialize-active-lora</code>: the cases are 0, the powers of 2 up to <code>max_loras</code>, and <code>max_loras + 1</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/utils.py#L55-L69" target="_blank" rel="noopener" title="vllm/lora/utils.py:55-69 at 3e44c0d"><code>vllm/lora/utils.py:55-69</code></a>). A batch with 3 adapters and <code>max_loras</code> 4 uses the case 4 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/cudagraph_utils.py#L203-L227" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/cudagraph_utils.py:203-227 at 3e44c0d"><code>vllm/v1/worker/gpu/cudagraph_utils.py:203-227</code></a>).</li>
+</ul>
+<p>The number of active adapters for the dispatch is the set of <code>LoRARequest</code>s in the batch (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/lora_utils.py#L38-L49" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/lora_utils.py:38-49 at 3e44c0d"><code>vllm/v1/worker/gpu/lora_utils.py:38-49</code></a>).</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-three-adapters-in-one-step" class="dd-title">Worked example: three adapters in one step</h3></summary><div class="dd-body"><p>Server (example): <code>vllm serve meta-llama/Llama-3.1-8B-Instruct --enable-lora --max-loras 3 --lora-modules sql=/adapters/sql chat-de=/adapters/de legal=/adapters/legal</code>. The front end gives the adapters the ids 1, 2 and 3 when it registers them (<code>lora_id_counter</code>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/models/serving.py#L167-L184" target="_blank" rel="noopener" title="vllm/entrypoints/openai/models/serving.py:167-184 at 3e44c0d"><code>vllm/entrypoints/openai/models/serving.py:167-184</code></a>).</p>
+<ol>
+  <li><strong>Requests.</strong> R1 <code>model: "sql"</code> with a 3-token prefill chunk, R2 <code>"chat-de"</code> in decode, R3 the base model in decode, R4 <code>"legal"</code> with 2 tokens. Each request carries its <code>LoRARequest</code> to the engine core.</li>
+  <li><strong>Scheduler.</strong> The running set is <code>{1, 2, 3}</code>, equal to <code>max_loras</code>. A new waiting request for a fourth adapter is skipped. A new request for <code>sql</code> is admitted, because id 1 is already in the set.</li>
+  <li><strong>Worker, at start-up.</strong> The front end loaded the three adapters in the order of <code>--lora-modules</code>, and each <code>add_adapter</code> activated its adapter at once (Step 3, line 323). So slot 0 holds sql, slot 1 chat-de, slot 2 legal: <code>lora_index_to_id = [1, 2, 3]</code>.</li>
+  <li><strong>Worker, in this step.</strong> <code>_apply_adapters</code> gets <code>{1, 2, 3}</code>. All are in the CPU cache and active, so each <code>add_adapter</code> only touches the LRU, and <code>activate_adapter</code> changes nothing (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/model_manager.py#L360-L361" target="_blank" rel="noopener" title="vllm/lora/model_manager.py:360-361 at 3e44c0d"><code>vllm/lora/model_manager.py:360-361</code></a>).</li>
+  <li><strong>Mapping.</strong> Per-request ids <code>[1, 2, 0, 3]</code>, tokens per request <code>[3, 1, 1, 2]</code> → <code>token_lora_mapping = (1, 1, 1, 2, 0, 3, 3)</code>. Punica slot indices: <code>(0, 0, 0, 1, -1, 2, 2)</code>.</li>
+  <li><strong>One q_proj.</strong> Base GEMM <code>[7, 4096] × [4096, 4096]</code>. Shrink buffer FP32 <code>[1, 7, 16]</code> (one slice for q_proj). Expand adds <code>[7, 4096]</code>. Token 4 (R3) has no adapter.</li>
+  <li><strong>CUDA graph.</strong> 3 adapters are active. With the default cases <code>[0, 4]</code>, the batch uses the LoRA graphs (case 4). A batch with only base-model requests uses case 0.</li>
+</ol></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="memory-per-slot" class="dd-title">Memory per slot</h3></summary><div class="dd-body"><p>Each wrapped linear layer allocates <code>lora_a_stacked [max_loras, 1, max_lora_rank, input_size]</code> and <code>lora_b_stacked [max_loras, 1, output_size, max_lora_rank]</code> per slice (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/layers/base_linear.py#L133-L154" target="_blank" rel="noopener" title="vllm/lora/layers/base_linear.py:133-154 at 3e44c0d"><code>vllm/lora/layers/base_linear.py:133-154</code></a>). The size follows the configured maximum rank, not the rank of the loaded adapters.</p>
+<p><a href="../learn/lora-adapters.html">LoRA adapters</a> computes the numbers for Llama-3.1-8B at rank 16 and TP = 1. The 7 linear layers of all 32 blocks take 83.9 MB, and <code>embed_tokens</code> and <code>lm_head</code> add 8.5 MB. So one slot holds <strong>92.4 MB</strong>. With <code>--max-loras 3</code> that is 277 MB; with <code>--max-loras 4 --max-lora-rank 64</code> it is 1.48 GB. This memory is reserved before the KV cache is sized. The CPU cache holds the loaded adapters at their own rank, in the LoRA dtype.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="runtime-load-and-unload-what-really-happens" class="dd-title">Runtime load and unload: what really happens</h3></summary><div class="dd-body"><p>The routes <code>/v1/load_lora_adapter</code> and <code>/v1/unload_lora_adapter</code> exist only with <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code>, and vLLM logs that this "should ONLY be used for local development" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/lora/api_router.py#L30-L36" target="_blank" rel="noopener" title="vllm/entrypoints/serve/lora/api_router.py:30-36 at 3e44c0d"><code>vllm/entrypoints/serve/lora/api_router.py:30-36</code></a>).</p>
+<ol>
+  <li><strong>Load.</strong> The API server builds a <code>LoRARequest</code> and calls <code>engine_client.add_lora()</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/models/serving.py#L179-L197" target="_blank" rel="noopener" title="vllm/entrypoints/openai/models/serving.py:179-197 at 3e44c0d"><code>vllm/entrypoints/openai/models/serving.py:179-197</code></a>). The call goes <code>AsyncLLM.add_lora</code> → <code>EngineCore.add_lora</code> → <code>collective_rpc("add_lora")</code> on every worker → <code>add_adapter</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L1231-L1233" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:1231-1233 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:1231-1233</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1076-L1077" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1076-1077 at 3e44c0d"><code>vllm/v1/engine/core.py:1076-1077</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/abstract.py#L363-L365" target="_blank" rel="noopener" title="vllm/v1/executor/abstract.py:363-365 at 3e44c0d"><code>vllm/v1/executor/abstract.py:363-365</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/lora_model_runner_mixin.py#L296-L298" target="_blank" rel="noopener" title="vllm/v1/worker/lora_model_runner_mixin.py:296-298 at 3e44c0d"><code>vllm/v1/worker/lora_model_runner_mixin.py:296-298</code></a>). <code>add_adapter</code> also activates the adapter into a GPU slot (line 323 in Step 3), which can evict another one.</li>
+  <li><strong>Unload.</strong> The API server only deletes the name from its dict (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/models/serving.py#L234-L247" target="_blank" rel="noopener" title="vllm/entrypoints/openai/models/serving.py:234-247 at 3e44c0d"><code>vllm/entrypoints/openai/models/serving.py:234-247</code></a>). No code in <code>vllm/entrypoints/</code> calls the engine's <code>remove_lora</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1079-L1080" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1079-1080 at 3e44c0d"><code>vllm/v1/engine/core.py:1079-1080</code></a>). The worker keeps the adapter in its CPU and GPU caches until LRU eviction needs the room.</li>
+  <li><strong>Reload in place</strong> from the same path keeps the old prefix-cache blocks valid, and vLLM warns about it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/models/serving.py#L215-L224" target="_blank" rel="noopener" title="vllm/entrypoints/openai/models/serving.py:215-224 at 3e44c0d"><code>vllm/entrypoints/openai/models/serving.py:215-224</code></a>).</li>
+  <li><strong>One API server.</strong> With <code>api_server_count</code> above 1, start-up fails (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/cli/serve.py#L315-L318" target="_blank" rel="noopener" title="vllm/entrypoints/cli/serve.py:315-318 at 3e44c0d"><code>vllm/entrypoints/cli/serve.py:315-318</code></a>).</li>
+</ol></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="lora-and-the-prefix-cache" class="dd-title">LoRA and the prefix cache</h3></summary><div class="dd-body"><p>An adapter changes the KV values, so the block hash of a LoRA request includes <code>("lora", lora_name, lora_path)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L590-L607" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:590-607 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:590-607</code></a>). The same prompt with two adapters never shares blocks. See <a href="../learn/prefix-caching.html">Prefix caching: the idea</a>.</p>
+<p>LoRA also touches the compile hash: <code>max_num_batched_tokens</code> is part of the scheduler hash, and the LoRA buffers are one of the two reasons (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/scheduler.py#L271-L280" target="_blank" rel="noopener" title="vllm/config/scheduler.py:271-280 at 3e44c0d"><code>vllm/config/scheduler.py:271-280</code></a>). With speculative decoding, LoRA requires <code>max_num_batched_tokens ≥ max_num_seqs × (k + 1)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L2700-L2713" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:2700-2713 at 3e44c0d"><code>vllm/engine/arg_utils.py:2700-2713</code></a>).</p></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><strong>Requests wait with many adapters.</strong> More distinct adapters than <code>--max-loras</code> among running requests make new requests wait (Step 2).</li>
+  <li><strong>Latency spikes on new adapters.</strong> Loading stops the engine loop while it runs (Step 3). Preload the adapters.</li>
+  <li><strong>"LoRA rank ... is greater than max_lora_rank".</strong> Raise <code>--max-lora-rank</code> to the largest rank you serve (<a href="../learn/lora-adapters.html">LoRA adapters</a>).</li>
+  <li><strong>"... does not support LoRA yet."</strong> The model class does not implement <code>SupportsLoRA</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/lora_model_runner_mixin.py#L49-L50" target="_blank" rel="noopener" title="vllm/v1/worker/lora_model_runner_mixin.py:49-50 at 3e44c0d"><code>vllm/v1/worker/lora_model_runner_mixin.py:49-50</code></a>).</li>
+  <li><strong>Unloaded adapters still use memory.</strong> Unload only removes the name in the API server (deep dive).</li>
+  <li><strong>Longer start-up.</strong> LoRA doubles the CUDA graph captures by default, and <code>--specialize-active-lora</code> adds more (Step 6).</li>
+</ul>
+<p><strong>Why it matters.</strong> Multi-LoRA serving puts many fine-tuned variants on one GPU. Its limits come from three fixed sizes: <code>max_loras</code> per step, <code>max_cpu_loras</code> in memory, and slot buffers sized for <code>max_lora_rank</code>.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Which request field selects the adapter, and what does the API server make from it?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The <code>model</code> field. The server returns the stored <code>LoRARequest</code> for that name (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/engine/serving.py#L194-L200" target="_blank" rel="noopener" title="vllm/entrypoints/serve/engine/serving.py:194-200 at 3e44c0d"><code>vllm/entrypoints/serve/engine/serving.py:194-200</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>Where are the adapter weights after <code>_load_adapter</code>, and when do they reach the GPU?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>In CPU memory: the loader uses <code>device="cpu"</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/worker_manager.py#L145" target="_blank" rel="noopener" title="vllm/lora/worker_manager.py:145 at 3e44c0d"><code>vllm/lora/worker_manager.py:145</code></a>). <code>activate_adapter</code> copies them into a GPU slot of the stacked buffers (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/model_manager.py#L355-L412" target="_blank" rel="noopener" title="vllm/lora/model_manager.py:355-412 at 3e44c0d"><code>vllm/lora/model_manager.py:355-412</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>With default settings and <code>--max-loras 4</code>, which LoRA cases does Model Runner V2 capture CUDA graphs for?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>[0, 5]</code>: <code>cudagraph_specialize_lora</code> is on and <code>specialize_active_lora</code> is off, so the cases are 0 and <code>max_loras + 1</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/lora_utils.py#L29-L35" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/lora_utils.py:29-35 at 3e44c0d"><code>vllm/v1/worker/gpu/lora_utils.py:29-35</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/utils.py#L64-L65" target="_blank" rel="noopener" title="vllm/lora/utils.py:64-65 at 3e44c0d"><code>vllm/lora/utils.py:64-65</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>A batch has 7 tokens: 3 for adapter id 1, 1 for id 2, 1 base, 2 for id 3. The slots hold ids <code>[1, 3, 2]</code>. What are <code>token_lora_mapping</code> and the Punica slot indices?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>(1, 1, 1, 2, 0, 3, 3)</code> from <code>lora_ids.repeat(num_scheduled_tokens)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/lora_utils.py#L100-L102" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/lora_utils.py:100-102 at 3e44c0d"><code>vllm/v1/worker/gpu/lora_utils.py:100-102</code></a>). Slot indices <code>(0, 0, 0, 2, -1, 1, 1)</code>: id → index in <code>lora_index_to_id</code>, and 0 → -1 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/punica_wrapper/utils.py#L94-L111" target="_blank" rel="noopener" title="vllm/lora/punica_wrapper/utils.py:94-111 at 3e44c0d"><code>vllm/lora/punica_wrapper/utils.py:94-111</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>You call <code>/v1/unload_lora_adapter</code> for "legal". Is GPU memory freed, and can a new request still use "legal"?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>No memory is freed: slot buffers are fixed at start-up, and the worker keeps the adapter until LRU eviction (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/lora/worker_manager.py#L309-L313" target="_blank" rel="noopener" title="vllm/lora/worker_manager.py:309-313 at 3e44c0d"><code>vllm/lora/worker_manager.py:309-313</code></a>). New requests get 404, because the API server deleted the name (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/models/serving.py#L244-L246" target="_blank" rel="noopener" title="vllm/entrypoints/openai/models/serving.py:244-246 at 3e44c0d"><code>vllm/entrypoints/openai/models/serving.py:244-246</code></a>). Requests that already carry the <code>LoRARequest</code> continue (derived).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../learn/lora-adapters.html">LoRA adapters</a><span class="rel-sum">A LoRA adapter changes a base model with two small matrices per layer. vLLM keeps the base model unchanged and applies different adapters to different requests in the same batch; the request&#x27;s model field selects the adapter.</span></li><li><a href="../concepts/frontend-plugins.html">Plugins in the API server</a><span class="rel-sum">Five kinds of plugins act in the API server - endpoint plugins add or replace HTTP routes, IO processor plugins shape pooling input and output, tool and reasoning parser plugins parse model text, LoRA resolvers find unknown adapters, and stat logger plugins receive the metrics of each step.</span></li><li><a href="../concepts/compile-and-cuda-graphs.html">torch.compile and CUDA graphs in vLLM</a><span class="rel-sum">vLLM compiles the inner model once with torch.compile and its own Inductor backend, splits the graph at the attention ops, caches the result on disk, and captures CUDA graphs at start-up. Each step, Model Runner V2 replays a FULL graph for uniform decode batches, PIECEWISE graphs for other batches up to the largest capture size, and runs eagerly above it.</span></li><li><a href="../learn/prefix-caching.html">Prefix caching: the idea</a><span class="rel-sum">Chat requests often start with the same tokens. Prefix caching keeps the KV cache blocks of earlier requests under a chain of hashes, so a new request with the same prefix skips the prefill of those blocks and gets a shorter TTFT.</span></li><li><a href="../concepts/scheduler.html">The V1 scheduler: one token budget, no phases</a><span class="rel-sum">In each engine step, Scheduler.schedule() shares one token budget: first among the running requests, then among the waiting ones. It has no prefill or decode phase, it preempts the last running request when KV blocks run out, and update_from_output() appends the sampled tokens.</span></li><li><a href="../concepts/openai-server.html">The OpenAI-compatible server: launch modes, app, serving classes and streaming</a><span class="rel-sum">How vllm serve builds its HTTP front end: the launch modes, the FastAPI app with its middleware, routers and exception handlers, the serving objects in app.state, the request flow down to AsyncLLM, streaming, n &gt; 1, request ids, priorities and admission limits.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../concepts/sampling-and-logits-processors.html"><span class="pn-dir">← Previous</span><span class="pn-title">Sampling and logits processors in Model Runner V2</span></a><a class="pn pn-next" href="../concepts/multimodal-serving.html"><span class="pn-dir">Next →</span><span class="pn-title">Multimodal serving: images, audio and video in vLLM</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-the-code">In the code</a></li><li class="toc-l3"><a href="#step-1-the-request-gets-a-lorarequest">Step 1: the request gets a LoRARequest</a></li><li class="toc-l3"><a href="#step-2-the-scheduler-limits-adapters-per-step">Step 2: the scheduler limits adapters per step</a></li><li class="toc-l3"><a href="#step-3-the-worker-loads-and-activates-adapters">Step 3: the worker loads and activates adapters</a></li><li class="toc-l3"><a href="#step-4-the-wrapped-layers">Step 4: the wrapped layers</a></li><li class="toc-l3"><a href="#step-5-token-lora-mapping-in-model-runner-v2">Step 5: token_lora_mapping in Model Runner V2</a></li><li class="toc-l3"><a href="#step-6-cuda-graphs-with-lora">Step 6: CUDA graphs with LoRA</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#worked-example-three-adapters-in-one-step">Worked example: three adapters in one step</a></li><li class="toc-l3"><a href="#memory-per-slot">Memory per slot</a></li><li class="toc-l3"><a href="#runtime-load-and-unload-what-really-happens">Runtime load and unload: what really happens</a></li><li class="toc-l3"><a href="#lora-and-the-prefix-cache">LoRA and the prefix cache</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,553 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Benchmarking vLLM: vllm bench serve, throughput, latency and startup · vLLM Explained</title>
+<meta name="description" content="How vllm bench serve loads a running server (datasets, request rate, burstiness, max concurrency), how it computes TTFT, TPOT, ITL, E2EL and goodput, why its numbers differ from the server&#x27;s Prometheus numbers, what vllm bench throughput, latency and startup measure, and a benchmarking method.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="concepts/benchmarking">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a class="current" aria-current="page" href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>vLLM concepts</span><span class="sep">›</span><span>Operating vLLM</span><span class="sep">›</span><span aria-current="page">Benchmarking</span></nav>
+<h1 class="page-title">Benchmarking vLLM: vllm bench serve, throughput, latency and startup</h1>
+<div class="page-meta"><span class="level level-intermediate" title="Level">Intermediate</span><span class="meta-sec">vLLM concepts</span><span class="meta-time">about 13 min read + 3 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../learn/serving-metrics.html">Serving metrics: TTFT, TPOT, ITL, throughput, goodput</a> <span class="level level-beginner level-sm">Beginner</span></li><li><a href="../concepts/metrics-and-observability.html">Metrics and observability: how to watch a vLLM server</a> <span class="level level-intermediate level-sm">Intermediate</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">vllm bench serve is an HTTP client. It sends requests at a chosen rate, times the stream chunks, and reports latency percentiles and goodput.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>To tune a server, you need numbers that you can repeat. <code>vllm bench</code> has several subcommands. Only one of them talks to a running server:</p>
+<ul>
+  <li><strong><code>vllm bench serve</code></strong> sends HTTP requests to a server that you started with <code>vllm serve</code>. It measures what a client sees. The metrics are time to first token (TTFT), time per output token (TPOT), inter-token latency (ITL), end-to-end latency (E2EL), throughput and goodput (<a href="../learn/serving-metrics.html">Serving metrics: TTFT, TPOT, ITL, throughput, goodput</a>).</li>
+  <li><strong><code>vllm bench throughput</code></strong>, <strong><code>latency</code></strong> and <strong><code>startup</code></strong> start their own engine in the same command, with the offline <code>LLM</code> class. They measure the engine without HTTP.</li>
+</ul>
+<p>The client controls the load: how many requests, how long each prompt is, how fast they arrive, and how many run at once. The server's own metrics measure the same requests from the inside (<a href="../concepts/metrics-and-observability.html">Metrics and observability: how to watch a vLLM server</a>). The two views differ by design, and this page shows where.</p>
+<p><strong>An everyday comparison.</strong> Think of a test shopper. The shopper starts a stopwatch at the shop door and stops it when the bag is in the hand. The shop's own records start when the order reaches the counter. Both are correct; they time different things. The comparison stops at the crowd. The test shopper of vLLM can be a thousand shoppers at once, with a random rhythm of arrivals that you choose.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b9_bench_timing"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: a schematic time axis. Above it, the client timing points of vllm bench serve: POST sent (st), chunk 1, chunk 2, chunk 3 and the last chunk; client TTFT runs from st to chunk 1, and ITL is one gap per chunk. Below it, the server points: arrival_time in the API server, QUEUED, SCHEDULED, first token and last token in the engine core. The Prometheus TTFT runs from arrival_time to the output handling after the first token, on the front-end clock. The per-request time_to_first_token_ms runs from SCHEDULED to the first token, on the engine clock. Panel 2: three boxes. vllm bench serve: TTFT POST to first chunk, TPOT (E2EL minus TTFT) over n minus 1 only for n above 1, ITL gap between SSE chunks, E2EL POST to last chunk. Prometheus: TTFT arrival to output handled, TPOT decode over n minus 1 or 0, ITL gap of engine timestamps, e2e arrival to finished. Per-request metrics field: time_to_first_token_ms SCHEDULED to first token, prefill only, and queue_time_ms QUEUED to SCHEDULED."><svg role="img" aria-label="Panel 1: a schematic time axis. Above it, the client timing points of vllm bench serve: POST sent (st), chunk 1, chunk 2, chunk 3 and the last chunk; client TTFT runs from st to chunk 1, and ITL is one gap per chunk. Below it, the server points: arrival_time in the API server, QUEUED, SCHEDULED, first token and last token in the engine core. The Prometheus TTFT runs from arrival_time to the output handling after the first token, on the front-end clock. The per-request time_to_first_token_ms runs from SCHEDULED to the first token, on the engine clock. Panel 2: three boxes. vllm bench serve: TTFT POST to first chunk, TPOT (E2EL minus TTFT) over n minus 1 only for n above 1, ITL gap between SSE chunks, E2EL POST to last chunk. Prometheus: TTFT arrival to output handled, TPOT decode over n minus 1 or 0, ITL gap of engine timestamps, e2e arrival to finished. Per-request metrics field: time_to_first_token_ms SCHEDULED to first token, prefill only, and queue_time_ms QUEUED to SCHEDULED." xmlns="http://www.w3.org/2000/svg" width="1100" height="796" viewBox="0 0 1100 796">
+<defs></defs>
+<rect width="1100" height="796" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Client timing vs server timing of one streamed request</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">vllm bench serve -&gt; POST /v1/completions (stream) -&gt; vllm serve  ·  schematic, not to scale</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">client: time.perf_counter()  ·  API server: time.time()  ·  engine core: time.monotonic()</text>
+<rect x="20.0" y="118.0" width="1060.0" height="350.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="144.0" r="13" fill="#111827"/>
+<text x="46.0" y="148.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="149.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Where does each tool start and stop its clock?</text>
+<text x="68.0" y="168.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The client clock starts first and stops last. The server clocks start only when rendering starts.</text>
+<line x1="70.0" y1="294.0" x2="1060.0" y2="294.0" stroke="#111827" stroke-width="1.4"/>
+<text x="1060.0" y="310.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="end" xml:space="preserve" style="white-space:pre">time (not to scale)</text>
+<text x="70.0" y="200.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Client (vllm bench serve)</text>
+<line x1="100.0" y1="234.0" x2="100.0" y2="294.0" stroke="#2563eb" stroke-width="1.2" stroke-dasharray="3 3"/>
+<circle cx="100.0" cy="234.0" r="4" fill="#2563eb"/>
+<text x="100.0" y="224.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">POST sent: st</text>
+<line x1="610.0" y1="234.0" x2="610.0" y2="294.0" stroke="#2563eb" stroke-width="1.2" stroke-dasharray="3 3"/>
+<circle cx="610.0" cy="234.0" r="4" fill="#2563eb"/>
+<text x="610.0" y="224.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 1</text>
+<line x1="700.0" y1="234.0" x2="700.0" y2="294.0" stroke="#2563eb" stroke-width="1.2" stroke-dasharray="3 3"/>
+<circle cx="700.0" cy="234.0" r="4" fill="#2563eb"/>
+<text x="700.0" y="224.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 2</text>
+<line x1="790.0" y1="234.0" x2="790.0" y2="294.0" stroke="#2563eb" stroke-width="1.2" stroke-dasharray="3 3"/>
+<circle cx="790.0" cy="234.0" r="4" fill="#2563eb"/>
+<text x="790.0" y="224.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">chunk 3</text>
+<line x1="1000.0" y1="234.0" x2="1000.0" y2="294.0" stroke="#2563eb" stroke-width="1.2" stroke-dasharray="3 3"/>
+<circle cx="1000.0" cy="234.0" r="4" fill="#2563eb"/>
+<text x="1000.0" y="224.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">last chunk</text>
+<line x1="100.0" y1="260.0" x2="610.0" y2="260.0" stroke="#2563eb" stroke-width="2"/>
+<text x="355.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">client ttft</text>
+<line x1="610.0" y1="260.0" x2="700.0" y2="260.0" stroke="#2563eb" stroke-width="2" stroke-dasharray="5 3"/>
+<text x="802.0" y="264.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">&lt;- itl: one gap per chunk</text>
+<line x1="190.0" y1="294.0" x2="190.0" y2="354.0" stroke="#7c3aed" stroke-width="1.2" stroke-dasharray="3 3"/>
+<circle cx="190.0" cy="354.0" r="4" fill="#7c3aed"/>
+<text x="190.0" y="372.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">arrival_time</text>
+<line x1="290.0" y1="294.0" x2="290.0" y2="354.0" stroke="#059669" stroke-width="1.2" stroke-dasharray="3 3"/>
+<circle cx="290.0" cy="354.0" r="4" fill="#059669"/>
+<text x="290.0" y="372.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">QUEUED</text>
+<line x1="390.0" y1="294.0" x2="390.0" y2="354.0" stroke="#059669" stroke-width="1.2" stroke-dasharray="3 3"/>
+<circle cx="390.0" cy="354.0" r="4" fill="#059669"/>
+<text x="390.0" y="372.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">SCHEDULED</text>
+<line x1="530.0" y1="294.0" x2="530.0" y2="354.0" stroke="#059669" stroke-width="1.2" stroke-dasharray="3 3"/>
+<circle cx="530.0" cy="354.0" r="4" fill="#059669"/>
+<text x="530.0" y="372.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1st token</text>
+<line x1="920.0" y1="294.0" x2="920.0" y2="354.0" stroke="#059669" stroke-width="1.2" stroke-dasharray="3 3"/>
+<circle cx="920.0" cy="354.0" r="4" fill="#059669"/>
+<text x="920.0" y="372.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">last token</text>
+<line x1="190.0" y1="324.0" x2="544.0" y2="324.0" stroke="#7c3aed" stroke-width="2"/>
+<text x="554.0" y="328.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Prometheus TTFT (front-end clock)</text>
+<line x1="390.0" y1="398.0" x2="530.0" y2="398.0" stroke="#059669" stroke-width="2"/>
+<text x="540.0" y="402.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">per-request time_to_first_token_ms (engine clock)</text>
+<text x="70.0" y="430.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Server (vllm serve)</text>
+<rect x="20.0" y="486.0" width="1060.0" height="196.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="512.0" r="13" fill="#111827"/>
+<text x="46.0" y="516.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="517.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Which numbers does each tool report?</text>
+<text x="68.0" y="536.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Same names, different start points, clocks and units of work.</text>
+<rect x="40.0" y="556.0" width="332.0" height="112.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="52.0" y="576.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">vllm bench serve (client)</text>
+<text x="52.0" y="594.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">TTFT: POST -&gt; 1st chunk</text>
+<text x="52.0" y="609.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">TPOT: (E2EL - TTFT)/(n - 1), n &gt; 1</text>
+<text x="52.0" y="624.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ITL: gap between SSE chunks</text>
+<text x="52.0" y="639.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">E2EL: POST -&gt; last chunk</text>
+<rect x="384.0" y="556.0" width="332.0" height="112.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="396.0" y="576.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Prometheus (API server)</text>
+<text x="396.0" y="594.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">TTFT: arrival -&gt; output handled</text>
+<text x="396.0" y="609.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">TPOT: decode / (n - 1), 0 if n &lt;= 1</text>
+<text x="396.0" y="624.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ITL: gap of engine timestamps</text>
+<text x="396.0" y="639.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">e2e: arrival -&gt; finished</text>
+<rect x="728.0" y="556.0" width="332.0" height="112.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="740.0" y="576.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Per-request &quot;metrics&quot; field</text>
+<text x="740.0" y="594.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">time_to_first_token_ms:</text>
+<text x="740.0" y="609.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">SCHEDULED -&gt; 1st token</text>
+<text x="740.0" y="624.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">(prefill only, no queue)</text>
+<text x="740.0" y="639.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">queue_time_ms: QUEUED -&gt; SCHED.</text>
+<text x="30.0" y="717.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="706.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="717.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">client clock</text>
+<rect x="209.6" y="706.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="230.6" y="717.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">API server clock</text>
+<rect x="354.1" y="706.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="375.1" y="717.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">engine core clock</text>
+<text x="30.0" y="746.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The axis is schematic. With --stream-interval &gt; 1 one SSE chunk carries several tokens: the client ITL grows, Prometheus ITL does not.</text>
+<text x="30.0" y="764.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Simplified: the network, HTTP parsing and SSE serialization are inside the client numbers only.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the client clock starts before the server clocks and stops after them (1); the same metric names mean three different intervals (2).</figcaption><a class="diagram-open" href="../diagrams/b9_bench_timing.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read panel 1 from left to right. The client clock starts when the POST leaves the client, before the server parses HTTP. The server clocks start only when rendering starts. Panel 2 is the summary to keep: compare a client number only with a client number.</p>
+
+<h2 id="in-the-code">In the code<a class="h-anchor" href="#in-the-code" aria-label="Link to this section">#</a></h2>
+
+<h3 id="step-1-the-command-and-the-request-function">Step 1: the command and the request function<a class="h-anchor" href="#step-1-the-command-and-the-request-function" aria-label="Link to this section">#</a></h3>
+<p><code>vllm bench serve</code> is a thin subcommand: it adds the arguments of <code>vllm/benchmarks/serve.py</code> and calls its <code>main</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/cli/benchmark/serve.py#L10-L21" target="_blank" rel="noopener" title="vllm/entrypoints/cli/benchmark/serve.py:10-21 at 3e44c0d"><code>vllm/entrypoints/cli/benchmark/serve.py:10-21</code></a>). The default backend is <code>openai</code> and the default endpoint is <code>/v1/completions</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1647-L1668" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1647-1668 at 3e44c0d"><code>vllm/benchmarks/serve.py:1647-1668</code></a>). The backend picks a request function; <code>openai-chat</code> sends chat requests, and there are functions for embeddings and rerank servers (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/lib/endpoint_request_func.py#L1155-L1172" target="_blank" rel="noopener" title="vllm/benchmarks/lib/endpoint_request_func.py:1155-1172 at 3e44c0d"><code>vllm/benchmarks/lib/endpoint_request_func.py:1155-1172</code></a>). Without <code>--model</code>, the client asks the server's <code>/v1/models</code> for the first model (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L2126-L2131" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:2126-2131 at 3e44c0d"><code>vllm/benchmarks/serve.py:2126-2131</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L170-L176" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:170-176 at 3e44c0d"><code>vllm/benchmarks/serve.py:170-176</code></a>).</p>
+<p>Each request is a stream with usage in the last chunk, so the client gets the server's token count (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/lib/endpoint_request_func.py#L226-L238" target="_blank" rel="noopener" title="vllm/benchmarks/lib/endpoint_request_func.py:226-238 at 3e44c0d"><code>vllm/benchmarks/lib/endpoint_request_func.py:226-238</code></a>). The client takes its time points here:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/lib/endpoint_request_func.py#L278-L297" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/benchmarks/lib/endpoint_request_func.py:278-297</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/lib/endpoint_request_func.py#L278-L297" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">278</span><span class="ln">279</span><span class="ln">280</span><span class="ln">281</span><span class="ln hl">282</span><span class="ln">283</span><span class="ln">284</span><span class="ln">285</span><span class="ln hl">286</span><span class="ln">287</span><span class="ln">288</span><span class="ln">289</span><span class="ln hl">290</span><span class="ln">291</span><span class="ln">292</span><span class="ln">293</span><span class="ln">294</span><span class="ln hl">295</span><span class="ln">296</span><span class="ln">297</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><pre><code class="language-python">                            if choices := data.get(&quot;choices&quot;):
+                                # Note that text could be empty here
+                                # e.g. for special tokens
+                                text = choices[0].get(&quot;text&quot;)
+                                timestamp = time.perf_counter()
+                                # First token
+                                if not first_chunk_received:
+                                    first_chunk_received = True
+                                    output.ttft = timestamp - st
+
+                                # Decoding phase
+                                else:
+                                    output.itl.append(timestamp - most_recent_timestamp)
+
+                                most_recent_timestamp = timestamp
+                                generated_text += text or &quot;&quot;
+                            elif usage := data.get(&quot;usage&quot;):
+                                output.output_tokens = usage.get(&quot;completion_tokens&quot;)
+                                if (pt := usage.get(&quot;prompt_tokens&quot;)) is not None:
+                                    output.prompt_len = pt</code></pre></div></div></div></figure>
+<ol>
+  <li>The clock starts with <code>time.perf_counter()</code> just before the POST (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/lib/endpoint_request_func.py#L248-L252" target="_blank" rel="noopener" title="vllm/benchmarks/lib/endpoint_request_func.py:248-252 at 3e44c0d"><code>vllm/benchmarks/lib/endpoint_request_func.py:248-252</code></a>).</li>
+  <li>Line 286: TTFT is the time of the first SSE chunk that has <code>choices</code>, even when its text is empty.</li>
+  <li>Line 290: each later chunk with <code>choices</code> adds one ITL value. One chunk can carry several tokens (for example with <code>--stream-interval</code>), so the client ITL is per chunk, not per token.</li>
+  <li>Line 295: the usage chunk gives <code>completion_tokens</code>; it does not move the end time.</li>
+  <li>E2EL (<code>latency</code>) is the time of the last chunk with <code>choices</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/lib/endpoint_request_func.py#L307" target="_blank" rel="noopener" title="vllm/benchmarks/lib/endpoint_request_func.py:307 at 3e44c0d"><code>vllm/benchmarks/lib/endpoint_request_func.py:307</code></a>). A request with no such chunk is a failure (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/lib/endpoint_request_func.py#L298-L305" target="_blank" rel="noopener" title="vllm/benchmarks/lib/endpoint_request_func.py:298-305 at 3e44c0d"><code>vllm/benchmarks/lib/endpoint_request_func.py:298-305</code></a>).</li>
+</ol>
+
+<h3 id="step-2-datasets">Step 2: datasets<a class="h-anchor" href="#step-2-datasets" aria-label="Link to this section">#</a></h3>
+<p><code>--dataset-name</code> picks where the prompts come from; the default is <code>random</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/datasets/datasets.py#L1593-L1612" target="_blank" rel="noopener" title="vllm/benchmarks/datasets/datasets.py:1593-1612 at 3e44c0d"><code>vllm/benchmarks/datasets/datasets.py:1593-1612</code></a>):</p>
+<table>
+  <thead><tr><th>Name</th><th>What it gives</th></tr></thead>
+  <tbody>
+    <tr><td><code>random</code></td><td>synthetic prompts of <code>--random-input-len</code> tokens (default 1024) and <code>--random-output-len</code> output tokens (default 128); <code>--random-range-ratio</code> spreads the lengths; <code>--random-prefix-len</code> adds a shared prefix (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/datasets/datasets.py#L1887-L1921" target="_blank" rel="noopener" title="vllm/benchmarks/datasets/datasets.py:1887-1921 at 3e44c0d"><code>vllm/benchmarks/datasets/datasets.py:1887-1921</code></a>)</td></tr>
+    <tr><td><code>random-mm</code>, <code>random-rerank</code></td><td>random multimodal prompts; random rerank pairs</td></tr>
+    <tr><td><code>sharegpt</code>, <code>burstgpt</code></td><td>real conversations or a real request trace, from <code>--dataset-path</code></td></tr>
+    <tr><td><code>hf</code></td><td>Hugging Face datasets with their own loader classes (for example MT-Bench, GSM8K, VisionArena, InstructCoder), all based on <code>HuggingFaceDataset</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/datasets/datasets.py#L3094-L3128" target="_blank" rel="noopener" title="vllm/benchmarks/datasets/datasets.py:3094-3128 at 3e44c0d"><code>vllm/benchmarks/datasets/datasets.py:3094-3128</code></a>)</td></tr>
+    <tr><td><code>custom</code>, <code>custom_audio</code>, <code>custom_image</code></td><td>your own JSONL file</td></tr>
+    <tr><td><code>prefix_repetition</code></td><td>prompts with repeated prefixes, to test prefix caching</td></tr>
+    <tr><td><code>spec_bench</code>, <code>speed_bench</code></td><td>speculative decoding workloads</td></tr>
+    <tr><td><code>timed_trace</code></td><td>a trace with its own timestamps; <code>--self-timed</code> then defaults to on, and <code>--ignore-eos</code> is set (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L2196-L2201" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:2196-2201 at 3e44c0d"><code>vllm/benchmarks/serve.py:2196-2201</code></a>)</td></tr>
+  </tbody>
+</table>
+<p>The random dataset makes token ids from a seeded generator, decodes them and encodes them again, so the prompt has the asked length (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/datasets/datasets.py#L556-L579" target="_blank" rel="noopener" title="vllm/benchmarks/datasets/datasets.py:556-579 at 3e44c0d"><code>vllm/benchmarks/datasets/datasets.py:556-579</code></a>). <code>--seed</code> (default 0) seeds it and the arrival times (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/datasets/datasets.py#L1585" target="_blank" rel="noopener" title="vllm/benchmarks/datasets/datasets.py:1585 at 3e44c0d"><code>vllm/benchmarks/datasets/datasets.py:1585</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L2060-L2061" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:2060-2061 at 3e44c0d"><code>vllm/benchmarks/serve.py:2060-2061</code></a>). <code>--num-prompts</code> defaults to 1,000 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/datasets/datasets.py#L70" target="_blank" rel="noopener" title="vllm/benchmarks/datasets/datasets.py:70 at 3e44c0d"><code>vllm/benchmarks/datasets/datasets.py:70</code></a>).</p>
+<aside class="callout callout-warning"><p class="callout-title">max_tokens is a maximum, not a length</p><div class="callout-body"><p>The client sends the output length as <code>max_tokens</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/lib/endpoint_request_func.py#L232" target="_blank" rel="noopener" title="vllm/benchmarks/lib/endpoint_request_func.py:232 at 3e44c0d"><code>vllm/benchmarks/lib/endpoint_request_func.py:232</code></a>). The model can stop earlier at an end token. Add <code>--ignore-eos</code> when every request must produce exactly that many tokens (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1831-L1836" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1831-1836 at 3e44c0d"><code>vllm/benchmarks/serve.py:1831-1836</code></a>). Also note: the client sends no <code>temperature</code> unless you pass <code>--temperature</code>, so the server's default sampling applies (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L2246-L2252" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:2246-2252 at 3e44c0d"><code>vllm/benchmarks/serve.py:2246-2252</code></a>).</p></div></aside>
+
+<h3 id="step-3-request-rate-burstiness-and-max-concurrency">Step 3: request rate, burstiness and max concurrency<a class="h-anchor" href="#step-3-request-rate-burstiness-and-max-concurrency" aria-label="Link to this section">#</a></h3>
+<p><a class="term" href="../reference/glossary.html#term-request-rate" data-term="request rate" data-def="In vllm bench serve, the mean number of requests that the client starts per second (--request-rate). The default inf sends all requests at time 0.">--request-rate</a> is in requests per second; the default <code>inf</code> sends all requests at time 0 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1745-L1753" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1745-1753 at 3e44c0d"><code>vllm/benchmarks/serve.py:1745-1753</code></a>). For a finite rate, the client draws the gap before each request from a gamma distribution:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L497-L526" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/benchmarks/serve.py:497-526</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L497-L526" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">497</span><span class="ln">498</span><span class="ln">499</span><span class="ln">500</span><span class="ln">501</span><span class="ln">502</span><span class="ln">503</span><span class="ln hl">504</span><span class="ln hl">505</span><span class="ln hl">506</span><span class="ln hl">507</span><span class="ln hl">508</span><span class="ln">509</span><span class="ln">510</span><span class="ln">511</span><span class="ln">512</span><span class="ln hl">513</span><span class="ln hl">514</span><span class="ln hl">515</span><span class="ln hl">516</span><span class="ln hl">517</span><span class="ln hl">518</span><span class="ln hl">519</span><span class="ln hl">520</span><span class="ln hl">521</span><span class="ln hl">522</span><span class="ln hl">523</span><span class="ln hl">524</span><span class="ln hl">525</span><span class="ln hl">526</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><pre><code class="language-python">            if current_request_rate == float(&quot;inf&quot;):
+                delay_ts.append(0)
+            elif burstiness == float(&quot;inf&quot;):
+                # when burstiness tends to infinity, the delay time becomes constant
+                # and tends to the inverse of the request rate
+                delay_ts.append(1.0 / current_request_rate)
+            else:
+                theta = 1.0 / (current_request_rate * burstiness)
+
+                # Sample the request interval from the gamma distribution.
+                # If burstiness is 1, it follows exponential distribution.
+                delay_ts.append(np.random.gamma(shape=burstiness, scale=theta))
+
+        # Calculate the cumulative delay time from the first sent out requests.
+        for i in range(1, len(delay_ts)):
+            delay_ts[i] += delay_ts[i - 1]
+        if ramp_up_strategy is None and delay_ts[-1] != 0:
+            # When ramp_up_strategy is not set, we assume the request rate is fixed
+            # and all requests should be sent in target_total_delay_s, the following
+            # logic would re-scale delay time to ensure the final delay_ts
+            # align with target_total_delay_s.
+            #
+            # NOTE: If we simply accumulate the random delta values
+            # from the gamma distribution, their sum would have 1-2% gap
+            # from target_total_delay_s. The purpose of the following logic is to
+            # close the gap for stabilizing the throughput data
+            # from different random seeds.
+            target_total_delay_s = total_requests / request_rate
+            normalize_factor = target_total_delay_s / delay_ts[-1]
+            delay_ts = [delay * normalize_factor for delay in delay_ts]</code></pre></div></div></div></figure>
+<ul>
+  <li><a class="term" href="../reference/glossary.html#term-burstiness" data-term="burstiness" data-def="The shape factor of the gamma distribution that vllm bench serve draws request gaps from. 1 gives a Poisson process; below 1 gives bursts; above 1 gives more even gaps.">--burstiness</a> is the shape of the gamma distribution, default 1.0 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1754-L1765" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1754-1765 at 3e44c0d"><code>vllm/benchmarks/serve.py:1754-1765</code></a>). The scale is <code>1 / (rate × burstiness)</code>, so the mean gap is always <code>1 / rate</code>. Burstiness 1 gives exponential gaps (a Poisson process). Below 1, gaps vary more (bursts); above 1, they are more even.</li>
+  <li>Lines 513-526: without a ramp-up, the client then scales all gaps so that the last request starts exactly at <code>num_prompts / rate</code>. The comment says that this keeps the throughput stable across seeds.</li>
+  <li><code>--max-concurrency N</code> wraps each request in an <code>asyncio.Semaphore(N)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1001-L1013" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1001-1013 at 3e44c0d"><code>vllm/benchmarks/serve.py:1001-1013</code></a>). Requests that wait for the semaphore start their TTFT clock only when they get it; the wait is kept as <code>client_queue_time</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1014-L1016" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1014-1016 at 3e44c0d"><code>vllm/benchmarks/serve.py:1014-1016</code></a>). With a rate and a concurrency limit, the real rate can be lower than the asked rate (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1679-L1690" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1679-1690 at 3e44c0d"><code>vllm/benchmarks/serve.py:1679-1690</code></a>).</li>
+  <li><code>--ramp-up-strategy linear|exponential</code> with start and end rates changes the rate during the run (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1965-L1987" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1965-1987 at 3e44c0d"><code>vllm/benchmarks/serve.py:1965-1987</code></a>).</li>
+</ul>
+
+<h3 id="step-4-warm-up-and-the-ready-check">Step 4: warm-up and the ready check<a class="h-anchor" href="#step-4-warm-up-and-the-ready-check" aria-label="Link to this section">#</a></h3>
+<p>Two start steps are off by default. <code>--ready-check-timeout-sec</code> defaults to 0, so the client skips the initial test request and prints "Skipping endpoint ready check." (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1989-L1994" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1989-1994 at 3e44c0d"><code>vllm/benchmarks/serve.py:1989-1994</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L908-L925" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:908-925 at 3e44c0d"><code>vllm/benchmarks/serve.py:908-925</code></a>). <code>--num-warmups</code> defaults to 0 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1780-L1785" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1780-1785 at 3e44c0d"><code>vllm/benchmarks/serve.py:1780-1785</code></a>). A first request after a server start can pay one-time costs, so a run without warm-up includes them in its first results.</p>
+
+<h3 id="step-5-how-the-metrics-are-computed">Step 5: how the metrics are computed<a class="h-anchor" href="#step-5-how-the-metrics-are-computed" aria-label="Link to this section">#</a></h3>
+<p>After all requests finish, <code>calculate_metrics</code> builds the result. TPOT is computed per request:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L652-L662" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/benchmarks/serve.py:652-662</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L652-L662" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">652</span><span class="ln">653</span><span class="ln">654</span><span class="ln hl">655</span><span class="ln hl">656</span><span class="ln hl">657</span><span class="ln hl">658</span><span class="ln">659</span><span class="ln hl">660</span><span class="ln">661</span><span class="ln">662</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><pre><code class="language-python">            actual_output_lens.append(output_len)
+            total_input += outputs[i].prompt_len
+            tpot = 0.0
+            if output_len &gt; 1:
+                latency_minus_ttft = outputs[i].latency - outputs[i].ttft
+                tpot = latency_minus_ttft / (output_len - 1)
+                tpots.append(tpot)
+            # Note: if output_len &lt;= 1, we regard tpot as 0 for goodput
+            all_tpots.append(tpot)
+            itls += outputs[i].itl
+            ttfts.append(outputs[i].ttft)</code></pre></div></div></div></figure>
+<ul>
+  <li>TPOT = (E2EL − TTFT) / (output tokens − 1), and only requests with more than one output token enter the TPOT statistics (lines 655-658). For goodput, a one-token request has TPOT 0 (line 660).</li>
+  <li>The output token count comes from the server's usage; without it, the client tokenizes the text (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L635-L650" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:635-650 at 3e44c0d"><code>vllm/benchmarks/serve.py:635-650</code></a>).</li>
+  <li>Throughputs divide by the benchmark duration, from the start of the send loop to the end of the last request (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L773-L781" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:773-781 at 3e44c0d"><code>vllm/benchmarks/serve.py:773-781</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1048" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1048 at 3e44c0d"><code>vllm/benchmarks/serve.py:1048</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1123" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1123 at 3e44c0d"><code>vllm/benchmarks/serve.py:1123</code></a>).</li>
+  <li>Mean, median, standard deviation and percentiles use NumPy over all requests (TTFT, TPOT, E2EL) or over all chunk gaps (ITL) (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L782-L806" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:782-806 at 3e44c0d"><code>vllm/benchmarks/serve.py:782-806</code></a>). <code>--metric-percentiles</code> defaults to 99 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1858-L1866" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1858-1866 at 3e44c0d"><code>vllm/benchmarks/serve.py:1858-1866</code></a>); <code>--percentile-metrics</code> defaults to <code>ttft,tpot,itl</code> for generative models (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L2255" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:2255 at 3e44c0d"><code>vllm/benchmarks/serve.py:2255</code></a>).</li>
+  <li><a class="term" href="../reference/glossary.html#term-goodput-slo" data-term="--goodput" data-def="The vllm bench serve flag that sets SLOs as KEY:VALUE in milliseconds (ttft, tpot, e2el). A request is good when it meets every given SLO.">--goodput</a> <code>ttft:500 tpot:50</code> sets SLOs in milliseconds (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1867-L1878" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1867-1878 at 3e44c0d"><code>vllm/benchmarks/serve.py:1867-1878</code></a>). A request is good when each given SLO is at least its measured value. Request goodput = good requests / duration (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L669-L692" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:669-692 at 3e44c0d"><code>vllm/benchmarks/serve.py:669-692</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L779" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:779 at 3e44c0d"><code>vllm/benchmarks/serve.py:779</code></a>).</li>
+</ul>
+
+<h3 id="step-6-client-numbers-vs-server-numbers">Step 6: client numbers vs server numbers<a class="h-anchor" href="#step-6-client-numbers-vs-server-numbers" aria-label="Link to this section">#</a></h3>
+<p>Run <code>vllm bench serve</code> against a server and watch its <code>/metrics</code> at the same time: the numbers differ. These are the reasons, each from the code:</p>
+<table>
+  <thead><tr><th>Metric</th><th>vllm bench serve (client)</th><th>Prometheus (server)</th></tr></thead>
+  <tbody>
+    <tr><td>TTFT</td><td>POST sent → first chunk received; includes the network, HTTP parsing and SSE output</td><td><code>arrival_time</code> (render start) → first output handled in the API server (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/base.py#L1380" target="_blank" rel="noopener" title="vllm/renderers/base.py:1380 at 3e44c0d"><code>vllm/renderers/base.py:1380</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/metrics/stats.py#L525" target="_blank" rel="noopener" title="vllm/v1/metrics/stats.py:525 at 3e44c0d"><code>vllm/v1/metrics/stats.py:525</code></a>)</td></tr>
+    <tr><td>ITL</td><td>gap between SSE chunks</td><td>gap between engine-core output timestamps (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/metrics/stats.py#L555" target="_blank" rel="noopener" title="vllm/v1/metrics/stats.py:555 at 3e44c0d"><code>vllm/v1/metrics/stats.py:555</code></a>)</td></tr>
+    <tr><td>TPOT</td><td>(E2EL − TTFT) / (n − 1), only n &gt; 1</td><td>decode time / (n − 1), and 0 for n = 1, which enters the histogram (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/metrics/stats.py#L612-L616" target="_blank" rel="noopener" title="vllm/v1/metrics/stats.py:612-616 at 3e44c0d"><code>vllm/v1/metrics/stats.py:612-616</code></a>)</td></tr>
+    <tr><td>Aborted requests</td><td>counted as failed</td><td>no finished-request stats after a client disconnect (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L807-L809" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:807-809 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:807-809</code></a>)</td></tr>
+    <tr><td>Clock</td><td><code>time.perf_counter()</code></td><td><code>time.time()</code> (front end) and <code>time.monotonic()</code> (engine core)</td></tr>
+  </tbody>
+</table>
+<p>With <code>--enable-per-request-metrics</code> on the server, the client also stores the server's <code>queue_time_ms</code> and <code>time_to_first_token_ms</code> per request in its result data (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/lib/endpoint_request_func.py#L110-L125" target="_blank" rel="noopener" title="vllm/benchmarks/lib/endpoint_request_func.py:110-125 at 3e44c0d"><code>vllm/benchmarks/lib/endpoint_request_func.py:110-125</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L391-L403" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:391-403 at 3e44c0d"><code>vllm/benchmarks/serve.py:391-403</code></a>). That server TTFT is the prefill interval only (<a href="../concepts/metrics-and-observability.html">Metrics and observability: how to watch a vLLM server</a>). With speculative decoding, the client reads the server's <code>vllm:spec_decode_*</code> counters before and after the run and reports the acceptance (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L996" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:996 at 3e44c0d"><code>vllm/benchmarks/serve.py:996</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L210-L260" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:210-260 at 3e44c0d"><code>vllm/benchmarks/serve.py:210-260</code></a>).</p>
+
+<h3 id="step-7-vllm-bench-throughput">Step 7: vllm bench throughput<a class="h-anchor" href="#step-7-vllm-bench-throughput" aria-label="Link to this section">#</a></h3>
+<p><code>vllm bench throughput</code> measures offline throughput: it builds an <code>LLM</code> from the engine flags and sends all prompts in one <code>generate()</code> call (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/throughput.py#L37-L48" target="_blank" rel="noopener" title="vllm/benchmarks/throughput.py:37-48 at 3e44c0d"><code>vllm/benchmarks/throughput.py:37-48</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/throughput.py#L129-L151" target="_blank" rel="noopener" title="vllm/benchmarks/throughput.py:129-151 at 3e44c0d"><code>vllm/benchmarks/throughput.py:129-151</code></a>). It prints requests/s, total tokens/s and output tokens/s (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/throughput.py#L1108-L1114" target="_blank" rel="noopener" title="vllm/benchmarks/throughput.py:1108-1114 at 3e44c0d"><code>vllm/benchmarks/throughput.py:1108-1114</code></a>). Without <code>--dataset-path</code>, it uses the random dataset and needs <code>--input-len</code> or <code>--random-input-len</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/throughput.py#L642-L650" target="_blank" rel="noopener" title="vllm/benchmarks/throughput.py:642-650 at 3e44c0d"><code>vllm/benchmarks/throughput.py:642-650</code></a>). <code>--async-engine</code> uses an in-process <code>AsyncLLM</code> instead (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/throughput.py#L863-L867" target="_blank" rel="noopener" title="vllm/benchmarks/throughput.py:863-867 at 3e44c0d"><code>vllm/benchmarks/throughput.py:863-867</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/throughput.py#L308-L314" target="_blank" rel="noopener" title="vllm/benchmarks/throughput.py:308-314 at 3e44c0d"><code>vllm/benchmarks/throughput.py:308-314</code></a>). There is no HTTP, no SLO and no arrival process: all requests wait at time 0.</p>
+
+<h3 id="step-8-vllm-bench-latency">Step 8: vllm bench latency<a class="h-anchor" href="#step-8-vllm-bench-latency" aria-label="Link to this section">#</a></h3>
+<p><code>vllm bench latency</code> measures the time of one batch. The batch has <code>--batch-size</code> (default 8) random prompts of <code>--input-len</code> (32) tokens. Each prompt gets exactly <code>--output-len</code> (128) tokens, because the command sets <code>ignore_eos</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/latency.py#L35-L37" target="_blank" rel="noopener" title="vllm/benchmarks/latency.py:35-37 at 3e44c0d"><code>vllm/benchmarks/latency.py:35-37</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/latency.py#L96-L103" target="_blank" rel="noopener" title="vllm/benchmarks/latency.py:96-103 at 3e44c0d"><code>vllm/benchmarks/latency.py:96-103</code></a>). It runs 10 warm-up iterations and 30 measured ones, and prints the mean and the 10th to 99th percentiles of the batch time (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/latency.py#L45-L53" target="_blank" rel="noopener" title="vllm/benchmarks/latency.py:45-53 at 3e44c0d"><code>vllm/benchmarks/latency.py:45-53</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/latency.py#L158-L168" target="_blank" rel="noopener" title="vllm/benchmarks/latency.py:158-168 at 3e44c0d"><code>vllm/benchmarks/latency.py:158-168</code></a>).</p>
+
+<h3 id="step-9-vllm-bench-startup">Step 9: vllm bench startup<a class="h-anchor" href="#step-9-vllm-bench-startup" aria-label="Link to this section">#</a></h3>
+<p><code>vllm bench startup</code> measures how long <code>LLM(...)</code> takes to start, cold and warm (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/startup.py#L3-L9" target="_blank" rel="noopener" title="vllm/benchmarks/startup.py:3-9 at 3e44c0d"><code>vllm/benchmarks/startup.py:3-9</code></a>). A cold run uses a new temporary <code>VLLM_CACHE_ROOT</code> and a fresh Inductor cache; a warm run reuses the caches (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/startup.py#L109-L128" target="_blank" rel="noopener" title="vllm/benchmarks/startup.py:109-128 at 3e44c0d"><code>vllm/benchmarks/startup.py:109-128</code></a>). Each run is a new subprocess (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/startup.py#L133-L147" target="_blank" rel="noopener" title="vllm/benchmarks/startup.py:133-147 at 3e44c0d"><code>vllm/benchmarks/startup.py:133-147</code></a>). The defaults are 3 cold runs, 1 warm-up and 3 warm runs (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/startup.py#L193-L210" target="_blank" rel="noopener" title="vllm/benchmarks/startup.py:193-210 at 3e44c0d"><code>vllm/benchmarks/startup.py:193-210</code></a>). It reports the start-up time and the compilation time of each run.</p>
+<aside class="callout callout-note"><p class="callout-title">The offline subcommands use the LLM-class defaults</p><div class="callout-body"><p><code>throughput</code>, <code>latency</code> and <code>startup</code> start the engine with the usage context <code>LLM_CLASS</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/llm.py#L341-L343" target="_blank" rel="noopener" title="vllm/entrypoints/llm.py:341-343 at 3e44c0d"><code>vllm/entrypoints/llm.py:341-343</code></a>). The exception is <code>throughput --async-engine</code>: it uses the <code>vllm serve</code> context <code>OPENAI_API_SERVER</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/launchers/api_server/entry.py#L69-L82" target="_blank" rel="noopener" title="vllm/entrypoints/launchers/api_server/entry.py:69-82 at 3e44c0d"><code>vllm/entrypoints/launchers/api_server/entry.py:69-82</code></a>). On an 80 GiB H100, that gives a token budget of 16,384, but <code>vllm serve</code> uses 8,192 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/engine/arg_utils.py#L2970-L2981" target="_blank" rel="noopener" title="vllm/engine/arg_utils.py:2970-2981 at 3e44c0d"><code>vllm/engine/arg_utils.py:2970-2981</code></a>). Set <code>--max-num-batched-tokens</code> explicitly when you compare with a server. <code>vllm bench sweep</code> runs <code>vllm bench serve</code> over a grid of server and client settings (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/sweep/cli.py#L19-L25" target="_blank" rel="noopener" title="vllm/benchmarks/sweep/cli.py:19-25 at 3e44c0d"><code>vllm/benchmarks/sweep/cli.py:19-25</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/sweep/serve.py#L465-L520" target="_blank" rel="noopener" title="vllm/benchmarks/sweep/serve.py:465-520 at 3e44c0d"><code>vllm/benchmarks/sweep/serve.py:465-520</code></a>).</p></div></aside>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-reading-one-result-block-illustrative-numbers" class="dd-title">Worked example: reading one result block (illustrative numbers)</h3></summary><div class="dd-body"><p>Command (an example, not from the repository):</p>
+<pre><code class="language-bash">vllm bench serve --model meta-llama/Llama-3.1-8B-Instruct --dataset-name random \
+  --random-input-len 1024 --random-output-len 128 --ignore-eos --num-prompts 1000 \
+  --request-rate 20 --num-warmups 20 --metric-percentiles 50,99 --goodput ttft:500 tpot:50</code></pre>
+<p>Output (the format is from <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1220-L1280" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1220-1280 at 3e44c0d"><code>vllm/benchmarks/serve.py:1220-1280</code></a> and <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1423-L1440" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1423-1440 at 3e44c0d"><code>vllm/benchmarks/serve.py:1423-1440</code></a>; <strong>all numbers are made up</strong> to show how to read them):</p>
+<pre><code class="language-none">============ Serving Benchmark Result ============
+Successful requests:                     1000
+Failed requests:                         0
+Request rate configured (RPS):           20.00
+Benchmark duration (s):                  52.10
+Total input tokens:                      1024000
+Total generated tokens:                  128000
+Request throughput (req/s):              19.19
+Request goodput (req/s):                 17.60
+Output token throughput (tok/s):         2456.81
+Peak output token throughput (tok/s):    3120.00
+Peak concurrent requests:                61.00
+Total token throughput (tok/s):          22111.32
+---------------Time to First Token----------------
+Mean TTFT (ms):                          182.40
+Median TTFT (ms):                        140.10
+P50 TTFT (ms):                           140.10
+P99 TTFT (ms):                           690.50
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          24.30
+Median TPOT (ms):                        23.90
+P50 TPOT (ms):                           23.90
+P99 TPOT (ms):                           38.20
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           24.20
+Median ITL (ms):                         19.80
+P50 ITL (ms):                            19.80
+P99 ITL (ms):                            95.70
+==================================================</code></pre>
+<ol>
+  <li><strong>Duration and throughput.</strong> 1,000 requests at 20 RPS start over 50 s (Step 3); the last ones finish at 52.1 s. Request throughput = 1000 / 52.10 = 19.19. It is below 20 because the duration includes the tail after the last send.</li>
+  <li><strong>Total token throughput</strong> = (1,024,000 + 128,000) / 52.10 = 22,111 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L781" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:781 at 3e44c0d"><code>vllm/benchmarks/serve.py:781</code></a>). Prompt tokens dominate it, so it says little about decode speed.</li>
+  <li><strong>Goodput</strong> 17.60 req/s = 917 good requests / 52.10 s. So 8.3 % of the requests missed at least one SLO. The mean TTFT (182 ms) and the mean TPOT (24 ms) are still far below the SLOs. The P99 TTFT (690 ms) shows the misses.</li>
+  <li><strong>ITL vs TPOT.</strong> The ITL median (19.8 ms) is below the TPOT median (23.9 ms), and the ITL P99 is high (95.7 ms). Some gaps contain a step with a large prefill chunk; TPOT spreads such spikes over the whole request.</li>
+  <li><strong>Peak values</strong> come from one-second buckets of the client's token times (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L715-L760" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:715-760 at 3e44c0d"><code>vllm/benchmarks/serve.py:715-760</code></a>). "Peak concurrent requests: 61" is the largest number of requests that were active in one second, as the client saw them. It is an upper bound for the requests in flight at one moment.</li>
+</ol></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="a-benchmarking-method-advice" class="dd-title">A benchmarking method (advice)</h3></summary><div class="dd-body"><p>This method is advice; each step names the code that makes it work.</p>
+<ol>
+  <li><strong>Fix the inputs.</strong> Use one <code>--seed</code>, one dataset and fixed lengths, with <code>--ignore-eos</code> for synthetic data (Step 2).</li>
+  <li><strong>Warm up.</strong> Set <code>--num-warmups</code> (default 0) and <code>--ready-check-timeout-sec</code> (default 0) (Step 4). Better: run one short benchmark after each server start and throw it away.</li>
+  <li><strong>Sweep the request rate</strong>, not only <code>inf</code>. With <code>inf</code>, all requests arrive at once, and TTFT mostly measures the queue. Sweep for example 2, 4, 8, 16 RPS until goodput stops rising. <code>vllm bench sweep</code> automates grids.</li>
+  <li><strong>Compare at equal goodput.</strong> For two configurations, compare the highest request rate at which goodput stays at, say, 95 % of throughput, with the same SLOs.</li>
+  <li><strong>Watch the server at the same time.</strong> <code>vllm:num_requests_waiting</code>, <code>vllm:kv_cache_usage_perc</code> and preemptions explain why a rate fails (<a href="../concepts/metrics-and-observability.html">Metrics and observability: how to watch a vLLM server</a>).</li>
+  <li><strong>Run the client on another machine</strong> or on free CPU cores. The client is one Python process; a busy client delays its own timestamps.</li>
+</ol></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="burstiness-in-numbers" class="dd-title">Burstiness, in numbers</h3></summary><div class="dd-body"><p>For <code>--request-rate 10</code>, the mean gap is 0.1 s at every burstiness b. The gamma mean is shape × scale = b × 1/(10 b) = 0.1 s (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L504-L508" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:504-508 at 3e44c0d"><code>vllm/benchmarks/serve.py:504-508</code></a>). The spread changes: the coefficient of variation of a gamma distribution is 1/√b (general statistics). So b = 1 gives a standard deviation of 0.1 s, and b = 4 gives 0.05 s. b = 0.25 gives 0.2 s: arrivals come in clusters with long pauses. <code>--burstiness inf</code> gives a constant gap of 0.1 s (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L499-L502" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:499-502 at 3e44c0d"><code>vllm/benchmarks/serve.py:499-502</code></a>). A lower burstiness at the same rate gives higher TTFT percentiles, because requests come in groups.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="flags-of-vllm-bench-serve" class="dd-title">Flags of vllm bench serve</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Flag</th><th>Default</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>--backend</code>, <code>--endpoint</code></td><td><code>openai</code>, <code>/v1/completions</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1647-L1668" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1647-1668 at 3e44c0d"><code>vllm/benchmarks/serve.py:1647-1668</code></a></td></tr>
+    <tr><td><code>--dataset-name</code>, <code>--num-prompts</code>, <code>--seed</code></td><td><code>random</code>, 1000, 0</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/datasets/datasets.py#L1585-L1612" target="_blank" rel="noopener" title="vllm/benchmarks/datasets/datasets.py:1585-1612 at 3e44c0d"><code>vllm/benchmarks/datasets/datasets.py:1585-1612</code></a></td></tr>
+    <tr><td><code>--random-input-len</code>, <code>--random-output-len</code></td><td>1024, 128</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/datasets/datasets.py#L1887-L1898" target="_blank" rel="noopener" title="vllm/benchmarks/datasets/datasets.py:1887-1898 at 3e44c0d"><code>vllm/benchmarks/datasets/datasets.py:1887-1898</code></a></td></tr>
+    <tr><td><code>--request-rate</code>, <code>--burstiness</code></td><td>inf, 1.0</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1745-L1765" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1745-1765 at 3e44c0d"><code>vllm/benchmarks/serve.py:1745-1765</code></a></td></tr>
+    <tr><td><code>--max-concurrency</code></td><td>none</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1678-L1690" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1678-1690 at 3e44c0d"><code>vllm/benchmarks/serve.py:1678-1690</code></a></td></tr>
+    <tr><td><code>--num-warmups</code>, <code>--ready-check-timeout-sec</code></td><td>0, 0</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1780-L1785" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1780-1785 at 3e44c0d"><code>vllm/benchmarks/serve.py:1780-1785</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1988-L1994" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1988-1994 at 3e44c0d"><code>vllm/benchmarks/serve.py:1988-1994</code></a></td></tr>
+    <tr><td><code>--percentile-metrics</code>, <code>--metric-percentiles</code></td><td><code>ttft,tpot,itl</code>, 99</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1847-L1866" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1847-1866 at 3e44c0d"><code>vllm/benchmarks/serve.py:1847-1866</code></a></td></tr>
+    <tr><td><code>--goodput</code></td><td>none</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1867-L1878" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1867-1878 at 3e44c0d"><code>vllm/benchmarks/serve.py:1867-1878</code></a></td></tr>
+    <tr><td><code>--ignore-eos</code></td><td>off</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1831-L1836" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1831-1836 at 3e44c0d"><code>vllm/benchmarks/serve.py:1831-1836</code></a></td></tr>
+    <tr><td><code>--profile</code></td><td>off; the server needs <code>--profiler-config</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1786-L1790" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1786-1790 at 3e44c0d"><code>vllm/benchmarks/serve.py:1786-1790</code></a></td></tr>
+    <tr><td><code>--save-result</code>, <code>--save-detailed</code></td><td>off</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1791-L1801" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1791-1801 at 3e44c0d"><code>vllm/benchmarks/serve.py:1791-1801</code></a></td></tr>
+  </tbody>
+</table>
+<p>The HTTP session has a total time limit of 6 hours per request (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L867-L871" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:867-871 at 3e44c0d"><code>vllm/benchmarks/serve.py:867-871</code></a>).</p></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><strong>Huge TTFT at <code>--request-rate inf</code>.</strong> All requests arrive at time 0, so most of them wait in the queue (Step 3). Use a finite rate or <code>--max-concurrency</code>.</li>
+  <li><strong>Output tokens below the asked length.</strong> The model stopped at an end token; use <code>--ignore-eos</code> (Step 2).</li>
+  <li><strong>The first run is slower than the next ones.</strong> No warm-up by default (Step 4).</li>
+  <li><strong>Client ITL is much larger than Prometheus ITL.</strong> The server sends several tokens per chunk (<code>--stream-interval</code>), or the client process is busy (Step 1, Step 6).</li>
+  <li><strong>All requests fail with "Never received a valid chunk".</strong> The endpoint does not stream <code>choices</code>, for example the wrong <code>--backend</code> for <code>--endpoint</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/lib/endpoint_request_func.py#L298-L305" target="_blank" rel="noopener" title="vllm/benchmarks/lib/endpoint_request_func.py:298-305 at 3e44c0d"><code>vllm/benchmarks/lib/endpoint_request_func.py:298-305</code></a>).</li>
+  <li><strong><code>vllm bench throughput</code> is faster than the server.</strong> It has no HTTP, no arrival process, and a larger default token budget (note in Step 9).</li>
+</ul>
+<p><strong>Why it matters.</strong> A benchmark number is only useful when you know its start point, its clock and its load. With that, you can compare two configurations fairly and explain the gap between the client view and the server view.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Which <code>vllm bench</code> subcommand needs a running <code>vllm serve</code>?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Only <code>serve</code>: it sends HTTP requests to <code>--host</code>/<code>--port</code> or <code>--base-url</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1654-L1662" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1654-1662 at 3e44c0d"><code>vllm/benchmarks/serve.py:1654-1662</code></a>). <code>throughput</code>, <code>latency</code> and <code>startup</code> build an <code>LLM</code> themselves (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/throughput.py#L48" target="_blank" rel="noopener" title="vllm/benchmarks/throughput.py:48 at 3e44c0d"><code>vllm/benchmarks/throughput.py:48</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/latency.py#L88" target="_blank" rel="noopener" title="vllm/benchmarks/latency.py:88 at 3e44c0d"><code>vllm/benchmarks/latency.py:88</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>A request produced exactly 1 output token. How does it count in the TPOT statistics of <code>vllm bench serve</code>, and in the goodput check?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>It is not in the TPOT statistics, because TPOT needs more than one token (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L655-L658" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:655-658 at 3e44c0d"><code>vllm/benchmarks/serve.py:655-658</code></a>). In the goodput check, its TPOT is 0 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L660" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:660 at 3e44c0d"><code>vllm/benchmarks/serve.py:660</code></a>), so it can only miss the TTFT or E2EL SLO.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>With <code>--request-rate 10 --burstiness 0.5</code>, what is the mean gap between requests, and how does the arrival pattern differ from the default?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The mean gap is still 0.1 s: shape 0.5 × scale 1/(10 × 0.5) (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L504-L508" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:504-508 at 3e44c0d"><code>vllm/benchmarks/serve.py:504-508</code></a>). The gaps vary more than with the default 1.0, so requests come in bursts. The client also scales the gaps so that the last request starts at 100 s for 1,000 prompts (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L513-L526" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:513-526 at 3e44c0d"><code>vllm/benchmarks/serve.py:513-526</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>With <code>--max-concurrency 8</code>, a request waits 2 s for the semaphore. Is the wait in its TTFT?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>No. The request function starts the clock only when it runs, after the semaphore (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1010-L1013" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1010-1013 at 3e44c0d"><code>vllm/benchmarks/serve.py:1010-1013</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/lib/endpoint_request_func.py#L248" target="_blank" rel="noopener" title="vllm/benchmarks/lib/endpoint_request_func.py:248 at 3e44c0d"><code>vllm/benchmarks/lib/endpoint_request_func.py:248</code></a>). The wait is kept as <code>client_queue_time</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/serve.py#L1016" target="_blank" rel="noopener" title="vllm/benchmarks/serve.py:1016 at 3e44c0d"><code>vllm/benchmarks/serve.py:1016</code></a>), which is reported only if you select it in <code>--percentile-metrics</code>.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>The client reports a P50 TTFT of 140 ms, the server's Prometheus P50 TTFT is 110 ms, and the per-request <code>time_to_first_token_ms</code> median is 60 ms. Explain all three.</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The client clock runs from the POST to the first chunk, with the network, HTTP parsing and SSE output (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/lib/endpoint_request_func.py#L248" target="_blank" rel="noopener" title="vllm/benchmarks/lib/endpoint_request_func.py:248 at 3e44c0d"><code>vllm/benchmarks/lib/endpoint_request_func.py:248</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/benchmarks/lib/endpoint_request_func.py#L286" target="_blank" rel="noopener" title="vllm/benchmarks/lib/endpoint_request_func.py:286 at 3e44c0d"><code>vllm/benchmarks/lib/endpoint_request_func.py:286</code></a>). Prometheus runs from <code>arrival_time</code> at render start to the handled first output (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/base.py#L1380" target="_blank" rel="noopener" title="vllm/renderers/base.py:1380 at 3e44c0d"><code>vllm/renderers/base.py:1380</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/metrics/stats.py#L525" target="_blank" rel="noopener" title="vllm/v1/metrics/stats.py:525 at 3e44c0d"><code>vllm/v1/metrics/stats.py:525</code></a>): rendering, tokenization, the queue and prefill. The per-request value is only SCHEDULED to first token, the prefill on the engine clock (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/generate/base/serving.py#L73-L74" target="_blank" rel="noopener" title="vllm/entrypoints/generate/base/serving.py:73-74 at 3e44c0d"><code>vllm/entrypoints/generate/base/serving.py:73-74</code></a>). So 140 − 110 ms is outside the server, and 110 − 60 ms is front-end work plus the queue.</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../learn/serving-metrics.html">Serving metrics: TTFT, TPOT, ITL, throughput, goodput</a><span class="rel-sum">Serving metrics tell how fast a server answers one user (TTFT, TPOT, ITL, E2E latency) and how much work it does for all users (throughput, goodput). vLLM measures them in the API server and the engine core, and vllm bench serve measures them at the client.</span></li><li><a href="../concepts/metrics-and-observability.html">Metrics and observability: how to watch a vLLM server</a><span class="rel-sum">Where the signals of vllm serve come from and how to read them: the /metrics endpoint and its multiprocess mode, the metrics to watch first with valid PromQL, the periodic log line, per-request metrics in responses, OpenTelemetry traces, stat logger plugins, the profiler routes, and the known gaps.</span></li><li><a href="../concepts/tuning.html">Tuning vLLM: throughput and latency knobs, their real defaults and what each one does</a><span class="rel-sum">Which vllm serve flags change throughput and latency, where in the code each one acts, and its real default. With a KV cache playground that computes blocks and the maximum-concurrency log line from the code&#x27;s formulas, and a symptom-to-knob table.</span></li><li><a href="../concepts/openai-server.html">The OpenAI-compatible server: launch modes, app, serving classes and streaming</a><span class="rel-sum">How vllm serve builds its HTTP front end: the launch modes, the FastAPI app with its middleware, routers and exception handlers, the serving objects in app.state, the request flow down to AsyncLLM, streaming, n &gt; 1, request ids, priorities and admission limits.</span></li><li><a href="../reference/metrics.html">Prometheus metrics</a><span class="rel-sum">vllm serve exports about 130 vllm:* Prometheus metrics at /metrics. This page tells where the endpoint is mounted, which process records the values, how the labels work, which metrics to put on a dashboard first, and the known problems, and lists every metric that vLLM code declares.</span></li><li><a href="../concepts/compile-and-cuda-graphs.html">torch.compile and CUDA graphs in vLLM</a><span class="rel-sum">vLLM compiles the inner model once with torch.compile and its own Inductor backend, splits the graph at the attention ops, caches the result on disk, and captures CUDA graphs at start-up. Each step, Model Runner V2 replays a FULL graph for uniform decode batches, PIECEWISE graphs for other batches up to the largest capture size, and runs eagerly above it.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../concepts/metrics-and-observability.html"><span class="pn-dir">← Previous</span><span class="pn-title">Metrics and observability: how to watch a vLLM server</span></a><a class="pn pn-next" href="../concepts/deployment-recipes.html"><span class="pn-dir">Next →</span><span class="pn-title">Deployment recipes: single GPU, TP, DP, multi-node, load balancers and security</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-the-code">In the code</a></li><li class="toc-l3"><a href="#step-1-the-command-and-the-request-function">Step 1: the command and the request function</a></li><li class="toc-l3"><a href="#step-2-datasets">Step 2: datasets</a></li><li class="toc-l3"><a href="#step-3-request-rate-burstiness-and-max-concurrency">Step 3: request rate, burstiness and max concurrency</a></li><li class="toc-l3"><a href="#step-4-warm-up-and-the-ready-check">Step 4: warm-up and the ready check</a></li><li class="toc-l3"><a href="#step-5-how-the-metrics-are-computed">Step 5: how the metrics are computed</a></li><li class="toc-l3"><a href="#step-6-client-numbers-vs-server-numbers">Step 6: client numbers vs server numbers</a></li><li class="toc-l3"><a href="#step-7-vllm-bench-throughput">Step 7: vllm bench throughput</a></li><li class="toc-l3"><a href="#step-8-vllm-bench-latency">Step 8: vllm bench latency</a></li><li class="toc-l3"><a href="#step-9-vllm-bench-startup">Step 9: vllm bench startup</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#worked-example-reading-one-result-block-illustrative-numbers">Worked example: reading one result block (illustrative numbers)</a></li><li class="toc-l3"><a href="#a-benchmarking-method-advice">A benchmarking method (advice)</a></li><li class="toc-l3"><a href="#burstiness-in-numbers">Burstiness, in numbers</a></li><li class="toc-l3"><a href="#flags-of-vllm-bench-serve">Flags of vllm bench serve</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

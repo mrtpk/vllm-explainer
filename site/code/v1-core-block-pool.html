@@ -1,0 +1,591 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>v1/core/block_pool.py: BlockPool and the prefix-cache map · vLLM Explained</title>
+<meta name="description" content="vllm/v1/core/block_pool.py holds BlockPool, the owner of every KVCacheBlock of an engine core. It hands out blocks from the free queue, frees them in eviction order, keeps the hash-to-block map of the prefix cache, emits KV cache events and computes the KV cache usage.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="code/v1-core-block-pool">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a class="current" aria-current="page" href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>Code map</span><span class="sep">›</span><span>Scheduler and KV cache</span><span class="sep">›</span><span aria-current="page">v1/core/block_pool.py</span></nav>
+<h1 class="page-title">v1/core/block_pool.py: BlockPool and the prefix-cache map</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">Code map</span><span class="meta-time">about 7 min read + 3 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../concepts/kv-cache-manager.html">The KV cache manager: blocks, the block pool and memory sizing</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../learn/prefix-caching.html">Prefix caching: the idea</a> <span class="level level-beginner level-sm">Beginner</span></li></ul></aside>
+<h2 id="purpose">Purpose<a class="h-anchor" href="#purpose" aria-label="Link to this section">#</a></h2>
+<p><code>vllm/v1/core/block_pool.py</code> owns all <code>KVCacheBlock</code> objects of one engine core: which are free, which are in use, and which full blocks can serve a prefix-cache hit.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/v1/core/block_pool.py</code>, 905 lines of Python. Two classes.</td></tr>
+    <tr><th>Main classes</th><td><code>BlockPool</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L136" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:136 at 3e44c0d"><code>vllm/v1/core/block_pool.py:136</code></a>) and <code>BlockHashToBlockMap</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L35" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:35 at 3e44c0d"><code>vllm/v1/core/block_pool.py:35</code></a>).</td></tr>
+    <tr><th>Runs in</th><td>The <a class="term" href="../reference/glossary.html#term-engine-core" data-term="EngineCore" data-def="The inner loop of vLLM. It owns the scheduler (which holds the KV cache manager) and the executor, and it runs steps on the workers. vllm serve runs it in its own process.">EngineCore</a> process, main thread. One pool per KV cache coordinator, so one per scheduler, shared by all KV cache groups. The only exception is the host group of HiSparse, which gets a private host pool (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L2231-L2247" target="_blank" rel="noopener" title="vllm/v1/core/single_type_kv_cache_manager.py:2231-2247 at 3e44c0d"><code>vllm/v1/core/single_type_kv_cache_manager.py:2231-2247</code></a>). CPU only.</td></tr>
+    <tr><th>Called by</th><td>The <code>SingleTypeKVCacheManager</code>s (<code>single_type_kv_cache_manager.py</code>), the coordinator, <code>KVCacheManager</code>, and the scheduler for deferred frees.</td></tr>
+    <tr><th>Calls</th><td><code>FreeKVCacheBlockQueue</code> and the hash helpers of <code>kv_cache_utils.py</code>; the KV event types of <code>vllm/distributed/kv_events.py</code>; an optional metrics collector.</td></tr>
+    <tr><th>Not in this file</th><td>The block class and the free queue (<code>kv_cache_utils.py</code>), the hit search (single-type managers), the decision when to cache (managers), the GPU memory (workers).</td></tr>
+  </tbody>
+</table>
+
+<h2 id="where-it-sits">Where it sits<a class="h-anchor" href="#where-it-sits" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b3a_free_queue"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: the free block queue as a doubly linked list from a fake head to a fake tail: blocks 9 and 40 without a hash at the front, blocks 15 and 21 without a hash, then blocks 12, 3 and 7 with a hash at the end. get_new_blocks takes from the front with popleft_n; freed blocks without a hash are added at the front with prepend_n; freed blocks with a hash at the end with append_n; touch on a cached hit removes a block from the middle in O(1). Panel 2: the life of a block: allocated (popped, old hash evicted, ref_cnt 1, hashed when full), shared or freed (touch adds 1, free subtracts 1, at 0 it goes back to the queue with its hash), hit again (touch removes it from the queue) or reused (popped again, hash evicted). Block 0 is the null block and never enters this cycle."><svg role="img" aria-label="Panel 1: the free block queue as a doubly linked list from a fake head to a fake tail: blocks 9 and 40 without a hash at the front, blocks 15 and 21 without a hash, then blocks 12, 3 and 7 with a hash at the end. get_new_blocks takes from the front with popleft_n; freed blocks without a hash are added at the front with prepend_n; freed blocks with a hash at the end with append_n; touch on a cached hit removes a block from the middle in O(1). Panel 2: the life of a block: allocated (popped, old hash evicted, ref_cnt 1, hashed when full), shared or freed (touch adds 1, free subtracts 1, at 0 it goes back to the queue with its hash), hit again (touch removes it from the queue) or reused (popped again, hash evicted). Block 0 is the null block and never enters this cycle." xmlns="http://www.w3.org/2000/svg" width="1100" height="688" viewBox="0 0 1100 688">
+<defs><marker id="dg-b3a_free_queue-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b3a_free_queue-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#db2777"/></marker><marker id="dg-b3a_free_queue-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker><marker id="dg-b3a_free_queue-m3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker></defs>
+<rect width="1100" height="688" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">BlockPool: the free block queue and the life of one block</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">One BlockPool per scheduler, shared by all KV cache groups (a HiSparse host group has its own)  ·  Python objects only</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">KVCacheBlock(block_id, ref_cnt, _block_hash, prev_free_block, next_free_block, is_null)</text>
+<rect x="20.0" y="118.0" width="1060.0" height="218.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="144.0" r="13" fill="#111827"/>
+<text x="46.0" y="148.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="149.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">How is the free queue ordered?</text>
+<text x="68.0" y="168.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">A doubly linked list through the blocks themselves. Take from the front; freed blocks go to the front or the end.</text>
+<rect x="66.0" y="222.0" width="78.0" height="40.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#d1d5db" stroke-width="1.2" stroke-dasharray="4 3"/>
+<text x="105.0" y="247.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">fake head</text>
+<line x1="144.0" y1="236.0" x2="178.1" y2="236.0" stroke="#111827" stroke-width="1.2"/>
+<line x1="144.0" y1="248.0" x2="178.1" y2="248.0" stroke="#111827" stroke-width="1.2"/>
+<rect x="178.1" y="222.0" width="78.0" height="40.0" rx="6" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="217.1" y="240.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">block 9</text>
+<text x="217.1" y="255.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">no hash</text>
+<line x1="256.1" y1="236.0" x2="290.2" y2="236.0" stroke="#111827" stroke-width="1.2"/>
+<line x1="256.1" y1="248.0" x2="290.2" y2="248.0" stroke="#111827" stroke-width="1.2"/>
+<rect x="290.2" y="222.0" width="78.0" height="40.0" rx="6" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="329.2" y="240.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">block 40</text>
+<text x="329.2" y="255.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">no hash</text>
+<line x1="368.2" y1="236.0" x2="402.3" y2="236.0" stroke="#111827" stroke-width="1.2"/>
+<line x1="368.2" y1="248.0" x2="402.3" y2="248.0" stroke="#111827" stroke-width="1.2"/>
+<rect x="402.3" y="222.0" width="78.0" height="40.0" rx="6" fill="#f3f4f6" fill-opacity="1.0" stroke="#111827" stroke-width="1.4"/>
+<text x="441.3" y="240.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">block 15</text>
+<text x="441.3" y="255.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">no hash</text>
+<line x1="480.3" y1="236.0" x2="514.4" y2="236.0" stroke="#111827" stroke-width="1.2"/>
+<line x1="480.3" y1="248.0" x2="514.4" y2="248.0" stroke="#111827" stroke-width="1.2"/>
+<rect x="514.4" y="222.0" width="78.0" height="40.0" rx="6" fill="#f3f4f6" fill-opacity="1.0" stroke="#111827" stroke-width="1.4"/>
+<text x="553.4" y="240.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">block 21</text>
+<text x="553.4" y="255.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">no hash</text>
+<line x1="592.4" y1="236.0" x2="626.5" y2="236.0" stroke="#111827" stroke-width="1.2"/>
+<line x1="592.4" y1="248.0" x2="626.5" y2="248.0" stroke="#111827" stroke-width="1.2"/>
+<rect x="626.5" y="222.0" width="78.0" height="40.0" rx="6" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="665.5" y="240.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">block 12</text>
+<text x="665.5" y="255.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">hash</text>
+<line x1="704.5" y1="236.0" x2="738.6" y2="236.0" stroke="#111827" stroke-width="1.2"/>
+<line x1="704.5" y1="248.0" x2="738.6" y2="248.0" stroke="#111827" stroke-width="1.2"/>
+<rect x="738.6" y="222.0" width="78.0" height="40.0" rx="6" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="777.6" y="240.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">block 3</text>
+<text x="777.6" y="255.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">hash</text>
+<line x1="816.6" y1="236.0" x2="850.7" y2="236.0" stroke="#111827" stroke-width="1.2"/>
+<line x1="816.6" y1="248.0" x2="850.7" y2="248.0" stroke="#111827" stroke-width="1.2"/>
+<rect x="850.7" y="222.0" width="78.0" height="40.0" rx="6" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="889.7" y="240.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">block 7</text>
+<text x="889.7" y="255.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">hash</text>
+<line x1="928.7" y1="236.0" x2="962.8" y2="236.0" stroke="#111827" stroke-width="1.2"/>
+<line x1="928.7" y1="248.0" x2="962.8" y2="248.0" stroke="#111827" stroke-width="1.2"/>
+<rect x="962.8" y="222.0" width="78.0" height="40.0" rx="6" fill="#ffffff" fill-opacity="1.0" stroke="#d1d5db" stroke-width="1.2" stroke-dasharray="4 3"/>
+<text x="1001.8" y="247.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">fake tail</text>
+<text x="217.1" y="200.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">get_new_blocks(): popleft_n</text>
+<line x1="217.1" y1="206.0" x2="217.1" y2="220.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b3a_free_queue-m0)"/>
+<text x="399.2" y="200.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#db2777" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">freed, no hash: prepend_n</text>
+<line x1="329.2" y1="206.0" x2="329.2" y2="220.0" stroke="#db2777" stroke-width="1.6" marker-end="url(#dg-b3a_free_queue-m1)"/>
+<text x="717.6" y="288.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">touch() on a cached hit: remove() from the middle, O(1)</text>
+<line x1="777.6" y1="276.0" x2="777.6" y2="264.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b3a_free_queue-m2)"/>
+<text x="889.7" y="200.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">freed, hash: append_n</text>
+<line x1="889.7" y1="206.0" x2="889.7" y2="220.0" stroke="#059669" stroke-width="1.6" marker-end="url(#dg-b3a_free_queue-m3)"/>
+<text x="46.0" y="318.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Front = evicted first. Unhashed blocks never match a prefix, so the pool reuses them first; cached blocks wait at the end (LRU).</text>
+<rect x="20.0" y="358.0" width="1060.0" height="236.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="384.0" r="13" fill="#111827"/>
+<text x="46.0" y="388.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="389.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What happens to one block over time?</text>
+<text x="68.0" y="408.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ref_cnt counts the requests that use it. The hash stays after the free, until the block is popped again.</text>
+<rect x="46.0" y="428.0" width="300.0" height="120.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="58.0" y="448.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">1. Allocated</text>
+<text x="58.0" y="466.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">get_new_blocks(): pop front,</text>
+<text x="58.0" y="481.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">old hash removed (eviction),</text>
+<text x="58.0" y="496.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ref_cnt 0 -&gt; 1</text>
+<text x="58.0" y="511.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">full: cache_full_blocks()</text>
+<text x="58.0" y="526.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  sets block_hash</text>
+<rect x="400.0" y="428.0" width="300.0" height="120.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="412.0" y="448.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">2. Shared / freed</text>
+<text x="412.0" y="466.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">prefix hit: touch() ref_cnt += 1</text>
+<text x="412.0" y="481.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">request ends: free_blocks()</text>
+<text x="412.0" y="496.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  ref_cnt -= 1</text>
+<text x="412.0" y="511.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ref_cnt 0: back in the queue</text>
+<text x="412.0" y="526.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  (hash kept, still a hit)</text>
+<rect x="754.0" y="428.0" width="300.0" height="120.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="766.0" y="448.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">3. Hit again or reused</text>
+<text x="766.0" y="466.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">hit while free: touch()</text>
+<text x="766.0" y="481.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  remove(), ref_cnt 0 -&gt; 1</text>
+<text x="766.0" y="496.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">reached the front: popped by</text>
+<text x="766.0" y="511.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  get_new_blocks(), hash evicted</text>
+<text x="766.0" y="526.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  -&gt; back to 1. Allocated</text>
+<line x1="346.0" y1="468.0" x2="398.0" y2="468.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b3a_free_queue-m0)"/>
+<line x1="700.0" y1="468.0" x2="752.0" y2="468.0" stroke="#059669" stroke-width="1.6" marker-end="url(#dg-b3a_free_queue-m3)"/>
+<text x="46.0" y="574.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Block 0 never enters this cycle: the pool pops it at start-up and marks it as the null block.</text>
+<text x="30.0" y="629.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="618.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="629.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">allocation</text>
+<rect x="199.7" y="618.0" width="14.0" height="14.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="220.7" y="629.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">freed without hash</text>
+<rect x="356.7" y="618.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="377.7" y="629.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">cached (has hash)</text>
+<rect x="500.8" y="618.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="521.8" y="629.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">hit on a free block</text>
+<rect x="652.1" y="618.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="673.1" y="629.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">reuse</text>
+<text x="30.0" y="656.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Simplified: one KV cache group, prefix caching on. Block ids are illustrative. With prefix caching off, every freed block goes to the front.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the order of the free queue (1) and the life of one block (2).</figcaption><a class="diagram-open" href="../diagrams/b3a_free_queue.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read panel 1 from left to right: the pool reuses the front first. Panel 2 shows that a free block can still be a prefix-cache hit until the pool pops it again.</p>
+
+<h3 id="who-calls-it">Who calls it<a class="h-anchor" href="#who-calls-it" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li>The coordinator builds one pool with <code>kv_cache_config.num_blocks</code> blocks (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_coordinator.py#L119-L125" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_coordinator.py:119-125 at 3e44c0d"><code>vllm/v1/core/kv_cache_coordinator.py:119-125</code></a>).</li>
+  <li>Single-type managers call <code>get_new_blocks</code>, <code>touch</code>, <code>free_blocks</code>, <code>cache_full_blocks</code> and <code>get_cached_block</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L303-L306" target="_blank" rel="noopener" title="vllm/v1/core/single_type_kv_cache_manager.py:303-306 at 3e44c0d"><code>vllm/v1/core/single_type_kv_cache_manager.py:303-306</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L406" target="_blank" rel="noopener" title="vllm/v1/core/single_type_kv_cache_manager.py:406 at 3e44c0d"><code>vllm/v1/core/single_type_kv_cache_manager.py:406</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L531-L539" target="_blank" rel="noopener" title="vllm/v1/core/single_type_kv_cache_manager.py:531-539 at 3e44c0d"><code>vllm/v1/core/single_type_kv_cache_manager.py:531-539</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L597-L598" target="_blank" rel="noopener" title="vllm/v1/core/single_type_kv_cache_manager.py:597-598 at 3e44c0d"><code>vllm/v1/core/single_type_kv_cache_manager.py:597-598</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L794" target="_blank" rel="noopener" title="vllm/v1/core/single_type_kv_cache_manager.py:794 at 3e44c0d"><code>vllm/v1/core/single_type_kv_cache_manager.py:794</code></a>).</li>
+  <li><code>KVCacheManager</code> reads <code>get_usage</code> and <code>take_events</code>, and calls <code>evict_blocks</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_manager.py#L234" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_manager.py:234 at 3e44c0d"><code>vllm/v1/core/kv_cache_manager.py:234</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_manager.py#L672" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_manager.py:672 at 3e44c0d"><code>vllm/v1/core/kv_cache_manager.py:672</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_manager.py#L703" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_manager.py:703 at 3e44c0d"><code>vllm/v1/core/kv_cache_manager.py:703</code></a>).</li>
+  <li>The scheduler frees deferred blocks directly (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2884" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2884 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2884</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2901" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2901 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2901</code></a>).</li>
+</ul>
+
+<h3 id="what-it-calls">What it calls<a class="h-anchor" href="#what-it-calls" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><code>FreeKVCacheBlockQueue</code>: <code>popleft</code>, <code>popleft_n</code>, <code>remove</code>, <code>prepend_n</code>, <code>append_n</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L258-L484" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:258-484 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:258-484</code></a>).</li>
+  <li>Hash helpers: <code>make_block_hash_with_group_id</code>, <code>resolve_block_hashes</code>, <code>generate_block_hash_extra_keys</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L16-L29" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:16-29 at 3e44c0d"><code>vllm/v1/core/block_pool.py:16-29</code></a>).</li>
+  <li>The event types <code>BlockStored</code>, <code>BlockRemoved</code>, <code>AllBlocksCleared</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L6-L12" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:6-12 at 3e44c0d"><code>vllm/v1/core/block_pool.py:6-12</code></a>).</li>
+</ul>
+
+<h2 id="key-classes-and-functions">Key classes and functions<a class="h-anchor" href="#key-classes-and-functions" aria-label="Link to this section">#</a></h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>BlockHashToBlockMap</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L35-L133" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:35-133 at 3e44c0d"><code>vllm/v1/core/block_pool.py:35-133</code></a></td><td>hash key → one block, or a dict of blocks with the same hash</td></tr>
+    <tr><td><code>BlockPool.__init__</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L157-L196" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:157-196 at 3e44c0d"><code>vllm/v1/core/block_pool.py:157-196</code></a></td><td>all blocks, the free queue, the maps, the null block</td></tr>
+    <tr><td><code>get_cached_block</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L198-L224" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:198-224 at 3e44c0d"><code>vllm/v1/core/block_pool.py:198-224</code></a></td><td>a cached block per group for one hash, or <code>None</code></td></tr>
+    <tr><td><code>cache_full_blocks</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L226-L344" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:226-344 at 3e44c0d"><code>vllm/v1/core/block_pool.py:226-344</code></a></td><td>sets the hash of newly full blocks; emits <code>BlockStored</code></td></tr>
+    <tr><td><code>emit_cached_block_events</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L376-L447" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:376-447 at 3e44c0d"><code>vllm/v1/core/block_pool.py:376-447</code></a></td><td>events for reused blocks (report mode "full")</td></tr>
+    <tr><td><code>cache_partial_block</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L449-L563" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:449-563 at 3e44c0d"><code>vllm/v1/core/block_pool.py:449-563</code></a></td><td>a hit entry inside a larger block (fine-grained hashing)</td></tr>
+    <tr><td><code>move_block_hashes</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L648-L664" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:648-664 at 3e44c0d"><code>vllm/v1/core/block_pool.py:648-664</code></a></td><td>moves cache entries to a copy-on-write block</td></tr>
+    <tr><td><code>get_new_blocks</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L666-L700" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:666-700 at 3e44c0d"><code>vllm/v1/core/block_pool.py:666-700</code></a></td><td>pops blocks from the front; evicts their old hash; <code>ref_cnt = 1</code></td></tr>
+    <tr><td><code>unpin_blocks</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L708-L727" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:708-727 at 3e44c0d"><code>vllm/v1/core/block_pool.py:708-727</code></a></td><td>releases blocks that stay readable until reused (connectors)</td></tr>
+    <tr><td><code>touch</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L752-L770" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:752-770 at 3e44c0d"><code>vllm/v1/core/block_pool.py:752-770</code></a></td><td><code>ref_cnt += 1</code>; out of the free queue if it was free</td></tr>
+    <tr><td><code>free_blocks</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L776-L809" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:776-809 at 3e44c0d"><code>vllm/v1/core/block_pool.py:776-809</code></a></td><td><code>ref_cnt -= 1</code>; at 0: front (no hash) or end (hash)</td></tr>
+    <tr><td><code>evict_blocks</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L811-L829" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:811-829 at 3e44c0d"><code>vllm/v1/core/block_pool.py:811-829</code></a></td><td>removes hashes by block id (KV connector)</td></tr>
+    <tr><td><code>reset_prefix_cache</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L831-L870" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:831-870 at 3e44c0d"><code>vllm/v1/core/block_pool.py:831-870</code></a></td><td>drops every hash, only when no block is in use</td></tr>
+    <tr><td><code>get_num_free_blocks</code>, <code>get_usage</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L872-L892" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:872-892 at 3e44c0d"><code>vllm/v1/core/block_pool.py:872-892</code></a></td><td>free count; KV cache usage</td></tr>
+    <tr><td><code>take_events</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L894-L905" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:894-905 at 3e44c0d"><code>vllm/v1/core/block_pool.py:894-905</code></a></td><td>drains the KV event queue</td></tr>
+  </tbody>
+</table>
+
+<h2 id="walk-through-the-main-methods">Walk through the main methods<a class="h-anchor" href="#walk-through-the-main-methods" aria-label="Link to this section">#</a></h2>
+
+<h3 id="init-all-blocks-at-once-and-the-null-block"><code>__init__</code>: all blocks at once, and the null block<a class="h-anchor" href="#init-all-blocks-at-once-and-the-null-block" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L166-L188" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/block_pool.py:166-188</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L166-L188" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">166</span><span class="ln">167</span><span class="ln">168</span><span class="ln">169</span><span class="ln">170</span><span class="ln">171</span><span class="ln hl">172</span><span class="ln hl">173</span><span class="ln hl">174</span><span class="ln">175</span><span class="ln">176</span><span class="ln">177</span><span class="ln hl">178</span><span class="ln">179</span><span class="ln">180</span><span class="ln hl">181</span><span class="ln hl">182</span><span class="ln">183</span><span class="ln">184</span><span class="ln">185</span><span class="ln">186</span><span class="ln hl">187</span><span class="ln hl">188</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><pre><code class="language-python">        assert isinstance(num_gpu_blocks, int) and num_gpu_blocks &gt; 0
+        self.num_gpu_blocks = num_gpu_blocks
+        self.medium = medium
+        self.enable_caching = enable_caching
+        self.hash_block_size = hash_block_size
+        # All kv-cache blocks.
+        self.blocks: list[KVCacheBlock] = [
+            KVCacheBlock(idx, pool=self) for idx in range(num_gpu_blocks)
+        ]
+        # Free block queue that constructs and manipulates a doubly linked
+        # list of free blocks (including eviction candidates when caching is
+        # enabled).
+        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+
+        # Cache for block lookup
+        self.cached_block_hash_to_block: BlockHashToBlockMap = BlockHashToBlockMap()
+        self.cached_block_hashes_by_block: dict[int, set[BlockHashWithGroupId]] = {}
+
+        # To represent a placeholder block with block_id=0.
+        # The ref_cnt of null_block is not maintained, needs special care to
+        # avoid freeing it.
+        self.null_block = self.free_block_queue.popleft()
+        self.null_block.is_null = True</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 172-174.</strong> One <code>KVCacheBlock</code> per id, all made at start-up. A block remembers its pool, because a deferred free can hold blocks of two pools (the GPU pool and a HiSparse host pool) (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L169-L172" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:169-172 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:169-172</code></a>).</li>
+  <li><strong>Line 178.</strong> All blocks start in the free queue, in id order.</li>
+  <li><strong>Lines 181-182.</strong> The prefix-cache map, and a second map for blocks with more than one hash entry.</li>
+  <li><strong>Lines 187-188.</strong> The first block (id 0) leaves the queue and becomes the <a class="term" href="../reference/glossary.html#term-null-block" data-term="null block" data-def="Block 0 of the block pool. It is never given to a request. It fills block table places that hold no data, for example blocks outside a sliding window.">null block</a>. Its <code>ref_cnt</code> is not kept, so <code>free_blocks</code> skips it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L790-L791" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:790-791 at 3e44c0d"><code>vllm/v1/core/block_pool.py:790-791</code></a>).</li>
+</ol>
+
+<h3 id="get-new-blocks-take-from-the-front"><code>get_new_blocks</code>: take from the front<a class="h-anchor" href="#get-new-blocks-take-from-the-front" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L666-L700" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/block_pool.py:666-700</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L666-L700" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">666</span><span class="ln">667</span><span class="ln">668</span><span class="ln">669</span><span class="ln">670</span><span class="ln">671</span><span class="ln">672</span><span class="ln">673</span><span class="ln">674</span><span class="ln">675</span><span class="ln">676</span><span class="ln">677</span><span class="ln hl">678</span><span class="ln hl">679</span><span class="ln">680</span><span class="ln hl">681</span><span class="ln">682</span><span class="ln">683</span><span class="ln">684</span><span class="ln">685</span><span class="ln">686</span><span class="ln hl">687</span><span class="ln hl">688</span><span class="ln hl">689</span><span class="ln hl">690</span><span class="ln hl">691</span><span class="ln">692</span><span class="ln">693</span><span class="ln">694</span><span class="ln">695</span><span class="ln">696</span><span class="ln">697</span><span class="ln">698</span><span class="ln">699</span><span class="ln">700</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><pre><code class="language-python">    def get_new_blocks(self, num_blocks: int) -&gt; list[KVCacheBlock]:
+        &quot;&quot;&quot;Get new blocks from the free block pool.
+
+        Note that we do not check block cache in this function.
+
+        Args:
+            num_blocks: The number of blocks to allocate.
+
+        Returns:
+            A list of new block.
+
+        &quot;&quot;&quot;
+        if num_blocks &gt; self.get_num_free_blocks():
+            raise ValueError(f&quot;Cannot get {num_blocks} free blocks from the pool&quot;)
+
+        ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+
+        if self._reuse_watchers:
+            self._notify_reuse(ret)
+
+        # In order to only iterate the list once, we duplicated code a bit
+        if self.enable_caching:
+            for block in ret:
+                self._maybe_evict_cached_block(block)
+                assert block.ref_cnt == 0
+                block.ref_cnt += 1
+                if self.metrics_collector:
+                    self.metrics_collector.on_block_allocated(block)
+        else:
+            for block in ret:
+                assert block.ref_cnt == 0
+                block.ref_cnt += 1
+                if self.metrics_collector:
+                    self.metrics_collector.on_block_allocated(block)
+        return ret</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 678-679.</strong> A request for more blocks than are free raises <code>ValueError</code>. Callers count first, so this means a bug.</li>
+  <li><strong>Line 681.</strong> <code>popleft_n</code>: the front of the queue is the eviction end.</li>
+  <li><strong>Lines 687-691.</strong> With prefix caching, a popped block may still hold a hash; <code>_maybe_evict_cached_block</code> removes it from the map and emits <code>BlockRemoved</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L729-L750" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:729-750 at 3e44c0d"><code>vllm/v1/core/block_pool.py:729-750</code></a>). This is the only eviction path in normal serving. Then <code>ref_cnt</code> goes from 0 to 1.</li>
+</ol>
+
+<h3 id="free-blocks-back-in-eviction-order"><code>free_blocks</code>: back in eviction order<a class="h-anchor" href="#free-blocks-back-in-eviction-order" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L776-L809" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/block_pool.py:776-809</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L776-L809" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">776</span><span class="ln">777</span><span class="ln">778</span><span class="ln">779</span><span class="ln">780</span><span class="ln">781</span><span class="ln">782</span><span class="ln">783</span><span class="ln">784</span><span class="ln">785</span><span class="ln">786</span><span class="ln">787</span><span class="ln">788</span><span class="ln">789</span><span class="ln hl">790</span><span class="ln hl">791</span><span class="ln">792</span><span class="ln">793</span><span class="ln">794</span><span class="ln hl">795</span><span class="ln hl">796</span><span class="ln hl">797</span><span class="ln hl">798</span><span class="ln hl">799</span><span class="ln hl">800</span><span class="ln hl">801</span><span class="ln hl">802</span><span class="ln">803</span><span class="ln">804</span><span class="ln hl">805</span><span class="ln">806</span><span class="ln hl">807</span><span class="ln">808</span><span class="ln">809</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><pre><code class="language-python">    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -&gt; None:
+        &quot;&quot;&quot;Free a list of blocks. The blocks should be ordered by their
+        eviction priority, where the first block will be evicted first.
+
+        Args:
+            ordered_blocks: A list of blocks to free ordered by their eviction
+                priority.
+
+        &quot;&quot;&quot;
+        # Identify blocks with hash (LRU cache) and without it (never match APC)
+        blocks_to_evict_last = []
+        blocks_to_evict_first = []
+        other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
+        for block in ordered_blocks:
+            if block.is_null:  # never pooled; its ref_cnt is not maintained
+                continue
+            if block.pool is not None and block.pool is not self:
+                other_pools.setdefault(block.pool, []).append(block)
+                continue
+            block.ref_cnt -= 1
+            if block.ref_cnt == 0:
+                if block.block_hash is None or not self.enable_caching:
+                    # LIFO reuse of non-cached blocks for better GPU locality.
+                    blocks_to_evict_first.append(block)
+                else:
+                    # FIFO reuse of cached blocks for LRU eviction behavior.
+                    blocks_to_evict_last.append(block)
+
+        # Blocks to reuse first are prepended to the front of the free queue.
+        self.free_block_queue.prepend_n(blocks_to_evict_first)
+        # Blocks to reuse last are appended to the end of the free queue.
+        self.free_block_queue.append_n(blocks_to_evict_last)
+        for pool, blocks in other_pools.items():
+            pool.free_blocks(blocks)</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 790-794.</strong> The null block is skipped; a block of another pool goes to its own pool.</li>
+  <li><strong>Lines 795-802.</strong> <code>ref_cnt -= 1</code>. At 0, a block without a hash (or any block with prefix caching off) goes to the "evict first" list; a hashed block to the "evict last" list.</li>
+  <li><strong>Line 805.</strong> <code>prepend_n</code>: unhashed blocks at the front, reused next. The comment names GPU locality as a reason.</li>
+  <li><strong>Line 807.</strong> <code>append_n</code>: cached blocks at the end, in the order given. Callers pass the blocks of a request in reverse, so the tail of a prefix is evicted before its head.</li>
+</ol>
+<p>A block that another request still uses keeps <code>ref_cnt &gt; 0</code> and stays out of the queue.</p>
+
+<h3 id="touch-and-cache-full-blocks"><code>touch</code> and <code>cache_full_blocks</code><a class="h-anchor" href="#touch-and-cache-full-blocks" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L752-L770" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/block_pool.py:752-770</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L752-L770" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">752</span><span class="ln">753</span><span class="ln">754</span><span class="ln">755</span><span class="ln">756</span><span class="ln">757</span><span class="ln">758</span><span class="ln">759</span><span class="ln">760</span><span class="ln">761</span><span class="ln hl">762</span><span class="ln hl">763</span><span class="ln hl">764</span><span class="ln hl">765</span><span class="ln hl">766</span><span class="ln hl">767</span><span class="ln hl">768</span><span class="ln">769</span><span class="ln">770</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><pre><code class="language-python">    def touch(self, blocks: Sequence[KVCacheBlock]) -&gt; None:
+        &quot;&quot;&quot;Touch a block increases its reference count by 1, and may remove
+        the block from the free queue. This is used when a block is hit by
+        another request with the same prefix.
+
+        Args:
+            blocks: A list of blocks to touch.
+
+        &quot;&quot;&quot;
+        for block in blocks:
+            if block.is_null:
+                continue
+            # ref_cnt=0 means this block is in the free list (i.e. eviction
+            # candidate), so remove it.
+            if block.ref_cnt == 0:
+                self.free_block_queue.remove(block)
+            block.ref_cnt += 1
+            if self.metrics_collector:
+                self.metrics_collector.on_block_accessed(block)</code></pre></div></div></div></figure>
+<p><code>touch</code> is how a hit takes a block: it removes the block from the middle of the free queue when the block was free (O(1) in the linked list), and adds a reference. <code>cache_full_blocks</code> gives each newly full block its hash key (block hash + group id) and inserts it in the map (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L261-L301" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:261-301 at 3e44c0d"><code>vllm/v1/core/block_pool.py:261-301</code></a>). It skips null blocks and blocks that a mask leaves out, for example sliding-window blocks that can never serve a hit (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L273-L278" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:273-278 at 3e44c0d"><code>vllm/v1/core/block_pool.py:273-278</code></a>).</p>
+
+<h3 id="get-usage-the-kv-cache-usage-metric"><code>get_usage</code>: the KV cache usage metric<a class="h-anchor" href="#get-usage-the-kv-cache-usage-metric" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L881-L892" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/core/block_pool.py:881-892</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L881-L892" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">881</span><span class="ln">882</span><span class="ln">883</span><span class="ln">884</span><span class="ln">885</span><span class="ln">886</span><span class="ln">887</span><span class="ln">888</span><span class="ln">889</span><span class="ln">890</span><span class="ln">891</span><span class="ln">892</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">    def get_usage(self) -&gt; float:
+        &quot;&quot;&quot;Get the KV cache usage.
+
+        Returns:
+            The KV cache usage (between 0.0 and 1.0).
+
+        &quot;&quot;&quot;
+        # Subtract 1 to account for null block.
+        total_gpu_blocks = self.num_gpu_blocks - 1
+        if not total_gpu_blocks:
+            return 0
+        return 1.0 - (self.get_num_free_blocks() / total_gpu_blocks)</code></pre></div></div></div></figure>
+<p>The null block is left out of the total. Free blocks with a cached prefix count as free. This value becomes <code>vllm:kv_cache_usage_perc</code> (<a href="../concepts/kv-cache-manager.html">The KV cache manager: blocks, the block pool and memory sizing</a>, Step 8).</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="data-layout-kvcacheblock-and-the-two-maps" class="dd-title">Data layout: KVCacheBlock and the two maps</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Field / structure</th><th>Type</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>KVCacheBlock.block_id</code></td><td><code>int</code>, 0 .. num_gpu_blocks − 1</td><td>index of the block in the KV tensors of every worker (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L165-L166" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:165-166 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:165-166</code></a>)</td></tr>
+    <tr><td><code>ref_cnt</code></td><td><code>int</code></td><td>requests that hold the block; 0 = in the free queue (except the null block)</td></tr>
+    <tr><td><code>_block_hash</code></td><td><code>BlockHashWithGroupId | None</code></td><td>bytes of the block hash plus the group id; set only when full and cached (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L173-L178" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:173-178 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:173-178</code></a>)</td></tr>
+    <tr><td><code>prev_free_block</code>, <code>next_free_block</code></td><td><code>KVCacheBlock | None</code></td><td>links of the free queue; <code>None</code> when not in the queue</td></tr>
+    <tr><td><code>is_null</code></td><td><code>bool</code></td><td>True only for block 0</td></tr>
+    <tr><td><code>cached_block_hash_to_block</code></td><td><code>dict[key, KVCacheBlock | dict[int, KVCacheBlock]]</code></td><td>the prefix cache; a dict of blocks only when two blocks have the same hash (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L57-L60" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:57-60 at 3e44c0d"><code>vllm/v1/core/block_pool.py:57-60</code></a>)</td></tr>
+    <tr><td><code>cached_block_hashes_by_block</code></td><td><code>dict[int, set[key]]</code></td><td>extra keys of a block (partial entries), so eviction removes them all</td></tr>
+  </tbody>
+</table>
+<p>The class uses <code>@dataclass(slots=True)</code>, so each block has no <code>__dict__</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L161" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:161 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:161</code></a>). With 27,955 blocks (an 8B model on an 80 GiB GPU, <a href="../concepts/kv-cache-manager.html">The KV cache manager: blocks, the block pool and memory sizing</a>), the pool holds 27,955 such objects plus 2 fake queue ends.</p>
+<p>Why can two blocks have the same hash? The map does not deduplicate: when a block becomes full, the pool does not look for an identical cached block, so that block ids in the block tables never change (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L48-L52" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:48-52 at 3e44c0d"><code>vllm/v1/core/block_pool.py:48-52</code></a>). Two requests that computed the same block at the same time both keep their own copy.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-eight-blocks-two-requests" class="dd-title">Worked example: eight blocks, two requests</h3></summary><div class="dd-body"><p>A pool of 9 blocks (block 0 is null), block size 4, prefix caching on. Free queue at start: <code>1 2 3 4 5 6 7 8</code>. (Derived from the methods above.)</p>
+<ol>
+  <li>R1 (10 tokens) gets 3 blocks: <code>get_new_blocks(3)</code> → 1, 2, 3. Queue: <code>4 5 6 7 8</code>. Blocks 1 and 2 are full: <code>cache_full_blocks</code> sets their hashes.</li>
+  <li>R2 has the same first 8 tokens and 12 tokens in total. Hit: blocks 1, 2 → <code>touch</code>: ref_cnt 2 each (they were not in the queue). New: 1 block → 4. Queue: <code>5 6 7 8</code>.</li>
+  <li>R1 ends after one output token: <code>free_blocks([3, 2, 1])</code>. Block 3 (no hash): ref_cnt 0, to the front. Blocks 2, 1: ref_cnt 1, stay out. Queue: <code>3 5 6 7 8</code>.</li>
+  <li>R2 ends after one output token: <code>free_blocks([4, 2, 1])</code>. Block 4 is full (tokens 8-11) and hashed. All three reach 0 and have a hash: append in order 4, 2, 1. Queue: <code>3 5 6 7 8 4 2 1</code>.</li>
+  <li>R3 needs 6 blocks: it pops 3, 5, 6, 7, 8, 4. Block 4 loses its hash (eviction). Blocks 2 and 1 survive at the end, so the first 8 tokens are still a possible hit.</li>
+</ol></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="kv-cache-events" class="dd-title">KV cache events</h3></summary><div class="dd-body"><p>With <code>--kv-events-config</code> and <code>enable_kv_cache_events</code>, the pool queues an event for each change of the prefix cache: <code>BlockStored</code> when blocks get hashes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L303-L344" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:303-344 at 3e44c0d"><code>vllm/v1/core/block_pool.py:303-344</code></a>), <code>BlockRemoved</code> when a hash goes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L611-L624" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:611-624 at 3e44c0d"><code>vllm/v1/core/block_pool.py:611-624</code></a>), and <code>AllBlocksCleared</code> on a reset (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L867-L868" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:867-868 at 3e44c0d"><code>vllm/v1/core/block_pool.py:867-868</code></a>). The scheduler drains them in <code>update_from_output</code> and publishes one batch per step (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2469-L2484" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2469-2484 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2469-2484</code></a>). External routers use these events to know which prefixes an engine has cached.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="error-paths" class="dd-title">Error paths</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>num_gpu_blocks</code> not a positive int</td><td><code>AssertionError</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L166" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:166 at 3e44c0d"><code>vllm/v1/core/block_pool.py:166</code></a></td></tr>
+    <tr><td><code>get_new_blocks</code> beyond the free count</td><td><code>ValueError</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L678-L679" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:678-679 at 3e44c0d"><code>vllm/v1/core/block_pool.py:678-679</code></a></td></tr>
+    <tr><td><code>popleft</code> on an empty queue</td><td><code>ValueError</code> "No free blocks available"</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/kv_cache_utils.py#L320-L325" target="_blank" rel="noopener" title="vllm/v1/core/kv_cache_utils.py:320-325 at 3e44c0d"><code>vllm/v1/core/kv_cache_utils.py:320-325</code></a></td></tr>
+    <tr><td><code>evict_blocks</code> with an id out of range</td><td><code>AssertionError</code> that blames the KV connector</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L823-L827" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:823-827 at 3e44c0d"><code>vllm/v1/core/block_pool.py:823-827</code></a></td></tr>
+    <tr><td><code>reset_prefix_cache</code> with blocks in use</td><td>WARNING log, returns <code>False</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L841-L848" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:841-848 at 3e44c0d"><code>vllm/v1/core/block_pool.py:841-848</code></a></td></tr>
+    <tr><td>A wrong type in the hash map</td><td><code>AssertionError</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L132-L133" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:132-133 at 3e44c0d"><code>vllm/v1/core/block_pool.py:132-133</code></a></td></tr>
+  </tbody>
+</table>
+<p>The file reads no environment variable. Its only settings are the constructor arguments: <code>num_gpu_blocks</code>, <code>enable_caching</code>, <code>hash_block_size</code>, <code>enable_kv_cache_events</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L157-L165" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:157-165 at 3e44c0d"><code>vllm/v1/core/block_pool.py:157-165</code></a>).</p></div></details>
+
+<h2 id="related-concepts">Related concepts<a class="h-anchor" href="#related-concepts" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><a href="../concepts/kv-cache-manager.html">The KV cache manager: blocks, the block pool and memory sizing</a>: how the pool fits under the manager, memory sizing and usage.</li>
+  <li><a href="../learn/prefix-caching.html">Prefix caching: the idea</a> and <a href="../concepts/prefix-caching.html">Prefix caching in the engine core: hashes, lookup, caching, eviction and KV events</a>: what the hash map is for.</li>
+  <li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py: block hashes, KVCacheBlock and the free queue</a>: <code>KVCacheBlock</code>, the free queue and the hash functions.</li>
+  <li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py: KVCacheManager and KVCacheBlocks</a>: the API above the pool.</li>
+</ul>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Where does <code>get_new_blocks</code> take blocks from, and what happens to an old hash?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>From the front of the free queue with <code>popleft_n</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L681" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:681 at 3e44c0d"><code>vllm/v1/core/block_pool.py:681</code></a>). With prefix caching, it removes the old hash of each block from the map: this is the eviction (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L687-L691" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:687-691 at 3e44c0d"><code>vllm/v1/core/block_pool.py:687-691</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L729-L750" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:729-750 at 3e44c0d"><code>vllm/v1/core/block_pool.py:729-750</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>Why does a freed block without a hash go to the front of the queue, and a block with a hash to the end?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>A block without a hash can never be a prefix-cache hit, so reusing it first costs nothing. A hashed block may serve a later hit, so it waits as long as possible (LRU) (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L797-L807" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:797-807 at 3e44c0d"><code>vllm/v1/core/block_pool.py:797-807</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>In the worked example of the deep dive, why do blocks 2 and 1 survive R3 while block 4 does not, although all three were freed at the same time?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>R2 freed its blocks in reverse order, <code>[4, 2, 1]</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/single_type_kv_cache_manager.py#L597-L598" target="_blank" rel="noopener" title="vllm/v1/core/single_type_kv_cache_manager.py:597-598 at 3e44c0d"><code>vllm/v1/core/single_type_kv_cache_manager.py:597-598</code></a>). All three had a hash, so <code>append_n</code> added them to the end in that order (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/block_pool.py#L807" target="_blank" rel="noopener" title="vllm/v1/core/block_pool.py:807 at 3e44c0d"><code>vllm/v1/core/block_pool.py:807</code></a>). Block 4 is nearer the front, so R3 popped it first. The tail of a prefix goes before its head, which keeps the more shareable head longer.</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/kv-cache-manager.html">The KV cache manager: blocks, the block pool and memory sizing</a><span class="rel-sum">In the engine core, the KVCacheManager hands out KV blocks to the scheduler through a coordinator, one single-type manager per KV cache group and one BlockPool. The workers only receive block ids. The number of blocks comes from a memory profile at start-up.</span></li><li><a href="../concepts/prefix-caching.html">Prefix caching in the engine core: hashes, lookup, caching, eviction and KV events</a><span class="rel-sum">The mechanics of prefix caching in the engine core. The input thread hashes each new request, the scheduler looks the hashes up in the block pool and touches the hits, allocate_slots hashes blocks that become full, and the free queue decides what to evict. KV events tell an external router what each engine holds.</span></li><li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py: KVCacheManager and KVCacheBlocks</a><span class="rel-sum">vllm/v1/core/kv_cache_manager.py is the KV cache API of the scheduler. KVCacheManager looks up prefix-cache hits, allocates slots, caches full blocks, frees requests and reports usage; KVCacheBlocks carries the result per KV cache group.</span></li><li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py: block hashes, KVCacheBlock and the free queue</a><span class="rel-sum">vllm/v1/core/kv_cache_utils.py holds the building blocks of the KV cache manager. It defines the block hash types, NONE_HASH, the extra keys and the request block hasher, the KVCacheBlock record, the FreeKVCacheBlockQueue linked list, the block-size resolution for several KV cache groups, and the capacity log line.</span></li><li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py: the Scheduler</a><span class="rel-sum">vllm/v1/core/sched/scheduler.py holds the Scheduler class (3,539 lines). schedule() shares the token budget between running and waiting requests and builds the SchedulerOutput; update_from_output() appends the sampled tokens, stops requests and builds the EngineCoreOutputs.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../code/v1-core-kv-cache-manager.html"><span class="pn-dir">← Previous</span><span class="pn-title">v1/core/kv_cache_manager.py: KVCacheManager and KVCacheBlocks</span></a><a class="pn pn-next" href="../code/v1-core-kv-cache-utils.html"><span class="pn-dir">Next →</span><span class="pn-title">v1/core/kv_cache_utils.py: block hashes, KVCacheBlock and the free queue</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#purpose">Purpose</a></li><li class="toc-l2"><a href="#where-it-sits">Where it sits</a></li><li class="toc-l3"><a href="#who-calls-it">Who calls it</a></li><li class="toc-l3"><a href="#what-it-calls">What it calls</a></li><li class="toc-l2"><a href="#key-classes-and-functions">Key classes and functions</a></li><li class="toc-l2"><a href="#walk-through-the-main-methods">Walk through the main methods</a></li><li class="toc-l3"><a href="#init-all-blocks-at-once-and-the-null-block">__init__: all blocks at once, and the null block</a></li><li class="toc-l3"><a href="#get-new-blocks-take-from-the-front">get_new_blocks: take from the front</a></li><li class="toc-l3"><a href="#free-blocks-back-in-eviction-order">free_blocks: back in eviction order</a></li><li class="toc-l3"><a href="#touch-and-cache-full-blocks">touch and cache_full_blocks</a></li><li class="toc-l3"><a href="#get-usage-the-kv-cache-usage-metric">get_usage: the KV cache usage metric</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#data-layout-kvcacheblock-and-the-two-maps">Data layout: KVCacheBlock and the two maps</a></li><li class="toc-l3"><a href="#worked-example-eight-blocks-two-requests">Worked example: eight blocks, two requests</a></li><li class="toc-l3"><a href="#kv-cache-events">KV cache events</a></li><li class="toc-l3"><a href="#error-paths">Error paths</a></li><li class="toc-l2"><a href="#related-concepts">Related concepts</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

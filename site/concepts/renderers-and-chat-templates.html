@@ -1,0 +1,742 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Renderers and chat templates: from messages to token ids · vLLM Explained</title>
+<meta name="description" content="The renderer is the front-end layer that turns a chat or completion request into token ids. This page shows which renderer vLLM picks, how it finds and fills the chat template, the thread pool and its timeout, the length check, multimodal placeholders, and the derender and token-in token-out paths.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="concepts/renderers-and-chat-templates">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a class="current" aria-current="page" href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>vLLM concepts</span><span class="sep">›</span><span>Serving features</span><span class="sep">›</span><span aria-current="page">Renderers and chat templates</span></nav>
+<h1 class="page-title">Renderers and chat templates: from messages to token ids</h1>
+<div class="page-meta"><span class="level level-intermediate" title="Level">Intermediate</span><span class="meta-sec">vLLM concepts</span><span class="meta-time">about 13 min read + 4 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../learn/openai-api.html">The OpenAI-compatible API</a> <span class="level level-beginner level-sm">Beginner</span></li><li><a href="../concepts/openai-server.html">The OpenAI-compatible server: launch modes, app, serving classes and streaming</a> <span class="level level-intermediate level-sm">Intermediate</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">A renderer turns the messages of a request into token ids. It fills the chat template, tokenizes in a thread pool and checks the length.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>The model reads one list of token ids. A chat request has a list of messages, maybe images, maybe tools. Something in between must write the messages into one text with the model's special markers and turn that text into ids. The <a class="term" href="../reference/glossary.html#term-chat-template" data-term="chat template" data-def="A Jinja template, usually in the tokenizer files of a model, that turns a list of chat messages into one prompt string.">chat template</a> (a Jinja program from the model's files) does the writing; the tokenizer does the cutting (<a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/learn/tokens.html" target="_blank" rel="noopener" title="DeepInfer Explained: Tokens and tokenizers">Tokens and tokenizers<span class="ext-mark" aria-hidden="true">↗</span></a>). In vLLM, the object that drives both is the <strong>renderer</strong>.</p>
+<p>The renderer has two layers. <code>OnlineRenderer</code> knows the OpenAI API: it checks <code>tool_choice</code>, refuses untrusted templates, merges the template variables and lets the parsers adjust the request (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/online_renderer.py#L225-L318" target="_blank" rel="noopener" title="vllm/renderers/online_renderer.py:225-318 at 3e44c0d"><code>vllm/renderers/online_renderer.py:225-318</code></a>). Under it, a <code>BaseRenderer</code> subclass knows the model family: <code>HfRenderer</code> for Hugging Face tokenizers, <code>MistralRenderer</code> for <code>mistral-common</code>, and a few others. Both layers run in the API server process (<a class="term" href="../reference/glossary.html#term-front-end" data-term="front end" data-def="The API server process of vllm serve. It runs the HTTP server and AsyncLLM, and sends requests to the engine core process.">front end</a>); the engine core gets token ids only.</p>
+<p>The renderer also starts the clock. <code>arrival_time</code> is taken at the start of rendering, before the template runs. The TTFT metric of vLLM starts there (<a href="../learn/serving-metrics.html">Serving metrics: TTFT, TPOT, ITL, throughput, goodput</a>).</p>
+<p><strong>An everyday comparison.</strong> Think of a clerk who copies a customer's letter onto a fixed form, then types the form into a machine code. The form layout comes from the model's owner, not from the clerk. The comparison stops being true in one place: the "form" is a small program (Jinja) that can branch on variables such as <code>add_generation_prompt</code> or <code>tools</code>. So the same messages can give different prompts.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b7a_render_flow"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: three boxes. The request has 3 messages: system &#x27;You are a helpful assistant.&#x27;, user &#x27;What is the capital of France?&#x27;, assistant &#x27;The capital of France is&#x27;, with continue_final_message true and add_generation_prompt false. The chat template box lists the resolution order: 1 the request template or --chat-template, 2 the processor template when there are no tools, 3 the tokenizer template, 4 a built-in fallback by model type; request kwargs override server defaults and unknown names are dropped; HF renderer timeout 30 s. The prompt string box shows the ChatML text with im_start and im_end markers and the open assistant turn &#x27;The capital of France is&#x27;. Panel 2: the tokenizer in the thread pool with add_special_tokens False makes 31 token ids starting 151644, 8948, 198, 2610; the length check compares with max_model_len and raises VLLMValidationError (HTTP 400) when the prompt is longer; the EngineInput dict has type token, the 31 ids, the prompt string and arrival_time, taken before the template."><svg role="img" aria-label="Panel 1: three boxes. The request has 3 messages: system &#x27;You are a helpful assistant.&#x27;, user &#x27;What is the capital of France?&#x27;, assistant &#x27;The capital of France is&#x27;, with continue_final_message true and add_generation_prompt false. The chat template box lists the resolution order: 1 the request template or --chat-template, 2 the processor template when there are no tools, 3 the tokenizer template, 4 a built-in fallback by model type; request kwargs override server defaults and unknown names are dropped; HF renderer timeout 30 s. The prompt string box shows the ChatML text with im_start and im_end markers and the open assistant turn &#x27;The capital of France is&#x27;. Panel 2: the tokenizer in the thread pool with add_special_tokens False makes 31 token ids starting 151644, 8948, 198, 2610; the length check compares with max_model_len and raises VLLMValidationError (HTTP 400) when the prompt is longer; the EngineInput dict has type token, the 31 ids, the prompt string and arrival_time, taken before the template." xmlns="http://www.w3.org/2000/svg" width="1100" height="812" viewBox="0 0 1100 812">
+<defs><marker id="dg-b7a_render_flow-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b7a_render_flow-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker><marker id="dg-b7a_render_flow-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker></defs>
+<rect width="1100" height="812" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">From chat messages to token ids</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">HfRenderer  ·  ChatML template (examples/template_chatml.jinja)  ·  Qwen2.5 tokenizer  ·  3 messages</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">messages → chat template → prompt string → tokenizer → 31 token ids + arrival_time</text>
+<rect x="20.0" y="116.0" width="1060.0" height="300.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="142.0" r="13" fill="#111827"/>
+<text x="46.0" y="146.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="147.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">How do the messages become one prompt string?</text>
+<text x="68.0" y="166.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The renderer picks a template, merges the template kwargs, and renders in a thread pool.</text>
+<rect x="46.0" y="186.0" width="300.0" height="196.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="58.0" y="206.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Request: 3 messages</text>
+<text x="58.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">system: You are a helpful</text>
+<text x="58.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">        assistant.</text>
+<text x="58.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">user:   What is the capital</text>
+<text x="58.0" y="269.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">        of France?</text>
+<text x="58.0" y="284.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">assistant: The capital of</text>
+<text x="58.0" y="299.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">        France is</text>
+<text x="58.0" y="314.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">continue_final_message: true</text>
+<text x="58.0" y="329.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">add_generation_prompt: false</text>
+<rect x="400.0" y="186.0" width="300.0" height="196.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="412.0" y="206.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Chat template (Jinja)</text>
+<text x="412.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">1 request / --chat-template</text>
+<text x="412.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">2 processor template (no tools)</text>
+<text x="412.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">3 tokenizer template</text>
+<text x="412.0" y="269.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">4 built-in fallback by model type</text>
+<text x="412.0" y="284.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">kwargs: request &gt; server default</text>
+<text x="412.0" y="299.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  unknown names dropped</text>
+<text x="412.0" y="314.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">timeout 30 s (HF renderer)</text>
+<text x="412.0" y="329.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">hf.py:264-319, 761-789</text>
+<rect x="754.0" y="186.0" width="300.0" height="196.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="766.0" y="206.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Prompt string</text>
+<text x="766.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">&lt;|im_start|&gt;system\n</text>
+<text x="766.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">You are a helpful assistant.</text>
+<text x="766.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">&lt;|im_end|&gt;\n</text>
+<text x="766.0" y="269.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">&lt;|im_start|&gt;user\n</text>
+<text x="766.0" y="284.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">What is the capital of France?</text>
+<text x="766.0" y="299.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">&lt;|im_end|&gt;\n</text>
+<text x="766.0" y="314.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">&lt;|im_start|&gt;assistant\n</text>
+<text x="766.0" y="329.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The capital of France is</text>
+<line x1="346.0" y1="284.0" x2="398.0" y2="284.0" stroke="#2563eb" stroke-width="1.6" marker-end="url(#dg-b7a_render_flow-m0)"/>
+<line x1="700.0" y1="284.0" x2="752.0" y2="284.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b7a_render_flow-m1)"/>
+<text x="754.0" y="404.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre" font-style="italic">No &lt;|im_end|&gt; after the last message: the turn stays open.</text>
+<rect x="20.0" y="438.0" width="1060.0" height="260.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="464.0" r="13" fill="#111827"/>
+<text x="46.0" y="468.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="469.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">How does the string become an engine input?</text>
+<text x="68.0" y="488.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The tokenizer runs in the same thread pool; then a length check and the arrival time.</text>
+<rect x="46.0" y="508.0" width="300.0" height="156.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="58.0" y="528.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Tokenizer (thread pool)</text>
+<text x="58.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">tokenizer(prompt, **kwargs)</text>
+<text x="58.0" y="561.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">add_special_tokens = False</text>
+<text x="58.0" y="576.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  (the template has them)</text>
+<text x="58.0" y="591.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">→ 31 token ids:</text>
+<text x="58.0" y="606.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">[151644, 8948, 198, 2610,</text>
+<text x="58.0" y="621.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  ..., 6722, 315, 9625, 374]</text>
+<text x="58.0" y="636.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">base.py:663-678</text>
+<rect x="400.0" y="508.0" width="300.0" height="156.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="412.0" y="528.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Length check</text>
+<text x="412.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">max_total_tokens = max_model_len</text>
+<text x="412.0" y="561.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">31 ≤ max_model_len → pass</text>
+<text x="412.0" y="576.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">longer → VLLMValidationError</text>
+<text x="412.0" y="591.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  → HTTP 400 (no engine call)</text>
+<text x="412.0" y="606.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">params.py:518-538</text>
+<rect x="754.0" y="508.0" width="300.0" height="156.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="766.0" y="528.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">EngineInput (dict)</text>
+<text x="766.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">type: &#x27;token&#x27;</text>
+<text x="766.0" y="561.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">prompt_token_ids: [31 ids]</text>
+<text x="766.0" y="576.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">prompt: the string of panel 1</text>
+<text x="766.0" y="591.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">arrival_time: time.time()</text>
+<text x="766.0" y="606.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  taken BEFORE the template</text>
+<text x="766.0" y="621.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">base.py:1380, 1274</text>
+<line x1="346.0" y1="586.0" x2="398.0" y2="586.0" stroke="#7c3aed" stroke-width="1.6" marker-end="url(#dg-b7a_render_flow-m1)"/>
+<line x1="700.0" y1="586.0" x2="752.0" y2="586.0" stroke="#d97706" stroke-width="1.6" marker-end="url(#dg-b7a_render_flow-m2)"/>
+<text x="30.0" y="733.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="722.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="733.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">request</text>
+<rect x="188.9" y="722.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="209.9" y="733.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">renderer work (thread pool)</text>
+<rect x="394.9" y="722.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="415.9" y="733.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">check</text>
+<rect x="473.7" y="722.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="494.7" y="733.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">result for AsyncLLM</text>
+<text x="30.0" y="762.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Token ids measured with the Qwen2.5 tokenizer outside the repo; another model gives other ids and counts.</text>
+<text x="30.0" y="780.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Not shown: multimodal content parts (placeholders, MM processor) and the other renderers (Mistral, DeepSeek, Kimi K3, ...).</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: a 3-message chat becomes a ChatML prompt string (panel 1), then 31 token ids in an EngineInput (panel 2). Token ids are from the Qwen2.5 tokenizer.</figcaption><a class="diagram-open" href="../diagrams/b7a_render_flow.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read each panel from left to right. Violet boxes run in the renderer's thread pool. The amber box is the length check; it can stop the request with HTTP 400 before the engine sees it.</p>
+
+<h2 id="in-the-code">In the code<a class="h-anchor" href="#in-the-code" aria-label="Link to this section">#</a></h2>
+
+<h3 id="step-1-which-renderer">Step 1: which renderer<a class="h-anchor" href="#step-1-which-renderer" aria-label="Link to this section">#</a></h3>
+<p>AsyncLLM makes one renderer at start-up (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L167" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:167 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:167</code></a>). The choice uses the tokenizer mode as the renderer mode:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/registry.py#L22-L34" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/renderers/registry.py:22-34</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/registry.py#L22-L34" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">22</span><span class="ln">23</span><span class="ln">24</span><span class="ln">25</span><span class="ln">26</span><span class="ln">27</span><span class="ln">28</span><span class="ln">29</span><span class="ln">30</span><span class="ln">31</span><span class="ln">32</span><span class="ln">33</span><span class="ln">34</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">_VLLM_RENDERERS = {
+    &quot;alpamayo2_super&quot;: (&quot;hf&quot;, &quot;HfRenderer&quot;),
+    &quot;cohere&quot;: (&quot;cohere&quot;, &quot;CohereRenderer&quot;),
+    &quot;deepseek_v32&quot;: (&quot;deepseek_v32&quot;, &quot;DeepseekV32Renderer&quot;),
+    &quot;deepseek_v4&quot;: (&quot;deepseek_v4&quot;, &quot;DeepseekV4Renderer&quot;),
+    &quot;deepseek_v41&quot;: (&quot;deepseek_v4&quot;, &quot;DeepseekV41Renderer&quot;),
+    &quot;hf&quot;: (&quot;hf&quot;, &quot;HfRenderer&quot;),
+    &quot;kimi_audio&quot;: (&quot;hf&quot;, &quot;HfRenderer&quot;),
+    &quot;kimi_k3&quot;: (&quot;kimi_k3&quot;, &quot;KimiK3Renderer&quot;),
+    &quot;mistral&quot;: (&quot;mistral&quot;, &quot;MistralRenderer&quot;),
+    &quot;terratorch&quot;: (&quot;terratorch&quot;, &quot;TerratorchRenderer&quot;),
+    &quot;inkling&quot;: (&quot;inkling&quot;, &quot;InklingRenderer&quot;),
+}</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/registry.py#L84-L90" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/renderers/registry.py:84-90</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/registry.py#L84-L90" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">84</span><span class="ln">85</span><span class="ln">86</span><span class="ln">87</span><span class="ln">88</span><span class="ln">89</span><span class="ln">90</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">def renderer_from_config(config: &quot;VllmConfig&quot;, **kwargs):
+    model_config = config.model_config
+
+    tokenizer = cached_tokenizer_from_config(model_config, **kwargs)
+    renderer_mode, *_ = tokenizer_args_from_config(model_config, **kwargs)
+
+    return RENDERER_REGISTRY.load_renderer(renderer_mode, config, tokenizer)</code></pre></div></div></div></figure>
+<p>The default <code>--tokenizer-mode auto</code> is resolved in two places:</p>
+<ol>
+  <li><code>ModelConfig</code> sets a family mode for some architectures: for example <code>DeepseekV32ForCausalLM</code> → <code>deepseek_v32</code>, <code>DeepseekV4ForCausalLM</code> → <code>deepseek_v4</code>, <code>KimiK3ForConditionalGeneration</code> → <code>kimi_k3</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/model.py#L746-L766" target="_blank" rel="noopener" title="vllm/config/model.py:746-766 at 3e44c0d"><code>vllm/config/model.py:746-766</code></a>).</li>
+  <li>If the mode is still <code>auto</code>, a Mistral repository with <code>tekken.json</code> or <code>tokenizer.model.v*</code> files gets <code>mistral</code>. Everything else gets <code>hf</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/tokenizers/registry.py#L145-L164" target="_blank" rel="noopener" title="vllm/tokenizers/registry.py:145-164 at 3e44c0d"><code>vllm/tokenizers/registry.py:145-164</code></a>).</li>
+</ol>
+<p>So most models use <code>HfRenderer</code>; a few families get their own renderer without a flag, and <code>cohere</code> needs <code>--tokenizer-mode cohere</code>. <code>RendererRegistry.register</code> can add or overwrite a mode, with a warning (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/registry.py#L42-L54" target="_blank" rel="noopener" title="vllm/renderers/registry.py:42-54 at 3e44c0d"><code>vllm/renderers/registry.py:42-54</code></a>).</p>
+
+<h3 id="step-2-onlinerenderer-prepares-the-chat">Step 2: OnlineRenderer prepares the chat<a class="h-anchor" href="#step-2-onlinerenderer-prepares-the-chat" aria-label="Link to this section">#</a></h3>
+<p><code>OpenAIServingChat</code> calls <code>OnlineRenderer.render_chat</code> after the model and engine checks (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/serving.py#L278-L285" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/serving.py:278-285 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/serving.py:278-285</code></a>). Before any template work, it checks the tools and the template:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/online_renderer.py#L260-L298" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/renderers/online_renderer.py:260-298</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/online_renderer.py#L260-L298" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">260</span><span class="ln">261</span><span class="ln">262</span><span class="ln">263</span><span class="ln">264</span><span class="ln hl">265</span><span class="ln">266</span><span class="ln">267</span><span class="ln">268</span><span class="ln">269</span><span class="ln">270</span><span class="ln">271</span><span class="ln hl">272</span><span class="ln">273</span><span class="ln">274</span><span class="ln">275</span><span class="ln">276</span><span class="ln">277</span><span class="ln">278</span><span class="ln">279</span><span class="ln">280</span><span class="ln">281</span><span class="ln">282</span><span class="ln hl">283</span><span class="ln hl">284</span><span class="ln hl">285</span><span class="ln hl">286</span><span class="ln hl">287</span><span class="ln hl">288</span><span class="ln">289</span><span class="ln">290</span><span class="ln">291</span><span class="ln hl">292</span><span class="ln hl">293</span><span class="ln hl">294</span><span class="ln hl">295</span><span class="ln hl">296</span><span class="ln">297</span><span class="ln">298</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><pre><code class="language-python">        # Validate tool_choice when tool parsing is required but unavailable
+        if tool_parsing_unavailable and request.tool_choice not in (
+            None,
+            &quot;none&quot;,
+        ):
+            if request.tool_choice == &quot;auto&quot; and not self.enable_auto_tools:
+                # for hf tokenizers, &quot;auto&quot; tools requires
+                # --enable-auto-tool-choice and --tool-call-parser
+                return self.create_error_response(
+                    &#x27;&quot;auto&quot; tool choice requires &#x27;
+                    &quot;--enable-auto-tool-choice and --tool-call-parser to be set&quot;
+                )
+            elif request.tool_choice != &quot;auto&quot;:
+                # &quot;required&quot; or named tool requires tool parser
+                if isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam):
+                    tool_choice_desc = f&#x27;function &quot;{request.tool_choice.function.name}&quot;&#x27;
+                else:
+                    tool_choice_desc = f&#x27;&quot;{request.tool_choice}&quot;&#x27;
+                return self.create_error_response(
+                    f&quot;tool_choice={tool_choice_desc} requires &quot;
+                    &quot;--tool-call-parser to be set&quot;
+                )
+
+        if request.tools is None or (
+            request.tool_choice == &quot;none&quot; and self.exclude_tools_when_tool_choice_none
+        ):
+            tool_dicts = None
+        else:
+            tool_dicts = [tool.model_dump() for tool in request.tools]
+
+        if not self.use_harmony:
+            # Common case.
+            error_check_ret = self.validate_chat_template(
+                request_chat_template=request.chat_template,
+                chat_template_kwargs=request.chat_template_kwargs,
+                trust_request_chat_template=self.trust_request_chat_template,
+            )
+            if error_check_ret is not None:
+                return error_check_ret</code></pre></div></div></div></figure>
+<ol>
+  <li>Lines 260-281: without a tool parser, <code>tool_choice</code> <code>"auto"</code>, <code>"required"</code> or a named function gives an error response. Mistral tokenizers and gpt-oss (Harmony) models skip this check (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/online_renderer.py#L253-L258" target="_blank" rel="noopener" title="vllm/renderers/online_renderer.py:253-258 at 3e44c0d"><code>vllm/renderers/online_renderer.py:253-258</code></a>). The page <a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers: from model text to tool_calls and reasoning</a> explains when the parser exists.</li>
+  <li>Lines 283-288: the tool definitions become plain dicts for the template. With <code>tool_choice: "none"</code> and <code>--exclude-tools-when-tool-choice-none</code>, the template gets no tools.</li>
+  <li>Lines 292-296: a template in the request (field <code>chat_template</code>, or the key <code>chat_template</code> in <code>chat_template_kwargs</code>) is refused unless the server runs with <code>--trust-request-chat-template</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/online_renderer.py#L679-L698" target="_blank" rel="noopener" title="vllm/renderers/online_renderer.py:679-698 at 3e44c0d"><code>vllm/renderers/online_renderer.py:679-698</code></a>).</li>
+</ol>
+<p><code>preprocess_chat</code> then merges the variables and calls the model-level renderer (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/online_renderer.py#L774-L815" target="_blank" rel="noopener" title="vllm/renderers/online_renderer.py:774-815 at 3e44c0d"><code>vllm/renderers/online_renderer.py:774-815</code></a>). After rendering, it builds a parser object and calls its <code>adjust_request</code>, if a tool or reasoning parser is set (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/online_renderer.py#L824-L859" target="_blank" rel="noopener" title="vllm/renderers/online_renderer.py:824-859 at 3e44c0d"><code>vllm/renderers/online_renderer.py:824-859</code></a>). A tool parser can add a structured-output constraint there (<a href="../concepts/structured-outputs.html">Structured outputs: JSON schemas, grammars and token bitmasks in vLLM</a>).</p>
+
+<h3 id="step-3-render-chat-async-step-by-step">Step 3: render_chat_async, step by step<a class="h-anchor" href="#step-3-render-chat-async-step-by-step" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/base.py#L1371-L1411" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/renderers/base.py:1371-1411</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/base.py#L1371-L1411" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1371</span><span class="ln">1372</span><span class="ln">1373</span><span class="ln">1374</span><span class="ln">1375</span><span class="ln">1376</span><span class="ln">1377</span><span class="ln">1378</span><span class="ln">1379</span><span class="ln hl">1380</span><span class="ln">1381</span><span class="ln">1382</span><span class="ln">1383</span><span class="ln">1384</span><span class="ln hl">1385</span><span class="ln hl">1386</span><span class="ln hl">1387</span><span class="ln hl">1388</span><span class="ln">1389</span><span class="ln">1390</span><span class="ln">1391</span><span class="ln">1392</span><span class="ln">1393</span><span class="ln">1394</span><span class="ln">1395</span><span class="ln hl">1396</span><span class="ln">1397</span><span class="ln">1398</span><span class="ln">1399</span><span class="ln">1400</span><span class="ln">1401</span><span class="ln hl">1402</span><span class="ln hl">1403</span><span class="ln hl">1404</span><span class="ln hl">1405</span><span class="ln hl">1406</span><span class="ln hl">1407</span><span class="ln hl">1408</span><span class="ln hl">1409</span><span class="ln">1410</span><span class="ln">1411</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(37 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(38 * var(--code-lh))"></span><pre><code class="language-python">    async def render_chat_async(
+        self,
+        conversations: Sequence[list[&quot;ChatCompletionMessageParam&quot;]],
+        chat_params: ChatParams,
+        tok_params: TokenizeParams | None = None,
+        *,
+        prompt_extras: dict[str, Any] | None = None,
+        skip_mm_cache: bool = False,
+    ):
+        arrival_time = time.time()
+
+        if tok_params is None:
+            tok_params = self.default_chat_tok_params
+
+        rendered = [
+            self.render_messages_async(conversation, chat_params)
+            for conversation in conversations
+        ]
+
+        out_conversations = list[list[&quot;ConversationMessage&quot;]]()
+        dict_prompts = list[DictPrompt]()
+        for conv, prompt in await asyncio.gather(*rendered):
+            out_conversations.append(conv)
+            dict_prompts.append(prompt)
+
+        tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
+
+        prompt_extras = dict(prompt_extras or {})
+        prompt_extras[&quot;media_io_kwargs&quot;] = chat_params.media_io_kwargs or {}
+        self._apply_prompt_extras(tok_prompts, prompt_extras)
+
+        eng_prompts = await asyncio.gather(
+            *(
+                self.process_for_engine_async(
+                    p, arrival_time, skip_mm_cache=skip_mm_cache, tok_params=tok_params
+                )
+                for p in tok_prompts
+            )
+        )
+
+        return out_conversations, eng_prompts</code></pre></div></div></div></figure>
+<ol>
+  <li>Line 1380: <code>arrival_time = time.time()</code>, before anything else.</li>
+  <li>Lines 1385-1394: <code>render_messages_async</code> for each conversation (the chat route sends one). It parses the content parts and applies the template; the result is a dict prompt with text or ids.</li>
+  <li>Line 1396: <code>tokenize_prompts_async</code>. A prompt that already has <code>prompt_token_ids</code> skips the tokenizer, but still gets the length check (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/base.py#L756-L769" target="_blank" rel="noopener" title="vllm/renderers/base.py:756-769 at 3e44c0d"><code>vllm/renderers/base.py:756-769</code></a>).</li>
+  <li>Lines 1398-1400: the extras <code>cache_salt</code>, <code>mm_processor_kwargs</code> and <code>media_io_kwargs</code> go into the prompt.</li>
+  <li>Lines 1402-1409: <code>process_for_engine_async</code> runs the multimodal processor if needed and writes <code>arrival_time</code> into the engine input (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/base.py#L1255-L1276" target="_blank" rel="noopener" title="vllm/renderers/base.py:1255-1276 at 3e44c0d"><code>vllm/renderers/base.py:1255-1276</code></a>).</li>
+</ol>
+
+<h3 id="step-4-which-template">Step 4: which template<a class="h-anchor" href="#step-4-which-template" aria-label="Link to this section">#</a></h3>
+<p><code>HfRenderer</code> resolves the template for every request, in this order:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L264-L319" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/renderers/hf.py:264-319</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L264-L319" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">264</span><span class="ln">265</span><span class="ln">266</span><span class="ln">267</span><span class="ln">268</span><span class="ln">269</span><span class="ln">270</span><span class="ln">271</span><span class="ln hl">272</span><span class="ln hl">273</span><span class="ln hl">274</span><span class="ln hl">275</span><span class="ln">276</span><span class="ln">277</span><span class="ln hl">278</span><span class="ln hl">279</span><span class="ln hl">280</span><span class="ln hl">281</span><span class="ln hl">282</span><span class="ln hl">283</span><span class="ln hl">284</span><span class="ln hl">285</span><span class="ln hl">286</span><span class="ln hl">287</span><span class="ln hl">288</span><span class="ln hl">289</span><span class="ln hl">290</span><span class="ln">291</span><span class="ln">292</span><span class="ln hl">293</span><span class="ln hl">294</span><span class="ln">295</span><span class="ln">296</span><span class="ln">297</span><span class="ln">298</span><span class="ln">299</span><span class="ln">300</span><span class="ln">301</span><span class="ln">302</span><span class="ln hl">303</span><span class="ln hl">304</span><span class="ln hl">305</span><span class="ln hl">306</span><span class="ln hl">307</span><span class="ln hl">308</span><span class="ln hl">309</span><span class="ln hl">310</span><span class="ln hl">311</span><span class="ln hl">312</span><span class="ln hl">313</span><span class="ln">314</span><span class="ln">315</span><span class="ln">316</span><span class="ln">317</span><span class="ln">318</span><span class="ln">319</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(39 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(40 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(41 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(42 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(43 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(44 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(45 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(46 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(47 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(48 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(49 * var(--code-lh))"></span><pre><code class="language-python">def resolve_chat_template(
+    tokenizer: HfTokenizer,
+    chat_template: str | None,
+    tools: list[dict[str, Any]] | None,
+    *,
+    model_config: ModelConfig,
+) -&gt; str | None:
+    # 1st priority: The given chat template
+    if chat_template is not None:
+        # Resolve template names (e.g. &quot;tool_use&quot;) to actual Jinja content
+        # so that downstream kwargs detection can parse template variables.
+        return tokenizer.get_chat_template(chat_template, tools=tools)
+
+    # 2nd priority: AutoProcessor chat template, unless tool calling is enabled
+    if tools is None:
+        chat_template = _try_get_processor_chat_template(
+            tokenizer,
+            revision=model_config.tokenizer_revision,
+            code_revision=(
+                model_config.code_revision
+                if model_config.tokenizer == model_config.model
+                else None
+            ),
+            trust_remote_code=model_config.trust_remote_code,
+        )
+        if chat_template is not None:
+            return chat_template
+
+    # 3rd priority: AutoTokenizer chat template
+    try:
+        return tokenizer.get_chat_template(chat_template, tools=tools)
+    except Exception:
+        logger.debug(
+            &quot;Failed to load AutoTokenizer chat template for %s&quot;,
+            tokenizer.name_or_path,
+            exc_info=True,
+        )
+
+    # 4th priority: Predefined fallbacks
+    path = get_chat_template_fallback_path(
+        model_type=model_config.hf_config.model_type,
+        tokenizer_name_or_path=tokenizer.name_or_path,
+    )
+    if path is not None:
+        logger.info_once(
+            &quot;Loading chat template fallback for %s as there isn&#x27;t one &quot;
+            &quot;defined on HF Hub.&quot;,
+            tokenizer.name_or_path,
+        )
+        chat_template = load_chat_template(path)
+    else:
+        logger.debug_once(
+            &quot;There is no chat template fallback for %s&quot;, tokenizer.name_or_path
+        )
+
+    return chat_template</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Given.</strong> The request template (only when trusted) or <code>--chat-template</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L656" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/protocol.py:656 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/protocol.py:656</code></a>). A name such as <code>tool_use</code> selects a named template of the tokenizer (line 275).</li>
+  <li><strong>Processor.</strong> The template of the model's <code>AutoProcessor</code>, but only when the request has no tools (lines 278-290). Multimodal models often keep their template there.</li>
+  <li><strong>Tokenizer.</strong> The template in the tokenizer files (line 294).</li>
+  <li><strong>Fallback.</strong> A template that vLLM ships, chosen by model type, for example <code>template_basic.jinja</code> for CLIP or <code>template_chatml.jinja</code> for older MiniCPM-V (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/transformers_utils/chat_templates/registry.py#L25-L40" target="_blank" rel="noopener" title="vllm/transformers_utils/chat_templates/registry.py:25-40 at 3e44c0d"><code>vllm/transformers_utils/chat_templates/registry.py:25-40</code></a>).</li>
+</ol>
+<p>No template at all raises <code>ChatTemplateResolutionError</code>, a client error, so the request gets HTTP 400 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L842-L847" target="_blank" rel="noopener" title="vllm/renderers/hf.py:842-847 at 3e44c0d"><code>vllm/renderers/hf.py:842-847</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/exceptions.py#L65-L68" target="_blank" rel="noopener" title="vllm/exceptions.py:65-68 at 3e44c0d"><code>vllm/exceptions.py:65-68</code></a>). <code>--chat-template</code> accepts a file path, a built-in file name, or the template text itself (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/chat_utils/chat_template.py#L56-L101" target="_blank" rel="noopener" title="vllm/renderers/chat_utils/chat_template.py:56-101 at 3e44c0d"><code>vllm/renderers/chat_utils/chat_template.py:56-101</code></a>). A path-like value that does not exist stops the server at start-up (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/chat_utils/chat_template.py#L21-L53" target="_blank" rel="noopener" title="vllm/renderers/chat_utils/chat_template.py:21-53 at 3e44c0d"><code>vllm/renderers/chat_utils/chat_template.py:21-53</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/common/cli_args.py#L510-L511" target="_blank" rel="noopener" title="vllm/entrypoints/common/cli_args.py:510-511 at 3e44c0d"><code>vllm/entrypoints/common/cli_args.py:510-511</code></a>).</p>
+
+<h3 id="step-5-the-template-variables">Step 5: the template variables<a class="h-anchor" href="#step-5-the-template-variables" aria-label="Link to this section">#</a></h3>
+<p>The template sees <code>messages</code>, <code>tools</code> and a set of keyword variables. The request builds them first:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L635-L669" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/entrypoints/openai/chat_completion/protocol.py:635-669</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L635-L669" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">635</span><span class="ln">636</span><span class="ln">637</span><span class="ln">638</span><span class="ln">639</span><span class="ln hl">640</span><span class="ln hl">641</span><span class="ln hl">642</span><span class="ln hl">643</span><span class="ln hl">644</span><span class="ln hl">645</span><span class="ln">646</span><span class="ln">647</span><span class="ln">648</span><span class="ln">649</span><span class="ln">650</span><span class="ln">651</span><span class="ln hl">652</span><span class="ln hl">653</span><span class="ln">654</span><span class="ln">655</span><span class="ln">656</span><span class="ln">657</span><span class="ln hl">658</span><span class="ln hl">659</span><span class="ln hl">660</span><span class="ln hl">661</span><span class="ln">662</span><span class="ln">663</span><span class="ln">664</span><span class="ln">665</span><span class="ln">666</span><span class="ln">667</span><span class="ln">668</span><span class="ln">669</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><pre><code class="language-python">    def build_chat_params(
+        self,
+        default_template: str | None,
+        default_template_content_format: ChatTemplateContentFormatOption,
+    ) -&gt; ChatParams:
+        extra_kwargs: dict[str, Any] = dict(
+            add_generation_prompt=self.add_generation_prompt,
+            continue_final_message=self.continue_final_message,
+            documents=self.documents,
+            reasoning_effort=self.reasoning_effort,
+        )
+
+        # When reasoning is requested, activate thinking for models whose
+        # chat templates require explicit opt-in (e.g., Gemma4 defaults
+        # enable_thinking to false). For templates that don&#x27;t declare the
+        # variable, resolve_chat_template_kwargs filters it out harmlessly.
+        user_kwargs = self.chat_template_kwargs or {}
+        if self.reasoning_effort is not None and &quot;enable_thinking&quot; not in user_kwargs:
+            extra_kwargs[&quot;enable_thinking&quot;] = self.reasoning_effort != &quot;none&quot;
+
+        return ChatParams(
+            chat_template=self.chat_template or default_template,
+            chat_template_content_format=default_template_content_format,
+            chat_template_kwargs=merge_kwargs(
+                self.chat_template_kwargs,
+                extra_kwargs,
+            ),
+            media_io_kwargs=self.media_io_kwargs,
+            # No-tools requests default to tool_choice=&quot;none&quot; at the API
+            # layer. Collapse that default before rendering, so K3 emits a
+            # model-visible tool-choice instruction only for requests with a
+            # tools block.
+            tool_choice=self.tool_choice if self.tools else None,
+            response_format=self.response_format,
+        )</code></pre></div></div></div></figure>
+<ul>
+  <li><a class="term" href="../reference/glossary.html#term-add-generation-prompt" data-term="add_generation_prompt" data-def="A chat template variable (default true) that adds the start of a new assistant turn at the end of the prompt, so the model answers next."><code>add_generation_prompt</code></a> (default true) and <code>continue_final_message</code> (default false) always go in. A request that sets both to true gets HTTP 400 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L1045-L1055" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/protocol.py:1045-1055 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/protocol.py:1045-1055</code></a>).</li>
+  <li><code>reasoning_effort</code> also sets <code>enable_thinking</code>: false for <code>"none"</code>, true for any other value. This does not happen when the request sets <code>enable_thinking</code> itself (lines 652-653).</li>
+  <li><a class="term" href="../reference/glossary.html#term-chat-template-kwargs" data-term="chat_template_kwargs" data-def="Extra variables for the chat template, for example enable_thinking. Request values override --default-chat-template-kwargs; names the template does not use are dropped."><code>chat_template_kwargs</code></a> from the request win over <code>--default-chat-template-kwargs</code>. The merge drops request values that are <code>None</code> or <code>"auto"</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/params.py#L36-L48" target="_blank" rel="noopener" title="vllm/renderers/params.py:36-48 at 3e44c0d"><code>vllm/renderers/params.py:36-48</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/params.py#L104-L134" target="_blank" rel="noopener" title="vllm/renderers/params.py:104-134 at 3e44c0d"><code>vllm/renderers/params.py:104-134</code></a>).</li>
+</ul>
+<p>Before the call, <code>resolve_chat_template_kwargs</code> keeps only the names that the template reads, that <code>apply_chat_template</code> accepts, or that the Hugging Face base class knows (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L778-L789" target="_blank" rel="noopener" title="vllm/renderers/hf.py:778-789 at 3e44c0d"><code>vllm/renderers/hf.py:778-789</code></a>). So a misspelled kwarg is dropped with no error. Two more fixes happen in <code>safe_apply_chat_template</code>. A <code>developer</code> message becomes a <code>system</code> message when the template does not know that role. An exception inside the template becomes <code>VLLMValidationError</code>, HTTP 400 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L848-L861" target="_blank" rel="noopener" title="vllm/renderers/hf.py:848-861 at 3e44c0d"><code>vllm/renderers/hf.py:848-861</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L871-L886" target="_blank" rel="noopener" title="vllm/renderers/hf.py:871-886 at 3e44c0d"><code>vllm/renderers/hf.py:871-886</code></a>).</p>
+<p><strong>Content format.</strong> Some templates read <code>message.content</code> as a string; others loop over a list of parts in OpenAI form. vLLM parses the template's syntax tree to find out, unless <code>--chat-template-content-format</code> sets it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L537-L554" target="_blank" rel="noopener" title="vllm/renderers/hf.py:537-554 at 3e44c0d"><code>vllm/renderers/hf.py:537-554</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L678-L710" target="_blank" rel="noopener" title="vllm/renderers/hf.py:678-710 at 3e44c0d"><code>vllm/renderers/hf.py:678-710</code></a>). With the string format, all text parts of a message are joined with newlines (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/chat_utils/chat_message.py#L396-L411" target="_blank" rel="noopener" title="vllm/renderers/chat_utils/chat_message.py:396-411 at 3e44c0d"><code>vllm/renderers/chat_utils/chat_message.py:396-411</code></a>).</p>
+
+<h3 id="step-6-the-thread-pool-and-the-timeout">Step 6: the thread pool and the timeout<a class="h-anchor" href="#step-6-the-thread-pool-and-the-timeout" aria-label="Link to this section">#</a></h3>
+<p>Template rendering and tokenization are blocking Python work. The renderer runs them in a thread pool, so the event loop stays free for other requests:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/base.py#L140-L158" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/renderers/base.py:140-158</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/base.py#L140-L158" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">140</span><span class="ln">141</span><span class="ln">142</span><span class="ln hl">143</span><span class="ln hl">144</span><span class="ln">145</span><span class="ln">146</span><span class="ln">147</span><span class="ln">148</span><span class="ln hl">149</span><span class="ln">150</span><span class="ln">151</span><span class="ln">152</span><span class="ln">153</span><span class="ln">154</span><span class="ln">155</span><span class="ln hl">156</span><span class="ln hl">157</span><span class="ln hl">158</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><pre><code class="language-python">        # Thread pool executor for blocking tokenizer operations.  The
+        # multimodal processor receives a deep-copied tokenizer (see #36557)
+        # so it is safe to run tokenization and MM preprocessing concurrently.
+        pool_workers = config.model_config.renderer_num_workers
+        self._executor = _SwappableExecutor(max_workers=pool_workers)
+        self._resources.callback(self._executor.shutdown, wait=False)
+
+        # Separate single-worker executor so tokenization never queues behind
+        # MM preprocessing; must stay single-worker per #38418 (P0/P1 order).
+        self._mm_executor = ThreadPoolExecutor(max_workers=1)
+        self._resources.callback(self._mm_executor.shutdown, wait=False)
+
+        # Offload tokenization to the thread pool. The sync
+        # ``_tokenize_prompt`` already encapsulates the unified ``__call__``
+        # path and char-offset extraction, so the async variant is just it
+        # offloaded (mirrors ``_process_multimodal_async`` below).
+        self._tokenize_prompt_async = make_async(
+            self._tokenize_prompt, executor=self._executor
+        )</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L1038-L1056" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/renderers/hf.py:1038-1056</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L1038-L1056" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1038</span><span class="ln">1039</span><span class="ln">1040</span><span class="ln">1041</span><span class="ln">1042</span><span class="ln">1043</span><span class="ln hl">1044</span><span class="ln hl">1045</span><span class="ln hl">1046</span><span class="ln">1047</span><span class="ln">1048</span><span class="ln">1049</span><span class="ln hl">1050</span><span class="ln">1051</span><span class="ln">1052</span><span class="ln">1053</span><span class="ln">1054</span><span class="ln">1055</span><span class="ln">1056</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><pre><code class="language-python">    async def _render_with_timeout(self, coro):
+        &quot;&quot;&quot;Run a template-rendering coroutine with a timeout.
+
+        On timeout, replaces the executor so subsequent renders are not
+        permanently blocked by the stuck thread.
+        &quot;&quot;&quot;
+        timeout = envs.VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT
+        if timeout &lt;= 0:
+            return await coro
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except TimeoutError:
+            self._replace_executor()
+            raise TimeoutError(
+                f&quot;Chat template rendering timed out after &quot;
+                f&quot;{timeout}s. This may indicate a malicious or &quot;
+                f&quot;excessively complex template. Adjust &quot;
+                f&quot;VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT to override.&quot;
+            ) from None</code></pre></div></div></div></figure>
+<ul>
+  <li>The pool has <code>--renderer-num-workers</code> threads, 1 by default (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/model.py#L412-L421" target="_blank" rel="noopener" title="vllm/config/model.py:412-421 at 3e44c0d"><code>vllm/config/model.py:412-421</code></a>). With one thread, renders of different requests queue behind each other. Multimodal work has its own one-thread pool.</li>
+  <li>The HF tokenizer gets a pool of <code>renderer_num_workers + 1</code> deep copies, so that calls from several threads do not share one Rust tokenizer object (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L1015-L1018" target="_blank" rel="noopener" title="vllm/renderers/hf.py:1015-1018 at 3e44c0d"><code>vllm/renderers/hf.py:1015-1018</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/tokenizers/hf.py#L27-L47" target="_blank" rel="noopener" title="vllm/tokenizers/hf.py:27-47 at 3e44c0d"><code>vllm/tokenizers/hf.py:27-47</code></a>).</li>
+  <li>The template call has a timeout: <code>VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT</code>, 30 s by default, 0 or less for none (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L817-L819" target="_blank" rel="noopener" title="vllm/envs.py:817-819 at 3e44c0d"><code>vllm/envs.py:817-819</code></a>). On a timeout, the pool's threads are replaced, because Python cannot stop the stuck thread. The client gets a <code>TimeoutError</code>, which the generic handler turns into HTTP 500 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/exception_handling/error_response.py#L93-L96" target="_blank" rel="noopener" title="vllm/entrypoints/serve/exception_handling/error_response.py:93-96 at 3e44c0d"><code>vllm/entrypoints/serve/exception_handling/error_response.py:93-96</code></a>).</li>
+  <li>Only <code>HfRenderer</code> has this timeout wrapper. <code>MistralRenderer</code> calls its template through the same pool with no timeout (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/mistral.py#L58-L60" target="_blank" rel="noopener" title="vllm/renderers/mistral.py:58-60 at 3e44c0d"><code>vllm/renderers/mistral.py:58-60</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/mistral.py#L104-L108" target="_blank" rel="noopener" title="vllm/renderers/mistral.py:104-108 at 3e44c0d"><code>vllm/renderers/mistral.py:104-108</code></a>).</li>
+</ul>
+<p>At start-up, <code>init_app_state</code> renders one warm-up message to compile the template (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/launchers/api_server/app_state.py#L104" target="_blank" rel="noopener" title="vllm/entrypoints/launchers/api_server/app_state.py:104 at 3e44c0d"><code>vllm/entrypoints/launchers/api_server/app_state.py:104</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/base.py#L356-L383" target="_blank" rel="noopener" title="vllm/renderers/base.py:356-383 at 3e44c0d"><code>vllm/renderers/base.py:356-383</code></a>). A model with no template only logs this at DEBUG level, so the first chat request is where the error shows.</p>
+
+<h3 id="step-7-tokenization-and-the-length-check">Step 7: tokenization and the length check<a class="h-anchor" href="#step-7-tokenization-and-the-length-check" aria-label="Link to this section">#</a></h3>
+<p>For chat, the tokenizer adds no special tokens of its own, because the template already writes them (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L342-L351" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/protocol.py:342-351 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/protocol.py:342-351</code></a>). The request field <code>add_special_tokens</code> can turn them on. The limit is the context length:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L671-L689" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/entrypoints/openai/chat_completion/protocol.py:671-689</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L671-L689" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">671</span><span class="ln">672</span><span class="ln">673</span><span class="ln">674</span><span class="ln">675</span><span class="ln">676</span><span class="ln">677</span><span class="ln">678</span><span class="ln">679</span><span class="ln hl">680</span><span class="ln hl">681</span><span class="ln hl">682</span><span class="ln hl">683</span><span class="ln hl">684</span><span class="ln">685</span><span class="ln">686</span><span class="ln">687</span><span class="ln">688</span><span class="ln">689</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><pre><code class="language-python">    def build_tok_params(self, model_config: ModelConfig) -&gt; TokenizeParams:
+        if self.max_completion_tokens is not None:
+            max_output_tokens: int | None = self.max_completion_tokens
+            max_output_tokens_param = &quot;max_completion_tokens&quot;
+        else:
+            max_output_tokens = self.max_tokens
+            max_output_tokens_param = &quot;max_tokens&quot;
+
+        return TokenizeParams(
+            max_total_tokens=model_config.max_model_len,
+            max_output_tokens=max_output_tokens,
+            truncate_prompt_tokens=self.truncate_prompt_tokens,
+            truncation_side=self.truncation_side,
+            add_special_tokens=self.add_special_tokens,
+            needs_detokenization=bool(self.echo and not self.return_token_ids),
+            max_total_tokens_param=&quot;max_model_len&quot;,
+            max_output_tokens_param=max_output_tokens_param,
+            return_token_offsets=bool(self.return_token_offsets),
+        )</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/params.py#L518-L538" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/renderers/params.py:518-538</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/params.py#L518-L538" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">518</span><span class="ln">519</span><span class="ln">520</span><span class="ln">521</span><span class="ln">522</span><span class="ln">523</span><span class="ln hl">524</span><span class="ln">525</span><span class="ln">526</span><span class="ln">527</span><span class="ln">528</span><span class="ln">529</span><span class="ln hl">530</span><span class="ln hl">531</span><span class="ln hl">532</span><span class="ln hl">533</span><span class="ln hl">534</span><span class="ln hl">535</span><span class="ln hl">536</span><span class="ln hl">537</span><span class="ln hl">538</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><pre><code class="language-python">    def _token_len_check(self, tokenizer: TokenizerLike | None, tokens: _S) -&gt; _S:
+        &quot;&quot;&quot;Apply length checks to prompt tokens if necessary.&quot;&quot;&quot;
+        max_input_tokens = self.max_input_tokens
+        if max_input_tokens is None:
+            return tokens
+
+        if len(tokens) &gt; max_input_tokens:
+            token_count = len(tokens)
+            # The tokenizer may have truncated the prompt to
+            # max_input_tokens + 1 (see get_encode_kwargs), so the
+            # actual prompt length could be larger.
+            qualifier = &quot;at least &quot; if token_count == max_input_tokens + 1 else &quot;&quot;
+            raise VLLMValidationError(
+                f&quot;This model&#x27;s maximum context length is &quot;
+                f&quot;{self.max_total_tokens} tokens. However, your prompt &quot;
+                f&quot;contains {qualifier}{token_count} input tokens, which &quot;
+                f&quot;exceeds this limit even without any output tokens. &quot;
+                f&quot;Please reduce the length of the input prompt.&quot;,
+                parameter=&quot;input_tokens&quot;,
+                value=token_count,
+            )</code></pre></div></div></div></figure>
+<p>A prompt of exactly <code>max_model_len</code> tokens passes this check. Then <code>get_max_tokens</code> computes 0 tokens of room (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/utils/api_utils.py#L248-L253" target="_blank" rel="noopener" title="vllm/entrypoints/serve/utils/api_utils.py:248-253 at 3e44c0d"><code>vllm/entrypoints/serve/utils/api_utils.py:248-253</code></a>), and the sampling parameters reject <code>max_tokens</code> 0 with HTTP 400 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/sampling_params.py#L691-L696" target="_blank" rel="noopener" title="vllm/sampling_params.py:691-696 at 3e44c0d"><code>vllm/sampling_params.py:691-696</code></a>). With <code>truncate_prompt_tokens</code>, the prompt is cut first, from the side that <code>truncation_side</code> names (left by default for generate models, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/tokenizers/registry.py#L137-L143" target="_blank" rel="noopener" title="vllm/tokenizers/registry.py:137-143 at 3e44c0d"><code>vllm/tokenizers/registry.py:137-143</code></a>). Generative requests keep one token free (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/params.py#L225-L244" target="_blank" rel="noopener" title="vllm/renderers/params.py:225-244 at 3e44c0d"><code>vllm/renderers/params.py:225-244</code></a>).</p>
+
+<h3 id="step-8-multimodal-content-parts">Step 8: multimodal content parts<a class="h-anchor" href="#step-8-multimodal-content-parts" aria-label="Link to this section">#</a></h3>
+<p>An <code>image_url</code>, <code>input_audio</code> or <code>video_url</code> part is fetched and stored in a tracker. The tracker asks the model class for its placeholder text, for example <code>&lt;image&gt;</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/chat_utils/item_tracker.py#L294" target="_blank" rel="noopener" title="vllm/renderers/chat_utils/item_tracker.py:294 at 3e44c0d"><code>vllm/renderers/chat_utils/item_tracker.py:294</code></a>). With the string content format and <code>--interleave-mm-strings</code> off (the default, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/multimodal.py#L420" target="_blank" rel="noopener" title="vllm/config/multimodal.py:420 at 3e44c0d"><code>vllm/config/multimodal.py:420</code></a>), the placeholders go in front of the message text (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/chat_utils/chat_message.py#L188-L195" target="_blank" rel="noopener" title="vllm/renderers/chat_utils/chat_message.py:188-195 at 3e44c0d"><code>vllm/renderers/chat_utils/chat_message.py:188-195</code></a>). With the OpenAI format, the parts stay a list, and the template places them. The data goes into the prompt as <code>multi_modal_data</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L1263-L1266" target="_blank" rel="noopener" title="vllm/renderers/hf.py:1263-1266 at 3e44c0d"><code>vllm/renderers/hf.py:1263-1266</code></a>). Later, the multimodal processor expands each placeholder into the real number of tokens. The page <a href="../concepts/multimodal-serving.html">Multimodal serving: images, audio and video in vLLM</a> covers that part.</p>
+
+<h3 id="step-9-the-derenderer-and-token-in-token-out">Step 9: the derenderer and token-in token-out<a class="h-anchor" href="#step-9-the-derenderer-and-token-in-token-out" aria-label="Link to this section">#</a></h3>
+<p>The renderer has a mirror image, <code>OnlineDerenderer</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/online_derenderer.py#L69-L86" target="_blank" rel="noopener" title="vllm/renderers/online_derenderer.py:69-86 at 3e44c0d"><code>vllm/renderers/online_derenderer.py:69-86</code></a>). It turns generated token ids back into an OpenAI response: detokenization plus reasoning and tool parsing, with no GPU. It serves <code>/v1/chat/completions/derender</code> and <code>/v1/completions/derender</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/scale_out/derender/api_router.py#L31-L33" target="_blank" rel="noopener" title="vllm/entrypoints/scale_out/derender/api_router.py:31-33 at 3e44c0d"><code>vllm/entrypoints/scale_out/derender/api_router.py:31-33</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/scale_out/derender/api_router.py#L81-L83" target="_blank" rel="noopener" title="vllm/entrypoints/scale_out/derender/api_router.py:81-83 at 3e44c0d"><code>vllm/entrypoints/scale_out/derender/api_router.py:81-83</code></a>). Together with <code>/v1/chat/completions/render</code> and the <a class="term" href="../reference/glossary.html#term-token-in-token-out" data-term="token-in token-out" data-def="Serving where the client sends token ids and gets token ids back, with no template and no detokenization in the server. vLLM has /inference/v1/generate for it.">token-in token-out</a> route <code>/inference/v1/generate</code>, it splits serving into render, generate and derender. A front end on another machine can then do the CPU work.</p>
+<p>These scale-out routes are off on a normal <code>vllm serve</code>. Without <code>--enable-scale-out</code> (or <code>--tokens-only</code>), they answer HTTP 403 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/scale_out/factories.py#L94-L127" target="_blank" rel="noopener" title="vllm/entrypoints/scale_out/factories.py:94-127 at 3e44c0d"><code>vllm/entrypoints/scale_out/factories.py:94-127</code></a>). The docs describe the request formats: <code>docs/serving/online_serving/renderer.md</code>, <code>derenderer.md</code> and <code>token_in_token_out.md</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/serving/online_serving/token_in_token_out.md#L1-L9" target="_blank" rel="noopener" title="docs/serving/online_serving/token_in_token_out.md:1-9 at 3e44c0d"><code>docs/serving/online_serving/token_in_token_out.md:1-9</code></a>).</p>
+<p>Two other ways skip the template on the normal routes. <code>/v1/completions</code> accepts token ids as the prompt (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/completion/protocol.py#L53-L59" target="_blank" rel="noopener" title="vllm/entrypoints/openai/completion/protocol.py:53-59 at 3e44c0d"><code>vllm/entrypoints/openai/completion/protocol.py:53-59</code></a>). A chat request in disaggregated serving can carry the prefill's ids in <code>kv_transfer_params["prompt_token_ids"]</code>; the renderer then skips templating and tokenization, but not the checks (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/online_renderer.py#L106-L151" target="_blank" rel="noopener" title="vllm/renderers/online_renderer.py:106-151 at 3e44c0d"><code>vllm/renderers/online_renderer.py:106-151</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/online_renderer.py#L794-L803" target="_blank" rel="noopener" title="vllm/renderers/online_renderer.py:794-803 at 3e44c0d"><code>vllm/renderers/online_renderer.py:794-803</code></a>).</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-three-messages-one-chatml-template-31-tokens" class="dd-title">Worked example: three messages, one ChatML template, 31 tokens</h3></summary><div class="dd-body"><p>The example uses the ChatML template of the repository (start the server with <code>--chat-template examples/template_chatml.jinja</code>) and the Qwen2.5 tokenizer. This is the whole template:</p>
+<figure class="code-excerpt" data-lang="none"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/examples/template_chatml.jinja#L1-L2" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">examples/template_chatml.jinja:1-2</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/examples/template_chatml.jinja#L1-L2" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1</span><span class="ln">2</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-none">{% for message in messages %}{{&#x27;&lt;|im_start|&gt;&#x27; + message[&#x27;role&#x27;] + &#x27;\n&#x27; + message[&#x27;content&#x27;]}}{% if (loop.last and add_generation_prompt) or not loop.last %}{{ &#x27;&lt;|im_end|&gt;&#x27; + &#x27;\n&#x27;}}{% endif %}{% endfor %}
+{% if add_generation_prompt and messages[-1][&#x27;role&#x27;] != &#x27;assistant&#x27; %}{{ &#x27;&lt;|im_start|&gt;assistant\n&#x27; }}{% endif %}</code></pre></div></div></div></figure>
+<p>The request has three messages and asks the model to continue the last one (a "prefill" of the answer):</p>
+<pre><code class="language-json">{"messages": [
+   {"role": "system",    "content": "You are a helpful assistant."},
+   {"role": "user",      "content": "What is the capital of France?"},
+   {"role": "assistant", "content": "The capital of France is"}],
+ "continue_final_message": true, "add_generation_prompt": false}</code></pre>
+<ol>
+  <li><code>build_chat_params</code> sets <code>add_generation_prompt=False</code> and <code>continue_final_message=True</code>. Both pass the kwargs filter, because the template reads <code>add_generation_prompt</code> and the Hugging Face base method knows both names (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L778-L789" target="_blank" rel="noopener" title="vllm/renderers/hf.py:778-789 at 3e44c0d"><code>vllm/renderers/hf.py:778-789</code></a>).</li>
+  <li>Line 1 of the template writes each message as <code>&lt;|im_start|&gt;role\ncontent</code>. It adds <code>&lt;|im_end|&gt;\n</code> after every message except the last one, because <code>loop.last and add_generation_prompt</code> is false and <code>not loop.last</code> is false.</li>
+  <li>Line 2 adds no new assistant turn, because <code>add_generation_prompt</code> is false.</li>
+</ol>
+<p>The prompt string is (newlines shown as <code>\n</code>):</p>
+<pre><code class="language-none">&lt;|im_start|&gt;system\nYou are a helpful assistant.&lt;|im_end|&gt;\n&lt;|im_start|&gt;user\nWhat is the capital of France?&lt;|im_end|&gt;\n&lt;|im_start|&gt;assistant\nThe capital of France is</code></pre>
+<p>The tokenizer gives 31 ids (measured with the Qwen2.5 <code>tokenizer.json</code>, outside the repo):</p>
+<pre><code class="language-none">[151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198,
+ 151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30, 151645, 198,
+ 151644, 77091, 198, 785, 6722, 315, 9625, 374]
+ &lt;|im_start|&gt; = 151644   &lt;|im_end|&gt; = 151645   "\n" = 198</code></pre>
+<p>Now take the default flags instead (<code>add_generation_prompt: true</code>) and drop the assistant message. The last user turn then ends with <code>&lt;|im_end|&gt;\n</code>, and line 2 adds <code>&lt;|im_start|&gt;assistant\n</code>. That prompt has 26 tokens: the same first 26 ids as above. The model starts a new answer instead of continuing "The capital of France is".</p>
+<aside class="callout callout-simplified"><p class="callout-title">Simplified</p><div class="callout-body"><p>The token ids depend on the tokenizer. Another model with a ChatML template (for example a Qwen chat model) gives the same structure; a model with another template gives another string. Hugging Face's <code>apply_chat_template</code> also has its own handling of <code>continue_final_message</code>; it is library code and not described here.</p></div></aside></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="precedence-of-template-variables-with-numbers" class="dd-title">Precedence of template variables, with numbers</h3></summary><div class="dd-body"><p>Server started with <code>--default-chat-template-kwargs '{"enable_thinking": false, "documents_style": "short"}'</code>. A request sends <code>"chat_template_kwargs": {"enable_thinking": true, "foo": 1}</code> and <code>"reasoning_effort": null</code>.</p>
+<ol>
+  <li><code>build_chat_params</code> merges the request kwargs with <code>add_generation_prompt=True</code>, <code>continue_final_message=False</code>, <code>documents=None</code>, <code>reasoning_effort=None</code>. Values that are <code>None</code> are dropped by <code>merge_kwargs</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/params.py#L48" target="_blank" rel="noopener" title="vllm/renderers/params.py:48 at 3e44c0d"><code>vllm/renderers/params.py:48</code></a>). Result: <code>{enable_thinking: true, foo: 1, add_generation_prompt: true, continue_final_message: false}</code>.</li>
+  <li><code>with_defaults</code> puts the server defaults under it: <code>enable_thinking</code> stays <code>true</code> (request wins); <code>documents_style: "short"</code> is added (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/params.py#L117-L123" target="_blank" rel="noopener" title="vllm/renderers/params.py:117-123 at 3e44c0d"><code>vllm/renderers/params.py:117-123</code></a>).</li>
+  <li><code>preprocess_chat</code> adds <code>tools</code> and <code>tokenize=False</code> as defaults under that (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/online_renderer.py#L774-L792" target="_blank" rel="noopener" title="vllm/renderers/online_renderer.py:774-792 at 3e44c0d"><code>vllm/renderers/online_renderer.py:774-792</code></a>).</li>
+  <li><code>resolve_chat_template_kwargs</code> keeps <code>enable_thinking</code> only if the template reads it, and drops <code>foo</code> and <code>documents_style</code> unless the template reads them (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L778-L789" target="_blank" rel="noopener" title="vllm/renderers/hf.py:778-789 at 3e44c0d"><code>vllm/renderers/hf.py:778-789</code></a>).</li>
+</ol>
+<p>The same merged dict also goes to the reasoning parser of the request (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/serving.py#L310-L313" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/serving.py:310-313 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/serving.py:310-313</code></a>). So <code>enable_thinking: false</code> changes both the prompt and how the parser reads the output.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="errors-of-the-render-step" class="dd-title">Errors of the render step</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Situation</th><th>Exception or response</th><th>HTTP</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>template in the request, server not trusting</td><td>error response "Refused request with untrusted chat template"</td><td>400</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/online_renderer.py#L686-L697" target="_blank" rel="noopener" title="vllm/renderers/online_renderer.py:686-697 at 3e44c0d"><code>vllm/renderers/online_renderer.py:686-697</code></a></td></tr>
+    <tr><td><code>tool_choice: "auto"</code> without auto tool choice</td><td>error response</td><td>400</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/online_renderer.py#L265-L271" target="_blank" rel="noopener" title="vllm/renderers/online_renderer.py:265-271 at 3e44c0d"><code>vllm/renderers/online_renderer.py:265-271</code></a></td></tr>
+    <tr><td>no template found</td><td><code>ChatTemplateResolutionError</code></td><td>400</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L842-L847" target="_blank" rel="noopener" title="vllm/renderers/hf.py:842-847 at 3e44c0d"><code>vllm/renderers/hf.py:842-847</code></a></td></tr>
+    <tr><td>the template raises (for example an unknown <code>reasoning_effort</code>)</td><td><code>VLLMValidationError</code> with the template's message</td><td>400</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L879-L886" target="_blank" rel="noopener" title="vllm/renderers/hf.py:879-886 at 3e44c0d"><code>vllm/renderers/hf.py:879-886</code></a></td></tr>
+    <tr><td>template render takes longer than the timeout</td><td><code>TimeoutError</code>; the pool is replaced</td><td>500</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L1047-L1056" target="_blank" rel="noopener" title="vllm/renderers/hf.py:1047-1056 at 3e44c0d"><code>vllm/renderers/hf.py:1047-1056</code></a></td></tr>
+    <tr><td>prompt longer than <code>max_model_len</code></td><td><code>VLLMValidationError</code>, parameter <code>input_tokens</code></td><td>400</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/params.py#L524-L538" target="_blank" rel="noopener" title="vllm/renderers/params.py:524-538 at 3e44c0d"><code>vllm/renderers/params.py:524-538</code></a></td></tr>
+    <tr><td>more placeholders in the text than media items</td><td><code>VLLMValidationError</code></td><td>400</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/chat_utils/chat_message.py#L171-L184" target="_blank" rel="noopener" title="vllm/renderers/chat_utils/chat_message.py:171-184 at 3e44c0d"><code>vllm/renderers/chat_utils/chat_message.py:171-184</code></a></td></tr>
+  </tbody>
+</table>
+<p>All of these happen before the serving class returns, so even a streaming request gets a real HTTP status, not an error chunk.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="flags-and-environment-variables" class="dd-title">Flags and environment variables</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Flag or variable</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--chat-template</code></td><td>none (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/common/cli_args.py#L85-L87" target="_blank" rel="noopener" title="vllm/entrypoints/common/cli_args.py:85-87 at 3e44c0d"><code>vllm/entrypoints/common/cli_args.py:85-87</code></a>)</td><td>Template file, built-in name or text; first in the resolution order.</td></tr>
+    <tr><td><code>--chat-template-content-format</code></td><td><code>auto</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/common/cli_args.py#L88-L93" target="_blank" rel="noopener" title="vllm/entrypoints/common/cli_args.py:88-93 at 3e44c0d"><code>vllm/entrypoints/common/cli_args.py:88-93</code></a>)</td><td><code>string</code> or <code>openai</code>; <code>auto</code> detects it from the template.</td></tr>
+    <tr><td><code>--trust-request-chat-template</code></td><td>false (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/common/cli_args.py#L94-L97" target="_blank" rel="noopener" title="vllm/entrypoints/common/cli_args.py:94-97 at 3e44c0d"><code>vllm/entrypoints/common/cli_args.py:94-97</code></a>)</td><td>Allow a template in the request.</td></tr>
+    <tr><td><code>--default-chat-template-kwargs</code></td><td>none (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/common/cli_args.py#L103-L108" target="_blank" rel="noopener" title="vllm/entrypoints/common/cli_args.py:103-108 at 3e44c0d"><code>vllm/entrypoints/common/cli_args.py:103-108</code></a>)</td><td>Server defaults under the request's kwargs.</td></tr>
+    <tr><td><code>--exclude-tools-when-tool-choice-none</code></td><td>false (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/common/cli_args.py#L118-L120" target="_blank" rel="noopener" title="vllm/entrypoints/common/cli_args.py:118-120 at 3e44c0d"><code>vllm/entrypoints/common/cli_args.py:118-120</code></a>)</td><td>Leave tools out of the prompt for <code>tool_choice: "none"</code>.</td></tr>
+    <tr><td><code>--renderer-num-workers</code></td><td>1 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/model.py#L412" target="_blank" rel="noopener" title="vllm/config/model.py:412 at 3e44c0d"><code>vllm/config/model.py:412</code></a>)</td><td>Threads for template and tokenizer work.</td></tr>
+    <tr><td><code>--tokenizer-mode</code></td><td><code>auto</code></td><td>Also selects the renderer (Step 1).</td></tr>
+    <tr><td><code>VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT</code></td><td>30 s (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L817-L819" target="_blank" rel="noopener" title="vllm/envs.py:817-819 at 3e44c0d"><code>vllm/envs.py:817-819</code></a>)</td><td>Time limit of one HF template render; 0 or less turns it off (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L1044-L1046" target="_blank" rel="noopener" title="vllm/renderers/hf.py:1044-1046 at 3e44c0d"><code>vllm/renderers/hf.py:1044-1046</code></a>).</td></tr>
+  </tbody>
+</table></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><strong>The model answers in the wrong format or rambles.</strong> The template may not be the one the model was trained with, for example a processor template chosen over the tokenizer template. Pass the right one with <code>--chat-template</code> (Step 4).</li>
+  <li><strong>A template variable has no effect.</strong> Misspelled or unused names in <code>chat_template_kwargs</code> are dropped with no error (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L778-L789" target="_blank" rel="noopener" title="vllm/renderers/hf.py:778-789 at 3e44c0d"><code>vllm/renderers/hf.py:778-789</code></a>).</li>
+  <li><strong>"Cannot set both continue_final_message and add_generation_prompt".</strong> To continue an assistant message, send <code>"add_generation_prompt": false</code> too (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L1050-L1054" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/protocol.py:1050-1054 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/protocol.py:1050-1054</code></a>).</li>
+  <li><strong>Slow first token under many concurrent requests.</strong> With the default single render thread, long templates or long prompts queue. Raise <code>--renderer-num-workers</code> or add API servers (<a href="../concepts/openai-server.html">The OpenAI-compatible server: launch modes, app, serving classes and streaming</a>).</li>
+  <li><strong>HTTP 500 after 30 seconds.</strong> The template render timed out; a complex request template is the usual cause (Step 6).</li>
+  <li><strong>A double BOS token.</strong> <code>"add_special_tokens": true</code> on a chat request adds the tokenizer's BOS in front of the template's BOS (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L342-L351" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/protocol.py:342-351 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/protocol.py:342-351</code></a>).</li>
+</ul>
+<p><strong>Why it matters.</strong> The prompt that the model sees is made here, and so is the start of the latency clock. Wrong templates give wrong answers with HTTP 200, and slow rendering shows up as TTFT that the engine cannot explain.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Which renderer class does a normal Hugging Face model use, and how is it chosen?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>HfRenderer</code>. The renderer mode is the tokenizer mode (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/registry.py#L84-L90" target="_blank" rel="noopener" title="vllm/renderers/registry.py:84-90 at 3e44c0d"><code>vllm/renderers/registry.py:84-90</code></a>). For an architecture without a family mode, <code>auto</code> becomes <code>hf</code>, unless the repository is a Mistral repository with Mistral tokenizer files (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/model.py#L746-L766" target="_blank" rel="noopener" title="vllm/config/model.py:746-766 at 3e44c0d"><code>vllm/config/model.py:746-766</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/tokenizers/registry.py#L145-L164" target="_blank" rel="noopener" title="vllm/tokenizers/registry.py:145-164 at 3e44c0d"><code>vllm/tokenizers/registry.py:145-164</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>A request has tools, and the model has both a processor template and a tokenizer template. No <code>--chat-template</code> is set. Which template renders it, and why?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The tokenizer template. The processor template is tried only when <code>tools</code> is <code>None</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L277-L290" target="_blank" rel="noopener" title="vllm/renderers/hf.py:277-290 at 3e44c0d"><code>vllm/renderers/hf.py:277-290</code></a>); with tools, resolution goes on to the tokenizer template (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L292-L294" target="_blank" rel="noopener" title="vllm/renderers/hf.py:292-294 at 3e44c0d"><code>vllm/renderers/hf.py:292-294</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>Why does the chat route tokenize with <code>add_special_tokens=False</code>, while <code>/v1/completions</code> uses <code>True</code>?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The chat template already writes the special tokens, such as BOS and the turn markers. Adding them again would double them (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/chat_completion/protocol.py#L342-L351" target="_blank" rel="noopener" title="vllm/entrypoints/openai/chat_completion/protocol.py:342-351 at 3e44c0d"><code>vllm/entrypoints/openai/chat_completion/protocol.py:342-351</code></a>). A raw completion prompt has no template, so the completion request's field <code>add_special_tokens</code> defaults to true (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/completion/protocol.py#L118-L124" target="_blank" rel="noopener" title="vllm/entrypoints/openai/completion/protocol.py:118-124 at 3e44c0d"><code>vllm/entrypoints/openai/completion/protocol.py:118-124</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/openai/completion/protocol.py#L299-L310" target="_blank" rel="noopener" title="vllm/entrypoints/openai/completion/protocol.py:299-310 at 3e44c0d"><code>vllm/entrypoints/openai/completion/protocol.py:299-310</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>With the ChatML template, a request sends two messages (system and user) with the default flags. How many tokens does the prompt of the worked example have, and what is the last token?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>26 tokens with the Qwen2.5 tokenizer. The last user turn ends with <code>&lt;|im_end|&gt;\n</code> because <code>add_generation_prompt</code> is true, and line 2 of the template adds <code>&lt;|im_start|&gt;assistant\n</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/examples/template_chatml.jinja#L1-L2" target="_blank" rel="noopener" title="examples/template_chatml.jinja:1-2 at 3e44c0d"><code>examples/template_chatml.jinja:1-2</code></a>). So the last token is <code>\n</code> (198), after the <code>assistant</code> token 77091 (deep dive "Worked example").</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>The server runs with the default <code>--renderer-num-workers</code>. 50 chat requests arrive at the same moment, and each needs 20 ms of pool work (template plus tokenizer). About how long does the last request wait before its own render starts, and is that wait inside vLLM's TTFT metric?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>About 49 × 20 ms ≈ 1 s. The pool has one thread by default, and the template and the tokenizer of every request run in it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/model.py#L412" target="_blank" rel="noopener" title="vllm/config/model.py:412 at 3e44c0d"><code>vllm/config/model.py:412</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/base.py#L143-L158" target="_blank" rel="noopener" title="vllm/renderers/base.py:143-158 at 3e44c0d"><code>vllm/renderers/base.py:143-158</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/hf.py#L1011-L1013" target="_blank" rel="noopener" title="vllm/renderers/hf.py:1011-1013 at 3e44c0d"><code>vllm/renderers/hf.py:1011-1013</code></a>). The wait is inside the metric, because <code>arrival_time</code> is taken at the start of <code>render_chat_async</code>, before the request waits for the pool (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/renderers/base.py#L1380" target="_blank" rel="noopener" title="vllm/renderers/base.py:1380 at 3e44c0d"><code>vllm/renderers/base.py:1380</code></a>). (Derived; real render times depend on the template and the prompt.)</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../tours/life-of-a-chat-request.html">Tour: Life of a chat request</a><span class="rel-sum">Follow one streaming POST /v1/chat/completions request through vllm serve in 16 stops: FastAPI route, chat template, AsyncLLM, ZMQ, engine core, scheduler, Model Runner V2, sampler, detokenizer and the SSE chunks.</span></li><li><a href="../concepts/openai-server.html">The OpenAI-compatible server: launch modes, app, serving classes and streaming</a><span class="rel-sum">How vllm serve builds its HTTP front end: the launch modes, the FastAPI app with its middleware, routers and exception handlers, the serving objects in app.state, the request flow down to AsyncLLM, streaming, n &gt; 1, request ids, priorities and admission limits.</span></li><li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers: from model text to tool_calls and reasoning</a><span class="rel-sum">How vllm serve turns the model&#x27;s raw text into the OpenAI fields reasoning, content and tool_calls - the flags, the parser registries, the Parser object that composes them, how each tool_choice mode is enforced, streaming deltas, reasoning-end detection, the reasoning parser in the engine core and the declarative parser engine.</span></li><li><a href="../concepts/multimodal-serving.html">Multimodal serving: images, audio and video in vLLM</a><span class="rel-sum">An overview of how vLLM serves a multimodal request - content parts and media loading in the API server, the per-model multimodal processor and its placeholder tokens, the processor cache between processes, the encoder cache and its budget in the scheduler, the encoder runs in Model Runner V2, and encoder-only disaggregation.</span></li><li><a href="../concepts/engine-client.html">The engine client: AsyncLLM in the API server</a><span class="rel-sum">AsyncLLM implements the EngineClient interface of the API server. It turns requests into EngineCoreRequests, sends them to the engine core, and streams RequestOutputs back through one background task and one collector per request.</span></li><li><a href="../concepts/data-contracts.html">Data contracts between the parts of vLLM</a><span class="rel-sum">The typed messages between the parts of vllm serve: EngineCoreRequest, Request, SchedulerOutput, ModelRunnerOutput, EngineCoreOutput(s), RequestOutput and the OpenAI response objects. Their fields, who makes them, and how they travel.</span></li><li><a href="../learn/serving-metrics.html">Serving metrics: TTFT, TPOT, ITL, throughput, goodput</a><span class="rel-sum">Serving metrics tell how fast a server answers one user (TTFT, TPOT, ITL, E2E latency) and how much work it does for all users (throughput, goodput). vLLM measures them in the API server and the engine core, and vllm bench serve measures them at the client.</span></li><li><a href="../code/entrypoints-openai-chat-completion-serving.html">entrypoints/openai/chat_completion/serving.py: OpenAIServingChat</a><span class="rel-sum">vllm/entrypoints/openai/chat_completion/serving.py defines OpenAIServingChat, the serving class of POST /v1/chat/completions. It renders the chat, makes the sampling parameters, starts AsyncLLM.generate and turns the RequestOutputs into SSE chunks or one ChatCompletionResponse.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../concepts/openai-server.html"><span class="pn-dir">← Previous</span><span class="pn-title">The OpenAI-compatible server: launch modes, app, serving classes and streaming</span></a><a class="pn pn-next" href="../concepts/tool-and-reasoning-parsers.html"><span class="pn-dir">Next →</span><span class="pn-title">Tool and reasoning parsers: from model text to tool_calls and reasoning</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-the-code">In the code</a></li><li class="toc-l3"><a href="#step-1-which-renderer">Step 1: which renderer</a></li><li class="toc-l3"><a href="#step-2-onlinerenderer-prepares-the-chat">Step 2: OnlineRenderer prepares the chat</a></li><li class="toc-l3"><a href="#step-3-render-chat-async-step-by-step">Step 3: render_chat_async, step by step</a></li><li class="toc-l3"><a href="#step-4-which-template">Step 4: which template</a></li><li class="toc-l3"><a href="#step-5-the-template-variables">Step 5: the template variables</a></li><li class="toc-l3"><a href="#step-6-the-thread-pool-and-the-timeout">Step 6: the thread pool and the timeout</a></li><li class="toc-l3"><a href="#step-7-tokenization-and-the-length-check">Step 7: tokenization and the length check</a></li><li class="toc-l3"><a href="#step-8-multimodal-content-parts">Step 8: multimodal content parts</a></li><li class="toc-l3"><a href="#step-9-the-derenderer-and-token-in-token-out">Step 9: the derenderer and token-in token-out</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#worked-example-three-messages-one-chatml-template-31-tokens">Worked example: three messages, one ChatML template, 31 tokens</a></li><li class="toc-l3"><a href="#precedence-of-template-variables-with-numbers">Precedence of template variables, with numbers</a></li><li class="toc-l3"><a href="#errors-of-the-render-step">Errors of the render step</a></li><li class="toc-l3"><a href="#flags-and-environment-variables">Flags and environment variables</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

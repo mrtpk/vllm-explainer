@@ -1,0 +1,650 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>v1/engine/output_processor.py: from token ids to RequestOutputs · vLLM Explained</title>
+<meta name="description" content="vllm/v1/engine/output_processor.py turns the EngineCoreOutputs of each step into RequestOutputs. It keeps one RequestState per request, detokenizes incrementally, checks stop strings, collects logprobs, merges n &gt; 1 children and feeds the per-request collectors.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="code/v1-engine-output-processor">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a class="current" aria-current="page" href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>Code map</span><span class="sep">›</span><span>Engine</span><span class="sep">›</span><span aria-current="page">v1/engine/output_processor.py</span></nav>
+<h1 class="page-title">v1/engine/output_processor.py: from token ids to RequestOutputs</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">Code map</span><span class="meta-time">about 9 min read + 4 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../concepts/engine-client.html">The engine client: AsyncLLM in the API server</a> <span class="level level-intermediate level-sm">Intermediate</span></li><li><a href="../concepts/data-contracts.html">Data contracts between the parts of vLLM</a> <span class="level level-intermediate level-sm">Intermediate</span></li></ul></aside>
+<h2 id="purpose">Purpose<a class="h-anchor" href="#purpose" aria-label="Link to this section">#</a></h2>
+<p><code>vllm/v1/engine/output_processor.py</code> turns the token ids that come back from the engine core into <a class="term" href="../reference/glossary.html#term-request-output" data-term="RequestOutput" data-def="The result object that AsyncLLM gives to the API server: new text, new token ids and a finished flag. In streaming mode it holds only the new part.">RequestOutputs</a> with text. It is the only place in the front end that loops over all outputs of a step.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/v1/engine/output_processor.py</code>, 1,047 lines of Python. Helpers in <code>detokenizer.py</code> (373 lines), <code>logprobs.py</code> (366 lines) and <code>parallel_sampling.py</code> (152 lines).</td></tr>
+    <tr><th>Main classes</th><td><code>RequestOutputCollector</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L53" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:53 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:53</code></a>), <code>RequestState</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L183" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:183 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:183</code></a>), <code>OutputProcessor</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L551" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:551 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:551</code></a>).</td></tr>
+    <tr><th>Runs in</th><td>The API server process, on the event loop, inside the <a class="term" href="../reference/glossary.html#term-output-handler" data-term="output handler" data-def="The one background asyncio task of AsyncLLM. It takes EngineCoreOutputs from the engine core client, runs the OutputProcessor and puts each RequestOutput into the collector of its request.">output handler</a> task. Offline: in the caller's thread of <code>LLMEngine.step</code>.</td></tr>
+    <tr><th>Called by</th><td><code>AsyncLLM</code> (<code>add_request</code>, <code>abort</code>, the output handler) and <code>LLMEngine</code>.</td></tr>
+    <tr><th>Calls</th><td><code>IncrementalDetokenizer</code>, <code>LogprobsProcessor</code>, <code>ParentRequest</code>, <code>IterationStats</code>, the tracing helpers.</td></tr>
+    <tr><th>Not in this file</th><td>EOS and stop-token-id checks (the scheduler in the engine core), the SSE format (the serving classes), the Prometheus metrics (<code>vllm/v1/metrics/</code>).</td></tr>
+  </tbody>
+</table>
+<p>The docstring of <code>process_outputs</code> states the design rule: "vLLM V1 minimizes the number of python loops over the full batch ... This is the only function that should loop over EngineCoreOutputs" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L746-L753" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:746-753 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:746-753</code></a>).</p>
+
+<h2 id="where-it-sits">Where it sits<a class="h-anchor" href="#where-it-sits" aria-label="Link to this section">#</a></h2>
+<p>The engine core client gives the output handler one <code>EngineCoreOutputs</code> per step. The handler passes slices of its <code>outputs</code> list to <code>process_outputs</code>. For each entry, the output processor finds the <a class="term" href="../reference/glossary.html#term-request-state" data-term="RequestState" data-def="The front-end record of one request in the OutputProcessor: prompt, detokenizer, logprobs processor, output kind, collector queue and timing stats.">RequestState</a>, updates it, and puts a <code>RequestOutput</code> into the collector of the request. The <code>generate()</code> task of the request takes it from there. The diagram on <a href="../concepts/engine-client.html#the-picture">The engine client: AsyncLLM in the API server</a> shows this path.</p>
+
+<h3 id="who-calls-it">Who calls it<a class="h-anchor" href="#who-calls-it" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><strong><code>AsyncLLM.__init__</code></strong> makes one <code>OutputProcessor</code> with the tokenizer, <code>log_stats</code> and the server-wide <code>stream_interval</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L180-L186" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:180-186 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:180-186</code></a>).</li>
+  <li><strong><code>AsyncLLM._add_request</code></strong> calls <code>add_request</code> before it sends the request (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L581" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:581 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:581</code></a>). <code>add_request</code> makes the collector first (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L529" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:529 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:529</code></a>).</li>
+  <li><strong>The output handler</strong> calls <code>process_outputs</code> per slice and <code>update_scheduler_stats</code> per message; on an error it calls <code>propagate_error</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L905-L910" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:905-910 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:905-910</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L924" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:924 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:924</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L944" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:944 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:944</code></a>).</li>
+  <li><strong><code>AsyncLLM.abort</code></strong> calls <code>abort_requests</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L955" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:955 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:955</code></a>).</li>
+  <li><strong><code>AsyncLLM.check_admission</code></strong> reads <code>get_num_unfinished_requests</code> and <code>get_num_queued_tokens</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L319-L323" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:319-323 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:319-323</code></a>).</li>
+</ul>
+
+<h3 id="what-it-calls">What it calls<a class="h-anchor" href="#what-it-calls" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><code>IncrementalDetokenizer.from_new_request</code>: a fast detokenizer with a <code>tokenizers</code> <code>DecodeStream</code>, a slow Python one, or a no-op one when there is no tokenizer. <code>detokenize=False</code> removes the tokenizer for the request (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L49-L66" target="_blank" rel="noopener" title="vllm/v1/engine/detokenizer.py:49-66 at 3e44c0d"><code>vllm/v1/engine/detokenizer.py:49-66</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L297-L298" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:297-298 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:297-298</code></a>).</li>
+  <li><code>LogprobsProcessor.from_new_request</code> and <code>update_from_output</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/logprobs.py#L46-L71" target="_blank" rel="noopener" title="vllm/v1/engine/logprobs.py:46-71 at 3e44c0d"><code>vllm/v1/engine/logprobs.py:46-71</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/logprobs.py#L360-L366" target="_blank" rel="noopener" title="vllm/v1/engine/logprobs.py:360-366 at 3e44c0d"><code>vllm/v1/engine/logprobs.py:360-366</code></a>).</li>
+  <li><code>ParentRequest.get_outputs</code> for <code>n &gt; 1</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/parallel_sampling.py#L102-L128" target="_blank" rel="noopener" title="vllm/v1/engine/parallel_sampling.py:102-128 at 3e44c0d"><code>vllm/v1/engine/parallel_sampling.py:102-128</code></a>).</li>
+  <li><code>IterationStats.update_from_output</code> and <code>update_from_finished_request</code> for metrics (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L1003-L1047" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:1003-1047 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:1003-1047</code></a>).</li>
+</ul>
+
+<h2 id="key-classes-and-functions">Key classes and functions<a class="h-anchor" href="#key-classes-and-functions" aria-label="Link to this section">#</a></h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>RequestOutputCollector</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L53-L113" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:53-113 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:53-113</code></a></td><td>One-slot queue per request; merges DELTA outputs.</td></tr>
+    <tr><td><code>StreamingInputOutputCollector</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L128-L160" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:128-160 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:128-160</code></a></td><td>Like the collector, but does not merge across input-chunk boundaries.</td></tr>
+    <tr><td><code>RequestState</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L183-L252" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:183-252 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:183-252</code></a></td><td>Everything the front end keeps per request.</td></tr>
+    <tr><td><code>RequestState.from_new_request</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L273-L352" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:273-352 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:273-352</code></a></td><td>Builds the state, the detokenizer and the logprobs processor from an <code>EngineCoreRequest</code>.</td></tr>
+    <tr><td><code>RequestState.make_request_output</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L354-L420" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:354-420 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:354-420</code></a></td><td>Decides if an output is due, and builds it.</td></tr>
+    <tr><td><code>RequestState._new_completion_output</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L475-L529" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:475-529 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:475-529</code></a></td><td>Text, token ids and logprobs for one sequence, by output kind.</td></tr>
+    <tr><td><code>OutputProcessor.add_request</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L663-L693" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:663-693 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:663-693</code></a></td><td>Registers a new request, or queues a streaming-input update.</td></tr>
+    <tr><td><code>OutputProcessor.process_outputs</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L728-L894" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:728-894 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:728-894</code></a></td><td>The loop over all outputs of a step.</td></tr>
+    <tr><td><code>OutputProcessor.abort_requests</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L599-L661" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:599-661 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:599-661</code></a></td><td>Removes requests by external or internal id; emits a final ABORT output.</td></tr>
+    <tr><td><code>_trim_surplus_tokens</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L896-L915" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:896-915 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:896-915</code></a></td><td>Drops tokens after a matched stop string.</td></tr>
+    <tr><td><code>BaseIncrementalDetokenizer.update</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L96-L155" target="_blank" rel="noopener" title="vllm/v1/engine/detokenizer.py:96-155 at 3e44c0d"><code>vllm/v1/engine/detokenizer.py:96-155</code></a></td><td>Decodes new ids into text and checks stop strings.</td></tr>
+    <tr><td><code>check_stop_strings</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L321-L373" target="_blank" rel="noopener" title="vllm/v1/engine/detokenizer.py:321-373 at 3e44c0d"><code>vllm/v1/engine/detokenizer.py:321-373</code></a></td><td>Finds the earliest stop string in the new text.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="walk-through-the-main-methods">Walk through the main methods<a class="h-anchor" href="#walk-through-the-main-methods" aria-label="Link to this section">#</a></h2>
+
+<h3 id="process-outputs-part-1-find-the-state-update-stats"><code>process_outputs</code>, part 1: find the state, update stats<a class="h-anchor" href="#process-outputs-part-1-find-the-state-update-stats" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L757-L777" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/output_processor.py:757-777</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L757-L777" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">757</span><span class="ln">758</span><span class="ln hl">759</span><span class="ln hl">760</span><span class="ln hl">761</span><span class="ln hl">762</span><span class="ln">763</span><span class="ln hl">764</span><span class="ln hl">765</span><span class="ln hl">766</span><span class="ln hl">767</span><span class="ln hl">768</span><span class="ln hl">769</span><span class="ln hl">770</span><span class="ln hl">771</span><span class="ln hl">772</span><span class="ln">773</span><span class="ln">774</span><span class="ln hl">775</span><span class="ln hl">776</span><span class="ln hl">777</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><pre><code class="language-python">        for engine_core_output in engine_core_outputs:
+            req_id = engine_core_output.request_id
+            req_state = self.request_states.get(req_id)
+            if req_state is None:
+                # Ignore output for already-aborted request.
+                continue
+
+            error = engine_core_output.error
+            if error is not None and req_state.queue is not None:
+                # Rejected on arrival, e.g. by a paused engine; nothing was run.
+                req_state.queue.put(error.to_exception())
+                self._finish_request(req_state)
+                if req_state.streaming_input:
+                    # Input chunks sent since may re-create the session.
+                    reqs_to_abort.append(req_id)
+                continue
+
+            # 1) Compute stats for this iteration.
+            self._update_stats_from_output(
+                req_state, engine_core_output, engine_core_timestamp, iteration_stats
+            )</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L790-L800" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/output_processor.py:790-800</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L790-L800" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">790</span><span class="ln">791</span><span class="ln">792</span><span class="ln">793</span><span class="ln">794</span><span class="ln">795</span><span class="ln">796</span><span class="ln">797</span><span class="ln">798</span><span class="ln">799</span><span class="ln">800</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">            if req_state.is_prefilling:
+                if engine_core_output.prefill_stats is not None:
+                    req_state.num_cached_tokens = (
+                        engine_core_output.prefill_stats.num_cached_tokens
+                    )
+                    req_state.num_cache_creation_tokens = (
+                        engine_core_output.prefill_stats.num_cache_creation_tokens
+                    )
+                if req_state.remote_prefill_cached_tokens is not None:
+                    req_state.num_cached_tokens = req_state.remote_prefill_cached_tokens
+                req_state.is_prefilling = False</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 759-762.</strong> No state means the request was aborted, or finished on a stop string, in the front end. The output is ignored.</li>
+  <li><strong>Lines 764-772.</strong> An output with <code>error</code> set means the engine rejected the request on arrival, for example a paused engine. The collector gets the exception.</li>
+  <li><strong>Lines 775-777.</strong> Timing stats, only when <code>iteration_stats</code> exists (stats on).</li>
+  <li><strong>Lines 790-800.</strong> The first output ends the prefill. Its <code>prefill_stats</code> give the number of prompt tokens that came from the prefix cache.</li>
+</ol>
+
+<h3 id="process-outputs-part-2-detokenize-logprobs-output"><code>process_outputs</code>, part 2: detokenize, logprobs, output<a class="h-anchor" href="#process-outputs-part-2-detokenize-logprobs-output" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L818-L842" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/output_processor.py:818-842</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L818-L842" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">818</span><span class="ln">819</span><span class="ln">820</span><span class="ln">821</span><span class="ln">822</span><span class="ln">823</span><span class="ln hl">824</span><span class="ln hl">825</span><span class="ln hl">826</span><span class="ln hl">827</span><span class="ln hl">828</span><span class="ln hl">829</span><span class="ln hl">830</span><span class="ln hl">831</span><span class="ln hl">832</span><span class="ln hl">833</span><span class="ln">834</span><span class="ln">835</span><span class="ln">836</span><span class="ln">837</span><span class="ln">838</span><span class="ln">839</span><span class="ln">840</span><span class="ln">841</span><span class="ln hl">842</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><pre><code class="language-python">            if pooling_output is None:
+                assert req_state.detokenizer is not None
+                assert req_state.logprobs_processor is not None
+                if new_token_ids and weight_version is not None:
+                    req_state.track_weight_version(weight_version)
+                # 2) Detokenize the token ids into text and perform stop checks.
+                num_prev_tokens = req_state.detokenizer.num_output_tokens()
+                stop_string = req_state.detokenizer.update(
+                    new_token_ids, finish_reason == FinishReason.STOP
+                )
+                if stop_string:
+                    finish_reason = FinishReason.STOP
+                    stop_reason = stop_string
+                    self._trim_surplus_tokens(
+                        req_state, engine_core_output, num_prev_tokens
+                    )
+
+                if engine_core_output.new_sampling_mask is not None:
+                    req_state.sampling_mask_chunks.append(
+                        engine_core_output.new_sampling_mask
+                    )
+
+                # 3) Compute sample and prompt logprobs for request,
+                # if required.
+                req_state.logprobs_processor.update_from_output(engine_core_output)</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L849-L866" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/output_processor.py:849-866</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L849-L866" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">849</span><span class="ln hl">850</span><span class="ln hl">851</span><span class="ln hl">852</span><span class="ln hl">853</span><span class="ln hl">854</span><span class="ln hl">855</span><span class="ln hl">856</span><span class="ln hl">857</span><span class="ln">858</span><span class="ln">859</span><span class="ln">860</span><span class="ln hl">861</span><span class="ln hl">862</span><span class="ln hl">863</span><span class="ln hl">864</span><span class="ln hl">865</span><span class="ln hl">866</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><pre><code class="language-python">            if request_output := req_state.make_request_output(
+                new_token_ids,
+                pooling_output,
+                finish_reason,
+                stop_reason,
+                kv_transfer_params,
+                ec_transfer_params,
+                error=request_error,
+            ):
+                if streaming_chunk_boundary:
+                    request_output.finished = False
+
+                if req_state.queue is not None:
+                    # AsyncLLM: put into queue for handling by generate().
+                    req_state.queue.put(request_output)
+                else:
+                    # LLMEngine: return list of RequestOutputs.
+                    request_outputs.append(request_output)</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 824-827.</strong> The detokenizer appends the new ids and returns a matched stop string or <code>None</code>. The second argument is true when the engine stopped the request with <code>STOP</code>: EOS or a stop token id.</li>
+  <li><strong>Lines 828-833.</strong> A stop string sets the finish reason to <code>STOP</code>, with the string as <code>stop_reason</code>, and trims surplus tokens.</li>
+  <li><strong>Line 842.</strong> Sample and prompt logprobs, if the request asked for them.</li>
+  <li><strong>Lines 849-857.</strong> <code>make_request_output</code> can return <code>None</code>: in <code>FINAL_ONLY</code> mode before the end, or between two stream intervals.</li>
+  <li><strong>Lines 861-866.</strong> AsyncLLM: into the collector. LLMEngine: into the returned list.</li>
+</ol>
+
+<h3 id="process-outputs-part-3-free-finished-requests"><code>process_outputs</code>, part 3: free finished requests<a class="h-anchor" href="#process-outputs-part-3-free-finished-requests" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L868-L894" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/output_processor.py:868-894</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L868-L894" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">868</span><span class="ln hl">869</span><span class="ln">870</span><span class="ln">871</span><span class="ln">872</span><span class="ln">873</span><span class="ln">874</span><span class="ln">875</span><span class="ln">876</span><span class="ln hl">877</span><span class="ln hl">878</span><span class="ln hl">879</span><span class="ln hl">880</span><span class="ln hl">881</span><span class="ln hl">882</span><span class="ln">883</span><span class="ln">884</span><span class="ln hl">885</span><span class="ln hl">886</span><span class="ln hl">887</span><span class="ln hl">888</span><span class="ln hl">889</span><span class="ln">890</span><span class="ln">891</span><span class="ln">892</span><span class="ln">893</span><span class="ln">894</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><pre><code class="language-python">            # Free completed requests.
+            if finish_reason is not None:
+                if streaming_chunk_boundary:
+                    if req_state.input_chunk_queue:
+                        update = req_state.input_chunk_queue.popleft()
+                        req_state.apply_streaming_update(update)
+                    else:
+                        req_state.input_chunk_queue = None
+                else:
+                    self._finish_request(req_state)
+                    if req_state.streaming_input or not engine_core_output.finished:
+                        # EngineCore may still have the request: a stop string
+                        # was detected here, or an in-flight streaming-input
+                        # chunk may re-create the session.
+                        reqs_to_abort.append(req_id)
+
+                    # Track per-request stats
+                    self._update_stats_from_finished(
+                        req_state, finish_reason, iteration_stats
+                    )
+                    if self.tracing_enabled:
+                        self.do_tracing(engine_core_output, req_state, iteration_stats)
+
+        return OutputProcessorOutput(
+            request_outputs=request_outputs,
+            reqs_to_abort=reqs_to_abort,
+        )</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 877.</strong> <code>_finish_request</code> removes the state, the id mapping and, for the last child, the parent (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L917-L932" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:917-932 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:917-932</code></a>).</li>
+  <li><strong>Lines 878-882.</strong> If the engine core did not finish the request itself (a stop string), its id goes to <code>reqs_to_abort</code>. The output handler sends these aborts after each slice (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L918-L922" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:918-922 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:918-922</code></a>).</li>
+  <li><strong>Lines 885-889.</strong> Finished-request stats and an optional trace span.</li>
+</ol>
+
+<h3 id="make-request-output-is-an-output-due"><code>make_request_output</code>: is an output due?<a class="h-anchor" href="#make-request-output-is-an-output-due" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L364-L400" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/output_processor.py:364-400</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L364-L400" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">364</span><span class="ln">365</span><span class="ln">366</span><span class="ln hl">367</span><span class="ln hl">368</span><span class="ln hl">369</span><span class="ln">370</span><span class="ln">371</span><span class="ln">372</span><span class="ln">373</span><span class="ln">374</span><span class="ln">375</span><span class="ln">376</span><span class="ln">377</span><span class="ln">378</span><span class="ln hl">379</span><span class="ln hl">380</span><span class="ln hl">381</span><span class="ln hl">382</span><span class="ln hl">383</span><span class="ln hl">384</span><span class="ln hl">385</span><span class="ln hl">386</span><span class="ln hl">387</span><span class="ln hl">388</span><span class="ln hl">389</span><span class="ln hl">390</span><span class="ln hl">391</span><span class="ln hl">392</span><span class="ln">393</span><span class="ln hl">394</span><span class="ln hl">395</span><span class="ln hl">396</span><span class="ln hl">397</span><span class="ln hl">398</span><span class="ln hl">399</span><span class="ln hl">400</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><pre><code class="language-python">        finished = finish_reason is not None
+        final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
+
+        if not finished and final_only:
+            # Only the final output is required in FINAL_ONLY mode.
+            return None
+
+        if pooling_output is not None:
+            return self._new_request_output(
+                self.external_req_id,
+                [self._new_pooling_output(pooling_output)],
+                finished,
+                error=error,
+            )
+
+        if self.stream_interval &gt; 1:
+            assert self.detokenizer is not None
+
+            # Send output request only when
+            # 1. It has finished, or
+            # 2. It is the first token, or
+            # 3. It has reached the stream interval number of tokens
+            if not (
+                finished
+                or self.sent_tokens_offset == 0
+                or self.detokenizer.num_output_tokens() - self.sent_tokens_offset
+                &gt;= self.stream_interval
+            ):
+                return None
+
+            if self.output_kind == RequestOutputKind.DELTA:
+                # Send tokens from the offset in DELTA mode, otherwise all
+                # tokens are sent.
+                new_token_ids = self.detokenizer.output_token_ids[
+                    self.sent_tokens_offset :
+                ]
+                self.sent_tokens_offset = self.detokenizer.num_output_tokens()</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L402-L420" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/output_processor.py:402-420</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L402-L420" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">402</span><span class="ln">403</span><span class="ln">404</span><span class="ln">405</span><span class="ln hl">406</span><span class="ln hl">407</span><span class="ln hl">408</span><span class="ln hl">409</span><span class="ln hl">410</span><span class="ln hl">411</span><span class="ln hl">412</span><span class="ln">413</span><span class="ln">414</span><span class="ln">415</span><span class="ln">416</span><span class="ln">417</span><span class="ln">418</span><span class="ln">419</span><span class="ln">420</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><pre><code class="language-python">        external_req_id = self.external_req_id
+
+        output = self._new_completion_output(new_token_ids, finish_reason, stop_reason)
+
+        if self.parent_req is None:
+            outputs = [output]
+        else:
+            outputs, finished = self.parent_req.get_outputs(self.request_id, output)
+            if not outputs:
+                return None
+            external_req_id = self.parent_req.external_req_id
+
+        return self._new_request_output(
+            external_req_id,
+            outputs,
+            finished,
+            kv_transfer_params,
+            ec_transfer_params,
+        )</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 367-369.</strong> <code>FINAL_ONLY</code> (a request without <code>stream</code>) gets one output, at the end.</li>
+  <li><strong>Lines 379-392.</strong> With <code>stream_interval &gt; 1</code>, an output goes out only at the end, for the first token, or after <code>stream_interval</code> new tokens.</li>
+  <li><strong>Lines 394-400.</strong> In that case the DELTA output carries all tokens since the last sent one.</li>
+  <li><strong>Line 402.</strong> The output uses the external id, the one the client knows.</li>
+  <li><strong>Lines 406-412.</strong> A child of an <code>n &gt; 1</code> request asks its parent which outputs to send, and uses the parent's external id.</li>
+</ol>
+
+<h3 id="incremental-detokenization-and-stop-strings">Incremental detokenization and stop strings<a class="h-anchor" href="#incremental-detokenization-and-stop-strings" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L103-L131" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/detokenizer.py:103-131</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L103-L131" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">103</span><span class="ln">104</span><span class="ln">105</span><span class="ln">106</span><span class="ln hl">107</span><span class="ln hl">108</span><span class="ln hl">109</span><span class="ln hl">110</span><span class="ln hl">111</span><span class="ln">112</span><span class="ln">113</span><span class="ln">114</span><span class="ln">115</span><span class="ln hl">116</span><span class="ln hl">117</span><span class="ln hl">118</span><span class="ln hl">119</span><span class="ln hl">120</span><span class="ln hl">121</span><span class="ln hl">122</span><span class="ln hl">123</span><span class="ln hl">124</span><span class="ln">125</span><span class="ln hl">126</span><span class="ln hl">127</span><span class="ln hl">128</span><span class="ln">129</span><span class="ln">130</span><span class="ln">131</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><pre><code class="language-python">        if not new_token_ids:
+            # Skip detokenization if no new token ids.
+            return None
+
+        if stop_terminated and not self.include_stop_str_in_output:
+            # If stop-terminated, exclude last token from detokenization
+            # based on include_stop_str_in_output parameter.
+            skipped_stop_token_id = new_token_ids[-1]
+            new_token_ids = new_token_ids[:-1]
+        else:
+            skipped_stop_token_id = None
+
+        # 1) Detokenize the new token ids incrementally.
+        num_prev_tokens = self.num_output_tokens()
+        first_new_token_index = len(self.token_ids)
+        # Output text offsets at the boundaries of the new tokens.
+        token_offsets = [len(self.output_text)] if self.stop else None
+        for new_token_id in new_token_ids:
+            self.token_ids.append(new_token_id)
+            self.output_text += self.decode_next(new_token_id)
+            if token_offsets is not None:
+                token_offsets.append(len(self.output_text))
+
+        if skipped_stop_token_id is not None:
+            # Cleanup after skipping detokenization.
+            self.token_ids.append(skipped_stop_token_id)
+            if token_offsets is not None:
+                token_offsets.append(len(self.output_text))
+</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 107-111.</strong> When the engine stopped the request on EOS or a stop token, the last token is not decoded, unless <code>include_stop_str_in_output</code> is set. So the final chunk of a chat stream has empty content.</li>
+  <li><strong>Lines 116-124.</strong> Each new id gives the next piece of text through <code>decode_next</code>. With stop strings, <code>token_offsets</code> records the text length after each token.</li>
+  <li><strong>Lines 126-128.</strong> The skipped stop token still counts as an output token.</li>
+</ol>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L132-L155" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/detokenizer.py:132-155</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L132-L155" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">132</span><span class="ln">133</span><span class="ln hl">134</span><span class="ln">135</span><span class="ln hl">136</span><span class="ln hl">137</span><span class="ln hl">138</span><span class="ln hl">139</span><span class="ln hl">140</span><span class="ln hl">141</span><span class="ln hl">142</span><span class="ln">143</span><span class="ln">144</span><span class="ln">145</span><span class="ln">146</span><span class="ln">147</span><span class="ln">148</span><span class="ln">149</span><span class="ln hl">150</span><span class="ln hl">151</span><span class="ln hl">152</span><span class="ln hl">153</span><span class="ln">154</span><span class="ln">155</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><pre><code class="language-python">        # 2) Evaluate stop strings.
+        stop_string = None
+        if token_offsets is not None and self.num_output_tokens() &gt; self.min_tokens:
+            # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014
+            stop_check_offset = token_offsets[max(self.min_tokens - num_prev_tokens, 0)]
+            stop = check_stop_strings(
+                output_text=self.output_text,
+                new_char_count=len(self.output_text) - stop_check_offset,
+                stop=self.stop,
+                include_in_output=self.include_stop_str_in_output,
+            )
+            if stop is not None:
+                stop_string, truncate_to = stop
+                stop_end = len(self.output_text) if truncate_to == -1 else truncate_to
+                if not self.include_stop_str_in_output:
+                    stop_end += len(stop_string)
+                # Drop tokens generated after the one completing the stop string
+                # (possible when multiple tokens are appended in one step).
+                num_kept = bisect_left(token_offsets, stop_end, lo=1)
+                del self.token_ids[first_new_token_index + num_kept :]
+                if truncate_to != -1:
+                    self.output_text = self.output_text[:truncate_to]
+
+        return stop_string</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 134.</strong> Stop strings count only after <code>min_tokens</code> output tokens.</li>
+  <li><strong>Line 136.</strong> The new text starts at the first token after <code>min_tokens</code>.</li>
+  <li><strong>Lines 137-142.</strong> <code>check_stop_strings</code> searches the new text plus up to (stop string length − 1) characters before it. So it finds a stop string that two tokens complete. It picks the stop string that ends first (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L336-L361" target="_blank" rel="noopener" title="vllm/v1/engine/detokenizer.py:336-361 at 3e44c0d"><code>vllm/v1/engine/detokenizer.py:336-361</code></a>).</li>
+  <li><strong>Lines 150-153.</strong> Tokens after the token that completed the stop string are dropped, and the text is cut.</li>
+</ol>
+<p>The fast detokenizer primes a <code>DecodeStream</code> with the prompt ids, so the first output token decodes in context (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L191-L198" target="_blank" rel="noopener" title="vllm/v1/engine/detokenizer.py:191-198 at 3e44c0d"><code>vllm/v1/engine/detokenizer.py:191-198</code></a>). The text that a stream may send is shorter than the decoded text by <code>stop_buffer_length</code> = the longest stop string minus 1. This holds back a stop string that is only partly generated (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L85-L90" target="_blank" rel="noopener" title="vllm/v1/engine/detokenizer.py:85-90 at 3e44c0d"><code>vllm/v1/engine/detokenizer.py:85-90</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L161-L176" target="_blank" rel="noopener" title="vllm/v1/engine/detokenizer.py:161-176 at 3e44c0d"><code>vllm/v1/engine/detokenizer.py:161-176</code></a>).</p>
+
+<h3 id="n-1-the-parent-request">n &gt; 1: the parent request<a class="h-anchor" href="#n-1-the-parent-request" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/parallel_sampling.py#L102-L128" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/parallel_sampling.py:102-128</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/parallel_sampling.py#L102-L128" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">102</span><span class="ln">103</span><span class="ln">104</span><span class="ln">105</span><span class="ln">106</span><span class="ln">107</span><span class="ln hl">108</span><span class="ln hl">109</span><span class="ln hl">110</span><span class="ln hl">111</span><span class="ln hl">112</span><span class="ln hl">113</span><span class="ln hl">114</span><span class="ln hl">115</span><span class="ln">116</span><span class="ln hl">117</span><span class="ln hl">118</span><span class="ln hl">119</span><span class="ln hl">120</span><span class="ln hl">121</span><span class="ln hl">122</span><span class="ln hl">123</span><span class="ln hl">124</span><span class="ln hl">125</span><span class="ln">126</span><span class="ln hl">127</span><span class="ln">128</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><pre><code class="language-python">    def get_outputs(
+        self,
+        child_request_id: str,
+        completion_output: CompletionOutput,
+    ) -&gt; tuple[list[CompletionOutput], bool]:
+        already_finished_and_returned: bool = False
+        if completion_output.finished():
+            if child_request_id in self.child_requests:
+                self.child_requests.remove(child_request_id)
+            else:
+                # child request ID is not available in child_requests
+                # which means the request had finished in previous
+                # batch step and returned to the client earlier
+                already_finished_and_returned = True
+
+        if self.sampling_params.output_kind != RequestOutputKind.FINAL_ONLY:
+            # If streaming, just return the current output
+            #
+            # DO NOT output finished and already returned child request to client again
+            outputs = [] if already_finished_and_returned else [completion_output]
+        else:
+            # If not streaming, aggregate the n final outputs.
+            self.output_aggregator[completion_output.index] = completion_output
+            outputs = [] if self.child_requests else self.output_aggregator
+
+        finished = not self.child_requests
+        return outputs, finished</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 108-115.</strong> A finished child leaves <code>child_requests</code>. A second finished output of the same child is not sent again.</li>
+  <li><strong>Lines 117-121.</strong> Streaming: each child's output goes out as it comes, with its own <code>index</code>.</li>
+  <li><strong>Lines 122-125.</strong> <code>FINAL_ONLY</code>: the parent collects all <code>n</code> outputs and sends them together when the last child finishes.</li>
+  <li><strong>Line 127.</strong> The parent is finished when no child is left.</li>
+</ol>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="data-flow-what-requeststate-holds" class="dd-title">Data flow: what RequestState holds</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Field</th><th>Type</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td><code>request_id</code>, <code>external_req_id</code></td><td><code>str</code></td><td>internal key; id for the client</td></tr>
+    <tr><td><code>parent_req</code>, <code>request_index</code></td><td><code>ParentRequest | None</code>, <code>int</code></td><td><code>n &gt; 1</code> fan-in; the <code>index</code> of the choice</td></tr>
+    <tr><td><code>output_kind</code></td><td><code>RequestOutputKind</code>: <code>CUMULATIVE</code>, <code>DELTA</code> or <code>FINAL_ONLY</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/sampling_params.py#L208-L214" target="_blank" rel="noopener" title="vllm/sampling_params.py:208-214 at 3e44c0d"><code>vllm/sampling_params.py:208-214</code></a>)</td><td>what each output carries</td></tr>
+    <tr><td><code>prompt</code>, <code>prompt_token_ids</code>, <code>prompt_len</code></td><td><code>str | None</code>, <code>list[int] | None</code>, <code>int</code></td><td>copied into every <code>RequestOutput</code></td></tr>
+    <tr><td><code>detokenizer</code>, <code>logprobs_processor</code></td><td>see above</td><td>text, stop strings, logprobs</td></tr>
+    <tr><td><code>is_prefilling</code>, <code>num_cached_tokens</code></td><td><code>bool</code>, <code>int</code></td><td>admission token count; prefix-cache hits for the usage info</td></tr>
+    <tr><td><code>queue</code></td><td><code>RequestOutputCollector | None</code></td><td>AsyncLLM only</td></tr>
+    <tr><td><code>stats</code></td><td><code>RequestStateStats | None</code></td><td>timing, only with <code>log_stats</code></td></tr>
+    <tr><td><code>stream_interval</code>, <code>sent_tokens_offset</code></td><td><code>int</code></td><td>chunking of the stream</td></tr>
+  </tbody>
+</table>
+<p>Sources: <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L208-L252" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:208-252 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:208-252</code></a>. A request's own <code>stream_interval</code> can only raise the server value, never lower it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L300-L302" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:300-302 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:300-302</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-a-stop-string-across-two-tokens" class="dd-title">Worked example: a stop string across two tokens</h3></summary><div class="dd-body"><p>A request has <code>stop=["END"]</code>, <code>include_stop_str_in_output=False</code>, <code>min_tokens=0</code> and a stream (DELTA). So <code>stop_buffer_length</code> = 3 − 1 = 2. The tokens are illustrative.</p>
+<table>
+  <thead><tr><th>Step</th><th>New token text</th><th><code>output_text</code></th><th>Stop check</th><th>Chunk sent</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><code>"The"</code></td><td><code>"The"</code> (3)</td><td>no match</td><td><code>"T"</code>: text[0:1], because 3 − 2 = 1</td></tr>
+    <tr><td>2</td><td><code>" answer"</code></td><td><code>"The answer"</code> (10)</td><td>no match</td><td><code>"he answ"</code>: text[1:8]</td></tr>
+    <tr><td>3</td><td><code>" E"</code></td><td><code>"The answer E"</code> (12)</td><td>searches the last 2 + 3 − 1 characters; no match</td><td><code>"er"</code>: text[8:10]</td></tr>
+    <tr><td>4</td><td><code>"ND"</code></td><td><code>"The answer END"</code> (14), then cut to <code>"The answer "</code> (11)</td><td>"END" at index 11; truncate to 11</td><td><code>" "</code>: text[10:11], with <code>finish_reason="stop"</code>, <code>stop_reason="END"</code></td></tr>
+  </tbody>
+</table>
+<p>The client receives <code>"The answer "</code> without "END". In step 4, <code>engine_core_output.finished</code> is false, because the engine core did not stop the request. So the request goes to <code>reqs_to_abort</code>, and the engine core gets an ABORT (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L878-L882" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:878-882 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:878-882</code></a>). The arithmetic follows <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L132-L153" target="_blank" rel="noopener" title="vllm/v1/engine/detokenizer.py:132-153 at 3e44c0d"><code>vllm/v1/engine/detokenizer.py:132-153</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L161-L176" target="_blank" rel="noopener" title="vllm/v1/engine/detokenizer.py:161-176 at 3e44c0d"><code>vllm/v1/engine/detokenizer.py:161-176</code></a> and <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L351-L373" target="_blank" rel="noopener" title="vllm/v1/engine/detokenizer.py:351-373 at 3e44c0d"><code>vllm/v1/engine/detokenizer.py:351-373</code></a>.</p>
+<aside class="callout callout-simplified"><p class="callout-title">Simplified</p><div class="callout-body"><p>Real tokenizers split text in other places. The fast detokenizer can also return an empty string for a token that is only part of a multi-byte character; the text then appears with the next token.</p></div></aside></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="logprobs-in-the-front-end" class="dd-title">Logprobs in the front end</h3></summary><div class="dd-body"><ul>
+  <li>The engine core sends logprobs as arrays: for each new token, the token ids, the logprobs and the ranks of the top candidates (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/outputs.py#L34-L45" target="_blank" rel="noopener" title="vllm/v1/outputs.py:34-45 at 3e44c0d"><code>vllm/v1/outputs.py:34-45</code></a>). The sampled token comes first (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/logprobs.py#L110-L111" target="_blank" rel="noopener" title="vllm/v1/engine/logprobs.py:110-111 at 3e44c0d"><code>vllm/v1/engine/logprobs.py:110-111</code></a>).</li>
+  <li><code>_update_sample_logprobs</code> adds the sampled token's logprob to <code>cumulative_logprob</code> and decodes each candidate token on its own, not incrementally (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/logprobs.py#L89-L122" target="_blank" rel="noopener" title="vllm/v1/engine/logprobs.py:89-122 at 3e44c0d"><code>vllm/v1/engine/logprobs.py:89-122</code></a>).</li>
+  <li>A decoded candidate that ends with the replacement character "�" is corrected with the sampled context, because it can be part of a multi-byte character (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/logprobs.py#L341-L358" target="_blank" rel="noopener" title="vllm/v1/engine/logprobs.py:341-358 at 3e44c0d"><code>vllm/v1/engine/logprobs.py:341-358</code></a>).</li>
+  <li>In DELTA mode, each <code>CompletionOutput</code> carries only the logprobs of its new tokens (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L492-L498" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:492-498 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:492-498</code></a>). Prompt logprobs are sent once and then forgotten (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L449-L454" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:449-454 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:449-454</code></a>).</li>
+</ul></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="aborts-by-external-or-internal-id" class="dd-title">Aborts by external or internal id</h3></summary><div class="dd-body"><p><code>abort_requests</code> accepts both kinds of id (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L599-L661" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:599-661 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:599-661</code></a>):</p>
+<ol>
+  <li>With <code>internal=True</code>, each id is an internal id, or the id of a parent request. The code removes it from the external-to-internal map.</li>
+  <li>With <code>internal=False</code>, each id is an external id. All internal ids that share it are aborted. This is how one external id can stop several requests.</li>
+  <li>For each internal id with a state, the code removes the state and puts a final output with <code>finish_reason=ABORT</code> into the collector. So a waiting <code>generate()</code> ends cleanly.</li>
+  <li>For a parent id, it aborts all children first.</li>
+  <li>It returns the internal ids, which the caller sends to the engine core.</li>
+</ol>
+<p>A client-disconnect abort skips the finished-request stats: <code>abort_requests</code> does not call <code>_update_stats_from_finished</code>.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="processes-and-threads" class="dd-title">Processes and threads</h3></summary><div class="dd-body"><p>The output processor has no lock. All its methods run on the event loop of one API server process: <code>add_request</code> and <code>abort_requests</code> in request tasks, <code>process_outputs</code> in the output handler task. They do not run in parallel, because asyncio runs one task at a time, and these methods do not <code>await</code>. (Derived from the code: none of the methods is <code>async</code>.)</p>
+<p>The CPU cost of this file grows with the number of output tokens per step: one detokenizer step per token, plus logprobs work. That cost is why the output handler cuts large steps into slices (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/async_llm.py#L887-L893" target="_blank" rel="noopener" title="vllm/v1/engine/async_llm.py:887-893 at 3e44c0d"><code>vllm/v1/engine/async_llm.py:887-893</code></a>).</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="error-paths" class="dd-title">Error paths</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>output for an unknown request</td><td>ignored</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L759-L762" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:759-762 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:759-762</code></a></td></tr>
+    <tr><td>output with <code>error</code> (rejected on arrival)</td><td>the collector gets the exception; the state is removed</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L764-L772" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:764-772 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:764-772</code></a></td></tr>
+    <tr><td>engine-wide failure</td><td><code>propagate_error</code> puts the exception into every collector</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L593-L597" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:593-597 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:593-597</code></a></td></tr>
+    <tr><td>invalid token id in the fast detokenizer</td><td>logged; the token decodes as empty text</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L236-L242" target="_blank" rel="noopener" title="vllm/v1/engine/detokenizer.py:236-242 at 3e44c0d"><code>vllm/v1/engine/detokenizer.py:236-242</code></a></td></tr>
+    <tr><td>"Invalid prefix" error of the decode stream</td><td>warning; the stream is reset and the token decoded again</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L243-L258" target="_blank" rel="noopener" title="vllm/v1/engine/detokenizer.py:243-258 at 3e44c0d"><code>vllm/v1/engine/detokenizer.py:243-258</code></a></td></tr>
+    <tr><td>multimodal cache miss on a pooling request</td><td>a retryable <code>RequestError</code> in the output</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L805-L816" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:805-816 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:805-816</code></a></td></tr>
+  </tbody>
+</table></div></details>
+
+<h2 id="related-concepts">Related concepts<a class="h-anchor" href="#related-concepts" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><a href="../concepts/engine-client.html">The engine client: AsyncLLM in the API server</a>: the output handler and the collectors.</li>
+  <li><a href="../concepts/data-contracts.html">Data contracts between the parts of vLLM</a>: <code>EngineCoreOutput</code> and <code>RequestOutput</code> field by field.</li>
+  <li><a href="../concepts/metrics-and-observability.html">Metrics and observability: how to watch a vLLM server</a>: what the stats calls in this file feed.</li>
+  <li><a href="../tours/life-of-a-chat-request.html#stop-15">Tour 1, stop 15</a>: this file in the path of one request.</li>
+</ul>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Where are stop strings checked, and why not in the engine core?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>In the front end, in the detokenizer that the output processor calls (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L825-L833" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:825-833 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:825-833</code></a>). The engine core works with token ids only and has no text; <code>EngineCoreOutput</code> carries <code>new_token_ids</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/__init__.py#L209-L210" target="_blank" rel="noopener" title="vllm/v1/engine/__init__.py:209-210 at 3e44c0d"><code>vllm/v1/engine/__init__.py:209-210</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>A request has <code>stream_interval</code> 4 on a server with the default 1. Which tokens make a new <code>RequestOutput</code>?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The first token, then each time 4 new tokens are ready, and the last one. The request value is clamped up to at least the server value, so 4 applies (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L300-L302" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:300-302 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:300-302</code></a>). The rule is at <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/output_processor.py#L379-L392" target="_blank" rel="noopener" title="vllm/v1/engine/output_processor.py:379-392 at 3e44c0d"><code>vllm/v1/engine/output_processor.py:379-392</code></a>.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>A request with <code>n = 2</code> and no stream finishes child 1 before child 0. When does the client get an output?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Only when child 0 finishes too. In <code>FINAL_ONLY</code> mode the parent stores each final output and returns all of them when no child is left (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/parallel_sampling.py#L122-L128" target="_blank" rel="noopener" title="vllm/v1/engine/parallel_sampling.py:122-128 at 3e44c0d"><code>vllm/v1/engine/parallel_sampling.py:122-128</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>The stop strings are <code>["END", "STOP"]</code>, without <code>include_stop_str_in_output</code>. How many characters does the stream hold back, and why?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>3: the longest stop string has 4 characters, minus 1 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L87-L88" target="_blank" rel="noopener" title="vllm/v1/engine/detokenizer.py:87-88 at 3e44c0d"><code>vllm/v1/engine/detokenizer.py:87-88</code></a>). The last 3 characters could be the start of "STOP", so the stream must not send them before the next token decides. When the request finishes, the buffer is 0 and the rest goes out (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/detokenizer.py#L165" target="_blank" rel="noopener" title="vllm/v1/engine/detokenizer.py:165 at 3e44c0d"><code>vllm/v1/engine/detokenizer.py:165</code></a>).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/engine-client.html">The engine client: AsyncLLM in the API server</a><span class="rel-sum">AsyncLLM implements the EngineClient interface of the API server. It turns requests into EngineCoreRequests, sends them to the engine core, and streams RequestOutputs back through one background task and one collector per request.</span></li><li><a href="../concepts/data-contracts.html">Data contracts between the parts of vLLM</a><span class="rel-sum">The typed messages between the parts of vllm serve: EngineCoreRequest, Request, SchedulerOutput, ModelRunnerOutput, EngineCoreOutput(s), RequestOutput and the OpenAI response objects. Their fields, who makes them, and how they travel.</span></li><li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py: AsyncLLM, the engine client of vllm serve</a><span class="rel-sum">vllm/v1/engine/async_llm.py defines AsyncLLM, the EngineClient of the API server. It builds the front-end parts of the engine, turns each request into an async stream of RequestOutputs, and runs the one output handler task.</span></li><li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py: from engine input to EngineCoreRequest</a><span class="rel-sum">vllm/v1/engine/input_processor.py checks a rendered prompt and its sampling or pooling parameters, fills in defaults such as max_tokens and the EOS stop ids, and builds the EngineCoreRequest that goes to the engine core. It also makes the internal request id.</span></li><li><a href="../concepts/metrics-and-observability.html">Metrics and observability: how to watch a vLLM server</a><span class="rel-sum">Where the signals of vllm serve come from and how to read them: the /metrics endpoint and its multiprocess mode, the metrics to watch first with valid PromQL, the periodic log line, per-request metrics in responses, OpenTelemetry traces, stat logger plugins, the profiler routes, and the known gaps.</span></li><li><a href="../tours/life-of-a-chat-request.html">Tour: Life of a chat request</a><span class="rel-sum">Follow one streaming POST /v1/chat/completions request through vllm serve in 16 stops: FastAPI route, chat template, AsyncLLM, ZMQ, engine core, scheduler, Model Runner V2, sampler, detokenizer and the SSE chunks.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../code/v1-engine-input-processor.html"><span class="pn-dir">← Previous</span><span class="pn-title">v1/engine/input_processor.py: from engine input to EngineCoreRequest</span></a><a class="pn pn-next" href="../code/v1-core-sched-scheduler.html"><span class="pn-dir">Next →</span><span class="pn-title">v1/core/sched/scheduler.py: the Scheduler</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#purpose">Purpose</a></li><li class="toc-l2"><a href="#where-it-sits">Where it sits</a></li><li class="toc-l3"><a href="#who-calls-it">Who calls it</a></li><li class="toc-l3"><a href="#what-it-calls">What it calls</a></li><li class="toc-l2"><a href="#key-classes-and-functions">Key classes and functions</a></li><li class="toc-l2"><a href="#walk-through-the-main-methods">Walk through the main methods</a></li><li class="toc-l3"><a href="#process-outputs-part-1-find-the-state-update-stats">process_outputs, part 1: find the state, update stats</a></li><li class="toc-l3"><a href="#process-outputs-part-2-detokenize-logprobs-output">process_outputs, part 2: detokenize, logprobs, output</a></li><li class="toc-l3"><a href="#process-outputs-part-3-free-finished-requests">process_outputs, part 3: free finished requests</a></li><li class="toc-l3"><a href="#make-request-output-is-an-output-due">make_request_output: is an output due?</a></li><li class="toc-l3"><a href="#incremental-detokenization-and-stop-strings">Incremental detokenization and stop strings</a></li><li class="toc-l3"><a href="#n-1-the-parent-request">n &gt; 1: the parent request</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#data-flow-what-requeststate-holds">Data flow: what RequestState holds</a></li><li class="toc-l3"><a href="#worked-example-a-stop-string-across-two-tokens">Worked example: a stop string across two tokens</a></li><li class="toc-l3"><a href="#logprobs-in-the-front-end">Logprobs in the front end</a></li><li class="toc-l3"><a href="#aborts-by-external-or-internal-id">Aborts by external or internal id</a></li><li class="toc-l3"><a href="#processes-and-threads">Processes and threads</a></li><li class="toc-l3"><a href="#error-paths">Error paths</a></li><li class="toc-l2"><a href="#related-concepts">Related concepts</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

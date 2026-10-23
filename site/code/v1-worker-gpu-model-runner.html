@@ -1,0 +1,637 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>&quot;v1/worker/gpu/model_runner.py: Model Runner V2&quot; · vLLM Explained</title>
+<meta name="description" content="vllm/v1/worker/gpu/model_runner.py holds GPUModelRunner, the default model runner (MRV2). It loads the model, sets up the KV cache, attention backends and CUDA graphs, and per step turns a SchedulerOutput into GPU inputs, runs the forward pass and samples into an AsyncOutput.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="code/v1-worker-gpu-model-runner">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a class="current" aria-current="page" href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>Code map</span><span class="sep">›</span><span>Executor and worker</span><span class="sep">›</span><span aria-current="page">worker/gpu/model_runner.py</span></nav>
+<h1 class="page-title">&quot;v1/worker/gpu/model_runner.py: Model Runner V2&quot;</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">Code map</span><span class="meta-time">about 8 min read + 2 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../concepts/model-runner.html">The model runner (Model Runner V2)</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../concepts/executors-and-workers.html">Executors and workers: from the engine core to the GPUs</a> <span class="level level-intermediate level-sm">Intermediate</span></li></ul></aside>
+<h2 id="purpose">Purpose<a class="h-anchor" href="#purpose" aria-label="Link to this section">#</a></h2>
+<p><code>vllm/v1/worker/gpu/model_runner.py</code> is the GPU half of an engine step: it keeps the request states on the GPU, builds each step's inputs, runs the model and samples the next tokens.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/v1/worker/gpu/model_runner.py</code>, 2,483 lines. The header asks contributors to keep the file "minimal" and to put model-specific code elsewhere (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L3-L17" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:3-17 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:3-17</code></a>).</td></tr>
+    <tr><th>Main class</th><td><code>GPUModelRunner(LoRAModelRunnerMixin)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L199" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:199 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:199</code></a>).</td></tr>
+    <tr><th>Runs in</th><td>Each <a class="term" href="../reference/glossary.html#term-worker" data-term="worker" data-def="The process or object that owns one GPU. It sets up the device and the process groups, and it holds the model runner.">worker</a> process, or the engine core process with the <a class="term" href="../reference/glossary.html#term-uni-executor" data-term="uni executor" data-def="The executor backend &quot;uni&quot; (UniProcExecutor). It makes the one worker as an object in the engine core process and calls its methods directly. By default, vLLM uses it only when TP = PP = DP = 1.">uni executor</a>. The Python code runs on the CPU and only queues GPU work; one extra CUDA stream copies outputs back.</td></tr>
+    <tr><th>Called by</th><td><code>Worker</code> in <code>v1/worker/gpu_worker.py</code>, which builds it when <code>use_v2_model_runner</code> is true (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L567-L580" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:567-580 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:567-580</code></a>).</td></tr>
+    <tr><th>Calls</th><td><code>states.py</code>, <code>input_batch.py</code>, <code>block_table.py</code>, <code>attn_utils.py</code>, <code>cudagraph_utils.py</code>, <code>async_utils.py</code>, the model states, the sampler, the speculators and the model itself (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L90-L190" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:90-190 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:90-190</code></a>).</td></tr>
+    <tr><th>Not in this file</th><td>Kernels for input preparation (in <code>input_batch.py</code> and <code>block_table.py</code>), CUDA graph capture details (<a href="../concepts/compile-and-cuda-graphs.html">torch.compile and CUDA graphs in vLLM</a>), attention (<a href="../concepts/attention-backends.html">Attention backends: backend, metadata builder and implementation</a>), the sampler (<code>gpu/sample/</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page <a href="../concepts/model-runner.html">The model runner (Model Runner V2)</a> explains the design. This page is a map of the file and a walk through its main methods.</p>
+
+<h2 id="where-it-sits">Where it sits<a class="h-anchor" href="#where-it-sits" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b6b_mr_timeline"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Three lanes over time: the caller thread, the GPU main stream and the copy stream. execute_model queues the forward pass, sample_tokens queues the sampler and starts a copy on the copy stream, and get_output() later waits for the copy event. A second panel shows who calls get_output: the engine core main thread with the uni executor, or the WorkerAsyncOutputCopy thread on the output rank with the multiproc executor and async scheduling."><svg role="img" aria-label="Three lanes over time: the caller thread, the GPU main stream and the copy stream. execute_model queues the forward pass, sample_tokens queues the sampler and starts a copy on the copy stream, and get_output() later waits for the copy event. A second panel shows who calls get_output: the engine core main thread with the uni executor, or the WorkerAsyncOutputCopy thread on the output rank with the multiproc executor and async scheduling." xmlns="http://www.w3.org/2000/svg" width="1100" height="750" viewBox="0 0 1100 750">
+<defs><marker id="dg-b6b_mr_timeline-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker></defs>
+<rect width="1100" height="750" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">One MRV2 step: the CPU queues work, and waits only in get_output()</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">execute_model and sample_tokens return at once  ·  durations are illustrative, not measured</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">time runs left to right  ·  the main stream runs kernels in queue order  ·  the copy stream overlaps</text>
+<rect x="20.0" y="118.0" width="1060.0" height="300.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="144.0" r="13" fill="#111827"/>
+<text x="46.0" y="148.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="149.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What runs where, in one step?</text>
+<text x="68.0" y="168.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Three lanes: the thread that calls the runner, the GPU main stream, and the runner&#x27;s copy stream.</text>
+<text x="46.0" y="211.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">caller thread</text>
+<text x="46.0" y="227.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">engine core or worker</text>
+<line x1="228.0" y1="243.0" x2="1060.0" y2="243.0" stroke="#d1d5db" stroke-width="1" stroke-dasharray="2 4"/>
+<text x="46.0" y="273.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">GPU main stream</text>
+<text x="46.0" y="289.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">kernels in order</text>
+<line x1="228.0" y1="305.0" x2="1060.0" y2="305.0" stroke="#d1d5db" stroke-width="1" stroke-dasharray="2 4"/>
+<text x="46.0" y="335.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">GPU copy stream</text>
+<text x="46.0" y="351.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">output_copy_stream</text>
+<line x1="228.0" y1="367.0" x2="1060.0" y2="367.0" stroke="#d1d5db" stroke-width="1" stroke-dasharray="2 4"/>
+<rect x="237.0" y="196.0" width="168.0" height="34.0" rx="4" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.3"/>
+<text x="321.0" y="217.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">execute_model</text>
+<rect x="407.0" y="202.0" width="58.0" height="22.0" rx="3" fill="#ffffff" fill-opacity="1.0" stroke="#6b7280" stroke-width="1" stroke-dasharray="3 3"/>
+<text x="436.0" y="217.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">bitmask</text>
+<rect x="467.0" y="196.0" width="168.0" height="34.0" rx="4" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.3"/>
+<text x="551.0" y="217.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">sample_tokens</text>
+<rect x="637.0" y="202.0" width="298.0" height="22.0" rx="3" fill="#ffffff" fill-opacity="1.0" stroke="#6b7280" stroke-width="1" stroke-dasharray="3 3"/>
+<text x="786.0" y="217.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">free: next step</text>
+<rect x="937.0" y="196.0" width="113.0" height="34.0" rx="4" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.3"/>
+<text x="993.5" y="217.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#7c3aed" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">get_output()</text>
+<rect x="387.0" y="258.0" width="298.0" height="34.0" rx="4" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.3"/>
+<text x="536.0" y="279.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">forward pass</text>
+<rect x="687.0" y="258.0" width="68.0" height="34.0" rx="4" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.3"/>
+<text x="721.0" y="279.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">sampler</text>
+<rect x="757.0" y="258.0" width="88.0" height="34.0" rx="4" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.3"/>
+<text x="801.0" y="279.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">post_update</text>
+<rect x="847.0" y="258.0" width="78.0" height="34.0" rx="4" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.3"/>
+<text x="886.0" y="279.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">drafter</text>
+<rect x="387.0" y="326.0" width="368.0" height="22.0" rx="3" fill="#ffffff" fill-opacity="1.0" stroke="#6b7280" stroke-width="1" stroke-dasharray="3 3"/>
+<text x="571.0" y="341.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#6b7280" font-weight="normal" text-anchor="middle" xml:space="preserve" style="white-space:pre">waits for main stream</text>
+<rect x="757.0" y="320.0" width="78.0" height="34.0" rx="4" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.3"/>
+<text x="796.0" y="341.5" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">D2H copy</text>
+<circle cx="836.0" cy="337.0" r="5" fill="#d97706"/>
+<text x="766.0" y="384.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">copy_event.record</text>
+<path d="M 841.0,337.0 L 944.0,337.0 L 944.0,232.0" fill="none" stroke="#d97706" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#dg-b6b_mr_timeline-m0)"/>
+<text x="952.0" y="279.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">synchronize()</text>
+<rect x="20.0" y="440.0" width="1060.0" height="196.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="466.0" r="13" fill="#111827"/>
+<text x="46.0" y="470.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="471.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Who calls get_output()?</text>
+<text x="68.0" y="490.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">It depends on the executor; in both cases the engine core gets plain Python lists.</text>
+<rect x="46.0" y="508.0" width="490.0" height="104.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="58.0" y="528.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">uni executor (TP = PP = DP = 1)</text>
+<text x="58.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">sample_tokens -&gt; AsyncOutputFuture (no wait)</text>
+<text x="58.0" y="561.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">engine core main thread, later:</text>
+<text x="58.0" y="576.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  batch_queue.pop() -&gt; future.result()</text>
+<text x="58.0" y="591.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  -&gt; AsyncOutput.get_output()</text>
+<rect x="564.0" y="508.0" width="490.0" height="104.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="576.0" y="528.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">multiproc + async scheduling (output rank)</text>
+<text x="576.0" y="546.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">worker main thread: handle_output()</text>
+<text x="576.0" y="561.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  -&gt; async_output_queue (no wait)</text>
+<text x="576.0" y="576.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">thread WorkerAsyncOutputCopy:</text>
+<text x="576.0" y="591.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  get_output() -&gt; reply MessageQueue</text>
+<text x="30.0" y="671.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="660.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="118.3" y="671.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">CPU work</text>
+<rect x="200.3" y="660.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="221.3" y="671.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">GPU kernels</text>
+<rect x="315.7" y="660.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="336.7" y="671.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">copy to the CPU and its event</text>
+<text x="30.0" y="700.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Dashed blocks: no work of this step (the engine core computes the bitmask; the caller is free for the next step).</text>
+<text x="30.0" y="718.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The drafter runs only with speculative decoding. With async scheduling, step N+1 is queued before get_output() of step N.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: one step of this file over time, and who waits for its output.</figcaption><a class="diagram-open" href="../diagrams/b6b_mr_timeline.svg" target="_blank">Open full size ↗</a></div></figure>
+
+<h3 id="who-calls-it">Who calls it<a class="h-anchor" href="#who-calls-it" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><strong>Start-up, through the worker.</strong> <code>load_model</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L591-L598" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:591-598 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:591-598</code></a>), <code>profile_run</code> during memory profiling (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L697" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:697 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:697</code></a>), <code>initialize_kv_cache</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L898" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:898 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:898</code></a>), warm-up <code>_dummy_run</code> calls and <code>capture_model</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L961-L985" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:961-985 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:961-985</code></a>).</li>
+  <li><strong>Every step.</strong> <code>Worker.execute_model</code> and <code>Worker.sample_tokens</code> forward the engine core's calls (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L1318-L1321" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:1318-1321 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:1318-1321</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L1350-L1353" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:1350-1353 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:1350-1353</code></a>).</li>
+  <li><strong>Subclasses.</strong> The CPU runner subclasses this class (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/cpu/model_runner.py#L10" target="_blank" rel="noopener" title="vllm/v1/worker/cpu/model_runner.py:10 at 3e44c0d"><code>vllm/v1/worker/cpu/model_runner.py:10</code></a>). An out-of-tree runner can pick its own PCP manager through <code>pcp_manager_cls</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2433-L2437" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2433-2437 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2433-2437</code></a>).</li>
+</ul>
+
+<h3 id="what-it-calls">What it calls<a class="h-anchor" href="#what-it-calls" aria-label="Link to this section">#</a></h3>
+<ul>
+  <li><code>RequestState</code> for the <a class="term" href="../reference/glossary.html#term-persistent-batch" data-term="persistent batch" data-def="The request state that Model Runner V2 keeps on the GPU between steps, one fixed row per running request. Each step gathers its inputs from these rows.">persistent batch</a> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L286-L295" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:286-295 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:286-295</code></a>), <code>InputBuffers</code> and <code>InputBatch</code> for the per-step tensors, <code>BlockTables</code> for block tables and slot mappings.</li>
+  <li><code>init_attn_backend</code>, <code>init_kv_cache</code> and <code>build_slot_mappings_by_layer</code> from <code>attn_utils.py</code>.</li>
+  <li><code>ModelCudaGraphManager</code> and <code>dispatch_cg_and_sync_dp</code> for CUDA graphs.</li>
+  <li><code>set_forward_context</code> around the model call (<a href="../code/forward-context.html">&quot;forward_context.py: the per-step context of the forward pass&quot;</a>).</li>
+  <li><code>Sampler</code>, <code>RejectionSampler</code>, <code>StructuredOutputsWorker</code>, the speculator, <code>AsyncOutput</code>.</li>
+</ul>
+
+<h2 id="key-classes-and-functions">Key classes and functions<a class="h-anchor" href="#key-classes-and-functions" aria-label="Link to this section">#</a></h2>
+<table>
+  <thead><tr><th>Name</th><th>Lines</th><th>Role</th></tr></thead>
+  <tbody>
+    <tr><td><code>__init__</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L200-L368" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:200-368 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:200-368</code></a></td><td>Configs, the copy stream, <code>RequestState</code>, speculator, input buffers, LoRA state.</td></tr>
+    <tr><td><code>load_model</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L385-L555" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:385-555 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:385-555</code></a></td><td>Load the model, pick the model state, build the samplers.</td></tr>
+    <tr><td><code>initialize_kv_cache</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L622-L823" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:622-823 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:622-823</code></a></td><td>Attention groups, block tables, CUDA graph mode and manager, KV cache tensors.</td></tr>
+    <tr><td><code>_dummy_run</code>, <code>profile_run</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L835-L1040" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:835-1040 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:835-1040</code></a></td><td>Fake batches through <code>execute_model</code> for profiling and warm-up.</td></tr>
+    <tr><td><code>capture_model</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1073-L1153" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1073-1153 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1073-1153</code></a></td><td>Capture the encoder and decoder CUDA graphs; log time and memory.</td></tr>
+    <tr><td><code>finish_requests</code>, <code>add_requests</code>, <code>update_requests</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1173-L1291" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1173-1291 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1173-1291</code></a></td><td>Apply the scheduler's plan to the persistent state.</td></tr>
+    <tr><td><code>gather_batch_req_state</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1293-L1373" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1293-1373 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1293-1373</code></a></td><td>Sort the batch, map to slots, find prefills and the uniform decode count.</td></tr>
+    <tr><td><code>prepare_inputs</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1375-L1575" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1375-1575 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1375-1575</code></a></td><td>Build the <code>InputBatch</code> with GPU kernels.</td></tr>
+    <tr><td><code>prepare_attn</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1577-L1597" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1577-1597 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1577-1597</code></a></td><td>Gather block tables, compute slot mappings.</td></tr>
+    <tr><td><code>sample</code>, <code>postprocess_sampled</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1615-L1730" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1615-1730 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1615-1730</code></a></td><td>Logits, bitmask, sampler; then write the new tokens into the state.</td></tr>
+    <tr><td><code>execute_model</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1741-L2110" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1741-2110 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1741-2110</code></a></td><td>The forward half of a step.</td></tr>
+    <tr><td><code>sample_tokens</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2112-L2311" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2112-2311 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2112-2311</code></a></td><td>The sampling half; returns an <code>AsyncOutput</code>.</td></tr>
+    <tr><td><code>pool</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2316-L2358" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2316-2358 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2316-2358</code></a></td><td>The pooling replacement of <code>sample_tokens</code>.</td></tr>
+    <tr><td><code>shutdown</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2368-L2407" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2368-2407 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2368-2407</code></a></td><td>Free weights, KV caches and graphs.</td></tr>
+    <tr><td><code>ExecuteModelState</code>, <code>BatchReqState</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2439-L2468" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2439-2468 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2439-2468</code></a></td><td>Hand-over from <code>execute_model</code> to <code>sample_tokens</code>; sorted batch state.</td></tr>
+    <tr><td><code>sort_batch_req_ids</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2471-L2483" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2471-2483 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2471-2483</code></a></td><td>Batch order: drafts, decodes, then by token count.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="walk-through-the-main-methods">Walk through the main methods<a class="h-anchor" href="#walk-through-the-main-methods" aria-label="Link to this section">#</a></h2>
+
+<h3 id="load-model"><code>load_model</code><a class="h-anchor" href="#load-model" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L397-L410" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/model_runner.py:397-410</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L397-L410" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">397</span><span class="ln hl">398</span><span class="ln">399</span><span class="ln">400</span><span class="ln">401</span><span class="ln hl">402</span><span class="ln hl">403</span><span class="ln hl">404</span><span class="ln hl">405</span><span class="ln hl">406</span><span class="ln hl">407</span><span class="ln hl">408</span><span class="ln hl">409</span><span class="ln hl">410</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><pre><code class="language-python">        with DeviceMemoryProfiler() as m:
+            model_loader = get_model_loader(self.vllm_config.load_config)
+            logger.info_once(&quot;Loading model from scratch...&quot;)
+
+            # Capture warmup providers selected while constructing the model.
+            with self.jit_warmup_registry.activate():
+                self.model = model or model_loader.load_model(
+                    vllm_config=self.vllm_config,
+                    model_config=self.vllm_config.model_config,
+                )
+            if self.lora_config:
+                self.model = self.load_lora_model(
+                    self.model, self.vllm_config, self.device
+                )</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 398.</strong> <code>get_model_loader</code> picks the loader for <code>--load-format</code> (<a href="../concepts/weight-loading.html">&quot;Weight loading: from checkpoint files to GPU parameters&quot;</a>).</li>
+  <li><strong>Lines 402-406.</strong> The loader builds the model and loads the weights. JIT warm-up providers chosen during the build are recorded.</li>
+  <li><strong>Lines 407-410.</strong> With LoRA, the model's layers are wrapped.</li>
+</ol>
+<p>After loading, it builds the model state and <code>decode_query_len</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L438-L445" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:438-445 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:438-445</code></a>). On the last PP rank of a generative model it builds the <code>Sampler</code>, a <code>RejectionSampler</code> with speculative decoding, the prompt-logprobs worker and the structured-output worker (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L464-L532" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:464-532 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:464-532</code></a>). A pooling model gets a <code>PoolingRunner</code> instead (lines 534-535). In <code>STOCK_TORCH_COMPILE</code> mode the whole model is compiled here (lines 554-555).</p>
+
+<h3 id="initialize-kv-cache"><code>initialize_kv_cache</code><a class="h-anchor" href="#initialize-kv-cache" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L684-L699" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/model_runner.py:684-699</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L684-L699" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">684</span><span class="ln">685</span><span class="ln">686</span><span class="ln">687</span><span class="ln">688</span><span class="ln">689</span><span class="ln">690</span><span class="ln">691</span><span class="ln hl">692</span><span class="ln hl">693</span><span class="ln hl">694</span><span class="ln hl">695</span><span class="ln hl">696</span><span class="ln hl">697</span><span class="ln hl">698</span><span class="ln hl">699</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><pre><code class="language-python">        if isinstance(self.speculator, DraftModelSpeculator):
+            draft_attn_layer_names = self.speculator.draft_attn_layer_names
+        # Metadata builders select attention kernels that need JIT warmup.
+        with self.jit_warmup_registry.activate():
+            (
+                self.attn_groups,
+                attn_cg_support,
+                self.kernel_block_sizes,
+            ) = init_attn_backend(
+                self.kv_cache_config,
+                self.vllm_config,
+                self.device,
+                draft_layer_names=draft_attn_layer_names,
+            )
+        additional_attn_cg_support = self.model_state.get_additional_cg_support()
+        attn_cg_support = attn_cg_support.narrow(*additional_attn_cg_support)</code></pre></div></div></div></figure>
+<p><code>init_attn_backend</code> returns the attention groups, the weakest CUDA graph support and the kernel block sizes. Then the method builds <code>BlockTables</code> (lines 716-728), resolves the CUDA graph mode with the backend support, and builds the CUDA graph manager:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L754-L772" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/model_runner.py:754-772</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L754-L772" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">754</span><span class="ln hl">755</span><span class="ln hl">756</span><span class="ln hl">757</span><span class="ln hl">758</span><span class="ln hl">759</span><span class="ln hl">760</span><span class="ln hl">761</span><span class="ln hl">762</span><span class="ln hl">763</span><span class="ln hl">764</span><span class="ln hl">765</span><span class="ln hl">766</span><span class="ln hl">767</span><span class="ln hl">768</span><span class="ln hl">769</span><span class="ln hl">770</span><span class="ln hl">771</span><span class="ln hl">772</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><pre><code class="language-python">        cudagraph_mode = self.compilation_config.resolve_cudagraph_mode_and_sizes(
+            attn_cg_support.min_cg_support,
+            attn_cg_support.min_cg_attn_backend,
+            self.decode_query_len,
+            use_v2_model_runner=True,
+            kv_cache_config=self.kv_cache_config,
+            max_num_reqs=self.max_num_reqs,
+            is_profiling=is_profiling,
+            piecewise_capture_available=piecewise_capture_available,
+        )
+        self.cudagraph_manager = ModelCudaGraphManager(
+            self.vllm_config,
+            self.device,
+            cudagraph_mode,
+            decode_query_len=self.decode_query_len,
+            lora_capture_cases=self.lora_capture_cases,
+            varlen_decode=self.adaptive_verification is not None,
+            ubatch_runner=self.ubatch_runner,
+        )</code></pre></div></div></div></figure>
+<p>Last, it allocates the KV cache and binds each view to its layer through <code>static_forward_context</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L792-L808" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:792-808 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:792-808</code></a>), and creates the KV connector unless this is a profiling call (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L813-L823" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:813-823 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:813-823</code></a>).</p>
+
+<h3 id="execute-model"><code>execute_model</code><a class="h-anchor" href="#execute-model" aria-label="Link to this section">#</a></h3>
+<p>The state updates (lines 1753-1771) and the input steps are on <a href="../concepts/model-runner.html">The model runner (Model Runner V2)</a>. The core of the method:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1806-L1838" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/model_runner.py:1806-1838</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1806-L1838" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">1806</span><span class="ln hl">1807</span><span class="ln hl">1808</span><span class="ln hl">1809</span><span class="ln hl">1810</span><span class="ln hl">1811</span><span class="ln hl">1812</span><span class="ln hl">1813</span><span class="ln hl">1814</span><span class="ln hl">1815</span><span class="ln hl">1816</span><span class="ln hl">1817</span><span class="ln hl">1818</span><span class="ln hl">1819</span><span class="ln hl">1820</span><span class="ln hl">1821</span><span class="ln">1822</span><span class="ln hl">1823</span><span class="ln hl">1824</span><span class="ln hl">1825</span><span class="ln hl">1826</span><span class="ln">1827</span><span class="ln">1828</span><span class="ln">1829</span><span class="ln">1830</span><span class="ln">1831</span><span class="ln">1832</span><span class="ln">1833</span><span class="ln">1834</span><span class="ln hl">1835</span><span class="ln hl">1836</span><span class="ln hl">1837</span><span class="ln hl">1838</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><pre><code class="language-python">        batch_desc, dp_sync_state = dispatch_cg_and_sync_dp(
+            self.cudagraph_manager,
+            num_reqs,
+            num_toks,
+            uniform_tok_count,
+            self.dp_size,
+            self.dp_rank,
+            max_query_len=max_query_len,
+            need_eager=is_profile or skip_compiled,
+            num_active_loras=num_active_loras,
+            parallel_config=self.parallel_config,
+            allow_ubatching=(
+                self.ubatch_runner is not None and not skip_attn_for_dummy_run
+            ),
+            uniform_decode=uniform_tok_count == self.decode_query_len,
+        )
+
+        if batch_desc.num_tokens == 0:
+            # All DP ranks have zero tokens to run.
+            empty_output = self.kv_connector.no_forward(scheduler_output)
+            return self._merge_ec_connector_no_forward(scheduler_output, empty_output)
+
+        cudagraph_stats = None
+        if not dummy_run:
+            # Common case.
+            # Prepare all the inputs and copy to the input buffers.
+            if self.observability_config.cudagraph_metrics:
+                cudagraph_stats = make_cudagraph_stats(batch_desc, num_toks)
+            assert batch_req_state is not None
+            input_batch = self.prepare_inputs(
+                scheduler_output, batch_req_state, batch_desc, num_active_loras
+            )
+            block_tables, slot_mappings = self.prepare_attn(input_batch)</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 1806-1821.</strong> Pick the CUDA graph descriptor; with DP &gt; 1 the ranks agree on one padded size.</li>
+  <li><strong>Lines 1823-1826.</strong> If every DP rank has zero tokens, return an empty output.</li>
+  <li><strong>Lines 1835-1838.</strong> Build the step tensors, then the block tables and slot mappings.</li>
+</ol>
+<p>Then the method builds the attention metadata (lines 1924-1951), the model inputs (lines 1984-2010), and runs the model in FULL, PIECEWISE or eager mode (lines 2024-2070). It stores an <code>ExecuteModelState</code> and returns <code>None</code>, or <code>IntermediateTensors</code> on a non-last PP rank (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2090-L2110" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2090-2110 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2090-2110</code></a>).</p>
+
+<h3 id="sample-tokens"><code>sample_tokens</code><a class="h-anchor" href="#sample-tokens" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2117-L2134" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/model_runner.py:2117-2134</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2117-L2134" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">2117</span><span class="ln hl">2118</span><span class="ln hl">2119</span><span class="ln">2120</span><span class="ln">2121</span><span class="ln">2122</span><span class="ln">2123</span><span class="ln">2124</span><span class="ln">2125</span><span class="ln">2126</span><span class="ln">2127</span><span class="ln">2128</span><span class="ln">2129</span><span class="ln">2130</span><span class="ln hl">2131</span><span class="ln">2132</span><span class="ln hl">2133</span><span class="ln">2134</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><pre><code class="language-python">        if self.execute_model_state is None:
+            # The prior execute_model call must have failed.
+            return None
+
+        input_batch = self.execute_model_state.input_batch
+        attn_metadata = self.execute_model_state.attn_metadata
+        slot_mappings_by_layer = self.execute_model_state.slot_mappings_by_layer
+        hidden_states = self.execute_model_state.hidden_states
+        aux_hidden_states = self.execute_model_state.aux_hidden_states
+        dp_sync_state = self.execute_model_state.dp_sync_state
+        finished_req_ids = self.execute_model_state.finished_req_ids
+        ec_connector_output = self.execute_model_state.ec_connector_output
+        cudagraph_stats = self.execute_model_state.cudagraph_stats
+        num_spec_tokens = self.execute_model_state.num_spec_tokens_to_schedule
+        self.execute_model_state = None
+
+        if not self.is_last_pp_rank:
+            # Non-last PP rank: hidden_states is None because this rank produced</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Lines 2117-2119.</strong> No stored state means <code>execute_model</code> failed; return <code>None</code>.</li>
+  <li><strong>Line 2131.</strong> The state is used once and cleared.</li>
+  <li><strong>Line 2133.</strong> A non-last PP rank only receives the sampled tokens from the last rank and updates its counters (lines 2134-2153).</li>
+</ol>
+<p>On the last rank: <code>sample()</code> (line 2163), prompt logprobs (lines 2176-2192), the <code>ModelRunnerOutput</code> shell with <code>sampled_token_ids=None</code> (lines 2195-2204), the <code>AsyncOutput</code> that starts the copy (lines 2210-2218), <code>postprocess_sampled</code> (lines 2249-2255), and the speculator (lines 2257-2293). It returns the <code>AsyncOutput</code> (line 2311).</p>
+
+<h3 id="prepare-inputs"><code>prepare_inputs</code><a class="h-anchor" href="#prepare-inputs" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1481-L1504" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/model_runner.py:1481-1504</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1481-L1504" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1481</span><span class="ln hl">1482</span><span class="ln hl">1483</span><span class="ln hl">1484</span><span class="ln hl">1485</span><span class="ln hl">1486</span><span class="ln hl">1487</span><span class="ln hl">1488</span><span class="ln">1489</span><span class="ln">1490</span><span class="ln">1491</span><span class="ln">1492</span><span class="ln hl">1493</span><span class="ln hl">1494</span><span class="ln hl">1495</span><span class="ln hl">1496</span><span class="ln hl">1497</span><span class="ln hl">1498</span><span class="ln hl">1499</span><span class="ln hl">1500</span><span class="ln hl">1501</span><span class="ln hl">1502</span><span class="ln hl">1503</span><span class="ln hl">1504</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><pre><code class="language-python">        # Prepare positions and seq_lens.
+        prepare_pos_seq_lens(
+            idx_mapping,
+            query_start_loc,
+            self.req_states.num_computed_tokens.gpu,
+            self.input_buffers.positions,
+            self.input_buffers.seq_lens,
+        )
+        seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+
+        # Some input token ids are directly read from the last sampled tokens
+        # and draft tokens. Also, get the logits indices to sample tokens from.
+        logits_indices = combine_sampled_and_draft_tokens(
+            self.input_buffers.input_ids,
+            idx_mapping,
+            self.req_states.last_sampled_tokens,
+            query_start_loc,
+            seq_lens,
+            self.req_states.prefill_len.gpu,
+            self.req_states.draft_tokens,
+            cu_num_logits,
+            total_num_logits,
+            self.model_state.num_new_sampled_tokens_per_step,
+        )</code></pre></div></div></div></figure>
+<p>Two of the four GPU steps: positions and sequence lengths, then the input tokens from the last sampled tokens and the drafts. The returned <code>logits_indices</code> select the rows for the sampler. The method ends with an <code>InputBatch</code> of more than 30 fields (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1532-L1574" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1532-1574 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1532-1574</code></a>).</p>
+
+<h3 id="capture-model"><code>capture_model</code><a class="h-anchor" href="#capture-model" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1091-L1127" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/worker/gpu/model_runner.py:1091-1127</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1091-L1127" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1091</span><span class="ln hl">1092</span><span class="ln">1093</span><span class="ln">1094</span><span class="ln">1095</span><span class="ln">1096</span><span class="ln hl">1097</span><span class="ln hl">1098</span><span class="ln">1099</span><span class="ln">1100</span><span class="ln">1101</span><span class="ln">1102</span><span class="ln">1103</span><span class="ln hl">1104</span><span class="ln hl">1105</span><span class="ln hl">1106</span><span class="ln hl">1107</span><span class="ln hl">1108</span><span class="ln hl">1109</span><span class="ln hl">1110</span><span class="ln hl">1111</span><span class="ln hl">1112</span><span class="ln hl">1113</span><span class="ln hl">1114</span><span class="ln hl">1115</span><span class="ln hl">1116</span><span class="ln hl">1117</span><span class="ln hl">1118</span><span class="ln hl">1119</span><span class="ln hl">1120</span><span class="ln hl">1121</span><span class="ln hl">1122</span><span class="ln hl">1123</span><span class="ln hl">1124</span><span class="ln hl">1125</span><span class="ln hl">1126</span><span class="ln hl">1127</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(18 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><pre><code class="language-python">        start_time = time.perf_counter()
+        with freeze_gc_for_cudagraph_capture():
+            torch.accelerator.empty_cache()
+            start_free_gpu_memory = torch.accelerator.get_memory_info()[0]
+
+            with self.maybe_setup_dummy_loras(self.lora_config):
+                if capture_encoder:
+                    self.model_state.encoder_runner.capture()
+
+                if capture_decoder:
+                    input_buffers = self.input_buffers
+                    if self.pcp_manager is not None:
+                        input_buffers = self.pcp_manager.input_buffers
+                    self.cudagraph_manager.capture(
+                        self.model,
+                        self.model_state,
+                        input_buffers,
+                        self.intermediate_tensors,
+                        self.block_tables,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                        pcp_manager=self.pcp_manager,
+                        has_lora=self.lora_config is not None,
+                        use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
+                        lora_capture_hook=create_lora_capture_hook(
+                            self.lora_config, self
+                        ),
+                    )
+                    self.model_state.capture_inner_cudagraphs(
+                        input_buffers,
+                        self.block_tables,
+                        self.attn_groups,
+                        self.kv_cache_config,
+                    )
+                    if self.speculator is not None:
+                        with use_workspace_lane(self._draft_workspace_lane):
+                            self.speculator.capture()</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 1092.</strong> Garbage collection is frozen during capture.</li>
+  <li><strong>Lines 1097-1098.</strong> A multimodal model can capture its encoder too.</li>
+  <li><strong>Lines 1104-1118.</strong> The decoder graphs: PIECEWISE and FULL descriptors (<a href="../concepts/compile-and-cuda-graphs.html">torch.compile and CUDA graphs in vLLM</a>).</li>
+  <li><strong>Lines 1119-1127.</strong> Model-state graphs and the speculator's graphs.</li>
+</ol>
+<p>The method returns the graph memory and logs "Graph capturing finished in ... secs, took ... GiB" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1144-L1153" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1144-1153 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1144-1153</code></a>).</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="a-map-of-the-file-by-line-ranges" class="dd-title">A map of the file by line ranges</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Lines</th><th>Section</th></tr></thead>
+  <tbody>
+    <tr><td>1-17</td><td>Style note: keep this file minimal (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L3-L17" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:3-17 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:3-17</code></a>)</td></tr>
+    <tr><td>19-197</td><td>Imports</td></tr>
+    <tr><td>199-383</td><td><code>__init__</code>, <code>update_max_model_len</code>, <code>get_supported_tasks</code></td></tr>
+    <tr><td>385-620</td><td>Model loading, small accessors, weight reload, <code>get_kv_cache_spec</code></td></tr>
+    <tr><td>622-833</td><td><code>initialize_kv_cache</code>, <code>_init_kv_zero_meta</code></td></tr>
+    <tr><td>835-1071</td><td>Dummy runs, profiling, CUDA graph memory profile</td></tr>
+    <tr><td>1073-1153</td><td><code>capture_model</code></td></tr>
+    <tr><td>1155-1291</td><td>Request state updates</td></tr>
+    <tr><td>1293-1613</td><td>Batch gathering, <code>prepare_inputs</code>, <code>prepare_attn</code>, dummy attention inputs</td></tr>
+    <tr><td>1615-1739</td><td><code>sample</code>, <code>postprocess_sampled</code>, EC connector helper</td></tr>
+    <tr><td>1741-2110</td><td><code>execute_model</code></td></tr>
+    <tr><td>2112-2366</td><td><code>sample_tokens</code>, <code>take_draft_token_ids</code>, <code>pool</code>, <code>postprocess_num_computed_tokens</code></td></tr>
+    <tr><td>2368-2437</td><td><code>shutdown</code>, EPLB properties, <code>pcp_manager_cls</code></td></tr>
+    <tr><td>2439-2483</td><td><code>ExecuteModelState</code>, <code>BatchReqState</code>, <code>sort_batch_req_ids</code></td></tr>
+  </tbody>
+</table></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="data-flow-types-and-shapes" class="dd-title">Data flow: types and shapes</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Value</th><th>Type, shape</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>scheduler_output</code></td><td><code>SchedulerOutput</code>, from the engine core</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1742-L1745" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1742-1745 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1742-1745</code></a></td></tr>
+    <tr><td><code>idx_mapping</code></td><td>int64 <code>[num_reqs]</code>, GPU</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1392-L1395" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1392-1395 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1392-1395</code></a></td></tr>
+    <tr><td><code>query_start_loc</code></td><td>int32 <code>[num_reqs_padded + 1]</code>, persistent GPU buffer</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1455-L1467" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1455-1467 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1455-1467</code></a></td></tr>
+    <tr><td><code>input_ids</code>, <code>positions</code></td><td>int32 / int64 <code>[num_tokens_after_padding]</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/input_batch.py#L25-L26" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/input_batch.py:25-26 at 3e44c0d"><code>vllm/v1/worker/gpu/input_batch.py:25-26</code></a></td></tr>
+    <tr><td><code>logits_indices</code></td><td>int64 <code>[total_num_logits]</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/input_batch.py#L486" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/input_batch.py:486 at 3e44c0d"><code>vllm/v1/worker/gpu/input_batch.py:486</code></a></td></tr>
+    <tr><td>block tables</td><td>tuple of int32 <code>[num_reqs_padded, max_num_blocks]</code>, one per KV cache group</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1584-L1588" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1584-1588 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1584-1588</code></a></td></tr>
+    <tr><td>slot mappings</td><td>int64 <code>[num_groups, num_tokens_padded]</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1589-L1596" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1589-1596 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1589-1596</code></a></td></tr>
+    <tr><td><code>attn_metadata</code></td><td><code>dict[layer name, metadata]</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1940-L1951" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1940-1951 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1940-1951</code></a></td></tr>
+    <tr><td><code>hidden_states</code></td><td><code>[num_tokens_after_padding, hidden_size]</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2074-L2081" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2074-2081 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2074-2081</code></a></td></tr>
+    <tr><td>result of <code>sample_tokens</code></td><td><code>AsyncOutput</code>; after <code>get_output()</code>, <code>ModelRunnerOutput</code> with <code>sampled_token_ids: list[list[int]]</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/async_utils.py#L173-L184" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/async_utils.py:173-184 at 3e44c0d"><code>vllm/v1/worker/gpu/async_utils.py:173-184</code></a></td></tr>
+  </tbody>
+</table></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="processes-threads-and-streams" class="dd-title">Processes, threads and streams</h3></summary><div class="dd-body"><ul>
+  <li><strong>One thread calls the runner</strong>: the engine core main thread (uni executor) or the worker main thread (multiproc executor). The runner has no threads of its own.</li>
+  <li><strong>Two CUDA streams.</strong> The main stream, cached as <code>main_stream</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L601-L604" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:601-604 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:601-604</code></a>), and <code>output_copy_stream</code> for the copy to the CPU (line 235). The structured-output worker uses its own stream for the bitmask copy (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/structured_outputs.py#L67" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/structured_outputs.py:67 at 3e44c0d"><code>vllm/v1/worker/gpu/structured_outputs.py:67</code></a>).</li>
+  <li><strong>The waiter.</strong> <code>AsyncOutput.get_output()</code> is called later, outside this file (<a href="../concepts/model-runner.html">The model runner (Model Runner V2)</a>, Step 9).</li>
+</ul></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="error-paths" class="dd-title">Error paths</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>skip_attn</code> outside a profile run</td><td><code>ValueError</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L850-L853" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:850-853 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:850-853</code></a></td></tr>
+    <tr><td>a dummy run above <code>max_num_batched_tokens</code></td><td><code>AssertionError</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L878-L881" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:878-881 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:878-881</code></a></td></tr>
+    <tr><td><code>sample_tokens</code> after a failed <code>execute_model</code></td><td>returns <code>None</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2117-L2119" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2117-2119 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2117-2119</code></a></td></tr>
+    <tr><td>capture with mode <code>NONE</code> and no encoder graph</td><td>WARNING "Skipping encoder and decoder CUDA graph capture", returns 0</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1081-L1087" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1081-1087 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1081-1087</code></a></td></tr>
+    <tr><td>FULL capture with <code>skip_attn</code></td><td><code>AssertionError</code>: metadata needed</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1877-L1881" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1877-1881 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1877-1881</code></a></td></tr>
+    <tr><td>batch-sharded sampling without <code>compute_logits_local</code></td><td>WARNING, feature off</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L447-L461" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:447-461 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:447-461</code></a></td></tr>
+  </tbody>
+</table></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="environment-variables" class="dd-title">Environment variables</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_MOE_SKIP_PADDING</code></td><td><code>1</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L1640" target="_blank" rel="noopener" title="vllm/envs.py:1640 at 3e44c0d"><code>vllm/envs.py:1640</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1386" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1386 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1386</code></a></td><td>Marks padding rows in <code>is_padding</code>.</td></tr>
+    <tr><td><code>VLLM_USE_BREAKABLE_CUDAGRAPH</code></td><td>off unless set or auto-enabled (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L777-L779" target="_blank" rel="noopener" title="vllm/envs.py:777-779 at 3e44c0d"><code>vllm/envs.py:777-779</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L746-L748" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:746-748 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:746-748</code></a></td><td>Piecewise capture without a compiled submodule.</td></tr>
+    <tr><td><code>VLLM_USE_V2_MODEL_RUNNER</code></td><td>unset (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L2147-L2149" target="_blank" rel="noopener" title="vllm/envs.py:2147-2149 at 3e44c0d"><code>vllm/envs.py:2147-2149</code></a>)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L730-L732" target="_blank" rel="noopener" title="vllm/config/vllm.py:730-732 at 3e44c0d"><code>vllm/config/vllm.py:730-732</code></a></td><td>Selects this file (or the V1 fallback).</td></tr>
+  </tbody>
+</table></div></details>
+
+<h2 id="related-concepts">Related concepts<a class="h-anchor" href="#related-concepts" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><a href="../concepts/model-runner.html">The model runner (Model Runner V2)</a>: the design of MRV2, with a worked example.</li>
+  <li><a href="../concepts/forward-context.html">The forward context: how layers find per-step data</a>: how the layers get the metadata set in <code>execute_model</code>.</li>
+  <li><a href="../concepts/attention-backends.html">Attention backends: backend, metadata builder and implementation</a>: the builders called from the model state.</li>
+  <li><a href="../concepts/compile-and-cuda-graphs.html">torch.compile and CUDA graphs in vLLM</a>: the modes and the dispatch rule.</li>
+  <li><a href="../concepts/async-scheduling.html">Async scheduling: overlap the CPU and the GPU</a>: why the two calls never wait.</li>
+</ul>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Which method returns the <code>AsyncOutput</code>, and what does <code>execute_model</code> return on the last PP rank?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p><code>sample_tokens</code> returns it (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2311" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2311 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2311</code></a>). <code>execute_model</code> returns <code>None</code> and keeps its results in <code>execute_model_state</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2090-L2110" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2090-2110 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2090-2110</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>Where is the CUDA graph mode of the run finally decided, and with which inputs?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>In <code>initialize_kv_cache</code>, by <code>resolve_cudagraph_mode_and_sizes</code> with the weakest attention support, its backend name, <code>decode_query_len</code>, the KV cache config and <code>piecewise_capture_available</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L754-L763" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:754-763 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:754-763</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>Why does <code>sample_tokens</code> create the <code>AsyncOutput</code> before <code>postprocess_sampled</code>?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>So the copy event is recorded first and the copy to the CPU does not wait for the post-processing kernels (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2244-L2248" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2244-2248 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2244-2248</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>A dummy run for the profile uses <code>skip_attn=True</code>. Why can a FULL capture not do the same?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>A FULL graph records the attention kernels too, so it needs real attention metadata at capture; the code asserts this (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1877-L1881" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1877-1881 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1877-1881</code></a>). The profile run only measures memory and may skip attention (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L1022-L1027" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:1022-1027 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:1022-1027</code></a>).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/model-runner.html">The model runner (Model Runner V2)</a><span class="rel-sum">Model Runner V2 keeps every running request in a fixed row of GPU tensors, gathers each step&#x27;s inputs from those rows with GPU kernels, runs the model (CUDA graph or eager), and samples in a second call that returns an AsyncOutput without a GPU wait.</span></li><li><a href="../concepts/forward-context.html">The forward context: how layers find per-step data</a><span class="rel-sum">Attention layers register themselves by name when the model is built, get their KV cache tensor bound at start-up, and read the per-step metadata from a global forward context that the model runner sets around each forward pass. The attention custom ops take only the layer name, so torch.compile sees them as opaque.</span></li><li><a href="../concepts/attention-backends.html">Attention backends: backend, metadata builder and implementation</a><span class="rel-sum">An attention backend is three classes. The backend class describes what it supports, the metadata builder turns the common batch description of a KV cache group into backend metadata once per step, and the implementation writes the KV cache and runs the kernel for one layer. The builders also report how much CUDA graph capture they allow.</span></li><li><a href="../concepts/compile-and-cuda-graphs.html">torch.compile and CUDA graphs in vLLM</a><span class="rel-sum">vLLM compiles the inner model once with torch.compile and its own Inductor backend, splits the graph at the attention ops, caches the result on disk, and captures CUDA graphs at start-up. Each step, Model Runner V2 replays a FULL graph for uniform decode batches, PIECEWISE graphs for other batches up to the largest capture size, and runs eagerly above it.</span></li><li><a href="../concepts/async-scheduling.html">Async scheduling: overlap the CPU and the GPU</a><span class="rel-sum">With async scheduling, the engine core schedules and starts step N+1 before it waits for the token of step N. Placeholders in the scheduler and a GPU-side token buffer in Model Runner V2 make this possible.</span></li><li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py: the GPU Worker</a><span class="rel-sum">vllm/v1/worker/gpu_worker.py defines Worker, the object that owns one GPU. It sets up the device and NCCL, builds Model Runner V2, profiles memory to size the KV cache, warms up the model, and forwards each step to the model runner.</span></li><li><a href="../code/forward-context.html">&quot;forward_context.py: the per-step context of the forward pass&quot;</a><span class="rel-sum">vllm/forward_context.py defines ForwardContext, BatchDescriptor and DPMetadata, and the context manager set_forward_context that the model runner wraps around each model call. Code inside the forward pass reads it with get_forward_context().</span></li><li><a href="../tours/engine-step.html">Tour: One engine step</a><span class="rel-sum">Follow one call of step_with_batch_queue in 12 stops, with two requests in the batch (a 1-token decode and an 8191-token prefill chunk): schedule, launch, sample, pop the previous step, update and send.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../code/v1-worker-gpu-worker.html"><span class="pn-dir">← Previous</span><span class="pn-title">v1/worker/gpu_worker.py: the GPU Worker</span></a><a class="pn pn-next" href="../code/plugins-init.html"><span class="pn-dir">Next →</span><span class="pn-title">plugins/__init__.py: the plugin loaders</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#purpose">Purpose</a></li><li class="toc-l2"><a href="#where-it-sits">Where it sits</a></li><li class="toc-l3"><a href="#who-calls-it">Who calls it</a></li><li class="toc-l3"><a href="#what-it-calls">What it calls</a></li><li class="toc-l2"><a href="#key-classes-and-functions">Key classes and functions</a></li><li class="toc-l2"><a href="#walk-through-the-main-methods">Walk through the main methods</a></li><li class="toc-l3"><a href="#load-model">load_model</a></li><li class="toc-l3"><a href="#initialize-kv-cache">initialize_kv_cache</a></li><li class="toc-l3"><a href="#execute-model">execute_model</a></li><li class="toc-l3"><a href="#sample-tokens">sample_tokens</a></li><li class="toc-l3"><a href="#prepare-inputs">prepare_inputs</a></li><li class="toc-l3"><a href="#capture-model">capture_model</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#a-map-of-the-file-by-line-ranges">A map of the file by line ranges</a></li><li class="toc-l3"><a href="#data-flow-types-and-shapes">Data flow: types and shapes</a></li><li class="toc-l3"><a href="#processes-threads-and-streams">Processes, threads and streams</a></li><li class="toc-l3"><a href="#error-paths">Error paths</a></li><li class="toc-l3"><a href="#environment-variables">Environment variables</a></li><li class="toc-l2"><a href="#related-concepts">Related concepts</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

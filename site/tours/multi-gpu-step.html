@@ -1,0 +1,665 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tour: One step across GPUs · vLLM Explained</title>
+<meta name="description" content="Follow two requests through vllm serve -tp 2 -dp 2 in 13 stops: the API servers pick an engine each, two independent engine cores schedule, each broadcasts the step to its two workers through shared memory, the workers meet in 65 all-reduces on their TP group, only rank 0 replies, and the coordinator publishes the new load.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="tours/multi-gpu-step">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a class="current" aria-current="page" href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>Guided tours</span><span class="sep">›</span><span aria-current="page">One step across GPUs</span></nav>
+<h1 class="page-title">Tour: One step across GPUs</h1>
+<div class="page-meta"><span class="level level-advanced" title="Level">Advanced</span><span class="meta-sec">Guided tours</span><span class="meta-time">about 15 min read + 4 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../tours/engine-step.html">Tour: One engine step</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../concepts/data-parallel-serving.html">Data parallel serving: several engine cores behind one endpoint</a> <span class="level level-advanced level-sm">Advanced</span></li><li><a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a> <span class="level level-advanced level-sm">Advanced</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">We follow two requests through four GPUs. Each lands on its own engine core, whose two workers run one step together.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>The tour <a href="../tours/engine-step.html">Tour: One engine step</a> stays inside one engine core with one GPU. This tour adds the two other dimensions of a real deployment. They are several GPUs per engine core (tensor parallelism) and several engine cores per server (data parallelism). It shows which process does what, which channel each message takes, and where the GPUs talk to each other. The model internals are in <a href="../tours/forward-pass.html">Tour: One forward pass</a>; here we only mark where the collectives run.</p>
+<p>Two requests, A and B, arrive at the same time. Request A reaches API server 0 and request B reaches API server 1. Each server picks an engine core. Each engine core plans a step, writes it once into shared memory, and its two workers run the step on two GPUs. At the end, only one worker per engine answers, and the outputs flow back to the API server that sent each request.</p>
+<p><strong>An everyday comparison.</strong> Think of two kitchens in one restaurant, each with two cooks who prepare every dish together, half each. Two hosts at the door send guests to the kitchens. A board in the hall shows how busy each kitchen is. The comparison stops here. The two cooks of a kitchen must finish each half of each layer at the same moment (the all-reduce). The two kitchens never talk for a dense model.</p>
+
+<h3 id="the-example">The example<a class="h-anchor" href="#the-example" aria-label="Link to this section">#</a></h3>
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-8B-Instruct -tp 2 -dp 2      # one node, 4 GPUs, dense model</code></pre>
+<ul>
+  <li>A dense model, so each DP rank is an independent engine core (<a href="../concepts/data-parallel-serving.html">Data parallel serving: several engine cores behind one endpoint</a>).</li>
+  <li>Default flags: internal load balancing, two API servers, async scheduling with the batch queue, Model Runner V2.</li>
+  <li>Both engines are idle when A and B arrive. A has a 300-token prompt, B a 200-token prompt; both are new.</li>
+</ul>
+<aside class="callout callout-simplified"><p class="callout-title">Simplified</p><div class="callout-body"><p>The prompt lengths are illustrative. The API servers share one listen socket, so the operating system decides which one receives a connection. We assume A reaches API server 0 and B reaches API server 1.</p></div></aside>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b8b_multi_gpu_step"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: ApiServer_0 receives request A and picks engine 0 with the DPLB score; ApiServer_1 receives request B and picks engine 1; the DP coordinator collects counts and publishes them; it has no waves for a dense model. A goes over ZMQ to DP rank 0, B to DP rank 1. Each DP rank has an EngineCore_DP process that schedules and calls execute_model and sample_tokens, a shared-memory MessageQueue with one write and two readers, two workers Worker_TP0 and Worker_TP1 on two GPUs that run the forward and sample, of which only TP0 replies, and a TP group [0, 1] bar with 65 all-reduces and one all-gather per step. Stop badges: 2 and 11 on the API servers, 3 and 4 on the engine cores, 5 on the shared-memory queue, 6 on the workers, 7, 8 and 9 on the TP group bar, 10 on worker TP0, 12 on the counts arrow, 13 on the coordinator. Panel 2: the collectives of one step: embedding all-reduce once, o_proj all-reduce 32 times, down_proj all-reduce 32 times, logits all-gather once, all on the TP group; the DP and PP groups have one rank each."><svg role="img" aria-label="Panel 1: ApiServer_0 receives request A and picks engine 0 with the DPLB score; ApiServer_1 receives request B and picks engine 1; the DP coordinator collects counts and publishes them; it has no waves for a dense model. A goes over ZMQ to DP rank 0, B to DP rank 1. Each DP rank has an EngineCore_DP process that schedules and calls execute_model and sample_tokens, a shared-memory MessageQueue with one write and two readers, two workers Worker_TP0 and Worker_TP1 on two GPUs that run the forward and sample, of which only TP0 replies, and a TP group [0, 1] bar with 65 all-reduces and one all-gather per step. Stop badges: 2 and 11 on the API servers, 3 and 4 on the engine cores, 5 on the shared-memory queue, 6 on the workers, 7, 8 and 9 on the TP group bar, 10 on worker TP0, 12 on the counts arrow, 13 on the coordinator. Panel 2: the collectives of one step: embedding all-reduce once, o_proj all-reduce 32 times, down_proj all-reduce 32 times, logits all-gather once, all on the TP group; the DP and PP groups have one rank each." xmlns="http://www.w3.org/2000/svg" width="1100" height="964" viewBox="0 0 1100 964">
+<defs><marker id="dg-b8b_multi_gpu_step-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker><marker id="dg-b8b_multi_gpu_step-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b8b_multi_gpu_step-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#db2777"/></marker></defs>
+<rect width="1100" height="964" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">One step across GPUs: the tour stops</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">vllm serve meta-llama/Llama-3.1-8B-Instruct -tp 2 -dp 2  ·  dense model  ·  4 GPUs  ·  request A and request B</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">10 processes: CLI + ApiServer_0/1 + DP coordinator + EngineCore_DP0/1 + 4 workers (Worker_TP0/TP1 ×2)</text>
+<rect x="20.0" y="116.0" width="1060.0" height="520.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="142.0" r="13" fill="#111827"/>
+<text x="46.0" y="146.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="147.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Where does each stop run?</text>
+<text x="68.0" y="166.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Badges are tour stops. Each engine core and its two workers form a separate world of TP = 2.</text>
+<rect x="46.0" y="186.0" width="300.0" height="84.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="58.0" y="206.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">ApiServer_0</text>
+<text x="58.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">request A arrives</text>
+<text x="58.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">DPLB score → engine 0</text>
+<text x="58.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">receives A&#x27;s tokens</text>
+<rect x="392.0" y="186.0" width="300.0" height="84.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="404.0" y="206.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">ApiServer_1</text>
+<text x="404.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">request B arrives</text>
+<text x="404.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">DPLB score → engine 1</text>
+<text x="404.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">receives B&#x27;s tokens</text>
+<rect x="738.0" y="186.0" width="316.0" height="84.0" rx="8" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.5"/>
+<text x="750.0" y="206.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#db2777" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">DP coordinator</text>
+<text x="750.0" y="224.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">counts in from engines</text>
+<text x="750.0" y="239.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">publishes to API servers</text>
+<text x="750.0" y="254.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">no waves (dense model)</text>
+<circle cx="330.0" cy="200.0" r="11" fill="#0d9488"/>
+<text x="330.0" y="204.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<circle cx="676.0" cy="200.0" r="11" fill="#0d9488"/>
+<text x="676.0" y="204.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<circle cx="330.0" cy="256.0" r="11" fill="#0d9488"/>
+<text x="330.0" y="260.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">11</text>
+<circle cx="676.0" cy="256.0" r="11" fill="#0d9488"/>
+<text x="676.0" y="260.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">11</text>
+<circle cx="1038.0" cy="200.0" r="11" fill="#0d9488"/>
+<text x="1038.0" y="204.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">13</text>
+<rect x="46.0" y="322.0" width="486.0" height="300.0" rx="12" fill="#faf8ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.2" stroke-opacity="0.35" stroke-dasharray="4 4"/>
+<rect x="46.0" y="322.0" width="486.0" height="50.0" rx="12" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<rect x="46.0" y="348.0" width="486.0" height="24.0" rx="0" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<text x="60.0" y="345.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="15" fill="#fff" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">DP rank 0</text>
+<text x="60.0" y="363.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#fff" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">GPUs 0, 1  ·  its own world of 2 ranks</text>
+<rect x="62.0" y="384.0" width="454.0" height="62.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="74.0" y="404.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">EngineCore_DP0  (EngineCoreProc)</text>
+<text x="74.0" y="422.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">schedule → execute_model / sample_tokens</text>
+<circle cx="500.0" cy="398.0" r="11" fill="#0d9488"/>
+<text x="500.0" y="402.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">4</text>
+<circle cx="474.0" cy="398.0" r="11" fill="#0d9488"/>
+<text x="474.0" y="402.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<line x1="182.0" y1="446.0" x2="182.0" y2="480.0" stroke="#059669" stroke-width="1.6" marker-end="url(#dg-b8b_multi_gpu_step-m0)"/>
+<text x="194.0" y="468.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">shm MessageQueue: 1 write, 2 readers</text>
+<circle cx="500.0" cy="464.0" r="11" fill="#0d9488"/>
+<text x="500.0" y="468.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">5</text>
+<rect x="62.0" y="484.0" width="222.0" height="84.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="74.0" y="504.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Worker_TP0  (GPU 0)</text>
+<text x="74.0" y="524.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">execute_model: forward</text>
+<text x="74.0" y="540.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">sample_tokens: sample</text>
+<text x="74.0" y="556.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">reply</text>
+<circle cx="268.0" cy="500.0" r="11" fill="#0d9488"/>
+<text x="268.0" y="504.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">6</text>
+<rect x="294.0" y="484.0" width="222.0" height="84.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="306.0" y="504.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Worker_TP1  (GPU 1)</text>
+<text x="306.0" y="524.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">execute_model: forward</text>
+<text x="306.0" y="540.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">sample_tokens: sample</text>
+<text x="306.0" y="556.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">no reply</text>
+<circle cx="500.0" cy="500.0" r="11" fill="#0d9488"/>
+<text x="500.0" y="504.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">6</text>
+<circle cx="268.0" cy="552.0" r="11" fill="#0d9488"/>
+<text x="268.0" y="556.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">10</text>
+<rect x="62.0" y="580.0" width="454.0" height="28.0" rx="6" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="289.0" y="599.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">TP group [0, 1]: 65 all-reduces + 1 all-gather per step</text>
+<circle cx="78.0" cy="594.0" r="11" fill="#d97706"/>
+<text x="78.0" y="598.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">7</text>
+<circle cx="102.0" cy="594.0" r="11" fill="#d97706"/>
+<text x="102.0" y="598.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">8</text>
+<circle cx="500.0" cy="594.0" r="11" fill="#d97706"/>
+<text x="500.0" y="598.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">9</text>
+<rect x="568.0" y="322.0" width="486.0" height="300.0" rx="12" fill="#faf8ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.2" stroke-opacity="0.35" stroke-dasharray="4 4"/>
+<rect x="568.0" y="322.0" width="486.0" height="50.0" rx="12" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<rect x="568.0" y="348.0" width="486.0" height="24.0" rx="0" fill="#7c3aed" fill-opacity="1.0" stroke="none"/>
+<text x="582.0" y="345.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="15" fill="#fff" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">DP rank 1</text>
+<text x="582.0" y="363.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#fff" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">GPUs 2, 3  ·  its own world of 2 ranks</text>
+<rect x="584.0" y="384.0" width="454.0" height="62.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="596.0" y="404.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">EngineCore_DP1  (EngineCoreProc)</text>
+<text x="596.0" y="422.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">schedule → execute_model / sample_tokens</text>
+<circle cx="1022.0" cy="398.0" r="11" fill="#0d9488"/>
+<text x="1022.0" y="402.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">4</text>
+<circle cx="996.0" cy="398.0" r="11" fill="#0d9488"/>
+<text x="996.0" y="402.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<line x1="704.0" y1="446.0" x2="704.0" y2="480.0" stroke="#059669" stroke-width="1.6" marker-end="url(#dg-b8b_multi_gpu_step-m0)"/>
+<text x="716.0" y="468.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">shm MessageQueue: 1 write, 2 readers</text>
+<circle cx="1022.0" cy="464.0" r="11" fill="#0d9488"/>
+<text x="1022.0" y="468.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">5</text>
+<rect x="584.0" y="484.0" width="222.0" height="84.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="596.0" y="504.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Worker_TP0  (GPU 2)</text>
+<text x="596.0" y="524.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">execute_model: forward</text>
+<text x="596.0" y="540.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">sample_tokens: sample</text>
+<text x="596.0" y="556.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">reply</text>
+<circle cx="790.0" cy="500.0" r="11" fill="#0d9488"/>
+<text x="790.0" y="504.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">6</text>
+<rect x="816.0" y="484.0" width="222.0" height="84.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="828.0" y="504.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Worker_TP1  (GPU 3)</text>
+<text x="828.0" y="524.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">execute_model: forward</text>
+<text x="828.0" y="540.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">sample_tokens: sample</text>
+<text x="828.0" y="556.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">no reply</text>
+<circle cx="1022.0" cy="500.0" r="11" fill="#0d9488"/>
+<text x="1022.0" y="504.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">6</text>
+<circle cx="790.0" cy="552.0" r="11" fill="#0d9488"/>
+<text x="790.0" y="556.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">10</text>
+<rect x="584.0" y="580.0" width="454.0" height="28.0" rx="6" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="811.0" y="599.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#d97706" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">TP group [0, 1]: 65 all-reduces + 1 all-gather per step</text>
+<circle cx="600.0" cy="594.0" r="11" fill="#d97706"/>
+<text x="600.0" y="598.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">7</text>
+<circle cx="624.0" cy="594.0" r="11" fill="#d97706"/>
+<text x="624.0" y="598.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">8</text>
+<circle cx="1022.0" cy="594.0" r="11" fill="#d97706"/>
+<text x="1022.0" y="598.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">9</text>
+<line x1="196.0" y1="270.0" x2="196.0" y2="320.0" stroke="#2563eb" stroke-width="2" marker-end="url(#dg-b8b_multi_gpu_step-m1)"/>
+<text x="206.0" y="300.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">A over ZMQ</text>
+<path d="M 542,270 L 542,292 L 700,292 L 700,320" fill="none" stroke="#2563eb" stroke-width="2" marker-end="url(#dg-b8b_multi_gpu_step-m1)"/>
+<text x="552.0" y="286.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">B over ZMQ</text>
+<path d="M 1000,322 L 1000,272" fill="none" stroke="#db2777" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#dg-b8b_multi_gpu_step-m2)"/>
+<text x="870.0" y="300.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#db2777" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">counts (stop 12)</text>
+<circle cx="1020.0" cy="304.0" r="11" fill="#db2777"/>
+<text x="1020.0" y="308.2" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">12</text>
+<rect x="20.0" y="658.0" width="1060.0" height="196.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="684.0" r="13" fill="#111827"/>
+<text x="46.0" y="688.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="689.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Which collectives run in one step, and on which group?</text>
+<text x="68.0" y="708.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Only the TP group has more than one rank, so it carries every collective of the step (Llama-3.1-8B, 32 layers).</text>
+<text x="46.0" y="744.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">embedding</text>
+<text x="160.0" y="744.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">VocabParallelEmbedding</text>
+<text x="520.0" y="744.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">all-reduce</text>
+<text x="660.0" y="744.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">× 1</text>
+<text x="46.0" y="768.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">attention</text>
+<text x="160.0" y="768.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">o_proj (RowParallelLinear)</text>
+<text x="520.0" y="768.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">all-reduce</text>
+<text x="660.0" y="768.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">× 32</text>
+<text x="46.0" y="792.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">MLP</text>
+<text x="160.0" y="792.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">down_proj (RowParallelLinear)</text>
+<text x="520.0" y="792.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">all-reduce</text>
+<text x="660.0" y="792.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">× 32</text>
+<text x="46.0" y="816.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">logits</text>
+<text x="160.0" y="816.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">LogitsProcessor._gather_logits</text>
+<text x="520.0" y="816.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">all-gather</text>
+<text x="660.0" y="816.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">× 1</text>
+<text x="46.0" y="842.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="11.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre" font-style="italic">DP group, PP group: 1 rank each (dense DP is reconfigured to DP = 1) → no collectives.</text>
+<text x="30.0" y="889.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="878.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="889.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">API server, requests</text>
+<rect x="267.2" y="878.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="288.2" y="889.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">engine core</text>
+<rect x="378.7" y="878.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="399.7" y="889.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">workers, shm</text>
+<rect x="504.1" y="878.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="525.1" y="889.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">NCCL collectives</text>
+<rect x="647.1" y="878.0" width="14.0" height="14.0" rx="3" fill="#fdf2f8" fill-opacity="1.0" stroke="#db2777" stroke-width="1.4"/>
+<text x="668.1" y="889.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">load counts</text>
+<text x="30.0" y="914.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Stop 1 (start-up) and the CLI supervisor are not drawn. Each request may land on either API server; the kernel</text>
+<text x="30.0" y="932.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">  spreads connections over the shared listen socket. Engine choice is the DPLB score (stops 2-3).</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the processes of <code>-tp 2 -dp 2</code> with the tour stops (panel 1), and the collectives of one step (panel 2).</figcaption><a class="diagram-open" href="../diagrams/b8b_multi_gpu_step.svg" target="_blank">Open full size ↗</a></div></figure>
+
+<table>
+  <thead><tr><th>Stop</th><th>What happens</th><th>Process: file and function</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>The ten processes and their GPUs</td><td>CLI: <code>entrypoints/cli/serve.py</code>; <code>v1/engine/utils.py</code></td></tr>
+    <tr><td>2</td><td>Each API server picks an engine</td><td>API server: <code>v1/engine/core_client.py</code>: <code>get_core_engine_for_request</code></td></tr>
+    <tr><td>3</td><td>The request crosses ZMQ to its engine core</td><td>API server → engine core: <code>_send_input_message</code>, <code>process_input_sockets</code></td></tr>
+    <tr><td>4</td><td>Each engine core schedules on its own</td><td>engine core: <code>v1/engine/core.py</code>: <code>EngineCoreProc</code></td></tr>
+    <tr><td>5</td><td>One shared-memory write reaches both workers</td><td>engine core: <code>v1/executor/multiproc_executor.py</code>: <code>collective_rpc</code></td></tr>
+    <tr><td>6</td><td>Each worker dequeues and runs <code>execute_model</code></td><td>worker: <code>worker_busy_loop</code>; <code>v1/worker/gpu_worker.py</code></td></tr>
+    <tr><td>7</td><td>The embedding all-reduce</td><td>worker: <code>vocab_parallel_embedding.py</code></td></tr>
+    <tr><td>8</td><td>Two all-reduces per decoder layer</td><td>worker: <code>linear.py</code>; <code>distributed/parallel_state.py</code></td></tr>
+    <tr><td>9</td><td><code>sample_tokens</code>: logits all-gather, both ranks sample</td><td>worker: <code>logits_processor.py</code>; Model Runner V2</td></tr>
+    <tr><td>10</td><td>Only TP rank 0 replies</td><td>worker → engine core: <code>_execute_worker_rpc</code>, <code>WorkerAsyncOutputCopy</code></td></tr>
+    <tr><td>11</td><td>Outputs go back to the API server that sent the request</td><td>engine core → API server: <code>process_output_sockets</code></td></tr>
+    <tr><td>12</td><td>Each engine core reports its new counts</td><td>engine core → coordinator: <code>_maybe_publish_request_counts</code></td></tr>
+    <tr><td>13</td><td>The coordinator publishes the load to both API servers</td><td>coordinator → API servers: <code>coordinator.py</code>; stats task</td></tr>
+  </tbody>
+</table>
+<p>All paths are under <code>vllm/</code>.</p>
+
+<section class="stop" id="stop-1"><h2 id="1ten-processes-four-gpus-two-separate-worlds" class="stop-title"><span class="stop-num">1</span>Ten processes, four GPUs, two separate worlds<a class="h-anchor" href="#1ten-processes-four-gpus-two-separate-worlds" aria-label="Link to this section">#</a></h2><p>We start after start-up; the tour <a href="../tours/serve-startup.html">Tour: Start-up of vllm serve</a> covers it. Two things decide the process layout. First, <code>--api-server-count</code> defaults to the DP size in internal mode, so there are two API servers and the CLI process stays as their supervisor (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/cli/serve.py#L124-L125" target="_blank" rel="noopener" title="vllm/entrypoints/cli/serve.py:124-125 at 3e44c0d"><code>vllm/entrypoints/cli/serve.py:124-125</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/cli/serve.py#L151-L152" target="_blank" rel="noopener" title="vllm/entrypoints/cli/serve.py:151-152 at 3e44c0d"><code>vllm/entrypoints/cli/serve.py:151-152</code></a>). Second, each engine core of a dense model becomes an independent <code>EngineCoreProc</code> with DP size 1:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1534-L1543" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:1534-1543</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1534-L1543" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1534</span><span class="ln">1535</span><span class="ln">1536</span><span class="ln">1537</span><span class="ln">1538</span><span class="ln hl">1539</span><span class="ln hl">1540</span><span class="ln hl">1541</span><span class="ln hl">1542</span><span class="ln hl">1543</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><pre><code class="language-python">            if data_parallel and vllm_config.model_config.is_moe:
+                # Set data parallel rank for this engine process.
+                parallel_config.data_parallel_rank = dp_rank
+                engine_core = DPEngineCoreProc(*args, **kwargs)
+            else:
+                # Non-MoE DP ranks are completely independent, so treat like DP=1.
+                # Note that parallel_config.data_parallel_index will still reflect
+                # the original DP rank.
+                parallel_config.reconfigure_for_independent_dp_rank()
+                engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)</code></pre></div></div></div></figure>
+<p>Engine 0 gets GPUs 0 and 1, engine 1 gets GPUs 2 and 3 ("[2, 3] for local_dp_rank=1", <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/utils.py#L441-L445" target="_blank" rel="noopener" title="vllm/v1/engine/utils.py:441-445 at 3e44c0d"><code>vllm/v1/engine/utils.py:441-445</code></a>). Each engine core starts a <code>MultiprocExecutor</code> with two worker processes. The DP size is 1 inside each engine. So each pair of workers builds its own world of two ranks. It has TP group [0, 1], and PP and DP groups of one rank (<a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a>). The workers rename themselves <code>Worker_TP0</code> and <code>Worker_TP1</code>; the name has a DP part only when the worker's DP group is larger than 1 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1101-L1109" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1101-1109 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1101-1109</code></a>).</p>
+<p>So there are 10 processes: CLI supervisor, 2 API servers, 1 DP coordinator, 2 engine cores and 4 workers (derived; <a href="../concepts/architecture-overview.html">The process and thread architecture of vllm serve</a> gives the rules).</p></section>
+
+<section class="stop" id="stop-2"><h2 id="2each-api-server-picks-an-engine-with-the-dplb-score" class="stop-title"><span class="stop-num">2</span>Each API server picks an engine with the DPLB score<a class="h-anchor" href="#2each-api-server-picks-an-engine-with-the-dplb-score" aria-label="Link to this section">#</a></h2><p>We are in API server 0, in <code>AsyncLLM.add_request</code>, which calls the engine core client. With DP &gt; 1 and internal load balancing, that is a <code>DPLBAsyncMPClient</code>. Before it sends, it stamps the request with the current wave and its own <code>client_index</code>:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1599-L1609" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core_client.py:1599-1609</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1599-L1609" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1599</span><span class="ln">1600</span><span class="ln">1601</span><span class="ln hl">1602</span><span class="ln hl">1603</span><span class="ln">1604</span><span class="ln">1605</span><span class="ln hl">1606</span><span class="ln">1607</span><span class="ln">1608</span><span class="ln">1609</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><pre><code class="language-python">    async def add_request_async(self, request: EngineCoreRequest) -&gt; None:
+        self._ensure_stats_update_task()
+
+        request.current_wave = self.current_wave
+        request.client_index = self.client_index
+
+        # The engine that receives it wakes the other ranks if they are idle.
+        chosen_engine = self.get_core_engine_for_request(request)
+        await self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
+
+        self._ensure_output_queue_task()</code></pre></div></div></div></figure>
+<p>The engine choice is the score of <a href="../concepts/data-parallel-serving.html">Data parallel serving: several engine cores behind one endpoint</a>: <code>max(client_count × in-flight, waiting + running)</code> plus a penalty for waiting requests on a full KV cache (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1777-L1786" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:1777-1786 at 3e44c0d"><code>vllm/v1/engine/core_client.py:1777-1786</code></a>). Both engines are idle, so every score is 0. Ties go to the first engine of the scan, because only a strictly smaller score replaces the minimum (line 1787). The scan starts at a different engine per API server:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1739-L1741" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core_client.py:1739-1741</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1739-L1741" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1739</span><span class="ln">1740</span><span class="ln">1741</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">        self.eng_start_index = (
+            len(self.core_engines) * self.client_index
+        ) // client_count</code></pre></div></div></div></figure>
+<ul>
+  <li>API server 0: <code>(2 × 0) // 2 = 0</code>, so request A goes to engine 0.</li>
+  <li>API server 1: <code>(2 × 1) // 2 = 1</code>, so request B goes to engine 1.</li>
+</ul>
+<p>Each server then adds <code>client_count</code> = 2 to the chosen engine's waiting count, adds 1 to its own in-flight count, and rotates its start index (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1792-L1803" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:1792-1803 at 3e44c0d"><code>vllm/v1/engine/core_client.py:1792-1803</code></a>). (Derived from the cited lines.)</p></section>
+
+<section class="stop" id="stop-3"><h2 id="3the-request-crosses-zmq-to-its-engine-core" class="stop-title"><span class="stop-num">3</span>The request crosses ZMQ to its engine core<a class="h-anchor" href="#3the-request-crosses-zmq-to-its-engine-core" aria-label="Link to this section">#</a></h2><p>The engine identity is the DP rank as two little-endian bytes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L748-L751" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:748-751 at 3e44c0d"><code>vllm/v1/engine/core_client.py:748-751</code></a>), so A's frames start with <code>b"\x00\x00"</code> and B's with <code>b"\x01\x00"</code>. The ROUTER socket routes on that frame:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1287-L1294" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core_client.py:1287-1294</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1287-L1294" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1287</span><span class="ln">1288</span><span class="ln">1289</span><span class="ln">1290</span><span class="ln">1291</span><span class="ln">1292</span><span class="ln">1293</span><span class="ln hl">1294</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><pre><code class="language-python">    def _send_input_message(
+        self, message: tuple[bytestr, ...], engine: EngineIdentity
+    ) -&gt; Awaitable[Any]:
+        self.ensure_alive()
+        # Any zero-copy tensor/ndarray frames are kept alive by zmq itself
+        # until it&#x27;s finished sending them (there is a ref chain from the underlying
+        # memoryview back to the original owning tensor/ndarray).
+        return self.input_socket.send_multipart((engine,) + message, copy=False)</code></pre></div></div></div></figure>
+<p>Each engine core connects one DEALER socket per API server. Its input thread receives the frames, decodes the <code>EngineCoreRequest</code>, builds the <code>Request</code>, and queues it for the busy loop (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1977-L1993" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1977-1993 at 3e44c0d"><code>vllm/v1/engine/core.py:1977-1993</code></a>). The request keeps its <code>client_index</code>, so the outputs can find their way back in stop 11. The page <a href="../learn/processes-and-ipc.html">Processes, ZMQ and shared memory</a> explains the frames.</p></section>
+
+<section class="stop" id="stop-4"><h2 id="4each-engine-core-schedules-on-its-own" class="stop-title"><span class="stop-num">4</span>Each engine core schedules on its own<a class="h-anchor" href="#4each-engine-core-schedules-on-its-own" aria-label="Link to this section">#</a></h2><p>Engine core 0 now has request A, engine core 1 has request B. Each runs the normal busy loop of <a href="../concepts/engine-core-loop.html">The engine core loop: threads, queues and the busy loop</a>: <code>step_with_batch_queue</code> schedules the 300 (or 200) prompt tokens, as in <a href="../tours/engine-step.html">Tour: One engine step</a>. Nothing ties the two engines together:</p>
+<ul>
+  <li>They are plain <code>EngineCoreProc</code> objects, not <code>DPEngineCoreProc</code>, so there are no waves, no dummy batches and no DP all-reduce (stop 1).</li>
+  <li>When an engine has no work, it blocks on its input queue: <code>has_work()</code> is false when nothing is running, waiting or in the batch queue (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1596-L1602" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1596-1602 at 3e44c0d"><code>vllm/v1/engine/core.py:1596-1602</code></a>).</li>
+  <li>Their steps are not aligned in time. Engine 1 may run three steps while engine 0 runs two.</li>
+</ul></section>
+
+<section class="stop" id="stop-5"><h2 id="5one-shared-memory-write-reaches-both-workers" class="stop-title"><span class="stop-num">5</span>One shared-memory write reaches both workers<a class="h-anchor" href="#5one-shared-memory-write-reaches-both-workers" aria-label="Link to this section">#</a></h2><p>The engine core calls <code>execute_model</code> on its <a class="term" href="../reference/glossary.html#term-multiproc-executor" data-term="multiproc executor" data-def="The executor backend &quot;mp&quot; (MultiprocExecutor). It starts one worker process per local rank and sends every call to all of them through one shared-memory message queue.">multiproc executor</a>. That is one <a class="term" href="../reference/glossary.html#term-collective-rpc" data-term="collective_rpc" data-def="The executor method that runs one worker method (by name, or a pickled function) on every worker and collects the results. execute_model and sample_tokens use it too.">collective_rpc</a> with a reply only from the output rank:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L342-L353" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/executor/multiproc_executor.py:342-353</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L342-L353" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">342</span><span class="ln">343</span><span class="ln">344</span><span class="ln hl">345</span><span class="ln hl">346</span><span class="ln hl">347</span><span class="ln">348</span><span class="ln hl">349</span><span class="ln">350</span><span class="ln">351</span><span class="ln">352</span><span class="ln">353</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><pre><code class="language-python">    def execute_model(  # type: ignore[override]
+        self, scheduler_output: SchedulerOutput, non_block: bool = False
+    ) -&gt; ModelRunnerOutput | None | Future[ModelRunnerOutput | None]:
+        return self.collective_rpc(
+            &quot;execute_model&quot;,
+            args=(scheduler_output,),
+            unique_reply_rank=self.output_rank,
+            non_block=non_block,
+            timeout=envs.VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS,
+            kv_output_aggregator=self.kv_output_aggregator,
+            ec_output_aggregator=self.ec_output_aggregator,
+        )</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L424-L432" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/executor/multiproc_executor.py:424-432</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L424-L432" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">424</span><span class="ln">425</span><span class="ln">426</span><span class="ln">427</span><span class="ln hl">428</span><span class="ln">429</span><span class="ln">430</span><span class="ln hl">431</span><span class="ln hl">432</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><pre><code class="language-python">        if isinstance(method, str):
+            send_method = method
+        else:
+            send_method = cloudpickle.dumps(method, protocol=pickle.HIGHEST_PROTOCOL)
+        self.rpc_broadcast_mq.enqueue((send_method, args, kwargs, output_rank))
+
+        response_mqs: Sequence[MessageQueue] = self.response_mqs
+        if output_rank is not None:
+            response_mqs = (response_mqs[output_rank],)</code></pre></div></div></div></figure>
+<p>Line 428 is the only write. The <a class="term" href="../reference/glossary.html#term-message-queue" data-term="MessageQueue" data-def="vLLM&#x27;s one-writer, many-reader queue in shared memory (a ring buffer of chunks). Large messages go over a ZMQ socket instead. The multiproc executor uses it to talk to its workers.">MessageQueue</a> pickles <code>("execute_model", (scheduler_output,), {}, 0)</code> once into a 16 MiB chunk of a ring in <code>/dev/shm</code>. Both workers read the same bytes (<a href="../code/distributed-device-communicators-shm-broadcast.html">distributed/device_communicators/shm_broadcast.py: MessageQueue</a>). Lines 431-432 already decide that the executor will read only the reply queue of rank 0. The step deadline is <code>VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS</code>, 300 s by default (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L1861-L1863" target="_blank" rel="noopener" title="vllm/envs.py:1861-1863 at 3e44c0d"><code>vllm/envs.py:1861-1863</code></a>).</p></section>
+
+<section class="stop" id="stop-6"><h2 id="6each-worker-dequeues-and-runs-execute-model" class="stop-title"><span class="stop-num">6</span>Each worker dequeues and runs execute_model<a class="h-anchor" href="#6each-worker-dequeues-and-runs-execute-model" aria-label="Link to this section">#</a></h2><p>We are now in one of the worker processes, in its main thread. It was blocked in the queue and wakes up with the message:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1041-L1060" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/executor/multiproc_executor.py:1041-1060</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1041-L1060" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1041</span><span class="ln">1042</span><span class="ln">1043</span><span class="ln">1044</span><span class="ln">1045</span><span class="ln hl">1046</span><span class="ln">1047</span><span class="ln">1048</span><span class="ln">1049</span><span class="ln hl">1050</span><span class="ln">1051</span><span class="ln">1052</span><span class="ln">1053</span><span class="ln">1054</span><span class="ln">1055</span><span class="ln">1056</span><span class="ln hl">1057</span><span class="ln hl">1058</span><span class="ln">1059</span><span class="ln">1060</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><pre><code class="language-python">    def worker_busy_loop(self):
+        &quot;&quot;&quot;Main busy loop for Multiprocessing Workers.&quot;&quot;&quot;
+        assert self.rpc_broadcast_mq is not None
+        while True:
+            with get_watch_dog().disable():
+                rpc_request = self.rpc_broadcast_mq.dequeue(indefinite=True)
+            self._execute_worker_rpc(rpc_request)
+            del rpc_request
+
+    def _execute_worker_rpc(
+        self,
+        rpc_request: tuple[str | bytes, tuple[Any, ...], dict[str, Any], int | None],
+    ) -&gt; None:
+        &quot;&quot;&quot;Execute one RPC in a separate frame from the dequeue loop.&quot;&quot;&quot;
+        method, args, kwargs, output_rank = rpc_request
+        try:
+            if isinstance(method, str):
+                func = getattr(self.worker, method)
+            elif isinstance(method, bytes):
+                func = partial(cloudpickle.loads(method), self.worker)</code></pre></div></div></div></figure>
+<p><code>getattr(self.worker, "execute_model")</code> leads to <code>Worker.execute_model</code>. With PP = 1 this worker is both the first and the last stage, so it receives no intermediate tensors and calls the model runner directly (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L1336-L1353" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:1336-1353 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:1336-1353</code></a>). From here, both workers run the same Python code on the same batch, each with half of every weight matrix (<a href="../concepts/tp-layers.html">The tensor-parallel layers (linear.py and vocab_parallel_embedding.py)</a>). Model Runner V2 also checks for DP padding, but with a DP size of 1 there is nothing to agree on (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/dp_utils.py#L278-L279" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/dp_utils.py:278-279 at 3e44c0d"><code>vllm/v1/worker/gpu/dp_utils.py:278-279</code></a>).</p></section>
+
+<section class="stop" id="stop-7"><h2 id="7the-first-collective-the-embedding-all-reduce" class="stop-title"><span class="stop-num">7</span>The first collective: the embedding all-reduce<a class="h-anchor" href="#7the-first-collective-the-embedding-all-reduce" aria-label="Link to this section">#</a></h2><p>Each rank holds half of the vocabulary rows of the embedding table. A rank looks up only the token ids in its half and writes zeros for the others; then the two partial results are summed:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/vocab_parallel_embedding.py#L556-L564" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/layers/vocab_parallel_embedding.py:556-564</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/vocab_parallel_embedding.py#L556-L564" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">556</span><span class="ln">557</span><span class="ln hl">558</span><span class="ln hl">559</span><span class="ln hl">560</span><span class="ln hl">561</span><span class="ln hl">562</span><span class="ln hl">563</span><span class="ln">564</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><pre><code class="language-python">        if not self.use_fused_embedding:
+            output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
+        if self.reduce_results:
+            output_parallel = (
+                self.parallel_group.all_reduce(output_parallel)
+                if self.parallel_group is not None
+                else tensor_model_parallel_all_reduce(output_parallel)
+            )
+        return output_parallel.view(output_dtype)</code></pre></div></div></div></figure>
+<p>For A's 300 tokens, the tensor is <code>[300, 4096]</code> BF16, 2.34 MiB, and it is summed over the TP group [GPU 0, GPU 1]. Engine 1 does the same for B on GPUs 2 and 3, at its own time. The tour <a href="../tours/forward-pass.html">Tour: One forward pass</a> gives the shapes of every layer (its deep dive "What changes with TP = 2").</p></section>
+
+<section class="stop" id="stop-8"><h2 id="8two-all-reduces-per-decoder-layer-on-the-tp-group" class="stop-title"><span class="stop-num">8</span>Two all-reduces per decoder layer, on the TP group<a class="h-anchor" href="#8two-all-reduces-per-decoder-layer-on-the-tp-group" aria-label="Link to this section">#</a></h2><p>Inside each of the 32 decoder layers, <code>o_proj</code> and <code>down_proj</code> are row-parallel. Each rank computes a partial sum, and the layer adds them:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1803-L1806" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/layers/linear.py:1803-1806</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/linear.py#L1803-L1806" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1803</span><span class="ln">1804</span><span class="ln">1805</span><span class="ln">1806</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">        if self.reduce_results and self.tp_size &gt; 1:
+            output = tensor_model_parallel_all_reduce(output_parallel)
+        else:
+            output = output_parallel</code></pre></div></div></div></figure>
+<p><code>tensor_model_parallel_all_reduce</code> goes to the TP group (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/communication_op.py#L12-L14" target="_blank" rel="noopener" title="vllm/distributed/communication_op.py:12-14 at 3e44c0d"><code>vllm/distributed/communication_op.py:12-14</code></a>). On CUDA, the group calls the registered op with only its name, so the compiled graph keeps one opaque node:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L739-L746" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/distributed/parallel_state.py:739-746</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L739-L746" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">739</span><span class="ln hl">740</span><span class="ln hl">741</span><span class="ln">742</span><span class="ln hl">743</span><span class="ln hl">744</span><span class="ln">745</span><span class="ln">746</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><pre><code class="language-python">        # Bypass the function if we are using only 1 GPU.
+        if self.world_size == 1:
+            return input_
+
+        if self.use_custom_op_call:
+            return torch.ops.vllm.all_reduce(input_, group_name=self.unique_name)
+        else:
+            return self._all_reduce_out_place(input_)</code></pre></div></div></div></figure>
+<p>The op ends in <code>CudaCommunicator.all_reduce</code>, which tries FlashInfer, the custom all-reduce, symmetric memory and pynccl in a fixed order (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/cuda_communicator.py#L362-L446" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/cuda_communicator.py:362-446 at 3e44c0d"><code>vllm/distributed/device_communicators/cuda_communicator.py:362-446</code></a>). Which one takes our 2.34 MiB tensor depends on the GPU (derived from the size rules on <a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a>):</p>
+<ul>
+  <li>Compute capability 8.x (for example A100), TP = 2 on one node with P2P access: FlashInfer all-reduce has no size entry and stays off. The custom all-reduce takes the tensor, because 2.34 MiB is below its 8 MiB limit.</li>
+  <li>Compute capability 9.0 or 10.x with FlashInfer installed: at O2 the compile pass <code>fuse_allreduce_rms</code> can fuse an all-reduce with the RMSNorm after it. A fused all-reduce does not reach this method (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L178-L202" target="_blank" rel="noopener" title="vllm/config/vllm.py:178-202 at 3e44c0d"><code>vllm/config/vllm.py:178-202</code></a>, <a href="../tours/forward-pass.html">Tour: One forward pass</a>). An all-reduce that is not fused goes to FlashInfer first; its limit at TP = 2 is 64 MiB (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/compilation/passes/fusion/allreduce_rms_fusion.py#L104-L115" target="_blank" rel="noopener" title="vllm/compilation/passes/fusion/allreduce_rms_fusion.py:104-115 at 3e44c0d"><code>vllm/compilation/passes/fusion/allreduce_rms_fusion.py:104-115</code></a>).</li>
+</ul>
+<p>Either way, the step has 1 + 2 × 32 = 65 all-reduces in total, all on the TP group. The DP and PP groups have one rank and run nothing.</p></section>
+
+<section class="stop" id="stop-9"><h2 id="9sample-tokens-one-all-gather-then-both-ranks-sample" class="stop-title"><span class="stop-num">9</span>sample_tokens: one all-gather, then both ranks sample<a class="h-anchor" href="#9sample-tokens-one-all-gather-then-both-ranks-sample" aria-label="Link to this section">#</a></h2><p>The engine core next calls <code>sample_tokens</code>, the second broadcast of the step (same path as stop 5). Each rank computes logits for its half of the vocabulary; the LM head then gathers them:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/logits_processor.py#L122-L134" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/model_executor/layers/logits_processor.py:122-134</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/logits_processor.py#L122-L134" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">122</span><span class="ln">123</span><span class="ln hl">124</span><span class="ln hl">125</span><span class="ln hl">126</span><span class="ln hl">127</span><span class="ln hl">128</span><span class="ln hl">129</span><span class="ln hl">130</span><span class="ln hl">131</span><span class="ln">132</span><span class="ln">133</span><span class="ln">134</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><pre><code class="language-python">    def _gather_logits(self, logits: torch.Tensor) -&gt; torch.Tensor:
+        &quot;&quot;&quot;gather/all-gather the logits tensor across model parallel group.&quot;&quot;&quot;
+        if self.use_all_gather:
+            # Gather is not supported for some devices such as TPUs.
+            # Use all-gather instead.
+            # NOTE(woosuk): Here, the outputs of every device should not be None
+            # because XLA requires strict SPMD among all devices. Every device
+            # should execute the same operations after gathering the logits.
+            logits = tensor_model_parallel_all_gather(logits)
+        else:
+            # None may be returned for rank &gt; 0
+            logits = tensor_model_parallel_gather(logits)
+        return logits</code></pre></div></div></div></figure>
+<p>Every built-in platform uses the all-gather, so both ranks hold the full <code>[num_rows, 128256]</code> logits (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/platforms/interface.py#L1275-L1278" target="_blank" rel="noopener" title="vllm/platforms/interface.py:1275-1278 at 3e44c0d"><code>vllm/platforms/interface.py:1275-1278</code></a>). Both ranks run the sampler. They draw the same tokens. After warm-up, every worker resets its random seed to a value that depends only on the model seed and the DP index (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L1083-L1087" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:1083-1087 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:1083-1087</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/utils/torch_utils.py#L533-L544" target="_blank" rel="noopener" title="vllm/utils/torch_utils.py:533-544 at 3e44c0d"><code>vllm/utils/torch_utils.py:533-544</code></a>). A different DP index gives a different seed, so engines 0 and 1 do not sample unseeded requests alike (the comment at line 536). Each worker then draws the per-request seed of an unseeded request from this same NumPy state, in the same order (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/sample/states.py#L54-L58" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/sample/states.py:54-58 at 3e44c0d"><code>vllm/v1/worker/gpu/sample/states.py:54-58</code></a>). By default, the code has no other synchronization of the sampled tokens between TP ranks (derived). The opt-in <code>--enable-batch-sharded-sampling</code> changes this: each rank samples a slice of the batch, and the ranks all-gather the results (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L192-L198" target="_blank" rel="noopener" title="vllm/config/parallel.py:192-198 at 3e44c0d"><code>vllm/config/parallel.py:192-198</code></a>).</p></section>
+
+<section class="stop" id="stop-10"><h2 id="10only-tp-rank-0-replies" class="stop-title"><span class="stop-num">10</span>Only TP rank 0 replies<a class="h-anchor" href="#10only-tp-rank-0-replies" aria-label="Link to this section">#</a></h2><p>The output rank is <code>world_size − TP × PCP</code>, the first TP rank of the last PP stage (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L549-L563" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:549-563 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:549-563</code></a>); here that is <code>2 − 2 = 0</code>. In each worker, the reply is conditional:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1070-L1071" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/executor/multiproc_executor.py:1070-1071</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1070-L1071" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1070</span><span class="ln">1071</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">            if output_rank is None or self.rank == output_rank:
+                self.handle_output(output)</code></pre></div></div></div></figure>
+<p>Worker TP0 hands its <code>AsyncOutput</code> to its <code>WorkerAsyncOutputCopy</code> thread. That thread waits for the copy to the CPU and writes <code>(SUCCESS, ModelRunnerOutput)</code> into its own <code>MessageQueue(1, 1)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1014-L1039" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1014-1039 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1014-1039</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1000-L1012" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1000-1012 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1000-1012</code></a>). Worker TP1 writes nothing; it goes back to its <code>dequeue</code>. The engine core reads the reply when it pops the step from its batch queue, exactly as in <a href="../tours/engine-step.html#stop-10">stop 10 of the engine-step tour</a>.</p></section>
+
+<section class="stop" id="stop-11"><h2 id="11outputs-go-back-to-the-api-server-that-sent-the-request" class="stop-title"><span class="stop-num">11</span>Outputs go back to the API server that sent the request<a class="h-anchor" href="#11outputs-go-back-to-the-api-server-that-sent-the-request" aria-label="Link to this section">#</a></h2><p>After <code>update_from_output</code>, the engine core groups its outputs by <code>client_index</code>, and its output thread sends each group on the PUSH socket of that API server:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2087-L2091" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:2087-2091</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2087-L2091" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">2087</span><span class="ln hl">2088</span><span class="ln hl">2089</span><span class="ln hl">2090</span><span class="ln">2091</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><pre><code class="language-python">                buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
+                buffers = encoder.encode_into(outputs, buffer)
+                tracker = self._send_msg_tracking_payload(
+                    sockets[client_index], buffers
+                )</code></pre></div></div></div></figure>
+<p>Request A was sent by API server 0, so A's first token goes to API server 0's PULL socket; B's goes to API server 1. Each API server detokenizes only its own requests, and its <code>DPLBAsyncMPClient</code> lowers its in-flight count when a request finishes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1810-L1817" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:1810-1817 at 3e44c0d"><code>vllm/v1/engine/core_client.py:1810-1817</code></a>).</p></section>
+
+<section class="stop" id="stop-12"><h2 id="12each-engine-core-reports-its-new-counts" class="stop-title"><span class="stop-num">12</span>Each engine core reports its new counts<a class="h-anchor" href="#12each-engine-core-reports-its-new-counts" aria-label="Link to this section">#</a></h2><p>Each engine core compares its waiting and running counts with the last ones it sent. When they changed (here: one new running request), it sends them, with its KV cache usage, to client index −1, the coordinator:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1622-L1633" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:1622-1633</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1622-L1633" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1622</span><span class="ln">1623</span><span class="ln">1624</span><span class="ln">1625</span><span class="ln">1626</span><span class="ln hl">1627</span><span class="ln hl">1628</span><span class="ln hl">1629</span><span class="ln hl">1630</span><span class="ln hl">1631</span><span class="ln hl">1632</span><span class="ln hl">1633</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><pre><code class="language-python">    def _maybe_publish_request_counts(self):
+        if not self.publish_dp_lb_stats:
+            return
+
+        # Publish our request counts (if they&#x27;ve changed).
+        counts = self.scheduler.get_request_counts()
+        if counts != self.last_counts:
+            self.last_counts = counts
+            stats = SchedulerStats(
+                *counts, kv_cache_usage=self.scheduler.get_kv_cache_usage()
+            )
+            self.output_queue.put_nowait((-1, EngineCoreOutputs(scheduler_stats=stats)))</code></pre></div></div></div></figure>
+<p>Separately, the scheduler stats of each step go to only one front end, inside the normal outputs (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2516-L2521" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2516-2521 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2516-2521</code></a>). Prometheus labels them with <code>engine="0"</code> or <code>engine="1"</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/metrics/loggers.py#L499-L504" target="_blank" rel="noopener" title="vllm/v1/metrics/loggers.py:499-504 at 3e44c0d"><code>vllm/v1/metrics/loggers.py:499-504</code></a>).</p></section>
+
+<section class="stop" id="stop-13"><h2 id="13the-coordinator-publishes-the-load-to-both-api-servers" class="stop-title"><span class="stop-num">13</span>The coordinator publishes the load to both API servers<a class="h-anchor" href="#13the-coordinator-publishes-the-load-to-both-api-servers" aria-label="Link to this section">#</a></h2><p>The coordinator stores the counts per engine and publishes all of them, at most every 100 ms while they change:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/coordinator.py#L277-L290" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/coordinator.py:277-290</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/coordinator.py#L277-L290" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">277</span><span class="ln">278</span><span class="ln">279</span><span class="ln">280</span><span class="ln">281</span><span class="ln">282</span><span class="ln">283</span><span class="ln">284</span><span class="ln">285</span><span class="ln">286</span><span class="ln hl">287</span><span class="ln hl">288</span><span class="ln">289</span><span class="ln">290</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><pre><code class="language-python">                events = poller.poll(timeout=max(min_timeout, wait_for - elapsed))
+                if not events:
+                    # Poller timeout - publish current stats to front-ends.
+                    if last_step_counts is not None:
+                        engine_req_counts_list = last_step_counts
+                        last_step_counts = None
+                    else:
+                        engine_req_counts_list = self._get_engine_counts()
+                        stats_changed = False
+
+                    to_publish = (engine_req_counts_list, current_wave, engines_running)
+                    publish_front.send(msgspec.msgpack.encode(to_publish))
+                    last_publish_time = int(time.time() * 1000)
+                    continue</code></pre></div></div></div></figure>
+<p>Each API server's stats task replaces its <code>lb_engines</code> with the new counts (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1578-L1590" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:1578-1590 at 3e44c0d"><code>vllm/v1/engine/core_client.py:1578-1590</code></a>). Real numbers now replace the local guesses of stop 2 (+2 waiting on the chosen engine). Engine 0 has 1 running request, and engine 1 has 1. The next request on either API server sees both, plus its own in-flight counts. Meanwhile, each engine core is already in its next step.</p></section>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="the-same-tour-with-an-moe-model" class="dd-title">The same tour with an MoE model</h3></summary><div class="dd-body"><pre><code class="language-bash">vllm serve &lt;an MoE model&gt; -tp 2 -dp 2 --enable-expert-parallel      # one node, 4 GPUs</code></pre>
+<ol>
+  <li><strong>Stop 1.</strong> Each engine core is a <code>DPEngineCoreProc</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1534-L1537" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1534-1537 at 3e44c0d"><code>vllm/v1/engine/core.py:1534-1537</code></a>). The four workers form one world with global rank = 2 × dp + tp. TP groups: [0, 1], [2, 3]. DP groups: [0, 2], [1, 3]. EP group: [0, 1, 2, 3] (<a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a>). The names become <code>Worker_DP0_TP0</code> … <code>Worker_DP1_TP1</code>, plus <code>_EP&lt;rank&gt;</code> with EP (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1101-L1115" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1101-1115 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1101-1115</code></a>).</li>
+  <li><strong>Stop 4.</strong> A arrives at engine 0 while both are idle. Engine 0 starts a wave and tells the coordinator, which sends <code>START_DP_WAVE</code> to engine 1 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2360-L2373" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:2360-2373 at 3e44c0d"><code>vllm/v1/engine/core.py:2360-2373</code></a>). From now on both step together. If B had not arrived, engine 1 would run a dummy batch each step (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2486-L2495" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:2486-2495 at 3e44c0d"><code>vllm/v1/engine/core.py:2486-2495</code></a>).</li>
+  <li><strong>Stop 6.</strong> Before its forward, each worker joins a CPU all-reduce over its worker DP group. The ranks agree on a padded token count and a CUDA graph mode, so A's 300 tokens and B's 200 get one shared shape (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/dp_utils.py#L65-L74" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/dp_utils.py:65-74 at 3e44c0d"><code>vllm/v1/worker/gpu/dp_utils.py:65-74</code></a>).</li>
+  <li><strong>Stop 8.</strong> The attention part is unchanged: two engines, TP = 2 each. In the MoE layers, the EP size is DP × TP = 4 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/config.py#L1105-L1114" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/config.py:1105-1114 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/config.py:1105-1114</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/layers/fused_moe/config.py#L1227-L1231" target="_blank" rel="noopener" title="vllm/model_executor/layers/fused_moe/config.py:1227-1231 at 3e44c0d"><code>vllm/model_executor/layers/fused_moe/config.py:1227-1231</code></a>). With TP &gt; 1, DP &gt; 1 and EP, the MoE input is sequence parallel (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L767-L785" target="_blank" rel="noopener" title="vllm/config/parallel.py:767-785 at 3e44c0d"><code>vllm/config/parallel.py:767-785</code></a>). This applies only to a model that passes the setting to its MoE layer, for example Qwen3-MoE (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/model_executor/models/qwen3_moe.py#L152" target="_blank" rel="noopener" title="vllm/model_executor/models/qwen3_moe.py:152 at 3e44c0d"><code>vllm/model_executor/models/qwen3_moe.py:152</code></a>). Then the default <code>allgather_reducescatter</code> dispatch and combine run on the EP group; otherwise they run on the DP group (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/all2all.py#L76-L86" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/all2all.py:76-86 at 3e44c0d"><code>vllm/distributed/device_communicators/all2all.py:76-86</code></a>). So every MoE layer now adds collectives over all four GPUs, across both engines.</li>
+  <li><strong>After the step.</strong> At the first step of the wave and every 16th step, the engine cores agree on "any unfinished requests?" over their own gloo group (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2542-L2559" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:2542-2559 at 3e44c0d"><code>vllm/v1/engine/core.py:2542-2559</code></a>). When both requests finish, the wave ends and both engines pause.</li>
+</ol>
+<p>The page <a href="../concepts/expert-parallel-moe.html">Expert parallelism and MoE serving</a> explains the MoE layer and the all2all backends.</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="the-same-tour-with-pp-2" class="dd-title">The same tour with PP = 2</h3></summary><div class="dd-body"><pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-8B-Instruct -tp 2 -pp 2      # one engine core, 4 GPUs</code></pre>
+<ol>
+  <li><strong>Groups.</strong> One engine, world size 4. TP groups [0, 1] and [2, 3]; PP groups [0, 2] and [1, 3]. Stage 0 holds layers 0-15 and the embedding; stage 1 holds layers 16-31, the final norm and the LM head (<a href="../learn/tp-pp-in-practice.html">Tensor and pipeline parallelism in practice</a>). Workers are named <code>Worker_PP0_TP0</code> etc. (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1104-L1109" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1104-1109 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1104-1109</code></a>).</li>
+  <li><strong>Batch queue.</strong> With async scheduling and Model Runner V2, <code>max_concurrent_batches</code> is <code>pp_size + 1</code> = 3, so up to three steps are in flight (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L586-L597" target="_blank" rel="noopener" title="vllm/config/vllm.py:586-597 at 3e44c0d"><code>vllm/config/vllm.py:586-597</code></a>).</li>
+  <li><strong>Stop 5.</strong> All four workers read every broadcast. The output rank is <code>4 − 2 = 2</code>, the first TP rank of the last stage (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L549-L563" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:549-563 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:549-563</code></a>).</li>
+  <li><strong>Stop 6, stage 0.</strong> Ranks 0 and 1 run layers 0-15. They send <a class="term" href="../reference/glossary.html#term-intermediate-tensors" data-term="IntermediateTensors" data-def="A dict of named tensors that a pipeline stage returns instead of hidden states. For Llama: hidden_states and residual, each [num_tokens, hidden_size].">IntermediateTensors</a> (<code>hidden_states</code> and <code>residual</code>, <code>[T, 4096]</code> each) to the next stage with <code>isend_tensor_dict</code>, without waiting. With <code>all_gather_group</code> = the TP group, each TP rank sends only half of each tensor (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L1372-L1378" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:1372-1378 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:1372-1378</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/parallel_state.py#L1219-L1222" target="_blank" rel="noopener" title="vllm/distributed/parallel_state.py:1219-1222 at 3e44c0d"><code>vllm/distributed/parallel_state.py:1219-1222</code></a>).</li>
+  <li><strong>Stop 6, stage 1.</strong> Ranks 2 and 3 post <code>irecv_tensor_dict</code>; each receives its half and all-gathers the full tensor in its TP group (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu_worker.py#L1336-L1347" target="_blank" rel="noopener" title="vllm/v1/worker/gpu_worker.py:1336-1347 at 3e44c0d"><code>vllm/v1/worker/gpu_worker.py:1336-1347</code></a>). They run layers 16-31.</li>
+  <li><strong>Stop 9.</strong> Only the last stage samples. It broadcasts the sampled tokens to the earlier stage on a separate NCCL group, on a side stream; stage 0 consumes them <code>pp_size</code> steps later (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/pp_utils.py#L56-L62" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/pp_utils.py:56-62 at 3e44c0d"><code>vllm/v1/worker/gpu/pp_utils.py:56-62</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2133-L2153" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2133-2153 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2133-2153</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/model_runner.py#L2167-L2174" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/model_runner.py:2167-2174 at 3e44c0d"><code>vllm/v1/worker/gpu/model_runner.py:2167-2174</code></a>).</li>
+  <li><strong>Collectives per step (derived).</strong> Stage 0 runs 1 + 2 × 16 = 33 TP all-reduces. Stage 1 runs two TP all-gathers to rebuild the received tensors, 2 × 16 = 32 TP all-reduces and one logits all-gather. Between the stages there is one send/receive of two tensors. Then come two small broadcasts (the sampled tokens and their counts); they are skipped when no request needs them (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/pp_utils.py#L254-L278" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/pp_utils.py:254-278 at 3e44c0d"><code>vllm/v1/worker/gpu/pp_utils.py:254-278</code></a>).</li>
+</ol></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="where-each-wait-happens" class="dd-title">Where each wait happens</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Who waits</th><th>For what</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>API server</td><td>nothing per step; outputs arrive on its PULL socket</td><td>stop 11</td></tr>
+    <tr><td>engine core main thread</td><td>the reply of rank 0, when it pops a step from the full batch queue</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L434-L450" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:434-450 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:434-450</code></a></td></tr>
+    <tr><td>worker main thread</td><td>the next broadcast, <code>dequeue(indefinite=True)</code></td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1046" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1046 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1046</code></a></td></tr>
+    <tr><td>worker GPU stream</td><td>the other TP rank, inside each NCCL or custom all-reduce</td><td>stops 7-9</td></tr>
+    <tr><td>worker copy thread (rank 0)</td><td>the GPU → CPU copy of the sampled tokens</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1000-L1005" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1000-1005 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1000-1005</code></a></td></tr>
+  </tbody>
+</table>
+<p>The slowest TP rank sets the pace of its engine, because every all-reduce waits for both ranks. The two engines of a dense model never wait for each other.</p></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><strong>A worker dies.</strong> The executor's monitor thread sees the process exit and fails the engine core; the API servers then report the engine as dead (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L314-L326" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:314-326 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:314-326</code></a>, <a href="../concepts/engine-core-loop.html">The engine core loop: threads, queues and the busy loop</a>).</li>
+  <li><strong>A collective hangs.</strong> Assume one TP rank stops, for example after an exception that only rank 1 sees. Rank 0 waits in the all-reduce, and the engine core waits for rank 0's reply. After <code>VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS</code> (300 s) the call ends with <code>TimeoutError</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L437-L443" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:437-443 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:437-443</code></a>). A failure on rank 1 is only logged, because rank 1 does not reply (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L1072-L1080" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:1072-1080 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:1072-1080</code></a>).</li>
+  <li><strong>Small <code>/dev/shm</code>.</strong> Each engine core's queues need several hundred MiB of shared memory; too little raises at start-up (<a href="../code/distributed-device-communicators-shm-broadcast.html">distributed/device_communicators/shm_broadcast.py: MessageQueue</a>).</li>
+  <li><strong>Unbalanced engines.</strong> The score uses counts that can be 100 ms old; a burst of long prompts can still pile up on one engine. Watch <code>vllm:num_requests_waiting</code> per <code>engine</code> label.</li>
+</ul>
+<p><strong>Why it matters.</strong> Multi-GPU serving multiplies the processes and the channels. If you know which process waits for which message, you can map a hang, a timeout or a load problem to one stop.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>How many processes does <code>vllm serve -tp 2 -dp 2</code> start for a dense model, and what are they?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Ten: the CLI supervisor, two API servers, the DP coordinator, two engine cores and four workers (stop 1; <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/cli/serve.py#L124-L125" target="_blank" rel="noopener" title="vllm/entrypoints/cli/serve.py:124-125 at 3e44c0d"><code>vllm/entrypoints/cli/serve.py:124-125</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1534-L1543" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1534-1543 at 3e44c0d"><code>vllm/v1/engine/core.py:1534-1543</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>Which worker answers <code>execute_model</code> in each engine core, and why only one?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>TP rank 0: the output rank is <code>world_size − TP × PCP</code> = 0 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L549-L563" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:549-563 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:549-563</code></a>). Both ranks compute the same output, so one reply is enough; the executor reads only that reply queue (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/executor/multiproc_executor.py#L430-L432" target="_blank" rel="noopener" title="vllm/v1/executor/multiproc_executor.py:430-432 at 3e44c0d"><code>vllm/v1/executor/multiproc_executor.py:430-432</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>Both engines are idle. A request arrives at API server 1 of 2. Which engine gets it, and why?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Engine 1. All scores are 0, and the scan of API server 1 starts at <code>(2 × 1) // 2 = 1</code>. Only a strictly smaller score replaces the first one (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1739-L1741" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:1739-1741 at 3e44c0d"><code>vllm/v1/engine/core_client.py:1739-1741</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L1787-L1789" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:1787-1789 at 3e44c0d"><code>vllm/v1/engine/core_client.py:1787-1789</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>How many collectives run on GPU 0 in one step of this tour, and on which group? How does that change with an MoE model and <code>--enable-expert-parallel</code>?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>Dense: 65 all-reduces and 1 all-gather, all on the TP group [0, 1] (stops 7-9). MoE with EP: the attention part keeps its TP all-reduces. Every MoE layer adds dispatch and combine collectives. They run on the EP group of all four ranks when the model uses sequence-parallel MoE, else on the DP group. Every step adds a CPU all-reduce on the worker DP group for padding (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/worker/gpu/dp_utils.py#L65-L74" target="_blank" rel="noopener" title="vllm/v1/worker/gpu/dp_utils.py:65-74 at 3e44c0d"><code>vllm/v1/worker/gpu/dp_utils.py:65-74</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/distributed/device_communicators/all2all.py#L76-L86" target="_blank" rel="noopener" title="vllm/distributed/device_communicators/all2all.py:76-86 at 3e44c0d"><code>vllm/distributed/device_communicators/all2all.py:76-86</code></a>).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../tours/engine-step.html">Tour: One engine step</a><span class="rel-sum">Follow one call of step_with_batch_queue in 12 stops, with two requests in the batch (a 1-token decode and an 8191-token prefill chunk): schedule, launch, sample, pop the previous step, update and send.</span></li><li><a href="../tours/forward-pass.html">Tour: One forward pass</a><span class="rel-sum">Follow one forward pass of Llama-3-8B on one H100 in 14 stops, for a batch of two decodes and one 298-token prompt: Model Runner V2 inputs, the PIECEWISE CUDA graph, one decoder layer with its shapes, FlashAttention, logits and the sampler.</span></li><li><a href="../tours/serve-startup.html">Tour: Start-up of vllm serve</a><span class="rel-sum">Follow vllm serve on one GPU in 18 stops, from the console script to &quot;Application startup complete&quot; - the parsers, create_engine_config, VllmConfig, AsyncLLM, the spawned engine core, model loading, the memory profile, compilation, CUDA graph capture, the READY handshake and uvicorn - with the log line of each stop.</span></li><li><a href="../concepts/data-parallel-serving.html">Data parallel serving: several engine cores behind one endpoint</a><span class="rel-sum">With --data-parallel-size N, vllm serve runs N engine cores with their own KV caches. API servers pick an engine for each request with a load score; a DP coordinator publishes the load counts. Dense models run independent engines; MoE models step in lockstep, in waves, with dummy batches.</span></li><li><a href="../concepts/distributed-groups.html">Process groups: how vLLM slices its ranks</a><span class="rel-sum">Each worker puts all ranks into one grid of shape (DP, PP, PCP, TP) and cuts it into process groups. Each group is a GroupCoordinator with a gloo CPU group, an NCCL device group and, for groups of more than one rank, a device communicator that picks the all-reduce implementation.</span></li><li><a href="../concepts/executors-and-workers.html">Executors and workers: from the engine core to the GPUs</a><span class="rel-sum">The executor starts the workers and runs each call on all of them. The uni executor calls one worker in the engine core process; the multiproc executor sends calls to one worker process per GPU through a shared-memory queue.</span></li><li><a href="../concepts/expert-parallel-moe.html">Expert parallelism and MoE serving</a><span class="rel-sum">An MoE layer in vLLM is an MoERunner built by FusedMoEFactory. Its kernel has two exchangeable parts - a prepare/finalize object that dispatches and combines tokens, and an experts object that runs the GEMMs. With --enable-expert-parallel the experts are split over all DP x TP ranks; EPLB moves busy experts, DBO overlaps the communication.</span></li><li><a href="../code/distributed-device-communicators-shm-broadcast.html">distributed/device_communicators/shm_broadcast.py: MessageQueue</a><span class="rel-sum">vllm/distributed/device_communicators/shm_broadcast.py implements MessageQueue, a one-writer, many-reader queue. Local readers share a lock-free ring of chunks in /dev/shm with one flag byte per reader; large messages and remote readers use ZMQ XPUB sockets. The executor uses it to send every call to its workers, and each worker uses one to reply.</span></li><li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py: MultiprocExecutor and WorkerProc</a><span class="rel-sum">vllm/v1/executor/multiproc_executor.py starts one worker process per local GPU, broadcasts every call to them through a shared-memory MessageQueue, reads the reply of one output rank, and watches the processes for failures.</span></li><li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py: process groups and GroupCoordinator</a><span class="rel-sum">vllm/distributed/parallel_state.py builds the world group and the model-parallel groups (TP, PP, DP, EP, PCP, DCP, EPLB, ...) of each worker, wraps each in a GroupCoordinator, registers the collectives as torch custom ops, and tears everything down at shutdown.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../tours/build-a-toy-plugin.html"><span class="pn-dir">← Previous</span><span class="pn-title">Tour: Build a toy plugin</span></a><a class="pn pn-next" href="../code/index.html"><span class="pn-dir">Next →</span><span class="pn-title">Code map: the folder tree</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l3"><a href="#the-example">The example</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#1ten-processes-four-gpus-two-separate-worlds">1Ten processes, four GPUs, two separate worlds</a></li><li class="toc-l2"><a href="#2each-api-server-picks-an-engine-with-the-dplb-score">2Each API server picks an engine with the DPLB score</a></li><li class="toc-l2"><a href="#3the-request-crosses-zmq-to-its-engine-core">3The request crosses ZMQ to its engine core</a></li><li class="toc-l2"><a href="#4each-engine-core-schedules-on-its-own">4Each engine core schedules on its own</a></li><li class="toc-l2"><a href="#5one-shared-memory-write-reaches-both-workers">5One shared-memory write reaches both workers</a></li><li class="toc-l2"><a href="#6each-worker-dequeues-and-runs-execute-model">6Each worker dequeues and runs execute_model</a></li><li class="toc-l2"><a href="#7the-first-collective-the-embedding-all-reduce">7The first collective: the embedding all-reduce</a></li><li class="toc-l2"><a href="#8two-all-reduces-per-decoder-layer-on-the-tp-group">8Two all-reduces per decoder layer, on the TP group</a></li><li class="toc-l2"><a href="#9sample-tokens-one-all-gather-then-both-ranks-sample">9sample_tokens: one all-gather, then both ranks sample</a></li><li class="toc-l2"><a href="#10only-tp-rank-0-replies">10Only TP rank 0 replies</a></li><li class="toc-l2"><a href="#11outputs-go-back-to-the-api-server-that-sent-the-request">11Outputs go back to the API server that sent the request</a></li><li class="toc-l2"><a href="#12each-engine-core-reports-its-new-counts">12Each engine core reports its new counts</a></li><li class="toc-l2"><a href="#13the-coordinator-publishes-the-load-to-both-api-servers">13The coordinator publishes the load to both API servers</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#the-same-tour-with-an-moe-model">The same tour with an MoE model</a></li><li class="toc-l3"><a href="#the-same-tour-with-pp-2">The same tour with PP = 2</a></li><li class="toc-l3"><a href="#where-each-wait-happens">Where each wait happens</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>

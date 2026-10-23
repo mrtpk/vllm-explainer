@@ -1,0 +1,1077 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The engine core loop: threads, queues and the busy loop · vLLM Explained</title>
+<meta name="description" content="The engine core process runs three threads. An input thread decodes requests, the main thread runs the busy loop with the scheduler and the executor, and an output thread sends the results back.">
+<script>try{var t=localStorage.getItem("explainer-theme");if(t==="light"||t==="dark")document.documentElement.setAttribute("data-theme",t);}catch(e){}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,400..700;1,14..32,400..700&amp;display=swap">
+<link rel="stylesheet" href="../assets/site.css">
+<link rel="icon" href="../assets/favicon.svg" type="image/svg+xml">
+</head>
+<body data-root="../" data-page="concepts/engine-core-loop">
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <button type="button" class="menu-btn" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><span></span><span></span><span></span></button>
+  <a class="brand" href="../index.html"><span class="brand-mark" aria-hidden="true">vL</span><span class="brand-name">vLLM Explained</span></a>
+  <div class="search" role="search">
+    <input type="search" id="search-input" placeholder="Search  ( / )" aria-label="Search the site" autocomplete="off" spellcheck="false">
+    <div class="search-results" id="search-results" role="listbox" hidden></div>
+  </div>
+  <button type="button" class="theme-btn" aria-label="Switch between light and dark mode" title="Light / dark mode">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z" fill="currentColor"/></svg>
+  </button>
+</header>
+<div class="layout">
+<aside class="sidebar" id="sidebar" aria-label="Site navigation">
+<nav>
+<a class="nav-home" href="../index.html">Home</a>
+<details class="nav-sec"><summary><span class="nav-sec-title">Learn the basics</span><span class="nav-count" title="12 of 12 pages written">12/12</span></summary>
+<ul>
+<li><a href="../learn/ml-basics-recap.html">Basics recap (DeepInfer)</a></li>
+<li><a href="../learn/what-is-vllm.html">What vLLM is today</a></li>
+<li><a href="../learn/serving-metrics.html">Serving metrics</a></li>
+<li><a href="../learn/openai-api.html">OpenAI-compatible API</a></li>
+<li><a href="../learn/processes-and-ipc.html">Processes and IPC</a></li>
+<li><a href="../learn/python-entry-points.html">Python entry points</a></li>
+<li><a href="../learn/pytorch-for-serving.html">PyTorch for serving</a></li>
+<li><a href="../learn/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../learn/tp-pp-in-practice.html">TP and PP in practice</a></li>
+<li><a href="../learn/quantized-checkpoints.html">Quantized checkpoints</a></li>
+<li><a href="../learn/lora-adapters.html">LoRA adapters</a></li>
+<li><a href="../learn/hf-checkpoints.html">Hugging Face checkpoints</a></li>
+</ul>
+</details>
+<details class="nav-sec" open><summary><span class="nav-sec-title">vLLM concepts</span><span class="nav-count" title="48 of 48 pages written">48/48</span></summary>
+<p class="nav-group">Architecture and engine</p>
+<ul>
+<li><a href="../concepts/architecture-overview.html">Architecture overview</a></li>
+<li><a href="../concepts/engine-client.html">The engine client (AsyncLLM)</a></li>
+<li><a class="current" aria-current="page" href="../concepts/engine-core-loop.html">The engine core loop</a></li>
+<li><a href="../concepts/data-contracts.html">Data contracts</a></li>
+<li><a href="../concepts/scheduler.html">The scheduler</a></li>
+<li><a href="../concepts/kv-cache-manager.html">The KV cache manager</a></li>
+<li><a href="../concepts/prefix-caching.html">Prefix caching</a></li>
+<li><a href="../concepts/hybrid-kv-cache.html">Hybrid KV cache</a></li>
+<li><a href="../concepts/async-scheduling.html">Async scheduling</a></li>
+<li><a href="../concepts/executors-and-workers.html">Executors and workers</a></li>
+<li><a href="../concepts/model-runner.html">The model runner (MRV2)</a></li>
+</ul>
+<p class="nav-group">Plugins and extensibility</p>
+<ul>
+<li><a href="../concepts/plugin-map.html">Plugin map</a></li>
+<li><a href="../concepts/plugin-loading.html">Plugin loading</a></li>
+<li><a href="../concepts/platform-plugins.html">Platform plugins</a></li>
+<li><a href="../concepts/platform-interface.html">Platform interface</a></li>
+<li><a href="../concepts/oot-models.html">Out-of-tree models</a></li>
+<li><a href="../concepts/model-interfaces.html">Model interfaces</a></li>
+<li><a href="../concepts/custom-ops.html">Custom ops</a></li>
+<li><a href="../concepts/attention-backend-selection.html">Attention backend selection</a></li>
+<li><a href="../concepts/quantization-plugins.html">Quantization plugins</a></li>
+<li><a href="../concepts/kv-connectors.html">KV connectors</a></li>
+<li><a href="../concepts/frontend-plugins.html">Front-end plugins</a></li>
+<li><a href="../concepts/engine-hooks.html">Engine hooks</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../concepts/model-definition.html">Model definition</a></li>
+<li><a href="../concepts/weight-loading.html">Weight loading</a></li>
+<li><a href="../concepts/forward-context.html">Forward context</a></li>
+<li><a href="../concepts/attention-backends.html">Attention backends</a></li>
+<li><a href="../concepts/compile-and-cuda-graphs.html">Compile and CUDA graphs</a></li>
+<li><a href="../concepts/tp-layers.html">TP layers</a></li>
+</ul>
+<p class="nav-group">Serving features</p>
+<ul>
+<li><a href="../concepts/openai-server.html">The OpenAI-compatible server</a></li>
+<li><a href="../concepts/renderers-and-chat-templates.html">Renderers and chat templates</a></li>
+<li><a href="../concepts/tool-and-reasoning-parsers.html">Tool and reasoning parsers</a></li>
+<li><a href="../concepts/structured-outputs.html">Structured outputs</a></li>
+<li><a href="../concepts/speculative-decoding.html">Speculative decoding</a></li>
+<li><a href="../concepts/sampling-and-logits-processors.html">Sampling and logits processors</a></li>
+<li><a href="../concepts/lora-serving.html">Serving LoRA adapters</a></li>
+<li><a href="../concepts/multimodal-serving.html">Multimodal serving</a></li>
+<li><a href="../concepts/pooling-and-embeddings.html">Pooling and embeddings</a></li>
+</ul>
+<p class="nav-group">Scale and deployment</p>
+<ul>
+<li><a href="../concepts/config-system.html">The config system</a></li>
+<li><a href="../concepts/distributed-groups.html">Process groups</a></li>
+<li><a href="../concepts/data-parallel-serving.html">Data parallel serving</a></li>
+<li><a href="../concepts/expert-parallel-moe.html">Expert parallel MoE</a></li>
+<li><a href="../concepts/disaggregated-prefill.html">Disaggregated prefill (P/D)</a></li>
+</ul>
+<p class="nav-group">Operating vLLM</p>
+<ul>
+<li><a href="../concepts/tuning.html">Tuning knobs</a></li>
+<li><a href="../concepts/metrics-and-observability.html">Metrics and observability</a></li>
+<li><a href="../concepts/benchmarking.html">Benchmarking</a></li>
+<li><a href="../concepts/deployment-recipes.html">Deployment recipes</a></li>
+<li><a href="../concepts/troubleshooting.html">Troubleshooting</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Guided tours</span><span class="nav-count" title="7 of 7 pages written">7/7</span></summary>
+<ul>
+<li><a href="../tours/life-of-a-chat-request.html">Life of a chat request</a></li>
+<li><a href="../tours/serve-startup.html">Start-up of vllm serve</a></li>
+<li><a href="../tours/engine-step.html">One engine step</a></li>
+<li><a href="../tours/forward-pass.html">One forward pass</a></li>
+<li><a href="../tours/life-of-a-plugin.html">Life of a plugin</a></li>
+<li><a href="../tours/build-a-toy-plugin.html">Build a toy plugin</a></li>
+<li><a href="../tours/multi-gpu-step.html">One step across GPUs</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Code map</span><span class="nav-count" title="31 of 31 pages written">31/31</span></summary>
+<p class="nav-group">Overview</p>
+<ul>
+<li><a href="../code/index.html">Folder tree</a></li>
+</ul>
+<p class="nav-group">Engine</p>
+<ul>
+<li><a href="../code/v1-engine-async-llm.html">v1/engine/async_llm.py</a></li>
+<li><a href="../code/v1-engine-core.html">v1/engine/core.py</a></li>
+<li><a href="../code/v1-engine-core-client.html">v1/engine/core_client.py</a></li>
+<li><a href="../code/v1-engine-input-processor.html">v1/engine/input_processor.py</a></li>
+<li><a href="../code/v1-engine-output-processor.html">v1/engine/output_processor.py</a></li>
+</ul>
+<p class="nav-group">Scheduler and KV cache</p>
+<ul>
+<li><a href="../code/v1-core-sched-scheduler.html">v1/core/sched/scheduler.py</a></li>
+<li><a href="../code/v1-core-kv-cache-manager.html">v1/core/kv_cache_manager.py</a></li>
+<li><a href="../code/v1-core-block-pool.html">v1/core/block_pool.py</a></li>
+<li><a href="../code/v1-core-kv-cache-utils.html">v1/core/kv_cache_utils.py</a></li>
+</ul>
+<p class="nav-group">Executor and worker</p>
+<ul>
+<li><a href="../code/v1-executor-multiproc-executor.html">v1/executor/multiproc_executor.py</a></li>
+<li><a href="../code/v1-worker-gpu-worker.html">v1/worker/gpu_worker.py</a></li>
+<li><a href="../code/v1-worker-gpu-model-runner.html">worker/gpu/model_runner.py</a></li>
+</ul>
+<p class="nav-group">Plugins and platforms</p>
+<ul>
+<li><a href="../code/plugins-init.html">plugins/__init__.py</a></li>
+<li><a href="../code/platforms-init.html">platforms/__init__.py</a></li>
+<li><a href="../code/platforms-interface.html">platforms/interface.py</a></li>
+<li><a href="../code/model-executor-custom-op.html">model_executor/custom_op.py</a></li>
+<li><a href="../code/model-executor-models-registry.html">models/registry.py</a></li>
+</ul>
+<p class="nav-group">Model execution</p>
+<ul>
+<li><a href="../code/forward-context.html">forward_context.py</a></li>
+<li><a href="../code/model-executor-layers-attention-attention.html">layers/attention/attention.py</a></li>
+<li><a href="../code/v1-attention-backend.html">v1/attention/backend.py</a></li>
+<li><a href="../code/model-executor-models-llama.html">models/llama.py</a></li>
+<li><a href="../code/model-executor-layers-linear.html">layers/linear.py</a></li>
+</ul>
+<p class="nav-group">Serving and config</p>
+<ul>
+<li><a href="../code/entrypoints-cli-serve.html">entrypoints/cli/serve.py</a></li>
+<li><a href="../code/entrypoints-openai-chat-completion-serving.html">openai/chat_completion/serving.py</a></li>
+<li><a href="../code/engine-arg-utils.html">engine/arg_utils.py</a></li>
+<li><a href="../code/config-vllm.html">config/vllm.py</a></li>
+<li><a href="../code/envs.html">envs.py</a></li>
+</ul>
+<p class="nav-group">Distributed</p>
+<ul>
+<li><a href="../code/distributed-parallel-state.html">distributed/parallel_state.py</a></li>
+<li><a href="../code/distributed-device-communicators-shm-broadcast.html">device_communicators/shm_broadcast.py</a></li>
+<li><a href="../code/distributed-kv-transfer-kv-connector-factory.html">kv_connector/factory.py</a></li>
+</ul>
+</details>
+<details class="nav-sec"><summary><span class="nav-sec-title">Reference</span><span class="nav-count" title="6 of 8 pages written">6/8</span></summary>
+<ul>
+<li><a href="../reference/env-vars.html">Environment variables</a></li>
+<li><a href="../reference/serve-flags.html">vllm serve flags</a></li>
+<li><a href="../reference/config-classes.html">Config classes</a></li>
+<li><a href="../reference/metrics.html">Prometheus metrics</a></li>
+<li><a href="../reference/extension-points.html">Extension points</a></li>
+<li class="soon"><span>vLLM and DeepInfer compared</span><span class="soon-tag">soon</span></li>
+<li><a href="../reference/glossary.html">Glossary</a></li>
+<li class="soon"><span>FAQ</span><span class="soon-tag">soon</span></li>
+</ul>
+</details>
+</nav>
+</aside>
+<div class="scrim" hidden></div>
+<main id="main" class="main">
+<article class="article">
+<nav class="breadcrumbs" aria-label="Breadcrumbs"><a href="../index.html">Home</a><span class="sep">›</span><span>vLLM concepts</span><span class="sep">›</span><span>Architecture and engine</span><span class="sep">›</span><span aria-current="page">The engine core loop</span></nav>
+<h1 class="page-title">The engine core loop: threads, queues and the busy loop</h1>
+<div class="page-meta"><span class="level level-intermediate" title="Level">Intermediate</span><span class="meta-sec">vLLM concepts</span><span class="meta-time">about 16 min read + 5 min deep dives</span><button type="button" class="dd-toggle-all">Open all deep dives</button></div>
+<p class="code-version">Code version: vLLM @ <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener" title="3e44c0db26f3530d674d255dafabaedcf0e3d742"><code>3e44c0d</code></a> · 2026-10-22</p>
+<aside class="before-read"><p class="before-read-title">Before you read</p><p>This page uses ideas from these pages:</p><ul><li><a href="../concepts/architecture-overview.html">The process and thread architecture of vllm serve</a> <span class="level level-intermediate level-sm">Intermediate</span></li><li><a href="../concepts/engine-client.html">The engine client: AsyncLLM in the API server</a> <span class="level level-intermediate level-sm">Intermediate</span></li></ul></aside>
+<div class="one-sentence"><p class="one-sentence-label">In one sentence</p><p class="one-sentence-text">The engine core process decodes requests in an input thread, runs engine steps in a busy loop, and sends results from an output thread.</p></div>
+
+<h2 id="the-idea">The idea<a class="h-anchor" href="#the-idea" aria-label="Link to this section">#</a></h2>
+<p>The <a class="term" href="../reference/glossary.html#term-engine-core" data-term="EngineCore" data-def="The inner loop of vLLM. It owns the scheduler (which holds the KV cache manager) and the executor, and it runs steps on the workers. vllm serve runs it in its own process.">EngineCore</a> is the part of vLLM that decides what the GPU does next. In <code>vllm serve</code> it runs in its own process, one per data parallel rank. The page <a href="../concepts/architecture-overview.html">The process and thread architecture of vllm serve</a> shows where this process sits. This page looks inside it.</p>
+<p>The process has one job that must never wait: keep the GPU busy with <a class="term" href="../reference/glossary.html#term-engine-step" data-term="engine step" data-def="One turn of the EngineCore loop: schedule a batch, run the model once, sample, and update the requests. Most requests get one new token per step.">engine steps</a>. Other work can wait a little. Requests arrive as <a class="term" href="../reference/glossary.html#term-msgpack" data-term="msgpack" data-def="MessagePack, a compact binary format for data. vLLM encodes the messages between the front end and the engine core with it.">msgpack</a> bytes and must be decoded. Results must be encoded and sent back. So the process uses three threads:</p>
+<ul>
+  <li>The <a class="term" href="../reference/glossary.html#term-input-thread" data-term="input thread" data-def="A daemon thread in the engine core process. It receives requests on the ZMQ sockets, decodes them, builds the Request object and puts it into input_queue.">input thread</a> receives bytes on <a class="term" href="../reference/glossary.html#term-zmq" data-term="ZMQ" data-def="ZeroMQ, a message library. vLLM uses ZMQ sockets to send requests and outputs between the front end and the engine core processes.">ZMQ</a> sockets, decodes them and builds the engine's <code>Request</code> objects. It puts them into <code>input_queue</code>.</li>
+  <li>The main thread runs the <a class="term" href="../reference/glossary.html#term-busy-loop" data-term="busy loop" data-def="The main loop of the engine core process. It takes new requests from the input queue, runs one engine step, and puts the outputs into the output queue.">busy loop</a>. It takes the requests from <code>input_queue</code>, gives them to the scheduler, runs one engine step, and puts the results into <code>output_queue</code>.</li>
+  <li>The <a class="term" href="../reference/glossary.html#term-output-thread" data-term="output thread" data-def="A daemon thread in the engine core process. It takes EngineCoreOutputs from output_queue, encodes them with msgpack and sends them on a ZMQ PUSH socket to the front end.">output thread</a> takes the results from <code>output_queue</code>, encodes them and sends them back to the front end.</li>
+</ul>
+<p>With <a class="term" href="../reference/glossary.html#term-async-scheduling" data-term="async scheduling" data-def="The engine core schedules and starts step k+1 before it waits for the result of step k. So CPU work overlaps with GPU work. It is on by default.">async scheduling</a> (the default), the busy loop does not wait for a step right after it starts it. Without pipeline parallelism, it keeps up to two steps in a <a class="term" href="../reference/glossary.html#term-batch-queue" data-term="batch queue" data-def="A short queue of started engine steps in the engine core. Its size is max_concurrent_batches: 2 on one GPU with async scheduling and Model Runner V2.">batch queue</a>: it starts step N+1 first, and only then waits for step N. The idea of an engine step loop is the same as in <a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/concepts/engine-step-loop.html" target="_blank" rel="noopener" title="DeepInfer Explained: Offline API and the step loop">The engine step loop<span class="ext-mark" aria-hidden="true">↗</span></a>. The page <a href="../concepts/async-scheduling.html">Async scheduling: overlap the CPU and the GPU</a> explains the overlap.</p>
+<p><strong>An everyday comparison.</strong> Think of a kitchen with a pass-through window on each side. One person takes the order slips from the left window and sorts them. The chef cooks, and starts the next pan before the last one is ready. A third person puts the finished plates through the right window. The chef never walks to a window. The comparison stops in one place: in Python, the three people share one lock, the GIL. The design works because socket I/O releases the GIL, and the chef often waits for the GPU anyway.</p>
+
+<h2 id="the-picture">The picture<a class="h-anchor" href="#the-picture" aria-label="Link to this section">#</a></h2>
+<figure class="diagram" id="fig-b2b_core_threads"><div class="diagram-card"><button type="button" class="diagram-zoom" aria-label="Zoom diagram: Panel 1: three boxes from left to right. The input thread runs process_input_sockets: a ZMQ DEALER socket receives from the front end&#x27;s ROUTER, decodes an EngineCoreRequest, calls preprocess_add_request to make a Request with block hashes, and also puts aborts into aborts_queue. An arrow labelled input_queue goes to the main thread, which runs run_busy_loop: process the input queue (blocks when there is no work), process one engine step with step_fn = step_with_batch_queue, put outputs into output_queue, then post_step. An arrow labelled output_queue goes to the output thread, which encodes EngineCoreOutputs and sends them on a ZMQ PUSH socket, to the DP coordinator for client index -1, and sends ENGINE_CORE_DEAD on a fatal error. Panel 2: three calls of step_with_batch_queue. Call 1 schedules step 1, starts it, puts it into the queue and returns no outputs. Call 2 schedules and starts step 2, the queue is full, so it pops step 1, waits for it and returns its outputs. Call 3 and later do the same with steps 3 and 2. Panel 3: who else writes into input_queue (EXECUTOR_FAILED, WAKEUP, START_DP_WAVE), into output_queue (utility results, abort outputs, DP counts, ENGINE_CORE_DEAD), and where each thread blocks."><svg role="img" aria-label="Panel 1: three boxes from left to right. The input thread runs process_input_sockets: a ZMQ DEALER socket receives from the front end&#x27;s ROUTER, decodes an EngineCoreRequest, calls preprocess_add_request to make a Request with block hashes, and also puts aborts into aborts_queue. An arrow labelled input_queue goes to the main thread, which runs run_busy_loop: process the input queue (blocks when there is no work), process one engine step with step_fn = step_with_batch_queue, put outputs into output_queue, then post_step. An arrow labelled output_queue goes to the output thread, which encodes EngineCoreOutputs and sends them on a ZMQ PUSH socket, to the DP coordinator for client index -1, and sends ENGINE_CORE_DEAD on a fatal error. Panel 2: three calls of step_with_batch_queue. Call 1 schedules step 1, starts it, puts it into the queue and returns no outputs. Call 2 schedules and starts step 2, the queue is full, so it pops step 1, waits for it and returns its outputs. Call 3 and later do the same with steps 3 and 2. Panel 3: who else writes into input_queue (EXECUTOR_FAILED, WAKEUP, START_DP_WAVE), into output_queue (utility results, abort outputs, DP counts, ENGINE_CORE_DEAD), and where each thread blocks." xmlns="http://www.w3.org/2000/svg" width="1100" height="1018" viewBox="0 0 1100 1018">
+<defs><marker id="dg-b2b_core_threads-m0" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker><marker id="dg-b2b_core_threads-m1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker><marker id="dg-b2b_core_threads-m2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#111827"/></marker></defs>
+<rect width="1100" height="1018" fill="#ffffff"/>
+<text x="30.0" y="42.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="26" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">The engine core process: three threads and two queues</text>
+<text x="30.0" y="68.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">One engine core process (EngineCoreProc) with TP = 1  ·  async scheduling on (default)</text>
+<text x="30.0" y="88.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">input_queue, output_queue: queue.Queue  ·  batch_queue: deque(maxlen=2)</text>
+<rect x="20.0" y="116.0" width="1060.0" height="268.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="142.0" r="13" fill="#111827"/>
+<text x="46.0" y="146.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">1</text>
+<text x="68.0" y="147.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Which thread does what?</text>
+<text x="68.0" y="166.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">The I/O threads move bytes and decode them. Only the main thread touches the scheduler and the GPU.</text>
+<rect x="46.0" y="192.0" width="280.0" height="170.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="58.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Input thread</text>
+<text x="58.0" y="230.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">process_input_sockets()</text>
+<text x="58.0" y="245.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ZMQ DEALER &lt;- ROUTER (front end)</text>
+<text x="58.0" y="260.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">poll, recv_multipart</text>
+<text x="58.0" y="275.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ADD: decode EngineCoreRequest</text>
+<text x="58.0" y="290.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   -&gt; preprocess_add_request()</text>
+<text x="58.0" y="305.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   -&gt; Request + block hashes</text>
+<text x="58.0" y="320.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ABORT: also into aborts_queue</text>
+<text x="58.0" y="335.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">UTILITY: decode (id, method, args)</text>
+<rect x="410.0" y="192.0" width="280.0" height="170.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="422.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Main thread: the busy loop</text>
+<text x="422.0" y="230.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">run_busy_loop()</text>
+<text x="422.0" y="245.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">1 _process_input_queue()</text>
+<text x="422.0" y="260.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">    blocks while there is no work</text>
+<text x="422.0" y="275.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">    add / abort / utility calls</text>
+<text x="422.0" y="290.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">2 _process_engine_step()</text>
+<text x="422.0" y="305.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">    step_fn = step_with_batch_queue</text>
+<text x="422.0" y="320.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">    outputs -&gt; output_queue</text>
+<text x="422.0" y="335.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">3 post_step()</text>
+<rect x="774.0" y="192.0" width="280.0" height="170.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="786.0" y="212.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Output thread</text>
+<text x="786.0" y="230.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">process_output_sockets()</text>
+<text x="786.0" y="245.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">output_queue.get()  (blocks)</text>
+<text x="786.0" y="260.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">(client_index, EngineCoreOutputs)</text>
+<text x="786.0" y="275.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">MsgpackEncoder.encode_into()</text>
+<text x="786.0" y="290.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ZMQ PUSH -&gt; PULL (front end)</text>
+<text x="786.0" y="305.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">sockets[client_index]</text>
+<text x="786.0" y="320.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">-1: to the DP coordinator</text>
+<text x="786.0" y="335.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">ENGINE_CORE_DEAD: send, stop</text>
+<line x1="326.0" y1="252.0" x2="408.0" y2="252.0" stroke="#2563eb" stroke-width="2" marker-end="url(#dg-b2b_core_threads-m0)"/>
+<text x="368.0" y="242.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#2563eb" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">input_queue</text>
+<line x1="690.0" y1="252.0" x2="772.0" y2="252.0" stroke="#059669" stroke-width="2" marker-end="url(#dg-b2b_core_threads-m1)"/>
+<text x="732.0" y="242.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11" fill="#059669" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">output_queue</text>
+<rect x="20.0" y="406.0" width="1060.0" height="262.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="432.0" r="13" fill="#111827"/>
+<text x="46.0" y="436.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">2</text>
+<text x="68.0" y="437.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">What does step_with_batch_queue do on each call?</text>
+<text x="68.0" y="456.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">It schedules and starts step N+1 first. Only then does it wait for step N and update the scheduler.</text>
+<rect x="46.0" y="482.0" width="280.0" height="160.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="58.0" y="502.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Call 1 (queue empty)</text>
+<text x="58.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">schedule() -&gt; step 1</text>
+<text x="58.0" y="535.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">execute_model(non_block=True)</text>
+<text x="58.0" y="550.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">sample_tokens(non_block=True)</text>
+<text x="58.0" y="565.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">appendleft(step 1)</text>
+<text x="58.0" y="580.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">queue: [1]   (1 &lt; 2)</text>
+<text x="58.0" y="595.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">return None: no outputs yet</text>
+<rect x="410.0" y="482.0" width="280.0" height="160.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="422.0" y="502.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Call 2 (queue now full)</text>
+<text x="422.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">schedule() -&gt; step 2, start it</text>
+<text x="422.0" y="535.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">appendleft(step 2)</text>
+<text x="422.0" y="550.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">queue: [2, 1]   (full)</text>
+<text x="422.0" y="565.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">pop() -&gt; step 1</text>
+<text x="422.0" y="580.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">future.result()  (wait for GPU)</text>
+<text x="422.0" y="595.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">update_from_output(step 1)</text>
+<text x="422.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">return outputs of step 1</text>
+<rect x="774.0" y="482.0" width="280.0" height="160.0" rx="8" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.5"/>
+<text x="786.0" y="502.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#7c3aed" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Call 3 and later</text>
+<text x="786.0" y="520.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">queue at start: [2]</text>
+<text x="786.0" y="535.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">schedule() -&gt; step 3, start it</text>
+<text x="786.0" y="550.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">queue: [3, 2]  -&gt; pop() step 2</text>
+<text x="786.0" y="565.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">wait, update_from_output(step 2)</text>
+<text x="786.0" y="580.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">return outputs of step 2</text>
+<text x="786.0" y="595.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">So the GPU always has the next</text>
+<text x="786.0" y="610.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">step in its stream.</text>
+<line x1="326.0" y1="562.0" x2="408.0" y2="562.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b2b_core_threads-m2)"/>
+<line x1="690.0" y1="562.0" x2="772.0" y2="562.0" stroke="#111827" stroke-width="1.6" marker-end="url(#dg-b2b_core_threads-m2)"/>
+<rect x="20.0" y="690.0" width="1060.0" height="214.0" rx="14" fill="#fafafa" fill-opacity="1.0" stroke="#e5e7eb" stroke-width="1"/>
+<circle cx="46.0" cy="716.0" r="13" fill="#111827"/>
+<text x="46.0" y="720.9" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#fff" font-weight="bold" text-anchor="middle" xml:space="preserve" style="white-space:pre">3</text>
+<text x="68.0" y="721.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="17" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Who else writes into the two queues?</text>
+<text x="68.0" y="740.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12.5" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Control messages use the same queues, so they keep their order with the requests.</text>
+<rect x="46.0" y="762.0" width="280.0" height="118.0" rx="8" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.5"/>
+<text x="58.0" y="782.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#2563eb" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Into input_queue</text>
+<text x="58.0" y="800.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">input thread: ADD, ABORT, UTILITY</text>
+<text x="58.0" y="815.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">executor failure callback:</text>
+<text x="58.0" y="830.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   EXECUTOR_FAILED</text>
+<text x="58.0" y="845.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">signal -&gt; wakeup callback: WAKEUP</text>
+<text x="58.0" y="860.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">DP only: START_DP_WAVE</text>
+<rect x="410.0" y="762.0" width="280.0" height="118.0" rx="8" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.5"/>
+<text x="422.0" y="782.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#059669" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Into output_queue</text>
+<text x="422.0" y="800.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">busy loop: step outputs</text>
+<text x="422.0" y="815.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">utility results (UtilityOutput)</text>
+<text x="422.0" y="830.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">abort / error outputs</text>
+<text x="422.0" y="845.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">DP counts: client_index -1</text>
+<text x="422.0" y="860.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">fatal error: ENGINE_CORE_DEAD</text>
+<rect x="774.0" y="762.0" width="280.0" height="118.0" rx="8" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.5"/>
+<text x="786.0" y="782.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13.5" fill="#d97706" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Blocking rules</text>
+<text x="786.0" y="800.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">input thread: blocks in poll()</text>
+<text x="786.0" y="815.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">busy loop: blocks in</text>
+<text x="786.0" y="830.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   input_queue.get() when idle</text>
+<text x="786.0" y="845.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">   future.result() when queue full</text>
+<text x="786.0" y="860.0" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="11.5" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">output thread: output_queue.get()</text>
+<text x="30.0" y="939.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#111827" font-weight="bold" text-anchor="start" xml:space="preserve" style="white-space:pre">Legend</text>
+<rect x="97.3" y="928.0" width="14.0" height="14.0" rx="3" fill="#eff6ff" fill-opacity="1.0" stroke="#2563eb" stroke-width="1.4"/>
+<text x="118.3" y="939.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">input path</text>
+<rect x="202.4" y="928.0" width="14.0" height="14.0" rx="3" fill="#f5f3ff" fill-opacity="1.0" stroke="#7c3aed" stroke-width="1.4"/>
+<text x="223.4" y="939.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">main thread work</text>
+<rect x="350.6" y="928.0" width="14.0" height="14.0" rx="3" fill="#ecfdf5" fill-opacity="1.0" stroke="#059669" stroke-width="1.4"/>
+<text x="371.6" y="939.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">output path</text>
+<rect x="464.8" y="928.0" width="14.0" height="14.0" rx="3" fill="#fffbeb" fill-opacity="1.0" stroke="#d97706" stroke-width="1.4"/>
+<text x="485.8" y="939.5" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#111827" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">where a thread waits</text>
+<text x="30.0" y="968.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Queue size 2 = max_concurrent_batches = pp_size + 1 with async scheduling and Model Runner V2 (vllm.py:587-597).</text>
+<text x="30.0" y="986.0" font-family="Inter,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#6b7280" font-weight="normal" text-anchor="start" xml:space="preserve" style="white-space:pre">Not shown: the DP coordinator sockets, the stack-dump watchdog and fault tolerance. Uni executor: the worker runs in the main thread.</text>
+</svg></button></div><div class="diagram-meta"><figcaption>Figure: the three threads of the engine core process and their two queues (panel 1), what one call of step_with_batch_queue does with the batch queue (panel 2), and the other messages in the queues (panel 3).</figcaption><a class="diagram-open" href="../diagrams/b2b_core_threads.svg" target="_blank">Open full size ↗</a></div></figure>
+<p>Read panel 1 from left to right: bytes come in on the left and go out on the right. Only the violet box touches the scheduler and the executor. Panel 2 shows why the first call of <code>step_with_batch_queue</code> returns nothing: the queue is not full yet. From the second call on, each call returns the outputs of the step before.</p>
+
+<h2 id="in-the-code">In the code<a class="h-anchor" href="#in-the-code" aria-label="Link to this section">#</a></h2>
+
+<h3 id="step-1-the-process-starts-in-run-engine-core">Step 1: the process starts in run_engine_core<a class="h-anchor" href="#step-1-the-process-starts-in-run-engine-core" aria-label="Link to this section">#</a></h3>
+<p>The engine core client starts one process per local data parallel rank. Its target is <code>EngineCoreProc.run_engine_core</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/utils.py#L279-L288" target="_blank" rel="noopener" title="vllm/v1/engine/utils.py:279-288 at 3e44c0d"><code>vllm/v1/engine/utils.py:279-288</code></a>). This static method sets the process title, installs signal handlers and picks the class:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1533-L1558" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:1533-1558</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1533-L1558" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1533</span><span class="ln hl">1534</span><span class="ln">1535</span><span class="ln">1536</span><span class="ln hl">1537</span><span class="ln">1538</span><span class="ln">1539</span><span class="ln">1540</span><span class="ln">1541</span><span class="ln hl">1542</span><span class="ln hl">1543</span><span class="ln">1544</span><span class="ln">1545</span><span class="ln">1546</span><span class="ln">1547</span><span class="ln">1548</span><span class="ln">1549</span><span class="ln">1550</span><span class="ln">1551</span><span class="ln">1552</span><span class="ln">1553</span><span class="ln">1554</span><span class="ln">1555</span><span class="ln">1556</span><span class="ln">1557</span><span class="ln hl">1558</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><pre><code class="language-python">            parallel_config.data_parallel_index = dp_rank
+            if data_parallel and vllm_config.model_config.is_moe:
+                # Set data parallel rank for this engine process.
+                parallel_config.data_parallel_rank = dp_rank
+                engine_core = DPEngineCoreProc(*args, **kwargs)
+            else:
+                # Non-MoE DP ranks are completely independent, so treat like DP=1.
+                # Note that parallel_config.data_parallel_index will still reflect
+                # the original DP rank.
+                parallel_config.reconfigure_for_independent_dp_rank()
+                engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+
+            assert engine_core is not None
+
+            # Apply a signal received during construction before entering the
+            # loop. run_busy_loop calls _handle_shutdown first, so the loop exits
+            # right away instead of blocking on an idle input_queue.
+            if shutdown_requested:
+                engine_core.shutdown_state = EngineShutdownState.REQUESTED
+
+            # Arm the wakeup callback only now that input_queue exists, so a
+            # later signal can still wake an idle busy loop.
+            signal_callback = SignalCallback(wakeup_engine)
+
+            start_watch_dog(f&quot;engine_{dp_rank}&quot;, vllm_config.watchdog_config, logger)
+            engine_core.run_busy_loop()</code></pre></div></div></div></figure>
+<ol>
+  <li>Line 1534: only an MoE model with DP &gt; 1 gets a <code>DPEngineCoreProc</code> (Step 11).</li>
+  <li>Line 1542: every other engine core treats itself as DP = 1. Dense DP ranks are independent.</li>
+  <li>Line 1558: <code>run_busy_loop()</code> runs until shutdown. It never returns normally; it raises <code>SystemExit</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1620" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1620 at 3e44c0d"><code>vllm/v1/engine/core.py:1620</code></a>).</li>
+</ol>
+<p>The signal handler only marks the shutdown as requested. It does not stop the process at once (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1510-L1531" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1510-1531 at 3e44c0d"><code>vllm/v1/engine/core.py:1510-1531</code></a>). The busy loop sees the flag on its next turn (Step 4).</p>
+
+<h3 id="step-2-the-handshake-the-heavy-start-up-and-the-ready-messages">Step 2: the handshake, the heavy start-up and the ready messages<a class="h-anchor" href="#step-2-the-handshake-the-heavy-start-up-and-the-ready-messages" aria-label="Link to this section">#</a></h3>
+<p><code>EngineCoreProc.__init__</code> makes the two queues first. The executor failure callback already points at <code>input_queue</code>:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1172-L1179" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:1172-1179</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1172-L1179" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">1172</span><span class="ln hl">1173</span><span class="ln hl">1174</span><span class="ln hl">1175</span><span class="ln hl">1176</span><span class="ln">1177</span><span class="ln">1178</span><span class="ln hl">1179</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><pre><code class="language-python">        self.input_queue = queue.Queue[tuple[EngineCoreRequestType, Any]]()
+        self.output_queue = queue.Queue[tuple[int, EngineCoreOutputs] | bytes]()
+        executor_fail_callback = lambda: self.input_queue.put_nowait(
+            (EngineCoreRequestType.EXECUTOR_FAILED, b&quot;&quot;)
+        )
+
+        self.engine_index = engine_index
+        identity = self.engine_index.to_bytes(length=2, byteorder=&quot;little&quot;)</code></pre></div></div></div></figure>
+<p>Then it does a handshake with the front end on a separate ZMQ <code>DEALER</code> socket. The engine sends <code>HELLO</code> and waits up to 5 minutes for an init message with the socket addresses (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1395-L1413" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1395-1413 at 3e44c0d"><code>vllm/v1/engine/core.py:1395-1413</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L113" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:113 at 3e44c0d"><code>vllm/v1/engine/core.py:113</code></a>). Inside the <code>with</code> block of this handshake, it runs all the heavy start-up:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1190-L1226" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:1190-1226</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1190-L1226" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln hl">1190</span><span class="ln">1191</span><span class="ln">1192</span><span class="ln">1193</span><span class="ln">1194</span><span class="ln">1195</span><span class="ln">1196</span><span class="ln">1197</span><span class="ln">1198</span><span class="ln">1199</span><span class="ln">1200</span><span class="ln">1201</span><span class="ln">1202</span><span class="ln">1203</span><span class="ln">1204</span><span class="ln">1205</span><span class="ln">1206</span><span class="ln">1207</span><span class="ln">1208</span><span class="ln">1209</span><span class="ln">1210</span><span class="ln">1211</span><span class="ln">1212</span><span class="ln">1213</span><span class="ln">1214</span><span class="ln">1215</span><span class="ln">1216</span><span class="ln">1217</span><span class="ln">1218</span><span class="ln">1219</span><span class="ln hl">1220</span><span class="ln hl">1221</span><span class="ln hl">1222</span><span class="ln hl">1223</span><span class="ln hl">1224</span><span class="ln hl">1225</span><span class="ln hl">1226</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(0 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(36 * var(--code-lh))"></span><pre><code class="language-python">        with self._perform_handshakes(
+            handshake_address,
+            identity,
+            local_client,
+            vllm_config,
+            client_handshake_address,
+        ) as addresses:
+            # Set up data parallel environment.
+            self.has_coordinator = addresses.coordinator_output is not None
+            self.frontend_stats_publish_address = (
+                addresses.frontend_stats_publish_address
+            )
+            logger.debug(
+                &quot;Has DP Coordinator: %s, stats publish address: %s&quot;,
+                self.has_coordinator,
+                self.frontend_stats_publish_address,
+            )
+            internal_dp_balancing = (
+                self.has_coordinator
+                and not vllm_config.parallel_config.data_parallel_external_lb
+            )
+            # Only publish request queue stats to coordinator for &quot;internal&quot;
+            # and &quot;hybrid&quot; LB modes.
+            self.publish_dp_lb_stats = internal_dp_balancing
+            self.last_counts = (0, 0)
+
+            self.addresses = addresses
+            self.process_input_queue_block = True
+            self._init_data_parallel(vllm_config)
+
+            super().__init__(
+                vllm_config,
+                executor_class,
+                log_stats,
+                executor_fail_callback,
+                internal_dp_balancing,
+            )</code></pre></div></div></div></figure>
+<p><code>super().__init__</code> is <code>EngineCore.__init__</code>. It loads the general plugins and builds the executor, with the workers and the model. Then it profiles the memory, allocates the KV cache and makes the scheduler (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L129-L185" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:129-185 at 3e44c0d"><code>vllm/v1/engine/core.py:129-185</code></a>). Then it sets up the batch queue and picks the step function:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L201-L229" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:201-229</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L201-L229" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">201</span><span class="ln">202</span><span class="ln">203</span><span class="ln">204</span><span class="ln hl">205</span><span class="ln">206</span><span class="ln">207</span><span class="ln">208</span><span class="ln hl">209</span><span class="ln hl">210</span><span class="ln hl">211</span><span class="ln">212</span><span class="ln">213</span><span class="ln">214</span><span class="ln">215</span><span class="ln">216</span><span class="ln">217</span><span class="ln">218</span><span class="ln">219</span><span class="ln">220</span><span class="ln">221</span><span class="ln">222</span><span class="ln">223</span><span class="ln">224</span><span class="ln">225</span><span class="ln">226</span><span class="ln hl">227</span><span class="ln hl">228</span><span class="ln hl">229</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><pre><code class="language-python">        # Setup batch queue for pipeline parallelism.
+        # Batch queue for scheduled batches. This enables us to asynchronously
+        # schedule and execute batches, and is required by pipeline parallelism
+        # to eliminate pipeline bubbles.
+        self.batch_queue_size = vllm_config.max_concurrent_batches
+        self.batch_queue: (
+            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
+        ) = None
+        if self.batch_queue_size &gt; 1:
+            logger.debug(&quot;Batch queue is enabled with size %d&quot;, self.batch_queue_size)
+            self.batch_queue = deque(maxlen=self.batch_queue_size)
+
+        self.is_mm_encoder_only = vllm_config.is_mm_encoder_only
+        self.is_pooling_model = vllm_config.model_config.runner_type == &quot;pooling&quot;
+
+        self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
+        if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
+            caching_hash_fn = get_hash_fn_by_name(
+                vllm_config.cache_config.prefix_caching_hash_algo
+            )
+            init_none_hash(caching_hash_fn)
+
+            self.request_block_hasher = get_request_block_hasher(
+                hash_block_size, caching_hash_fn
+            )
+
+        self.step_fn = (
+            self.step if self.batch_queue is None else self.step_with_batch_queue
+        )</code></pre></div></div></div></figure>
+<p><code>max_concurrent_batches</code> is <code>pp_size + 1</code> with async scheduling and Model Runner V2, so 2 on one GPU (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L586-L597" target="_blank" rel="noopener" title="vllm/config/vllm.py:586-597 at 3e44c0d"><code>vllm/config/vllm.py:586-597</code></a>). Then the I/O threads start (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1238-L1265" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1238-1265 at 3e44c0d"><code>vllm/v1/engine/core.py:1238-1265</code></a>). Two "ready" messages go out:</p>
+<ol>
+  <li>The input thread sends an <code>EngineCoreReadyResponse</code> on each input socket. A ROUTER socket can only send to a peer that has sent to it first (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1961-L1968" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1961-1968 at 3e44c0d"><code>vllm/v1/engine/core.py:1961-1968</code></a>). The client waits for this message, with the timeout <code>VLLM_ENGINE_READY_TIMEOUT_S</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L753-L771" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:753-771 at 3e44c0d"><code>vllm/v1/engine/core_client.py:753-771</code></a>).</li>
+  <li>When the <code>with</code> block ends, the engine sends <code>{"status": "READY"}</code> on the handshake socket (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1364-L1386" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1364-1386 at 3e44c0d"><code>vllm/v1/engine/core.py:1364-1386</code></a>). The start-up code of the front end waits for it, with no time limit. It stops only when an engine process exits (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/utils.py#L1434-L1470" target="_blank" rel="noopener" title="vllm/v1/engine/utils.py:1434-1470 at 3e44c0d"><code>vllm/v1/engine/utils.py:1434-1470</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/utils.py#L1547" target="_blank" rel="noopener" title="vllm/v1/engine/utils.py:1547 at 3e44c0d"><code>vllm/v1/engine/utils.py:1547</code></a>).</li>
+</ol>
+
+<h3 id="step-3-the-input-thread-decodes-and-preprocesses">Step 3: the input thread decodes and preprocesses<a class="h-anchor" href="#step-3-the-input-thread-decodes-and-preprocesses" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1977-L2028" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:1977-2028</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1977-L2028" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1977</span><span class="ln hl">1978</span><span class="ln">1979</span><span class="ln hl">1980</span><span class="ln">1981</span><span class="ln">1982</span><span class="ln">1983</span><span class="ln">1984</span><span class="ln">1985</span><span class="ln">1986</span><span class="ln">1987</span><span class="ln">1988</span><span class="ln">1989</span><span class="ln">1990</span><span class="ln hl">1991</span><span class="ln">1992</span><span class="ln hl">1993</span><span class="ln">1994</span><span class="ln">1995</span><span class="ln">1996</span><span class="ln">1997</span><span class="ln">1998</span><span class="ln">1999</span><span class="ln">2000</span><span class="ln">2001</span><span class="ln">2002</span><span class="ln">2003</span><span class="ln">2004</span><span class="ln">2005</span><span class="ln">2006</span><span class="ln">2007</span><span class="ln">2008</span><span class="ln">2009</span><span class="ln hl">2010</span><span class="ln">2011</span><span class="ln">2012</span><span class="ln">2013</span><span class="ln">2014</span><span class="ln">2015</span><span class="ln">2016</span><span class="ln">2017</span><span class="ln">2018</span><span class="ln">2019</span><span class="ln">2020</span><span class="ln">2021</span><span class="ln">2022</span><span class="ln">2023</span><span class="ln">2024</span><span class="ln hl">2025</span><span class="ln">2026</span><span class="ln">2027</span><span class="ln hl">2028</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(48 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(51 * var(--code-lh))"></span><pre><code class="language-python">            while True:
+                for input_socket, _ in poller.poll():
+                    # (RequestType, RequestData)
+                    type_frame, *data_frames = input_socket.recv_multipart(copy=False)
+                    # NOTE(yongji): ignore READY message sent by DP coordinator
+                    # that is used to notify newly started engines
+                    if type_frame.buffer == b&quot;READY&quot;:
+                        assert input_socket == coord_socket
+                        continue
+                    request_type = EngineCoreRequestType(bytes(type_frame.buffer))
+
+                    # Deserialize the request data.
+                    request: Any
+                    if request_type == EngineCoreRequestType.ADD:
+                        req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                        try:
+                            request = self.preprocess_add_request(req)
+                        except MultiModalCacheMissError as e:
+                            # P0/P1 shadow drift -- return a retryable signal (P0
+                            # drops the stale entry, client resends with data).
+                            self._handle_mm_cache_miss(req, e)
+                            continue
+                        except VLLMValidationError as e:
+                            # Note(arpera):
+                            # Currently we validate in engine core
+                            # only if request uses the same structured output backend
+                            # as engine core latched
+                            self._handle_request_validation_error(req, e)
+                            continue
+                        except Exception:
+                            self._handle_request_preproc_error(req)
+                            continue
+                    elif request_type == EngineCoreRequestType.UTILITY:
+                        request = generic_decoder.decode(data_frames)
+                        client_idx, call_id, method, args = request
+                        if method == FT_UTILITY_METHOD:
+                            self.ft_sentinel.handle_command(
+                                client_idx, call_id, args[0]
+                            )
+                            continue
+                    else:
+                        request = generic_decoder.decode(data_frames)
+
+                        if request_type == EngineCoreRequestType.ABORT:
+                            # Aborts are added to *both* queues, allows us to eagerly
+                            # process aborts while also ensuring ordering in the input
+                            # queue to avoid leaking requests. This is ok because
+                            # aborting in the scheduler is idempotent.
+                            self.aborts_queue.put_nowait(request)
+
+                    # Push to input queue for core busy loop.
+                    self.input_queue.put_nowait((request_type, request))</code></pre></div></div></div></figure>
+<ol>
+  <li>Line 1978: <code>poller.poll()</code> blocks until a socket has a message. ZMQ releases the GIL while it waits.</li>
+  <li>Line 1980: the first frame is the request type, one byte: <code>ADD</code>, <code>ABORT</code>, <code>START_DP_WAVE</code> or <code>UTILITY</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/__init__.py#L300-L312" target="_blank" rel="noopener" title="vllm/v1/engine/__init__.py:300-312 at 3e44c0d"><code>vllm/v1/engine/__init__.py:300-312</code></a>).</li>
+  <li>Lines 1991-1993: an ADD is decoded into an <code>EngineCoreRequest</code>. Then <code>preprocess_add_request</code> makes the <code>Request</code>, with its block hashes, in this thread (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1114-L1136" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1114-1136 at 3e44c0d"><code>vllm/v1/engine/core.py:1114-1136</code></a>). Its docstring says why: so request set-up runs "in parallel with Model forward" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1115-L1119" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1115-1119 at 3e44c0d"><code>vllm/v1/engine/core.py:1115-1119</code></a>).</li>
+  <li>Lines 1999-2008: a request that fails here does not stop the thread. The engine sends a finish output with an error for that request only (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2149-L2167" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:2149-2167 at 3e44c0d"><code>vllm/v1/engine/core.py:2149-2167</code></a>).</li>
+  <li>Line 2025: an ABORT goes into <code>aborts_queue</code> as well (Step 9).</li>
+  <li>Line 2028: everything goes into <code>input_queue</code>, in arrival order.</li>
+</ol>
+<p>The fields of <code>EngineCoreRequest</code> and <code>Request</code> are on <a href="../concepts/data-contracts.html">Data contracts between the parts of vLLM</a>.</p>
+
+<h3 id="step-4-the-busy-loop">Step 4: the busy loop<a class="h-anchor" href="#step-4-the-busy-loop" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1608-L1620" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:1608-1620</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1608-L1620" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1608</span><span class="ln">1609</span><span class="ln">1610</span><span class="ln hl">1611</span><span class="ln">1612</span><span class="ln hl">1613</span><span class="ln">1614</span><span class="ln">1615</span><span class="ln">1616</span><span class="ln hl">1617</span><span class="ln">1618</span><span class="ln">1619</span><span class="ln">1620</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><pre><code class="language-python">    @fault_tolerant_wrapper
+    def run_busy_loop(self):
+        &quot;&quot;&quot;Core busy loop of the EngineCore.&quot;&quot;&quot;
+        while self._handle_shutdown():
+            # 1) Poll the input queue until there is work to do.
+            self._process_input_queue()
+            # Publish request counts before and after GPU step to ensure freshness.
+            self._maybe_publish_request_counts()
+            # 2) Step the engine core and return the outputs.
+            self._process_engine_step()
+            self._maybe_publish_request_counts()
+
+        raise SystemExit</code></pre></div></div></div></figure>
+<p><code>_handle_shutdown()</code> returns true while the engine runs. After a signal it aborts or drains the requests, and it returns false when no work is left (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1691-L1737" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1691-1737 at 3e44c0d"><code>vllm/v1/engine/core.py:1691-1737</code></a>). Each turn has two parts: drain the input queue, then run one step. <code>_maybe_publish_request_counts</code> does something only for data parallel load balancing (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1622-L1633" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1622-1633 at 3e44c0d"><code>vllm/v1/engine/core.py:1622-1633</code></a>).</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1666-L1684" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:1666-1684</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1666-L1684" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1666</span><span class="ln">1667</span><span class="ln">1668</span><span class="ln">1669</span><span class="ln">1670</span><span class="ln hl">1671</span><span class="ln">1672</span><span class="ln hl">1673</span><span class="ln hl">1674</span><span class="ln">1675</span><span class="ln hl">1676</span><span class="ln">1677</span><span class="ln">1678</span><span class="ln">1679</span><span class="ln">1680</span><span class="ln hl">1681</span><span class="ln hl">1682</span><span class="ln">1683</span><span class="ln">1684</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><pre><code class="language-python">    def _process_engine_step(self) -&gt; bool:
+        &quot;&quot;&quot;Called only when there are unfinished local requests.&quot;&quot;&quot;
+        get_watch_dog().feed()
+
+        # Step the engine core.
+        outputs, model_executed = self.step_fn()
+        # Put EngineCoreOutputs into the output queue.
+        for output in outputs.items() if outputs else ():
+            self.output_queue.put_nowait(output)
+        # Post-step hook.
+        self.post_step(model_executed)
+
+        # If no model execution happened but there is still scheduler work
+        # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
+        # the GIL briefly to allow background transfer threads to make progress.
+        if not model_executed and self.scheduler.has_requests():
+            time.sleep(0.001)
+
+        return model_executed</code></pre></div></div></div></figure>
+<ol>
+  <li>Line 1671: <code>step_fn</code> is <code>step_with_batch_queue</code> by default (Step 5). It returns a dict from client index to <code>EngineCoreOutputs</code>, or <code>None</code>.</li>
+  <li>Lines 1673-1674: each output goes into <code>output_queue</code> as a pair <code>(client_index, outputs)</code>.</li>
+  <li>Line 1676: <code>post_step</code> takes draft tokens from the workers, but only without async scheduling (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L689-L696" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:689-696 at 3e44c0d"><code>vllm/v1/engine/core.py:689-696</code></a>).</li>
+  <li>Lines 1681-1682: if no model ran but requests wait (for example for remote KV), the loop sleeps 1 ms so other threads can run.</li>
+</ol>
+
+<h3 id="step-5-step-and-step-with-batch-queue">Step 5: step() and step_with_batch_queue()<a class="h-anchor" href="#step-5-step-and-step-with-batch-queue" aria-label="Link to this section">#</a></h3>
+<p><code>EngineCore.step()</code> is the simple loop: schedule, run, wait, sample, update. It waits for each step before it schedules the next one:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L657-L687" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:657-687</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L657-L687" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">657</span><span class="ln">658</span><span class="ln">659</span><span class="ln">660</span><span class="ln">661</span><span class="ln">662</span><span class="ln">663</span><span class="ln">664</span><span class="ln">665</span><span class="ln">666</span><span class="ln hl">667</span><span class="ln hl">668</span><span class="ln hl">669</span><span class="ln">670</span><span class="ln">671</span><span class="ln">672</span><span class="ln">673</span><span class="ln hl">674</span><span class="ln">675</span><span class="ln hl">676</span><span class="ln">677</span><span class="ln">678</span><span class="ln">679</span><span class="ln">680</span><span class="ln hl">681</span><span class="ln">682</span><span class="ln">683</span><span class="ln">684</span><span class="ln">685</span><span class="ln">686</span><span class="ln">687</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(17 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><pre><code class="language-python">    def step(self) -&gt; tuple[dict[int, EngineCoreOutputs], bool]:
+        &quot;&quot;&quot;Schedule, execute, and make output.
+
+        Returns tuple of outputs and a flag indicating whether the model
+        was executed.
+        &quot;&quot;&quot;
+        # Check for any requests remaining in the scheduler - unfinished,
+        # or finished and not yet removed from the batch.
+        if not self.scheduler.has_requests():
+            return {}, False
+        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        future = self.model_executor.execute_model(scheduler_output, non_block=True)
+        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+        with (
+            self.capture_iteration_details(scheduler_output) as iteration_details,
+            self.log_error_detail(scheduler_output),
+        ):
+            model_output = future.result()
+            if model_output is None:
+                model_output = self.model_executor.sample_tokens(grammar_output)
+
+        # Before processing the model output, process any aborts that happened
+        # during the model execution.
+        self._process_aborts_queue()
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, model_output
+        )
+        self._attach_iteration_details(engine_core_outputs, iteration_details)
+        self._attach_weight_version(engine_core_outputs)
+
+        return engine_core_outputs, scheduler_output.total_num_scheduled_tokens &gt; 0</code></pre></div></div></div></figure>
+<p>The engine uses it only when there is no batch queue, for example with <code>--no-async-scheduling</code> and no pipeline parallelism (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L227-L229" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:227-229 at 3e44c0d"><code>vllm/v1/engine/core.py:227-229</code></a>). The default is <code>step_with_batch_queue()</code>. Its docstring gives the rule: "fulfilling the batch queue has a higher priority than getting model outputs" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L701-L713" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:701-713 at 3e44c0d"><code>vllm/v1/engine/core.py:701-713</code></a>). The core lines:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L724-L759" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:724-759</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L724-L759" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">724</span><span class="ln hl">725</span><span class="ln">726</span><span class="ln hl">727</span><span class="ln hl">728</span><span class="ln hl">729</span><span class="ln">730</span><span class="ln">731</span><span class="ln">732</span><span class="ln">733</span><span class="ln">734</span><span class="ln">735</span><span class="ln">736</span><span class="ln">737</span><span class="ln">738</span><span class="ln">739</span><span class="ln">740</span><span class="ln">741</span><span class="ln">742</span><span class="ln hl">743</span><span class="ln hl">744</span><span class="ln hl">745</span><span class="ln">746</span><span class="ln">747</span><span class="ln">748</span><span class="ln hl">749</span><span class="ln">750</span><span class="ln">751</span><span class="ln">752</span><span class="ln hl">753</span><span class="ln hl">754</span><span class="ln hl">755</span><span class="ln hl">756</span><span class="ln hl">757</span><span class="ln hl">758</span><span class="ln hl">759</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(19 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(20 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(30 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(31 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(32 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(33 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(34 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(35 * var(--code-lh))"></span><pre><code class="language-python">        if self.scheduler.has_requests():
+            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            with self.log_error_detail(scheduler_output):
+                exec_future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
+            if not self.is_mm_encoder_only:
+                model_executed = scheduler_output.total_num_scheduled_tokens &gt; 0
+
+            if self.is_pooling_model or not model_executed:
+                # No sampling required (no requests scheduled).
+                future = cast(Future[ModelRunnerOutput], exec_future)
+            else:
+                if not scheduler_output.pending_structured_output_tokens:
+                    # We aren&#x27;t waiting for any tokens, get any grammar output
+                    # and sample immediately.
+                    grammar_output = self.scheduler.get_grammar_bitmask(
+                        scheduler_output
+                    )
+                    future = self.model_executor.sample_tokens(
+                        grammar_output, non_block=True
+                    )
+                else:
+                    # We need to defer sampling until we have processed the model output
+                    # from the prior step.
+                    deferred_scheduler_output = scheduler_output
+
+            if not deferred_scheduler_output:
+                # Add this step&#x27;s future to the queue.
+                batch_queue.appendleft((future, scheduler_output, exec_future))
+                if len(batch_queue) &lt; self.batch_queue_size and (
+                    model_executed or self.scheduler.has_requests()
+                ):
+                    # Don&#x27;t block on next worker response unless the queue is full
+                    # or there are no more requests to schedule.
+                    return None, model_executed</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L767-L787" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:767-787</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L767-L787" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">767</span><span class="ln hl">768</span><span class="ln">769</span><span class="ln">770</span><span class="ln">771</span><span class="ln">772</span><span class="ln hl">773</span><span class="ln">774</span><span class="ln">775</span><span class="ln">776</span><span class="ln">777</span><span class="ln">778</span><span class="ln">779</span><span class="ln">780</span><span class="ln">781</span><span class="ln hl">782</span><span class="ln hl">783</span><span class="ln">784</span><span class="ln">785</span><span class="ln">786</span><span class="ln">787</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><pre><code class="language-python">        # Block until the next result is available.
+        future, scheduler_output, exec_model_fut = batch_queue.pop()
+        with (
+            self.capture_iteration_details(scheduler_output) as iteration_details,
+            self.log_error_detail(scheduler_output),
+        ):
+            model_output = future.result()
+            if model_output is None:
+                # None from sample_tokens() implies that the original execute_model()
+                # call failed - raise that exception.
+                exec_model_fut.result()
+                raise RuntimeError(&quot;unexpected error&quot;)
+
+        # Before processing the model output, process any aborts that happened
+        # during the model execution.
+        self._process_aborts_queue()
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, model_output
+        )
+        self._attach_iteration_details(engine_core_outputs, iteration_details)
+        self._attach_weight_version(engine_core_outputs)</code></pre></div></div></div></figure>
+<ol>
+  <li>Line 725: the scheduler makes the plan of step N+1. The page <a href="../concepts/scheduler.html">The V1 scheduler: one token budget, no phases</a> explains it.</li>
+  <li>Lines 727-729 and 743-745: <code>execute_model</code> and <code>sample_tokens</code> both get <code>non_block=True</code>. They return futures.</li>
+  <li>Line 749: with structured output, sampling can wait for the previous step (see <a href="../concepts/async-scheduling.html">Async scheduling: overlap the CPU and the GPU</a>).</li>
+  <li>Lines 753-759: the new step goes to the left end of the queue. If the queue is not full, the function returns <code>None</code> at once.</li>
+  <li>Line 768: else it takes the oldest step from the right end, and line 773 waits for its result.</li>
+  <li>Lines 782-783: it applies the aborts that came in meanwhile, then <code>update_from_output</code> makes the outputs.</li>
+</ol>
+<p>The tour <a href="../tours/engine-step.html">Tour: One engine step</a> follows one call of this function with real numbers.</p>
+
+<h3 id="step-6-when-there-is-no-work">Step 6: when there is no work<a class="h-anchor" href="#step-6-when-there-is-no-work" aria-label="Link to this section">#</a></h3>
+<p>The busy loop does not spin when the engine is idle. <code>_process_input_queue</code> blocks on <code>input_queue.get()</code> while <code>has_work()</code> is false:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1635-L1664" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:1635-1664</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1635-L1664" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1635</span><span class="ln">1636</span><span class="ln">1637</span><span class="ln hl">1638</span><span class="ln">1639</span><span class="ln">1640</span><span class="ln">1641</span><span class="ln">1642</span><span class="ln">1643</span><span class="ln">1644</span><span class="ln">1645</span><span class="ln">1646</span><span class="ln">1647</span><span class="ln hl">1648</span><span class="ln">1649</span><span class="ln">1650</span><span class="ln hl">1651</span><span class="ln">1652</span><span class="ln">1653</span><span class="ln">1654</span><span class="ln">1655</span><span class="ln">1656</span><span class="ln">1657</span><span class="ln">1658</span><span class="ln">1659</span><span class="ln">1660</span><span class="ln">1661</span><span class="ln hl">1662</span><span class="ln hl">1663</span><span class="ln hl">1664</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(28 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(29 * var(--code-lh))"></span><pre><code class="language-python">    def _process_input_queue(self):
+        &quot;&quot;&quot;Exits when an engine step needs to be performed.&quot;&quot;&quot;
+        waited = False
+        while not self.has_work() and self.is_running():
+            # Notify callbacks waiting for engine to become idle.
+            self._notify_idle_state_callbacks()
+            if self.input_queue.empty():
+                # Drain aborts queue; all aborts are also processed via input_queue.
+                with self.aborts_queue.mutex:
+                    self.aborts_queue.queue.clear()
+                if logger.isEnabledFor(DEBUG):
+                    logger.debug(&quot;EngineCore waiting for work.&quot;)
+                    waited = True
+            block = self.process_input_queue_block
+            try:
+                with get_watch_dog().disable():
+                    req = self.input_queue.get(block=block)
+                self._handle_client_request(*req)
+            except queue.Empty:
+                break
+            if not block:
+                break
+
+        if waited:
+            logger.debug(&quot;EngineCore loop active.&quot;)
+
+        # Handle any more client requests.
+        while not self.input_queue.empty():
+            req = self.input_queue.get_nowait()
+            self._handle_client_request(*req)</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1596-L1602" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:1596-1602</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1596-L1602" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1596</span><span class="ln">1597</span><span class="ln">1598</span><span class="ln">1599</span><span class="ln">1600</span><span class="ln">1601</span><span class="ln">1602</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">    def has_work(self) -&gt; bool:
+        &quot;&quot;&quot;Returns true if the engine should be stepped.&quot;&quot;&quot;
+        return (
+            self.engines_running
+            or self.scheduler.has_requests()
+            or bool(self.batch_queue)
+        )</code></pre></div></div></div></figure>
+<ol>
+  <li>Line 1638: the wait loop runs only while there is no work and no shutdown.</li>
+  <li>Lines 1648-1651: <code>process_input_queue_block</code> is <code>True</code> for an engine core process (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1217" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1217 at 3e44c0d"><code>vllm/v1/engine/core.py:1217</code></a>). So the thread sleeps in <code>get()</code> and uses no CPU.</li>
+  <li>Lines 1662-1664: when there is work, the loop still takes every message that is already queued, without a wait.</li>
+</ol>
+<p><code>has_work()</code> is also true while the batch queue is not empty. So after the last request finishes, the loop runs until the last in-flight step is processed. A signal during an idle wait puts a <code>WAKEUP</code> message into the queue, so the loop can see the shutdown (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1503-L1508" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1503-1508 at 3e44c0d"><code>vllm/v1/engine/core.py:1503-1508</code></a>).</p>
+
+<h3 id="step-7-the-output-thread">Step 7: the output thread<a class="h-anchor" href="#step-7-the-output-thread" aria-label="Link to this section">#</a></h3>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2064-L2096" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:2064-2096</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2064-L2096" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">2064</span><span class="ln hl">2065</span><span class="ln hl">2066</span><span class="ln hl">2067</span><span class="ln hl">2068</span><span class="ln hl">2069</span><span class="ln">2070</span><span class="ln">2071</span><span class="ln">2072</span><span class="ln">2073</span><span class="ln hl">2074</span><span class="ln hl">2075</span><span class="ln hl">2076</span><span class="ln hl">2077</span><span class="ln hl">2078</span><span class="ln hl">2079</span><span class="ln">2080</span><span class="ln">2081</span><span class="ln">2082</span><span class="ln">2083</span><span class="ln">2084</span><span class="ln">2085</span><span class="ln">2086</span><span class="ln">2087</span><span class="ln hl">2088</span><span class="ln hl">2089</span><span class="ln hl">2090</span><span class="ln hl">2091</span><span class="ln">2092</span><span class="ln">2093</span><span class="ln">2094</span><span class="ln">2095</span><span class="ln">2096</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(1 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(24 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(25 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(26 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(27 * var(--code-lh))"></span><pre><code class="language-python">            while True:
+                output = self.output_queue.get()
+                if output == EngineCoreProc.ENGINE_CORE_DEAD:
+                    for socket in sockets:
+                        socket.send(output)
+                    break
+                assert not isinstance(output, bytes)
+                client_index, outputs = output
+                outputs.engine_index = engine_index
+
+                if client_index == -1:
+                    # Don&#x27;t reuse buffer for coordinator message
+                    # which will be very small.
+                    assert coord_socket is not None
+                    coord_socket.send_multipart(encoder.encode(outputs))
+                    continue
+
+                # Reclaim buffers that zmq is finished with.
+                while pending and pending[-1][0].done:
+                    reclaimed = pending.pop()[1]
+                    if len(reuse_buffers) &lt; max_reuse_bufs:
+                        reuse_buffers.append(reclaimed)
+
+                buffer = reuse_buffers.pop() if reuse_buffers else bytearray()
+                buffers = encoder.encode_into(outputs, buffer)
+                tracker = self._send_msg_tracking_payload(
+                    sockets[client_index], buffers
+                )
+                if not tracker.done:
+                    pending.appendleft((tracker, buffer))
+                elif len(reuse_buffers) &lt; max_reuse_bufs:
+                    # Limit the number of buffers to reuse.
+                    reuse_buffers.append(buffer)</code></pre></div></div></div></figure>
+<ol>
+  <li>Line 2065: the thread blocks until an output is ready.</li>
+  <li>Lines 2066-2069: <code>ENGINE_CORE_DEAD</code> goes to every front end, and the thread stops (Step 10).</li>
+  <li>Lines 2074-2079: client index <code>-1</code> means the DP coordinator (load counts and wave messages).</li>
+  <li>Lines 2088-2091: <code>encode_into</code> writes into a reused buffer, and the message goes to the socket of the front end that sent the request. A tracker tells when ZMQ has finished with the buffer.</li>
+</ol>
+
+<h3 id="step-8-utility-calls">Step 8: utility calls<a class="h-anchor" href="#step-8-utility-calls" aria-label="Link to this section">#</a></h3>
+<p>A <a class="term" href="../reference/glossary.html#term-utility-call" data-term="utility call" data-def="A remote method call from the front end to the engine core: a UTILITY message with a call id, a method name and arguments. The reply comes back in EngineCoreOutputs.utility_output.">utility call</a> is a remote method call from the front end, for example <code>get_supported_tasks</code>, <code>sleep</code> or <code>collective_rpc</code>. The input thread decodes it into <code>(client_idx, call_id, method_name, args)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2009-L2011" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:2009-2011 at 3e44c0d"><code>vllm/v1/engine/core.py:2009-2011</code></a>). The busy loop runs it between two steps:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1752-L1765" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:1752-1765</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1752-L1765" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1752</span><span class="ln">1753</span><span class="ln">1754</span><span class="ln">1755</span><span class="ln">1756</span><span class="ln">1757</span><span class="ln hl">1758</span><span class="ln hl">1759</span><span class="ln hl">1760</span><span class="ln hl">1761</span><span class="ln hl">1762</span><span class="ln hl">1763</span><span class="ln hl">1764</span><span class="ln">1765</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><pre><code class="language-python">        elif request_type == EngineCoreRequestType.UTILITY:
+            client_idx, call_id, method_name, args = request
+            if self._reject_utility_in_shutdown(client_idx, call_id, method_name):
+                return
+            output = UtilityOutput(call_id)
+            # Lazily look-up utility method so that failure will be handled/returned.
+            get_result = lambda: (
+                (method := getattr(self, method_name))
+                and method(*self._convert_msgspec_args(method, args))
+            )
+            enqueue_output = lambda out: self.output_queue.put_nowait(
+                (client_idx, EngineCoreOutputs(utility_output=out))
+            )
+            self._invoke_utility_method(method_name, get_result, output, enqueue_output)</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1822-L1839" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:1822-1839</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1822-L1839" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1822</span><span class="ln">1823</span><span class="ln">1824</span><span class="ln">1825</span><span class="ln">1826</span><span class="ln">1827</span><span class="ln hl">1828</span><span class="ln hl">1829</span><span class="ln hl">1830</span><span class="ln hl">1831</span><span class="ln hl">1832</span><span class="ln hl">1833</span><span class="ln hl">1834</span><span class="ln">1835</span><span class="ln hl">1836</span><span class="ln hl">1837</span><span class="ln hl">1838</span><span class="ln">1839</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(8 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(9 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(10 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(14 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(15 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(16 * var(--code-lh))"></span><pre><code class="language-python">    @staticmethod
+    def _invoke_utility_method(
+        name: str, get_result: Callable, output: UtilityOutput, enqueue_output: Callable
+    ):
+        try:
+            result = get_result()
+            if isinstance(result, Future):
+                # Defer utility output handling until future completion.
+                callback = lambda future: EngineCoreProc._invoke_utility_method(
+                    name, future.result, output, enqueue_output
+                )
+                result.add_done_callback(callback)
+                return
+            output.result = UtilityResult(result)
+        except Exception as e:
+            logger.exception(&quot;Invocation of %s method failed&quot;, name)
+            output.failure_message = f&quot;Call to {name} method failed: {str(e)}&quot;
+        enqueue_output(output)</code></pre></div></div></div></figure>
+<ol>
+  <li>Lines 1758-1761: the method is looked up by name on the engine object, inside the call. So a wrong name becomes a failure message, not a crash.</li>
+  <li>Lines 1828-1834: a method can return a <code>Future</code>. Then the reply waits until the future is done. <code>sleep()</code> uses this when the pause is not complete yet: it frees GPU memory only after the engine has no more work (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L994-L1017" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:994-1017 at 3e44c0d"><code>vllm/v1/engine/core.py:994-1017</code></a>).</li>
+  <li>Lines 1836-1838: an exception becomes <code>failure_message</code> in the <code>UtilityOutput</code>; the engine keeps running.</li>
+</ol>
+<p>The reply travels in <code>EngineCoreOutputs.utility_output</code> to the front end that asked (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/__init__.py#L254-L263" target="_blank" rel="noopener" title="vllm/v1/engine/__init__.py:254-263 at 3e44c0d"><code>vllm/v1/engine/__init__.py:254-263</code></a>). The client side is on <a href="../code/v1-engine-core-client.html">v1/engine/core_client.py: the engine core clients</a>.</p>
+
+<h3 id="step-9-aborts">Step 9: aborts<a class="h-anchor" href="#step-9-aborts" aria-label="Link to this section">#</a></h3>
+<p>An abort arrives when a client disconnects or a stop string matches in the front end (<a href="../concepts/engine-client.html">The engine client: AsyncLLM in the API server</a>). The input thread puts it into two queues. The comment explains why: aborts can act early, and the order in <code>input_queue</code> stays correct (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2020-L2025" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:2020-2025 at 3e44c0d"><code>vllm/v1/engine/core.py:2020-2025</code></a>). The early path runs just before <code>update_from_output</code>:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L814-L822" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:814-822</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L814-L822" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">814</span><span class="ln">815</span><span class="ln">816</span><span class="ln">817</span><span class="ln">818</span><span class="ln">819</span><span class="ln">820</span><span class="ln">821</span><span class="ln">822</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">    def _process_aborts_queue(self):
+        if not self.aborts_queue.empty():
+            request_ids = []
+            while not self.aborts_queue.empty():
+                ids = self.aborts_queue.get_nowait()
+                # Should be a list here, but also handle string just in case.
+                request_ids.extend((ids,) if isinstance(ids, str) else ids)
+            # More efficient to abort all as a single batch.
+            self.abort_requests(request_ids)</code></pre></div></div></div></figure>
+<p><code>abort_requests</code> calls <code>scheduler.finish_requests(..., FINISHED_ABORTED)</code>, which frees the blocks (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L554-L559" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:554-559 at 3e44c0d"><code>vllm/v1/engine/core.py:554-559</code></a>). The same ABORT then comes again from <code>input_queue</code>; this is safe because "aborting in the scheduler is idempotent" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2021-L2024" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:2021-2024 at 3e44c0d"><code>vllm/v1/engine/core.py:2021-2024</code></a>). A step that was already running for an aborted request still finishes on the GPU. <code>update_from_output</code> skips its results, because the request is finished (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2184-L2192" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2184-2192 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2184-2192</code></a>).</p>
+
+<h3 id="step-10-errors-and-engine-death">Step 10: errors and engine death<a class="h-anchor" href="#step-10-errors-and-engine-death" aria-label="Link to this section">#</a></h3>
+<p>Three kinds of error reach the engine core:</p>
+<ul>
+  <li><strong>One request is bad.</strong> The input thread sends an error output for that request and continues (Step 3).</li>
+  <li><strong>A worker process dies.</strong> The executor's monitor calls the failure callback, which puts <code>EXECUTOR_FAILED</code> into <code>input_queue</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1174-L1176" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1174-1176 at 3e44c0d"><code>vllm/v1/engine/core.py:1174-1176</code></a>). The busy loop raises <code>RuntimeError("Executor failed.")</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1766-L1767" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1766-1767 at 3e44c0d"><code>vllm/v1/engine/core.py:1766-1767</code></a>).</li>
+  <li><strong>Any exception in the busy loop</strong>, for example from <code>execute_model</code>. For an error in the model launch or in the wait for its result, <code>log_error_detail</code> first dumps the scheduler output and stats (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L561-L575" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:561-575 at 3e44c0d"><code>vllm/v1/engine/core.py:561-575</code></a>).</li>
+</ul>
+<p>An exception that leaves <code>run_busy_loop</code> reaches <code>run_engine_core</code>:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1570-L1583" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:1570-1583</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1570-L1583" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1570</span><span class="ln">1571</span><span class="ln hl">1572</span><span class="ln">1573</span><span class="ln hl">1574</span><span class="ln hl">1575</span><span class="ln">1576</span><span class="ln">1577</span><span class="ln">1578</span><span class="ln">1579</span><span class="ln">1580</span><span class="ln">1581</span><span class="ln">1582</span><span class="ln hl">1583</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(2 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><pre><code class="language-python">        except Exception as e:
+            if engine_core is None:
+                logger.exception(&quot;EngineCore failed to start.&quot;)
+            else:
+                logger.exception(&quot;EngineCore encountered a fatal error.&quot;)
+                engine_core._send_engine_dead()
+            raise e
+        finally:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            if signal_callback is not None:
+                signal_callback.stop()
+            if engine_core is not None:
+                engine_core.shutdown()</code></pre></div></div></div></figure>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1858-L1869" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:1858-1869</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1858-L1869" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">1858</span><span class="ln">1859</span><span class="ln">1860</span><span class="ln hl">1861</span><span class="ln">1862</span><span class="ln">1863</span><span class="ln hl">1864</span><span class="ln">1865</span><span class="ln">1866</span><span class="ln">1867</span><span class="ln">1868</span><span class="ln">1869</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(3 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><pre><code class="language-python">    def _send_engine_dead(self):
+        &quot;&quot;&quot;Send EngineDead status to the EngineCoreClient.&quot;&quot;&quot;
+        # Put ENGINE_CORE_DEAD in the queue.
+        self.output_queue.put_nowait(EngineCoreProc.ENGINE_CORE_DEAD)
+
+        # Wait until msg sent by the daemon before shutdown.
+        self.output_thread.join(timeout=5.0)
+        if self.output_thread.is_alive():
+            logger.fatal(
+                &quot;vLLM shutdown signal from EngineCore failed &quot;
+                &quot;to send. Please report this issue.&quot;
+            )</code></pre></div></div></div></figure>
+<p>The engine puts <code>ENGINE_CORE_DEAD</code> into the output queue and gives the output thread 5 seconds to send it. The front end then raises <a class="term" href="../reference/glossary.html#term-engine-dead-error" data-term="EngineDeadError" data-def="The exception that the front end raises when an engine core process has died. It cannot be recovered; the API server then shuts down unless VLLM_KEEP_ALIVE_ON_ENGINE_DEATH is set.">EngineDeadError</a>. The page <a href="../concepts/engine-client.html">The engine client: AsyncLLM in the API server</a> shows what the API server does next. Open streams get errors, and <code>/health</code> returns HTTP 503 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/serve/instrumentator/health.py#L32-L33" target="_blank" rel="noopener" title="vllm/entrypoints/serve/instrumentator/health.py:32-33 at 3e44c0d"><code>vllm/entrypoints/serve/instrumentator/health.py:32-33</code></a>). The server shuts down unless <code>VLLM_KEEP_ALIVE_ON_ENGINE_DEATH</code> is set (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/launchers/launcher.py#L332-L337" target="_blank" rel="noopener" title="vllm/entrypoints/launchers/launcher.py:332-337 at 3e44c0d"><code>vllm/entrypoints/launchers/launcher.py:332-337</code></a>).</p>
+<aside class="callout callout-note"><p class="callout-title">Fault tolerance is off by default</p><div class="callout-body"><p><code>run_busy_loop</code> has the decorator <code>fault_tolerant_wrapper</code>. It re-raises at once unless <code>enable_fault_tolerance</code> is set (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/fault_tolerance/engine_core_sentinel.py#L172-L194" target="_blank" rel="noopener" title="vllm/v1/fault_tolerance/engine_core_sentinel.py:172-194 at 3e44c0d"><code>vllm/v1/fault_tolerance/engine_core_sentinel.py:172-194</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L466" target="_blank" rel="noopener" title="vllm/config/parallel.py:466 at 3e44c0d"><code>vllm/config/parallel.py:466</code></a>).</p></div></aside>
+
+<h3 id="step-11-dpenginecoreproc-the-data-parallel-variant-for-moe">Step 11: DPEngineCoreProc, the data parallel variant for MoE<a class="h-anchor" href="#step-11-dpenginecoreproc-the-data-parallel-variant-for-moe" aria-label="Link to this section">#</a></h3>
+<p>With DP &gt; 1, the ranks of a dense model are "completely independent" (the comment at <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1539" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1539 at 3e44c0d"><code>vllm/v1/engine/core.py:1539</code></a>). The ranks of an MoE model are not. The docs say why: the expert layers of all ranks must synchronize in every forward pass. So the forward passes of all ranks must be aligned (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/docs/serving/data_parallel_deployment.md#L9" target="_blank" rel="noopener" title="docs/serving/data_parallel_deployment.md:9 at 3e44c0d"><code>docs/serving/data_parallel_deployment.md:9</code></a>, <a class="ext-link deepinfer-link" href="https://explaindeepinfer.projects.thomaspaul.dev/concepts/expert-parallelism.html" target="_blank" rel="noopener" title="DeepInfer Explained: Expert parallelism (dispatch/combine)">Expert parallelism<span class="ext-mark" aria-hidden="true">↗</span></a>). <code>DPEngineCoreProc</code> changes the busy loop in two ways:</p>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2482-L2505" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:2482-2505</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2482-L2505" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">2482</span><span class="ln">2483</span><span class="ln">2484</span><span class="ln">2485</span><span class="ln hl">2486</span><span class="ln hl">2487</span><span class="ln hl">2488</span><span class="ln hl">2489</span><span class="ln">2490</span><span class="ln">2491</span><span class="ln">2492</span><span class="ln hl">2493</span><span class="ln hl">2494</span><span class="ln hl">2495</span><span class="ln">2496</span><span class="ln">2497</span><span class="ln">2498</span><span class="ln">2499</span><span class="ln">2500</span><span class="ln">2501</span><span class="ln">2502</span><span class="ln hl">2503</span><span class="ln hl">2504</span><span class="ln hl">2505</span></div><div class="code-scroll"><div class="code-inner"><span class="hl-bar" style="top:calc(4 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(5 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(6 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(7 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(11 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(12 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(13 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(21 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(22 * var(--code-lh))"></span><span class="hl-bar" style="top:calc(23 * var(--code-lh))"></span><pre><code class="language-python">            executed = self._process_engine_step()
+            self._maybe_publish_request_counts()
+
+            local_unfinished_reqs = self.scheduler.has_unfinished_requests()
+            if not executed:
+                if not local_unfinished_reqs and not self.engines_running:
+                    # All engines are idle.
+                    continue
+
+                # Execute a dummy pass when no ready requests ran, unless the
+                # engine is sleeping.
+                elif not self.model_executor.is_sleeping:
+                    with self.capture_iteration_details(None) as iteration_details:
+                        self.execute_dummy_batch()
+                    if iteration_details is not None and not self.has_coordinator:
+                        stats = self._make_iteration_details_stats(iteration_details)
+                        self.output_queue.put_nowait(
+                            (0, EngineCoreOutputs(scheduler_stats=stats))
+                        )
+
+            # 3) All-reduce operation to determine global unfinished reqs.
+            self.engines_running = self._has_global_unfinished_reqs(
+                local_unfinished_reqs
+            )</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Dummy batches.</strong> Assume that this rank ran no step, but the group still runs. Then the rank runs <code>execute_dummy_batch()</code>, so the collectives of the other ranks do not hang (lines 2486-2495).</li>
+  <li><strong>Waves.</strong> All ranks agree, with an all-reduce, whether any rank has unfinished requests. They check at the first step of a wave and then only every <code>dp_sync_interval</code> steps, default 16 (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2542-L2559" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:2542-2559 at 3e44c0d"><code>vllm/v1/engine/core.py:2542-2559</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L163" target="_blank" rel="noopener" title="vllm/config/parallel.py:163 at 3e44c0d"><code>vllm/config/parallel.py:163</code></a>). When no rank has work, the wave ends and the engines pause. A new request starts the next wave (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2360-L2373" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:2360-2373 at 3e44c0d"><code>vllm/v1/engine/core.py:2360-2373</code></a>).</li>
+</ol>
+<p>The page <a href="../concepts/data-parallel-serving.html">Data parallel serving: several engine cores behind one endpoint</a> explains waves, the coordinator and load balancing.</p>
+
+<h2 id="deep-dive">Deep dive<a class="h-anchor" href="#deep-dive" aria-label="Link to this section">#</a></h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="step-with-batch-queue-line-by-line" class="dd-title">step_with_batch_queue(), line by line</h3></summary><div class="dd-body"><figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L714-L765" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:714-765</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L714-L765" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">714</span><span class="ln">715</span><span class="ln">716</span><span class="ln">717</span><span class="ln">718</span><span class="ln">719</span><span class="ln">720</span><span class="ln">721</span><span class="ln">722</span><span class="ln">723</span><span class="ln">724</span><span class="ln">725</span><span class="ln">726</span><span class="ln">727</span><span class="ln">728</span><span class="ln">729</span><span class="ln">730</span><span class="ln">731</span><span class="ln">732</span><span class="ln">733</span><span class="ln">734</span><span class="ln">735</span><span class="ln">736</span><span class="ln">737</span><span class="ln">738</span><span class="ln">739</span><span class="ln">740</span><span class="ln">741</span><span class="ln">742</span><span class="ln">743</span><span class="ln">744</span><span class="ln">745</span><span class="ln">746</span><span class="ln">747</span><span class="ln">748</span><span class="ln">749</span><span class="ln">750</span><span class="ln">751</span><span class="ln">752</span><span class="ln">753</span><span class="ln">754</span><span class="ln">755</span><span class="ln">756</span><span class="ln">757</span><span class="ln">758</span><span class="ln">759</span><span class="ln">760</span><span class="ln">761</span><span class="ln">762</span><span class="ln">763</span><span class="ln">764</span><span class="ln">765</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">        batch_queue = self.batch_queue
+        assert batch_queue is not None
+
+        # Try to schedule a new batch if the batch queue is not full, but
+        # the scheduler may return an empty batch if all requests are scheduled.
+        # Note that this is not blocking.
+        assert len(batch_queue) &lt; self.batch_queue_size
+
+        model_executed = False
+        deferred_scheduler_output = None
+        if self.scheduler.has_requests():
+            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            with self.log_error_detail(scheduler_output):
+                exec_future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
+            if not self.is_mm_encoder_only:
+                model_executed = scheduler_output.total_num_scheduled_tokens &gt; 0
+
+            if self.is_pooling_model or not model_executed:
+                # No sampling required (no requests scheduled).
+                future = cast(Future[ModelRunnerOutput], exec_future)
+            else:
+                if not scheduler_output.pending_structured_output_tokens:
+                    # We aren&#x27;t waiting for any tokens, get any grammar output
+                    # and sample immediately.
+                    grammar_output = self.scheduler.get_grammar_bitmask(
+                        scheduler_output
+                    )
+                    future = self.model_executor.sample_tokens(
+                        grammar_output, non_block=True
+                    )
+                else:
+                    # We need to defer sampling until we have processed the model output
+                    # from the prior step.
+                    deferred_scheduler_output = scheduler_output
+
+            if not deferred_scheduler_output:
+                # Add this step&#x27;s future to the queue.
+                batch_queue.appendleft((future, scheduler_output, exec_future))
+                if len(batch_queue) &lt; self.batch_queue_size and (
+                    model_executed or self.scheduler.has_requests()
+                ):
+                    # Don&#x27;t block on next worker response unless the queue is full
+                    # or there are no more requests to schedule.
+                    return None, model_executed
+
+        elif not batch_queue:
+            # Queue is empty. We should not reach here since this method should
+            # only be called when the scheduler contains requests or the queue
+            # is non-empty.
+            return None, False</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 720.</strong> The function must only be called when the queue has room. The busy loop guarantees this: every call that fills the queue also pops one step.</li>
+  <li><strong>Line 724.</strong> <code>has_requests()</code> is true for unfinished requests and for finished requests that the workers do not know yet. With a KV or EC connector, it is also true while the connector has pending push work (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2922-L2937" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2922-2937 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2922-2937</code></a>).</li>
+  <li><strong>Line 725.</strong> <code>_should_throttle_prefills()</code> is always false for a plain engine core (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L652-L655" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:652-655 at 3e44c0d"><code>vllm/v1/engine/core.py:652-655</code></a>). Only the DP engine overrides it.</li>
+  <li><strong>Lines 726-729.</strong> <code>log_error_detail</code> wraps the launch, so a launch error dumps the scheduler state.</li>
+  <li><strong>Lines 730-731.</strong> A step with zero scheduled tokens does not count as executed. A multimodal encoder-only instance never counts.</li>
+  <li><strong>Lines 733-735.</strong> A pooling model, or a step with no tokens, needs no sampling. The future of <code>execute_model</code> is the result.</li>
+  <li><strong>Lines 737-745.</strong> Normal case: compute the grammar bitmask now (on the CPU, while the GPU runs the forward pass), then queue sampling.</li>
+  <li><strong>Lines 746-749.</strong> Deferred case: a structured output request still waits for its previous token, so the bitmask cannot be computed yet.</li>
+  <li><strong>Lines 751-759.</strong> A queue entry is a tuple <code>(sample future, SchedulerOutput, execute future)</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L206-L208" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:206-208 at 3e44c0d"><code>vllm/v1/engine/core.py:206-208</code></a>). The function returns early only if the queue has room and there is more to do.</li>
+  <li><strong>Lines 761-765.</strong> No requests and an empty queue: nothing to do.</li>
+</ol>
+<figure class="code-excerpt" data-lang="python"><div class="code-head"><a class="code-path" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L767-L812" target="_blank" rel="noopener" title="Open on GitHub at commit 3e44c0d">vllm/v1/engine/core.py:767-812</a><span class="code-actions"><a class="code-gh" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L767-L812" target="_blank" rel="noopener">GitHub ↗</a><button type="button" class="code-copy" aria-label="Copy code">Copy</button></span></div><div class="code-body"><div class="code-gutter" aria-hidden="true"><span class="ln">767</span><span class="ln">768</span><span class="ln">769</span><span class="ln">770</span><span class="ln">771</span><span class="ln">772</span><span class="ln">773</span><span class="ln">774</span><span class="ln">775</span><span class="ln">776</span><span class="ln">777</span><span class="ln">778</span><span class="ln">779</span><span class="ln">780</span><span class="ln">781</span><span class="ln">782</span><span class="ln">783</span><span class="ln">784</span><span class="ln">785</span><span class="ln">786</span><span class="ln">787</span><span class="ln">788</span><span class="ln">789</span><span class="ln">790</span><span class="ln">791</span><span class="ln">792</span><span class="ln">793</span><span class="ln">794</span><span class="ln">795</span><span class="ln">796</span><span class="ln">797</span><span class="ln">798</span><span class="ln">799</span><span class="ln">800</span><span class="ln">801</span><span class="ln">802</span><span class="ln">803</span><span class="ln">804</span><span class="ln">805</span><span class="ln">806</span><span class="ln">807</span><span class="ln">808</span><span class="ln">809</span><span class="ln">810</span><span class="ln">811</span><span class="ln">812</span></div><div class="code-scroll"><div class="code-inner"><pre><code class="language-python">        # Block until the next result is available.
+        future, scheduler_output, exec_model_fut = batch_queue.pop()
+        with (
+            self.capture_iteration_details(scheduler_output) as iteration_details,
+            self.log_error_detail(scheduler_output),
+        ):
+            model_output = future.result()
+            if model_output is None:
+                # None from sample_tokens() implies that the original execute_model()
+                # call failed - raise that exception.
+                exec_model_fut.result()
+                raise RuntimeError(&quot;unexpected error&quot;)
+
+        # Before processing the model output, process any aborts that happened
+        # during the model execution.
+        self._process_aborts_queue()
+        engine_core_outputs = self.scheduler.update_from_output(
+            scheduler_output, model_output
+        )
+        self._attach_iteration_details(engine_core_outputs, iteration_details)
+        self._attach_weight_version(engine_core_outputs)
+
+        # NOTE(nick): We can either handle the deferred tasks here or save
+        # in a field and do it immediately once step_with_batch_queue is
+        # re-called. The latter slightly favors TTFT over TPOT/throughput.
+        if deferred_scheduler_output:
+            # When draft tokens are used with structured output, validate them
+            # before computing the grammar bitmask for the deferred request.
+            if self.check_for_draft_tokens:
+                draft_token_ids = self.model_executor.take_draft_token_ids()
+                if draft_token_ids is not None:
+                    # Update the draft token ids in the scheduler output to
+                    # filter out the invalid spec tokens, which will be padded
+                    # with -1 and skipped by the grammar bitmask computation.
+                    self.scheduler.update_draft_token_ids_in_output(
+                        draft_token_ids, deferred_scheduler_output
+                    )
+            # We now have the tokens needed to compute the bitmask for the
+            # deferred request. Get the bitmask and call sample tokens.
+            grammar_output = self.scheduler.get_grammar_bitmask(
+                deferred_scheduler_output
+            )
+            future = self.model_executor.sample_tokens(grammar_output, non_block=True)
+            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+
+        return engine_core_outputs, model_executed</code></pre></div></div></div></figure>
+<ol>
+  <li><strong>Line 768.</strong> <code>pop()</code> takes the right end, the oldest step, because new steps go in with <code>appendleft</code>.</li>
+  <li><strong>Lines 773-778.</strong> A <code>None</code> result from <code>sample_tokens</code> means that <code>execute_model</code> failed. The code calls <code>exec_model_fut.result()</code> to raise that error.</li>
+  <li><strong>Lines 789-791.</strong> The comment gives the trade-off of the deferred case: handle it here, which "slightly favors TTFT over TPOT/throughput".</li>
+  <li><strong>Lines 792-810.</strong> Now the previous token is known. The code computes the bitmask, starts sampling for the deferred step and puts it into the queue.</li>
+</ol></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="worked-example-the-batch-queue-over-five-calls" class="dd-title">Worked example: the batch queue over five calls</h3></summary><div class="dd-body"><p>One request decodes alone. Queue size 2. "S k" = schedule and start step k; "U k" = wait for step k and update.</p>
+<table>
+  <thead><tr><th>Call</th><th>Queue before</th><th>Work</th><th>Queue after</th><th>Returns</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><code>[]</code></td><td>S 1</td><td><code>[1]</code></td><td><code>None</code></td></tr>
+    <tr><td>2</td><td><code>[1]</code></td><td>S 2, U 1</td><td><code>[2]</code></td><td>token of step 1</td></tr>
+    <tr><td>3</td><td><code>[2]</code></td><td>S 3, U 2</td><td><code>[3]</code></td><td>token of step 2</td></tr>
+    <tr><td>4 (step 3 sampled EOS)</td><td><code>[3]</code></td><td>S 4, U 3</td><td><code>[4]</code></td><td>token of step 3, finish reason</td></tr>
+    <tr><td>5</td><td><code>[4]</code></td><td>S 5 with 0 tokens (it only tells the workers that the request finished), U 4</td><td><code>[5]</code></td><td>nothing for the finished request</td></tr>
+    <tr><td>6</td><td><code>[5]</code></td><td>no requests; U 5 only</td><td><code>[]</code></td><td>nothing; then <code>has_work()</code> is false and the loop blocks</td></tr>
+  </tbody>
+</table>
+<p>Call 5 still schedules, because a finished request counts in <code>has_requests()</code> until its id goes out in a <code>SchedulerOutput</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2913-L2914" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2913-2914 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2913-2914</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L1597-L1601" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:1597-1601 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:1597-1601</code></a>). <code>schedule()</code> then clears the set, so call 6 finds no requests (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L1731-L1734" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:1731-1734 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:1731-1734</code></a>). Step 4 ran on the GPU for a request that was already finished. Its result is ignored (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L2184-L2192" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:2184-2192 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:2184-2192</code></a>). This extra step is the cost of the overlap. The scheduler avoids it only when it is sure that <code>max_tokens</code> is reached (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/scheduler.py#L720-L734" target="_blank" rel="noopener" title="vllm/v1/core/sched/scheduler.py:720-734 at 3e44c0d"><code>vllm/v1/core/sched/scheduler.py:720-734</code></a>). (Table derived from <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L724-L785" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:724-785 at 3e44c0d"><code>vllm/v1/engine/core.py:724-785</code></a>.)</p></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="every-message-type-in-the-two-queues" class="dd-title">Every message type in the two queues</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Queue item</th><th>Put by</th><th>Handled by</th></tr></thead>
+  <tbody>
+    <tr><td><code>(ADD, (Request, wave))</code></td><td>input thread (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2028" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:2028 at 3e44c0d"><code>vllm/v1/engine/core.py:2028</code></a>)</td><td><code>add_request</code>, unless the engine shuts down or a user pause rejects new requests (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1745-L1749" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1745-1749 at 3e44c0d"><code>vllm/v1/engine/core.py:1745-1749</code></a>)</td></tr>
+    <tr><td><code>(ABORT, [ids])</code></td><td>input thread</td><td><code>abort_requests</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1750-L1751" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1750-1751 at 3e44c0d"><code>vllm/v1/engine/core.py:1750-1751</code></a>)</td></tr>
+    <tr><td><code>(UTILITY, (client, call_id, name, args))</code></td><td>input thread</td><td><code>_invoke_utility_method</code> (Step 8)</td></tr>
+    <tr><td><code>(START_DP_WAVE, (wave, exclude))</code></td><td>input thread, from the DP coordinator</td><td><code>DPEngineCoreProc</code> only (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2406-L2424" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:2406-2424 at 3e44c0d"><code>vllm/v1/engine/core.py:2406-2424</code></a>)</td></tr>
+    <tr><td><code>(EXECUTOR_FAILED, b"")</code></td><td>executor monitor thread</td><td>raises <code>RuntimeError</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1766-L1767" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1766-1767 at 3e44c0d"><code>vllm/v1/engine/core.py:1766-1767</code></a>)</td></tr>
+    <tr><td><code>(WAKEUP, None)</code></td><td>wakeup callback, after a signal</td><td>ignored; it only ends the blocking <code>get()</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1743-L1744" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1743-1744 at 3e44c0d"><code>vllm/v1/engine/core.py:1743-1744</code></a>)</td></tr>
+    <tr><td><code>(client_index, EngineCoreOutputs)</code></td><td>busy loop, utility calls, abort and error paths</td><td>output thread, to <code>sockets[client_index]</code></td></tr>
+    <tr><td><code>(-1, EngineCoreOutputs)</code></td><td>request counts and wave messages</td><td>output thread, to the DP coordinator (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2074-L2079" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:2074-2079 at 3e44c0d"><code>vllm/v1/engine/core.py:2074-2079</code></a>)</td></tr>
+    <tr><td><code>ENGINE_CORE_DEAD</code> (bytes)</td><td><code>_send_engine_dead</code></td><td>output thread: send to all, then stop</td></tr>
+  </tbody>
+</table></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="shutdown-step-by-step" class="dd-title">Shutdown, step by step</h3></summary><div class="dd-body"><ol>
+  <li>SIGTERM or SIGINT sets <code>shutdown_state = REQUESTED</code> and triggers the wakeup callback (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1510-L1528" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1510-1528 at 3e44c0d"><code>vllm/v1/engine/core.py:1510-1528</code></a>).</li>
+  <li>The next <code>_handle_shutdown()</code> picks a mode from <code>shutdown_timeout</code>: 0 (the default) aborts all requests; a positive value drains them (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1696-L1727" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1696-1727 at 3e44c0d"><code>vllm/v1/engine/core.py:1696-1727</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L453" target="_blank" rel="noopener" title="vllm/config/vllm.py:453 at 3e44c0d"><code>vllm/config/vllm.py:453</code></a>).</li>
+  <li>In both modes new ADD messages get an ABORT output (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1773-L1782" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1773-1782 at 3e44c0d"><code>vllm/v1/engine/core.py:1773-1782</code></a>) and utility calls fail with "Server shutting down" (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1806-L1820" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1806-1820 at 3e44c0d"><code>vllm/v1/engine/core.py:1806-1820</code></a>).</li>
+  <li>When <code>has_work()</code> is false, the loop ends and raises <code>SystemExit</code>. The <code>finally</code> block calls <code>engine_core.shutdown()</code>, which shuts down the executor and the scheduler (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L824-L840" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:824-840 at 3e44c0d"><code>vllm/v1/engine/core.py:824-840</code></a>).</li>
+</ol></div></details>
+
+<details class="deepdive"><summary><span class="dd-label">Deep dive</span><h3 id="configuration-and-environment-variables" class="dd-title">Configuration and environment variables</h3></summary><div class="dd-body"><table>
+  <thead><tr><th>Name</th><th>Default</th><th>Where</th><th>Effect here</th></tr></thead>
+  <tbody>
+    <tr><td><code>--async-scheduling</code> / <code>--no-async-scheduling</code></td><td>on, unless incompatible</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L1664-L1698" target="_blank" rel="noopener" title="vllm/config/vllm.py:1664-1698 at 3e44c0d"><code>vllm/config/vllm.py:1664-1698</code></a></td><td>Selects <code>step_with_batch_queue</code> and <code>AsyncScheduler</code>.</td></tr>
+    <tr><td><code>max_concurrent_batches</code> (derived)</td><td><code>pp_size + 1</code> with MRV2 and async</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L586-L597" target="_blank" rel="noopener" title="vllm/config/vllm.py:586-597 at 3e44c0d"><code>vllm/config/vllm.py:586-597</code></a></td><td>Size of the batch queue; 1 means no queue and <code>step()</code>.</td></tr>
+    <tr><td><code>VLLM_ENGINE_READY_TIMEOUT_S</code></td><td>600 s</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/envs.py#L812-L814" target="_blank" rel="noopener" title="vllm/envs.py:812-814 at 3e44c0d"><code>vllm/envs.py:812-814</code></a></td><td>How long the client waits for the ready message.</td></tr>
+    <tr><td><code>HANDSHAKE_TIMEOUT_MINS</code> (constant)</td><td>5 min</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L113" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:113 at 3e44c0d"><code>vllm/v1/engine/core.py:113</code></a></td><td>How long the engine waits for the front end's init message.</td></tr>
+    <tr><td><code>shutdown_timeout</code></td><td>0</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/vllm.py#L453" target="_blank" rel="noopener" title="vllm/config/vllm.py:453 at 3e44c0d"><code>vllm/config/vllm.py:453</code></a></td><td>0 aborts in-flight requests at shutdown; &gt; 0 drains them.</td></tr>
+    <tr><td><code>dp_sync_interval</code></td><td>16</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/parallel.py#L163" target="_blank" rel="noopener" title="vllm/config/parallel.py:163 at 3e44c0d"><code>vllm/config/parallel.py:163</code></a></td><td>MoE DP only: steps between the "any rank has work" all-reduces.</td></tr>
+    <tr><td>watchdog <code>dump_dir</code></td><td><code>""</code> (off)</td><td><a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/watchdog_config.py#L28-L30" target="_blank" rel="noopener" title="vllm/config/watchdog_config.py:28-30 at 3e44c0d"><code>vllm/config/watchdog_config.py:28-30</code></a></td><td>When set, a thread dumps all stacks if the busy loop stops feeding it (timeout 300 s, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/config/watchdog_config.py#L21" target="_blank" rel="noopener" title="vllm/config/watchdog_config.py:21 at 3e44c0d"><code>vllm/config/watchdog_config.py:21</code></a>).</td></tr>
+  </tbody>
+</table></div></details>
+
+<h2 id="what-can-go-wrong">What can go wrong<a class="h-anchor" href="#what-can-go-wrong" aria-label="Link to this section">#</a></h2>
+<ul>
+  <li><strong>The engine core does not become ready.</strong> Loading, profiling and CUDA-graph capture all run inside the handshake (Step 2). With one API server, the API server starts the engine and waits with no time limit (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L695-L710" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:695-710 at 3e44c0d"><code>vllm/v1/engine/core_client.py:695-710</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/utils.py#L1388-L1395" target="_blank" rel="noopener" title="vllm/v1/engine/utils.py:1388-1395 at 3e44c0d"><code>vllm/v1/engine/utils.py:1388-1395</code></a>). With more than one API server, the API server processes start before the engines are ready (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/entrypoints/cli/serve.py#L336-L382" target="_blank" rel="noopener" title="vllm/entrypoints/cli/serve.py:336-382 at 3e44c0d"><code>vllm/entrypoints/cli/serve.py:336-382</code></a>). Then a slow model load can hit <code>VLLM_ENGINE_READY_TIMEOUT_S</code> in each API server (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core_client.py#L756-L768" target="_blank" rel="noopener" title="vllm/v1/engine/core_client.py:756-768 at 3e44c0d"><code>vllm/v1/engine/core_client.py:756-768</code></a>).</li>
+  <li><strong>"EngineCore failed to start."</strong> An exception before the busy loop starts. Look at the traceback in the engine core log (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1571-L1572" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1571-1572 at 3e44c0d"><code>vllm/v1/engine/core.py:1571-1572</code></a>).</li>
+  <li><strong>"EngineCore encountered a fatal error."</strong> An exception in a step, for example a CUDA error or an out-of-memory error. Every open request fails with <a class="term" href="../reference/glossary.html#term-engine-dead-error" data-term="EngineDeadError" data-def="The exception that the front end raises when an engine core process has died. It cannot be recovered; the API server then shuts down unless VLLM_KEEP_ALIVE_ON_ENGINE_DEATH is set.">EngineDeadError</a> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1573-L1575" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1573-1575 at 3e44c0d"><code>vllm/v1/engine/core.py:1573-1575</code></a>).</li>
+  <li><strong>"Executor failed."</strong> A worker process died (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1766-L1767" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1766-1767 at 3e44c0d"><code>vllm/v1/engine/core.py:1766-1767</code></a>). The worker log has the cause; see <a href="../concepts/executors-and-workers.html">Executors and workers: from the engine core to the GPUs</a>.</li>
+  <li><strong>A slow input thread.</strong> Request set-up (block hashes, multimodal features, grammar set-up) runs in the input thread, not in the busy loop. Many large prompts at once can delay new requests, but not running steps.</li>
+  <li><strong>One extra step after a stop.</strong> With async scheduling, a request that stops on EOS has already a next step on the GPU. The scheduler ignores that result (Deep dive, worked example).</li>
+</ul>
+<p><strong>Why it matters.</strong> Almost every performance question about vLLM comes down to one question: is the GPU always busy? The three threads and the batch queue are vLLM's answer. In a profile, a gap between two GPU steps means that this loop waited. It waited for the scheduler, for a deferred grammar bitmask, or for the input queue.</p>
+
+<section class="quiz"><h2 id="check-yourself">Check yourself<a class="h-anchor" href="#check-yourself" aria-label="Link to this section">#</a></h2><ol class="q-list"><li class="q"><div class="q-text"><span class="q-num">1</span><div>Which thread of the engine core process builds the <code>Request</code> object of a new request?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The input thread. After it decodes the <code>EngineCoreRequest</code>, it calls <code>preprocess_add_request</code>, which makes the <code>Request</code> with its block hashes (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1991-L1993" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1991-1993 at 3e44c0d"><code>vllm/v1/engine/core.py:1991-1993</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1114-L1128" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1114-1128 at 3e44c0d"><code>vllm/v1/engine/core.py:1114-1128</code></a>). The main thread only calls <code>add_request</code> later.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">2</span><div>What does the busy loop do when no request is waiting or running?</div><span class="q-level q-easy">easy</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>It blocks in <code>input_queue.get()</code>, because <code>process_input_queue_block</code> is <code>True</code> and <code>has_work()</code> is false (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1638-L1651" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1638-1651 at 3e44c0d"><code>vllm/v1/engine/core.py:1638-1651</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L1217" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:1217 at 3e44c0d"><code>vllm/v1/engine/core.py:1217</code></a>). It uses no CPU until a message arrives.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">3</span><div>The batch queue has size 2. Why does the first call of <code>step_with_batch_queue</code> return no outputs?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>After it starts step 1, the queue holds one entry, which is less than 2, and the scheduler still has requests. So the function returns <code>None</code> before it waits for any result (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L753-L759" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:753-759 at 3e44c0d"><code>vllm/v1/engine/core.py:753-759</code></a>). The outputs of step 1 come in the second call, after step 2 is started.</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">4</span><div>An ABORT arrives while a step runs on the GPU. Which two paths handle it, and why is the second one harmless?</div><span class="q-level q-medium">medium</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The input thread puts it into <code>aborts_queue</code> and into <code>input_queue</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2020-L2028" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:2020-2028 at 3e44c0d"><code>vllm/v1/engine/core.py:2020-2028</code></a>). <code>_process_aborts_queue</code> applies it just before <code>update_from_output</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L780-L782" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:780-782 at 3e44c0d"><code>vllm/v1/engine/core.py:780-782</code></a>). The copy in <code>input_queue</code> calls <code>finish_requests</code> again, which is idempotent (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L2021-L2024" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:2021-2024 at 3e44c0d"><code>vllm/v1/engine/core.py:2021-2024</code></a>).</p></div></details></li><li class="q"><div class="q-text"><span class="q-num">5</span><div>A request has structured output and async scheduling is on. Why can <code>step_with_batch_queue</code> not call <code>sample_tokens</code> right after <code>execute_model</code>, and what does it do instead?</div><span class="q-level q-hard">hard</span></div><details class="q-answer"><summary>Show answer</summary><div class="q-answer-body"><p>The grammar bitmask of step N+1 depends on the token of step N, which is still in flight. <code>AsyncScheduler</code> marks this with <code>pending_structured_output_tokens</code> (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/core/sched/async_scheduler.py#L37-L39" target="_blank" rel="noopener" title="vllm/v1/core/sched/async_scheduler.py:37-39 at 3e44c0d"><code>vllm/v1/core/sched/async_scheduler.py:37-39</code></a>). The engine then keeps the scheduler output as <code>deferred_scheduler_output</code>, first processes step N, and only then computes the bitmask and queues sampling (<a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L746-L749" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:746-749 at 3e44c0d"><code>vllm/v1/engine/core.py:746-749</code></a>, <a class="cite" href="https://github.com/vllm-project/vllm/blob/3e44c0db26f3530d674d255dafabaedcf0e3d742/vllm/v1/engine/core.py#L792-L810" target="_blank" rel="noopener" title="vllm/v1/engine/core.py:792-810 at 3e44c0d"><code>vllm/v1/engine/core.py:792-810</code></a>).</p></div></details></li></ol><p class="quiz-tools"><button type="button" class="quiz-toggle">Show all answers</button></p></section>
+
+<section class="related"><h2 id="related-pages">Related pages</h2><ul><li><a href="../concepts/async-scheduling.html">Async scheduling: overlap the CPU and the GPU</a><span class="rel-sum">With async scheduling, the engine core schedules and starts step N+1 before it waits for the token of step N. Placeholders in the scheduler and a GPU-side token buffer in Model Runner V2 make this possible.</span></li><li><a href="../concepts/executors-and-workers.html">Executors and workers: from the engine core to the GPUs</a><span class="rel-sum">The executor starts the workers and runs each call on all of them. The uni executor calls one worker in the engine core process; the multiproc executor sends calls to one worker process per GPU through a shared-memory queue.</span></li><li><a href="../concepts/data-contracts.html">Data contracts between the parts of vLLM</a><span class="rel-sum">The typed messages between the parts of vllm serve: EngineCoreRequest, Request, SchedulerOutput, ModelRunnerOutput, EngineCoreOutput(s), RequestOutput and the OpenAI response objects. Their fields, who makes them, and how they travel.</span></li><li><a href="../concepts/scheduler.html">The V1 scheduler: one token budget, no phases</a><span class="rel-sum">In each engine step, Scheduler.schedule() shares one token budget: first among the running requests, then among the waiting ones. It has no prefill or decode phase, it preempts the last running request when KV blocks run out, and update_from_output() appends the sampled tokens.</span></li><li><a href="../concepts/data-parallel-serving.html">Data parallel serving: several engine cores behind one endpoint</a><span class="rel-sum">With --data-parallel-size N, vllm serve runs N engine cores with their own KV caches. API servers pick an engine for each request with a load score; a DP coordinator publishes the load counts. Dense models run independent engines; MoE models step in lockstep, in waves, with dummy batches.</span></li><li><a href="../code/v1-engine-core.html">v1/engine/core.py: EngineCore and the engine core process</a><span class="rel-sum">vllm/v1/engine/core.py defines EngineCore (scheduler + executor + step functions), EngineCoreProc (the process with its ZMQ threads and busy loop) and DPEngineCoreProc (the lock-step variant for MoE data parallelism).</span></li><li><a href="../tours/engine-step.html">Tour: One engine step</a><span class="rel-sum">Follow one call of step_with_batch_queue in 12 stops, with two requests in the batch (a 1-token decode and an 8191-token prefill chunk): schedule, launch, sample, pop the previous step, update and send.</span></li><li><a href="../tours/life-of-a-chat-request.html">Tour: Life of a chat request</a><span class="rel-sum">Follow one streaming POST /v1/chat/completions request through vllm serve in 16 stops: FastAPI route, chat template, AsyncLLM, ZMQ, engine core, scheduler, Model Runner V2, sampler, detokenizer and the SSE chunks.</span></li></ul></section>
+<nav class="prevnext" aria-label="Previous and next page"><a class="pn pn-prev" href="../concepts/engine-client.html"><span class="pn-dir">← Previous</span><span class="pn-title">The engine client: AsyncLLM in the API server</span></a><a class="pn pn-next" href="../concepts/data-contracts.html"><span class="pn-dir">Next →</span><span class="pn-title">Data contracts between the parts of vLLM</span></a></nav>
+<footer class="page-foot"><p class="foot-commit">Code version: <a href="https://github.com/vllm-project/vllm/tree/3e44c0db26f3530d674d255dafabaedcf0e3d742" target="_blank" rel="noopener"><code class="foot-sha">3e44c0db26f3530d674d255dafabaedcf0e3d742</code></a> · 2026-10-22 22:21:12 +0800 · “[Bugfix][Benchmark] Support boolean sweep plot filters (#60774)” · <a href="../index.html#code-version">How to study this version</a></p><p>Source: <a href="https://github.com/vllm-project/vllm" target="_blank" rel="noopener">vllm-project/vllm</a> · Built 2026-10-23 · Code excerpts are copied from the repo at this commit by the build.</p></footer>
+</article>
+<nav class="toc" aria-label="On this page"><p class="toc-title">On this page</p><ul><li class="toc-l2"><a href="#the-idea">The idea</a></li><li class="toc-l2"><a href="#the-picture">The picture</a></li><li class="toc-l2"><a href="#in-the-code">In the code</a></li><li class="toc-l3"><a href="#step-1-the-process-starts-in-run-engine-core">Step 1: the process starts in run_engine_core</a></li><li class="toc-l3"><a href="#step-2-the-handshake-the-heavy-start-up-and-the-ready-messages">Step 2: the handshake, the heavy start-up and the ready messages</a></li><li class="toc-l3"><a href="#step-3-the-input-thread-decodes-and-preprocesses">Step 3: the input thread decodes and preprocesses</a></li><li class="toc-l3"><a href="#step-4-the-busy-loop">Step 4: the busy loop</a></li><li class="toc-l3"><a href="#step-5-step-and-step-with-batch-queue">Step 5: step() and step_with_batch_queue()</a></li><li class="toc-l3"><a href="#step-6-when-there-is-no-work">Step 6: when there is no work</a></li><li class="toc-l3"><a href="#step-7-the-output-thread">Step 7: the output thread</a></li><li class="toc-l3"><a href="#step-8-utility-calls">Step 8: utility calls</a></li><li class="toc-l3"><a href="#step-9-aborts">Step 9: aborts</a></li><li class="toc-l3"><a href="#step-10-errors-and-engine-death">Step 10: errors and engine death</a></li><li class="toc-l3"><a href="#step-11-dpenginecoreproc-the-data-parallel-variant-for-moe">Step 11: DPEngineCoreProc, the data parallel variant for MoE</a></li><li class="toc-l2"><a href="#deep-dive">Deep dive</a></li><li class="toc-l3"><a href="#step-with-batch-queue-line-by-line">step_with_batch_queue(), line by line</a></li><li class="toc-l3"><a href="#worked-example-the-batch-queue-over-five-calls">Worked example: the batch queue over five calls</a></li><li class="toc-l3"><a href="#every-message-type-in-the-two-queues">Every message type in the two queues</a></li><li class="toc-l3"><a href="#shutdown-step-by-step">Shutdown, step by step</a></li><li class="toc-l3"><a href="#configuration-and-environment-variables">Configuration and environment variables</a></li><li class="toc-l2"><a href="#what-can-go-wrong">What can go wrong</a></li><li class="toc-l2"><a href="#check-yourself">Check yourself</a></li><li class="toc-l2"><a href="#related-pages">Related pages</a></li></ul></nav>
+</main>
+</div>
+<div class="lightbox" hidden><div class="lightbox-bar"><span class="lightbox-hint">Scroll to pan. Press Esc to close.</span><button type="button" class="lightbox-close">Close ✕</button></div><div class="lightbox-body"></div></div>
+<div class="tooltip" role="tooltip" id="term-tooltip" hidden></div>
+<script src="../assets/search-index.js" defer></script>
+<script src="../assets/site.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-core.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-clike.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-python.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-json.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js" defer></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js" defer></script>
+</body>
+</html>
