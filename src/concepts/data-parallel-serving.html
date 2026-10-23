@@ -1,0 +1,201 @@
+---
+title: Data parallel serving: several engine cores behind one endpoint
+nav_title: Data parallel serving
+level: Advanced
+prerequisites: concepts/architecture-overview, concepts/engine-client, concepts/distributed-groups
+related: concepts/architecture-overview, concepts/engine-client, concepts/engine-core-loop, concepts/expert-parallel-moe, concepts/distributed-groups, tours/multi-gpu-step, tours/serve-startup, code/v1-engine-core-client, learn/tp-pp-in-practice
+summary: With --data-parallel-size N, vllm serve runs N engine cores with their own KV caches. API servers pick an engine for each request with a load score; a DP coordinator publishes the load counts. Dense models run independent engines; MoE models step in lockstep, in waves, with dummy batches.
+---
+<x-sentence>Data parallelism runs several full engine cores; the API servers pick one per request, and a coordinator shares the load counts.</x-sentence>
+
+<h2>The idea</h2>
+<p>Data parallelism runs several copies of the model, and each copy serves other requests ({{deepinfer learn/parallelism | Parallelism basics}}). In <code>vllm serve</code>, one copy is one engine core process with its own workers, scheduler and KV cache. Each copy is one {{term data-parallel-rank}}. With <code>-dp 4</code> there are four engine cores, but the clients still see one HTTP endpoint.</p>
+<p>Three questions follow. Which process decides where a request goes? How does it know the load of each engine? And do the engines need to wait for each other? vLLM answers them like this:</p>
+<ul>
+  <li>The API servers decide. Each one scores every engine and sends the request to the lowest score. This is the default {{term load-balancing-mode}}, internal load balancing.</li>
+  <li>The engines report their queue lengths and KV cache usage to a {{term dp-coordinator}}. The coordinator publishes them to all API servers, by default every 100 ms when they change.</li>
+  <li>The engines of a dense model are independent. The engines of an MoE model must run every forward pass together, because the expert layers exchange tokens across ranks. They step in {{term dp-wave | waves}} and run dummy batches when they have no work.</li>
+</ul>
+<p><strong>An everyday comparison.</strong> Think of a supermarket with four checkouts and four entrance doors. A guide at each door sends each customer to the checkout with the shortest line. A screen above the doors shows the line lengths and refreshes every few seconds. Each guide also remembers whom she sent recently, because the screen is a little late. The comparison stops here. For MoE models, the checkouts scan in lockstep, and an idle cashier must "scan" an empty basket while others work.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b8b_dp_serving" alt="Panel 1: for vllm serve M -dp 4 with a dense model on one node with 4 GPUs. A CLI process starts and watches the others and serves no HTTP. Four API servers, ApiServer_0 to ApiServer_3, share one listen socket; each has AsyncLLM and a DPLBAsyncMPClient, with client_index i of client_count 4. A DP coordinator collects waiting, running and kv_usage counts and publishes them through XPUB to all API servers; it has no request waves for a dense model. Four engine cores, independent EngineCoreProc, one per DP rank, each with one worker process on GPU 0 to 3 and ZMQ identity 00 00 to 03 00. Requests go from the API servers to the engines over ZMQ ROUTER to DEALER, outputs come back over PUSH, and the engines send counts to the coordinator with client index minus 1. Panel 2: step 1, engines report waiting, running and kv_cache_usage when counts change. Step 2, the coordinator publishes every 100 ms if changed, else every 5 s, a message with counts, wave and running state. Step 3, the API server scores each engine as max of client_count times in-flight and waiting plus running, plus 6 times waiting times max of 0 and kv minus 0.5, and picks the lowest score, scanning from a rotating start." caption="Figure: <code>-dp 4</code> with a dense model. The processes and their channels (panel 1), and the loop that turns engine counts into a routing decision (panel 2)." />
+<p>Read panel 1 from top to bottom. API servers send requests down to any engine core. Outputs come back to the API server that sent the request. The pink dashed path is the slow load loop. Panel 2 shows that the API server combines two sources. The coordinator's published counts can be 100 ms old; its own count of requests in flight is exact.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: one flag, N engine cores and N API servers</h3>
+<p><code>--data-parallel-size</code> (<code>-dp</code>) sets the number of engine cores; the default is 1 ({{cite vllm/engine/arg_utils.py:1230-1232}}, {{cite vllm/config/parallel.py:147-149}}). The engine launcher starts one process per local DP rank, named <code>EngineCore_DP&lt;rank&gt;</code>:</p>
+<x-code file="vllm/v1/engine/utils.py" lines="272-285" highlight="279-281" />
+<p>Each rank gets its own GPUs: local rank <em>r</em> takes devices <code>r × world_size</code> and up. The docstring example is "[2, 3] for local_dp_rank=1" with <code>world_size=2</code> ({{cite vllm/v1/engine/utils.py:441-445}}). The number of API server processes has its own default, set in the CLI by the load-balancing mode:</p>
+<x-code file="vllm/entrypoints/cli/serve.py" lines="107-130" highlight="113-115,116-117,124-125" />
+<p>So internal load balancing gets one API server per DP rank. With more than one API server, the CLI process stays alive as a supervisor and serves no HTTP ({{cite vllm/entrypoints/cli/serve.py:149-156}}). The API servers share one listen socket with <code>SO_REUSEPORT</code>, so the kernel spreads the TCP connections over them ({{cite vllm/entrypoints/cli/serve.py:298}}). The page {{link concepts/architecture-overview}} counts all processes.</p>
+
+<h3>Step 2: dense model or MoE model</h3>
+<p>The engine core process chooses its class at start-up:</p>
+<x-code file="vllm/v1/engine/core.py" lines="1533-1543" highlight="1534,1537,1539-1543" />
+<ul>
+  <li><strong>Dense model.</strong> <code>reconfigure_for_independent_dp_rank()</code> sets the DP size to 1 and the DP rank to 0 ({{cite vllm/config/parallel.py:1192-1201}}). The engine is a plain <code>EngineCoreProc</code>. It has its own NCCL world and never waits for the other ranks. It sleeps when it has no work.</li>
+  <li><strong>MoE model.</strong> The engine is a <code>DPEngineCoreProc</code>. Its workers form one NCCL world with all DP ranks, so the expert layers can exchange tokens ({{link concepts/distributed-groups}}). Step 5 explains the lockstep.</li>
+</ul>
+
+<h3>Step 3: the DP coordinator</h3>
+<p>The coordinator is a separate process. It exists only when it has a job:</p>
+<x-code file="vllm/config/vllm.py" lines="856-874" highlight="870-874" />
+<p>Only DP rank 0 starts it, and only in online serving. Wave coordination is turned on only for MoE models ({{cite vllm/v1/engine/utils.py:1227-1232}}, {{cite vllm/v1/engine/utils.py:1260-1265}}). The engines publish their counts only in internal and hybrid mode ({{cite vllm/v1/engine/core.py:1207-1213}}). When the counts change, an engine sends <code>SchedulerStats</code> with waiting count, running count and KV cache usage to client index −1, the coordinator ({{cite vllm/v1/engine/core.py:1622-1633}}).</p>
+<x-code file="vllm/v1/engine/coordinator.py" lines="263-290" highlight="267,269-275,287-288" />
+<ol>
+  <li><strong>Line 267.</strong> Publish at most every <code>stats_update_interval_ms</code> (100 by default, {{cite vllm/v1/engine/coordinator.py:152}}) when something changed, otherwise every 5 s.</li>
+  <li><strong>Lines 269-275.</strong> For lockstep MoE engines, wait at least 50 ms so that the counts of one step arrive from all ranks.</li>
+  <li><strong>Lines 287-288.</strong> The message is <code>(counts, current_wave, engines_running)</code>, sent on an XPUB socket to every API server.</li>
+</ol>
+<p>The class docstring says the engines send "just waiting and running queue lengths" ({{cite vllm/v1/engine/coordinator.py:29-31}}). The code also stores <code>kv_cache_usage</code> ({{cite vllm/v1/engine/coordinator.py:404-406}}).</p>
+
+<h3>Step 4: the API server picks an engine</h3>
+<p>With DP &gt; 1 and internal load balancing, <code>AsyncLLM</code> uses a <code>DPLBAsyncMPClient</code> ({{cite vllm/v1/engine/core_client.py:158-173}}). A background task keeps the newest published counts in <code>lb_engines</code> ({{cite vllm/v1/engine/core_client.py:1578-1590}}). Each new request runs this choice:</p>
+<x-code file="vllm/v1/engine/core_client.py" lines="1754-1798" highlight="1755-1759,1765-1768,1777-1778,1779-1786,1792,1798" />
+<ol>
+  <li><strong>Lines 1755-1759.</strong> A request may name its rank. The serving layer takes it from the <code>X-data-parallel-rank</code> header ({{cite vllm/entrypoints/generate/base/serving.py:216-228}}). Then no score is computed.</li>
+  <li><strong>Lines 1765-1768.</strong> The scan starts at <code>eng_start_index</code>, which differs per API server: <code>(engines × client_index) // client_count</code> ({{cite vllm/v1/engine/core_client.py:1739-1741}}).</li>
+  <li><strong>Lines 1777-1778.</strong> The base score is the larger of two loads. One is this API server's in-flight requests times the number of API servers; the other is waiting + running.</li>
+  <li><strong>Lines 1779-1786.</strong> Waiting requests cost extra when the KV cache is more than half full: up to 3 × waiting at 100 % usage.</li>
+  <li><strong>Line 1792.</strong> The chosen engine's waiting count grows by <code>client_count</code> at once, so the next request sees it before the next publication.</li>
+  <li><strong>Line 1798.</strong> The start index rotates by one, so equal scores do not always pick the same engine.</li>
+</ol>
+<p>The in-flight count drops when the engine reports the request as finished ({{cite vllm/v1/engine/core_client.py:1810-1817}}). <code>add_request_async</code> also stamps the request with the current wave and this API server's <code>client_index</code>. So the engine can send the outputs back to the right API server ({{cite vllm/v1/engine/core_client.py:1599-1609}}).</p>
+<x-note title="Docs and code differ on the score">
+<p>The deployment doc says the internal load balancing is "based on the running and waiting queues" and could later add "KV cache aware logic" ({{cite docs/serving/data_parallel_deployment.md:77}}). The code already uses the KV cache usage in the waiting penalty (lines 1779-1786 above).</p>
+</x-note>
+
+<h3>Step 5: MoE engines step together in waves</h3>
+<p>The expert layers of all ranks must meet in every forward pass ({{cite docs/serving/data_parallel_deployment.md:9}}, {{deepinfer concepts/expert-parallelism | Expert parallelism}}). So <code>DPEngineCoreProc</code> changes the busy loop:</p>
+<x-code file="vllm/v1/engine/core.py" lines="2484-2525" highlight="2486-2489,2491-2495,2502-2505,2507-2525" />
+<ol>
+  <li><strong>Lines 2486-2495.</strong> The engine ran no real step. If no rank is running, it waits. Otherwise it runs <code>execute_dummy_batch()</code>, so the other ranks' collectives do not hang.</li>
+  <li><strong>Lines 2502-2505.</strong> All ranks agree whether any rank still has unfinished requests.</li>
+  <li><strong>Lines 2507-2525.</strong> When none has, the wave ends. Rank 0 tells the coordinator, and every rank increments its wave number and resets its step counter.</li>
+</ol>
+<p>The agreement is a CPU all-reduce over a gloo group that the engine core process makes for itself ({{cite vllm/config/parallel.py:735-743}}). It does not run every step: only at the first step of a wave and then every <code>dp_sync_interval</code> steps, 16 by default ({{cite vllm/v1/engine/core.py:2542-2559}}, {{cite vllm/config/parallel.py:163-164}}). A new request on an idle engine starts the next wave: the engine tells the coordinator, and the coordinator sends <code>START_DP_WAVE</code> to the others ({{cite vllm/v1/engine/core.py:2360-2373}}, {{cite vllm/v1/engine/coordinator.py:426-440}}).</p>
+
+<h3>Step 6: metrics per engine</h3>
+<p>Every Prometheus metric of the engines has an <code>engine</code> label with the DP rank as a string, next to <code>model_name</code> ({{cite vllm/v1/metrics/loggers.py:499-504}}). An engine core sends its scheduler stats of a step to only one front end ({{cite vllm/v1/core/sched/scheduler.py:2516-2521}}). With more than one API server, vLLM turns off the periodic log line, because each API server sees only part of the stats ({{cite vllm/v1/metrics/loggers.py:1384-1389}}). Prometheus then runs in multiprocess mode with a shared directory for all API server processes ({{cite vllm/entrypoints/cli/serve.py:282-283}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: -dp 4 on one node, three requests">
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-8B-Instruct -dp 4      # one node, 4 GPUs, dense model</code></pre>
+<p><strong>Processes.</strong> <code>--api-server-count</code> is unset, so it becomes 4. The coordinator runs, because the mode is internal. Each engine core has one worker process: <code>world_size_across_dp</code> is 4, so the executor backend is <code>"mp"</code> ({{cite vllm/config/parallel.py:1055-1061}}). Total (derived): 1 CLI supervisor + 4 API servers + 1 coordinator + 4 engine cores + 4 workers = <strong>14</strong>.</p>
+<p><strong>The state.</strong> Three requests arrive at <code>ApiServer_0</code> (<code>client_index</code> 0, <code>client_count</code> C = 4), so the scan starts at engine 0. The latest published counts and this API server's in-flight requests are (illustrative):</p>
+<table>
+  <thead><tr><th>Engine</th><th>waiting w</th><th>running r</th><th>KV usage</th><th>in-flight (this server)</th><th>C × in-flight</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>2</td><td>10</td><td>0.90</td><td>2</td><td>8</td></tr>
+    <tr><td>1</td><td>0</td><td>8</td><td>0.40</td><td>1</td><td>4</td></tr>
+    <tr><td>2</td><td>1</td><td>7</td><td>0.60</td><td>1</td><td>4</td></tr>
+    <tr><td>3</td><td>0</td><td>9</td><td>0.30</td><td>2</td><td>8</td></tr>
+  </tbody>
+</table>
+<p><strong>The three decisions</strong> (score = max(C × in-flight, w + r) + 6 × w × max(0, kv − 0.5)):</p>
+<ol>
+  <li><strong>Request 1</strong>, scan 0, 1, 2, 3. e0 = max(8, 12) + 6 × 2 × 0.4 = 16.8. e1 = max(4, 8) = 8. e2 = max(4, 8) + 6 × 1 × 0.1 = 8.6. e3 = max(8, 9) = 9. Engine 1 wins. Its waiting count becomes 0 + 4 = 4, its in-flight count 2, and the start index 1.</li>
+  <li><strong>Request 2</strong>, scan 1, 2, 3, 0. e1 = max(8, 12) = 12, with no KV penalty because 0.40 &lt; 0.5. e2 = 8.6, e3 = 9, e0 = 16.8. Engine 2 wins. Its waiting count becomes 5, its in-flight count 2, and the start index 2.</li>
+  <li><strong>Request 3</strong>, scan 2, 3, 0, 1. e2 = max(8, 12) + 6 × 5 × 0.1 = 15; e3 = 9; e0 = 16.8; e1 = 12. Engine 3 wins.</li>
+</ol>
+<p>Engine 0 gets nothing: it has a queue and a nearly full KV cache. Engine 2 was a good choice once, but the local +4 on its waiting count and the KV penalty pushed request 3 elsewhere. The next publication from the coordinator, within about 100 ms, replaces these local guesses with real counts. (Derived from {{cite vllm/v1/engine/core_client.py:1754-1798}}.)</p>
+</x-deepdive>
+
+<x-deepdive title="The load-balancing modes and their flags">
+<table>
+  <thead><tr><th>Mode</th><th>How you select it</th><th>Default API servers</th><th>Who picks the engine</th><th>Coordinator</th></tr></thead>
+  <tbody>
+    <tr><td>internal (default)</td><td><code>-dp N</code> only</td><td>N (the DP size)</td><td>each API server, score of Step 4; it sees all ranks</td><td>yes</td></tr>
+    <tr><td>hybrid</td><td><code>--data-parallel-hybrid-lb</code>, or <code>--data-parallel-start-rank</code> without <code>--headless</code></td><td><code>--data-parallel-size-local</code></td><td>API servers on each node, only for the node's own ranks; an outside balancer spreads across nodes</td><td>yes</td></tr>
+    <tr><td>external</td><td><code>--data-parallel-external-lb</code> or <code>--data-parallel-rank</code></td><td>1</td><td>an outside router; each rank has its own endpoint</td><td>MoE only (waves)</td></tr>
+    <tr><td>multi-port external</td><td><code>--data-parallel-multi-port-external-lb</code></td><td>1 per local rank, under a node supervisor</td><td>an outside router</td><td>as external</td></tr>
+  </tbody>
+</table>
+<p>Sources: mode detection and defaults ({{cite vllm/entrypoints/cli/serve.py:79-130}}), flags ({{cite vllm/engine/arg_utils.py:1233-1292}}), engine-args checks ({{cite vllm/engine/arg_utils.py:2436-2510}}), coordinator rule (Step 3). Each API server of the hybrid and external modes manages only its local engines ({{cite vllm/config/parallel.py:654-659}}).</p>
+<x-warning title="External DP flags are only for MoE models">
+<p>For a dense model, <code>--data-parallel-rank</code> or <code>--data-parallel-external-lb</code> raises "Non-MoE models do not support external data parallel mode" ({{cite vllm/engine/arg_utils.py:2445-2455}}). The docs give the reason: dense ranks are fully independent, so you start independent vLLM instances behind your own router instead ({{cite docs/serving/data_parallel_deployment.md:103}}).</p>
+</x-warning>
+</x-deepdive>
+
+<x-deepdive title="Multi-node data parallelism with the mp backend">
+<p>Run one <code>vllm serve</code> per node. The docs example puts DP ranks 0-1 on the head node and 2-3 on a second node ({{cite docs/serving/data_parallel_deployment.md:39-49}}):</p>
+<pre><code class="language-bash"># Node 0 (10.99.48.128): API servers + DP ranks 0 and 1
+vllm serve $MODEL --data-parallel-size 4 --data-parallel-size-local 2 \
+                  --data-parallel-address 10.99.48.128 --data-parallel-rpc-port 13345
+# Node 1: no API server, DP ranks 2 and 3
+vllm serve $MODEL --headless --data-parallel-size 4 --data-parallel-size-local 2 \
+                  --data-parallel-start-rank 2 \
+                  --data-parallel-address 10.99.48.128 --data-parallel-rpc-port 13345</code></pre>
+<table>
+  <thead><tr><th>Flag</th><th>Short</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>--data-parallel-size-local</code></td><td><code>-dpl</code></td><td>DP ranks on this node. 0 on node 0 means "API servers only" ({{cite docs/serving/data_parallel_deployment.md:51-60}}).</td></tr>
+    <tr><td><code>--data-parallel-start-rank</code></td><td><code>-dpr</code></td><td>First DP rank of this node. Without <code>--headless</code> it turns on hybrid mode ({{cite vllm/engine/arg_utils.py:2478-2480}}).</td></tr>
+    <tr><td><code>--data-parallel-address</code></td><td><code>-dpa</code></td><td>Address of the head node. Unset: <code>--master-addr</code>, else 127.0.0.1 ({{cite vllm/engine/arg_utils.py:2526-2544}}).</td></tr>
+    <tr><td><code>--data-parallel-rpc-port</code></td><td><code>-dpp</code></td><td>Fixed port for the ZMQ handshake, the same on all nodes; default 29550 ({{cite vllm/config/parallel.py:161-162}}). Only used with remote engines; one node uses <code>ipc://</code> ({{cite vllm/engine/arg_utils.py:2546-2552}}).</td></tr>
+    <tr><td><code>--headless</code></td><td>–</td><td>No API server on this node; <code>--api-server-count</code> &gt; 0 then raises ({{cite vllm/entrypoints/cli/serve.py:69-77}}).</td></tr>
+  </tbody>
+</table>
+<p>A headless node runs <code>run_headless</code>: it builds the config and starts its local engine cores. They connect to the head node's handshake address <code>tcp://&lt;address&gt;:&lt;rpc port&gt;</code> ({{cite vllm/entrypoints/cli/serve.py:235-256}}). On a node that only holds the second half of a TP/PP replica (<code>node_rank_within_dp &gt; 0</code>), it starts only a <code>MultiprocExecutor</code> for those workers ({{cite vllm/entrypoints/cli/serve.py:218-232}}). Flag names are from {{cite vllm/engine/arg_utils.py:1243-1266}}.</p>
+</x-deepdive>
+
+<x-deepdive title="The Ray backend for data parallelism">
+<p>With <code>--data-parallel-backend ray</code> (<code>-dpb</code>, default <code>mp</code>, {{cite vllm/engine/arg_utils.py:1267-1273}}), one command on any node starts all DP ranks as Ray actors. <code>CoreEngineActorManager</code> places them ({{cite vllm/v1/engine/utils.py:493}}), and the engine cores run as <code>DPMoEEngineCoreActor</code> or <code>EngineCoreActor</code> ({{cite vllm/v1/engine/core.py:2799}}, {{cite vllm/v1/engine/core.py:2822}}). The docs list the differences: no per-node command, no <code>--data-parallel-address</code> or <code>--data-parallel-rpc-port</code>, and <code>VLLM_RAY_DP_PACK_STRATEGY="span"</code> when one replica spans nodes ({{cite docs/serving/data_parallel_deployment.md:62-75}}). <code>--nnodes</code> &gt; 1 needs the <code>mp</code> backend ({{cite vllm/engine/arg_utils.py:2379-2386}}). This site does not cover Ray further.</p>
+</x-deepdive>
+
+<x-deepdive title="Waves in detail: one MoE request on an idle -dp 2 server">
+<ol>
+  <li>Both engines are idle: <code>engines_running</code> is false, so <code>has_work()</code> is false, and each busy loop blocks on its input queue ({{cite vllm/v1/engine/core.py:1596-1602}}).</li>
+  <li>The request reaches engine 0. <code>add_request</code> sees an idle, unpaused engine, sets <code>engines_running</code> and sends <code>start_wave</code> to the coordinator ({{cite vllm/v1/engine/core.py:2360-2373}}).</li>
+  <li>The coordinator moves to "running" and sends <code>START_DP_WAVE (wave, exclude=0)</code> to the engines; engine 0 is excluded because it started the wave ({{cite vllm/v1/engine/coordinator.py:426-440}}, {{cite vllm/v1/engine/coordinator.py:447-456}}).</li>
+  <li>Engine 1 starts its loop for the wave ({{cite vllm/v1/engine/core.py:2406-2424}}). With no requests, each of its steps is a dummy batch: one uniform-decode token through the model ({{cite vllm/v1/worker/gpu_worker.py:1454-1460}}).</li>
+  <li>In every forward, the workers of both ranks first agree on a padded token count and a CUDA graph mode. They use a CPU all-reduce of a <code>[6, dp_size]</code> int32 tensor ({{cite vllm/v1/worker/gpu/dp_utils.py:65-74}}). Model Runner V2 calls this before it prepares the inputs ({{cite vllm/v1/worker/gpu/model_runner.py:1806-1821}}).</li>
+  <li>At step 1 and every 16th step, the engines run the "unfinished?" all-reduce. Assume the request is done on engine 0 and nothing waits anywhere. Then the result is false: the wave ends, rank 0 sends <code>wave_complete</code>, and both engines block again ({{cite vllm/v1/engine/core.py:2502-2525}}).</li>
+</ol>
+<p>So an idle MoE rank can run up to 15 dummy steps after the last request ends somewhere (derived from the sync interval). Larger <code>--dp-sync-interval</code> means fewer CPU all-reduces but more dummy steps at the end of a wave.</p>
+</x-deepdive>
+
+<x-deepdive title="Process counts and per-rank limits">
+<table>
+  <thead><tr><th>Command (one node, dense)</th><th>API</th><th>CLI sup.</th><th>coord.</th><th>engines</th><th>workers</th><th>total</th></tr></thead>
+  <tbody>
+    <tr><td><code>-dp 2</code></td><td>2</td><td>1</td><td>1</td><td>2</td><td>2</td><td>8</td></tr>
+    <tr><td><code>-tp 2 -dp 2</code></td><td>2</td><td>1</td><td>1</td><td>2</td><td>4</td><td>10</td></tr>
+    <tr><td><code>-dp 4</code></td><td>4</td><td>1</td><td>1</td><td>4</td><td>4</td><td>14</td></tr>
+    <tr><td><code>-dp 4 --api-server-count 1</code></td><td>1 (the CLI process)</td><td>0</td><td>1</td><td>4</td><td>4</td><td>10</td></tr>
+  </tbody>
+</table>
+<p>The counts are derived from the rules on {{link concepts/architecture-overview}}. Limits per rank: <code>--max-num-seqs</code> applies to each DP rank, but <code>--max-num-queued-reqs</code> and <code>--max-num-queued-tokens</code> count over all ranks that an API server routes to ({{cite docs/serving/data_parallel_deployment.md:27-29}}). The KV cache of each rank is separate, so a prefix-cache hit needs the request to reach the rank that holds the blocks.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>The API servers time out at start-up.</strong> With more than one API server, they wait for the engines with <code>VLLM_ENGINE_READY_TIMEOUT_S</code>, 600 s by default; a slow model load can exceed it ({{cite vllm/v1/engine/core_client.py:753-768}}).</li>
+  <li><strong>Runtime LoRA updates are refused.</strong> <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code> with more than one API server raises <code>ValueError</code> ({{cite vllm/entrypoints/cli/serve.py:316-319}}).</li>
+  <li><strong>Prefix-cache hits get lost.</strong> The score looks at load, not at prefixes, so a repeated prompt can land on another rank. Use <code>X-data-parallel-rank</code> or an external router if you need affinity.</li>
+  <li><strong>Idle MoE ranks still use the GPU.</strong> During a wave, an idle rank runs dummy batches ({{cite vllm/v1/engine/core.py:2486-2495}}).</li>
+  <li><strong>Missing log line.</strong> With several API servers, the periodic "Avg prompt throughput" line is gone by design; use <code>/metrics</code> ({{cite vllm/v1/metrics/loggers.py:1384-1389}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> DP is the main way to add throughput when one copy of the model fits. With the routing score and the MoE lockstep, you can predict where a request goes and why an idle GPU is busy.</p>
+
+<x-quiz>
+  <x-q level="easy">With <code>-dp 4</code> and no other DP flag, how many API server processes run, and why?
+    <x-a><p>Four. In internal mode, an unset <code>--api-server-count</code> becomes the DP size ({{cite vllm/entrypoints/cli/serve.py:124-125}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Which engine core class does a dense model get with DP &gt; 1, and which does an MoE model get?
+    <x-a><p>Dense: <code>EngineCoreProc</code>, after the DP size is reset to 1. MoE: <code>DPEngineCoreProc</code> ({{cite vllm/v1/engine/core.py:1534-1543}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">When does the DP coordinator process not exist, even with DP &gt; 1?
+    <x-a><p>Only DP rank 0 (the head node) starts it, and never in offline mode ({{cite vllm/v1/engine/utils.py:1230-1232}}). <code>needs_dp_coordinator</code> is also false for a dense model in external load-balancing mode ({{cite vllm/config/vllm.py:870-874}}), but <code>vllm serve</code> refuses that combination at start-up ({{cite vllm/engine/arg_utils.py:2445-2454}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">An engine has waiting = 4, running = 6, KV usage 0.75. An API server with <code>client_count</code> 2 has 3 requests in flight on it. What is the score?
+    <x-a><p>max(2 × 3, 4 + 6) = 10, plus 4 × 6 × max(0, 0.75 − 0.5) = 6. Score 16 ({{cite vllm/v1/engine/core_client.py:1777-1786}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">Why can an MoE rank with no requests keep its GPU busy for a while, and what controls how long?
+    <x-a><p>During a wave every rank must join each forward pass, so an idle rank runs dummy batches ({{cite vllm/v1/engine/core.py:2486-2495}}). The wave ends only after an all-reduce shows no unfinished requests. That all-reduce runs at the first step and then every <code>dp_sync_interval</code> steps, 16 by default ({{cite vllm/v1/engine/core.py:2542-2559}}).</p></x-a>
+  </x-q>
+</x-quiz>

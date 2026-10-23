@@ -1,0 +1,210 @@
+---
+title: distributed/parallel_state.py: process groups and GroupCoordinator
+nav_title: distributed/parallel_state.py
+level: Advanced
+prerequisites: concepts/distributed-groups
+related: concepts/distributed-groups, concepts/tp-layers, concepts/expert-parallel-moe, concepts/data-parallel-serving, code/distributed-device-communicators-shm-broadcast, code/v1-worker-gpu-worker, code/v1-executor-multiproc-executor, tours/multi-gpu-step
+summary: vllm/distributed/parallel_state.py builds the world group and the model-parallel groups (TP, PP, DP, EP, PCP, DCP, EPLB, ...) of each worker, wraps each in a GroupCoordinator, registers the collectives as torch custom ops, and tears everything down at shutdown.
+---
+<h2>Purpose</h2>
+<p><code>vllm/distributed/parallel_state.py</code> owns the {{term process-group | process groups}} of a worker process: it creates them from the {{term rank-layout}}, keeps them in module globals such as <code>_TP</code>, and gives model code one object per group, the {{term group-coordinator}}, with all collectives.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/distributed/parallel_state.py</code>, 2,767 lines of Python. The header says it is adapted from Megatron-LM ({{cite vllm/distributed/parallel_state.py:4-23}}).</td></tr>
+    <tr><th>Main class</th><td><code>GroupCoordinator</code> ({{cite vllm/distributed/parallel_state.py:427}}).</td></tr>
+    <tr><th>Main functions</th><td><code>init_distributed_environment</code> ({{cite vllm/distributed/parallel_state.py:1836}}), <code>initialize_model_parallel</code> ({{cite vllm/distributed/parallel_state.py:2078}}), <code>ensure_model_parallel_initialized</code> ({{cite vllm/distributed/parallel_state.py:2388}}), the getters <code>get_tp_group</code> … <code>get_eplb_group</code>, <code>graph_capture</code>, <code>destroy_model_parallel</code>, <code>cleanup_dist_env_and_memory</code>.</td></tr>
+    <tr><th>Runs in</th><td>Each worker process (or the engine core process with the uni executor), main thread. The groups are per process.</td></tr>
+    <tr><th>Called by</th><td><code>init_worker_distributed_environment</code> in the GPU worker ({{cite vllm/v1/worker/gpu_worker.py:1678-1720}}); model layers through <code>vllm.distributed</code>, which re-exports this module ({{cite vllm/distributed/__init__.py:4-6}}).</td></tr>
+    <tr><th>Calls</th><td><code>torch.distributed</code> (<code>init_process_group</code>, <code>new_group</code>, send/recv), the platform's device communicator class, <code>MessageQueue</code> from <code>shm_broadcast.py</code>, <code>direct_register_custom_op</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The all-reduce kernels and their selection (<code>device_communicators/cuda_communicator.py</code> and friends), the ring buffer (<code>shm_broadcast.py</code>), the MoE all2all managers (<code>device_communicators/all2all.py</code>), the stateless DP group of the engine core (<code>config/parallel.py</code>), the helpers <code>tensor_model_parallel_all_reduce</code> etc. (<code>communication_op.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/distributed-groups}} explains the ideas and the rank layout. This page reads the file function by function.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b8b_rank_grid" alt="Panel 1: eight ranks for TP = 2, PP = 2, DP = 2 of an MoE model, in two lanes for DP rank 0 and 1, each a 2 by 2 grid of PP stage and TP rank. Panel 2: TP groups [0,1] [2,3] [4,5] [6,7], PP groups [0,2] [1,3] [4,6] [5,7], DP groups [0,4] [2,6] [1,5] [3,7], EP groups [0,1,4,5] and [2,3,6,7]. Panel 3: the TP group gets a CudaCommunicator with pynccl, custom all-reduce, symmetric memory, FlashInfer and a MessageQueue broadcaster; PP and DP groups get pynccl only; the EP group gets pynccl and an all2all manager; the world group has no device communicator." caption="Figure: what <code>initialize_model_parallel</code> builds for TP = 2 × PP = 2 × DP = 2 (MoE): the grid, the groups and their communicators." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li>The GPU worker, in <code>init_device</code>, before the memory snapshot ({{cite vllm/v1/worker/gpu_worker.py:497-507}}). Its helper calls <code>set_custom_all_reduce</code>, <code>init_distributed_environment</code> and <code>ensure_model_parallel_initialized</code> in that order ({{cite vllm/v1/worker/gpu_worker.py:1694-1716}}).</li>
+  <li>Model layers call the getters at construction and the collectives at run time, for example <code>RowParallelLinear</code> through <code>tensor_model_parallel_all_reduce</code> ({{cite vllm/model_executor/layers/linear.py:1803-1806}}, {{cite vllm/distributed/communication_op.py:12-14}}).</li>
+  <li>Model Runner V2 wraps CUDA graph capture in <code>graph_capture</code>, and the worker uses the PP group for <code>isend_tensor_dict</code>/<code>irecv_tensor_dict</code> ({{cite vllm/v1/worker/gpu_worker.py:1336-1347}}).</li>
+  <li>Shutdown: the worker process calls <code>destroy_model_parallel</code> and <code>destroy_distributed_environment</code> ({{cite vllm/v1/executor/multiproc_executor.py:824-833}}); the engine core calls <code>cleanup_dist_env_and_memory</code> ({{cite vllm/v1/engine/core.py:837-839}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>torch.distributed.init_process_group</code> for the world, then <code>new_group</code> twice per group: device backend and gloo ({{cite vllm/distributed/parallel_state.py:1973-1982}}, {{cite vllm/distributed/parallel_state.py:501-518}}).</li>
+  <li><code>current_platform.get_device_communicator_cls()</code>, only for groups with more than one rank ({{cite vllm/distributed/parallel_state.py:549-560}}).</li>
+  <li><code>MessageQueue.create_from_process_group</code> for the groups that ask for a broadcaster ({{cite vllm/distributed/parallel_state.py:562-567}}).</li>
+  <li><code>direct_register_custom_op</code> for <code>all_reduce</code>, <code>reduce_scatter</code>, <code>all_gather</code> and a patched scaled-matmul reduce-scatter, at import time ({{cite vllm/distributed/parallel_state.py:399-425}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>_split_tensor_dict</code></td><td>{{cite vllm/distributed/parallel_state.py:116-139}}</td><td>Splits a dict into metadata (with <code>TensorMetadata</code> for tensors) and a tensor list.</td></tr>
+    <tr><td><code>_get_unique_name</code>, <code>_register_group</code></td><td>{{cite vllm/distributed/parallel_state.py:145-164}}</td><td>Names like <code>tp:0</code>; weak references by name for the custom ops.</td></tr>
+    <tr><td><code>all_reduce</code>, <code>reduce_scatter</code>, <code>all_gather</code> (+ fakes)</td><td>{{cite vllm/distributed/parallel_state.py:199-244}}</td><td>The custom-op bodies: look up the group by name, call its out-of-place method.</td></tr>
+    <tr><td><code>GroupCoordinator</code></td><td>{{cite vllm/distributed/parallel_state.py:427-1489}}</td><td>One process group: CPU and device groups, communicator, broadcaster, collectives, send/recv, MoE dispatch/combine.</td></tr>
+    <tr><td><code>init_world_group</code>, <code>init_model_parallel_group</code></td><td>{{cite vllm/distributed/parallel_state.py:1507-1536}}</td><td>Thin constructors for <code>GroupCoordinator</code>.</td></tr>
+    <tr><td><code>get_tp_group</code> … <code>get_pcp_group</code></td><td>{{cite vllm/distributed/parallel_state.py:1590-1685}}</td><td>Getters that assert the group exists.</td></tr>
+    <tr><td><code>graph_capture</code></td><td>{{cite vllm/distributed/parallel_state.py:1693-1726}}</td><td>Capture stream plus the capture contexts of TP, PP and DP.</td></tr>
+    <tr><td><code>init_distributed_environment</code></td><td>{{cite vllm/distributed/parallel_state.py:1836-2039}}</td><td>Default process group and the world <code>GroupCoordinator</code>.</td></tr>
+    <tr><td><code>initialize_model_parallel</code></td><td>{{cite vllm/distributed/parallel_state.py:2078-2385}}</td><td>The rank grid and every model-parallel group.</td></tr>
+    <tr><td><code>ensure_model_parallel_initialized</code></td><td>{{cite vllm/distributed/parallel_state.py:2388-2437}}</td><td>Build once; on a second call, assert the same sizes.</td></tr>
+    <tr><td><code>destroy_model_parallel</code>, <code>destroy_distributed_environment</code>, <code>cleanup_dist_env_and_memory</code></td><td>{{cite vllm/distributed/parallel_state.py:2480-2583}}</td><td>Tear-down in a fixed order.</td></tr>
+    <tr><td><code>in_the_same_node_as</code>, <code>_node_count</code></td><td>{{cite vllm/distributed/parallel_state.py:2586-2767}}</td><td>Node detection through a shared-memory segment.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>GroupCoordinator.__init__</code>: two PyTorch groups per row</h3>
+<x-code file="vllm/distributed/parallel_state.py" lines="493-518" highlight="498-499,501-512,513-518" />
+<ol>
+  <li><strong>Lines 498-499.</strong> Optional timeouts for the device and CPU groups (from <code>--distributed-timeout-seconds</code> and its CPU twin).</li>
+  <li><strong>Lines 501-512.</strong> For <em>every</em> row of <code>group_ranks</code>, the process makes a device group and a gloo group. <code>new_group</code> is collective, so all ranks must make all rows in the same order, even rows they are not in.</li>
+  <li><strong>Lines 513-518.</strong> The process keeps the pair for its own row, and records its rank inside the group.</li>
+</ol>
+<p>The class comment shows the difference between <code>rank</code>, <code>local_rank</code> and <code>rank_in_group</code> with a 4-rank group over two nodes ({{cite vllm/distributed/parallel_state.py:436-449}}). With <code>VLLM_DISTRIBUTED_USE_SPLIT_GROUP=1</code>, the groups come from PyTorch <code>split_group</code> instead ({{cite vllm/distributed/parallel_state.py:480-491}}). The rest of the constructor picks the device, then adds the optional parts:</p>
+<x-code file="vllm/distributed/parallel_state.py" lines="546-574" highlight="549-559,563-567,571-573" />
+<ol>
+  <li><strong>Lines 549-559.</strong> A device communicator only for more than one rank. <code>use_all2all</code> is passed through; the communicator honours it only for groups named <code>ep</code> ({{cite vllm/distributed/device_communicators/base_device_communicator.py:244-245}}).</li>
+  <li><strong>Lines 563-567.</strong> The broadcaster: a <code>MessageQueue</code> of 6 chunks × 4 MiB, writer = the group's first rank.</li>
+  <li><strong>Lines 571-573.</strong> <code>use_custom_op_call</code> decides whether the collectives go through <code>torch.ops.vllm.*</code>.</li>
+</ol>
+
+<h3><code>all_reduce</code> and friends</h3>
+<x-code file="vllm/distributed/parallel_state.py" lines="725-751" highlight="740-741,743-746,748-751" />
+<ol>
+  <li><strong>Lines 740-741.</strong> A group of one returns the input; no kernel runs.</li>
+  <li><strong>Lines 743-746.</strong> The registered op takes the group's unique name (a string), because Dynamo cannot pass the Python object. The op body looks the group up in <code>_groups</code> ({{cite vllm/distributed/parallel_state.py:199-204}}).</li>
+  <li><strong>Lines 748-751.</strong> The real work is in the device communicator; without one this raises "No device communicator found".</li>
+</ol>
+<p><code>all_gather</code> and <code>reduce_scatter</code> follow the same pattern and check the <code>dim</code> argument ({{cite vllm/distributed/parallel_state.py:753-798}}). <code>gather</code>, <code>all_gatherv</code> and <code>reduce_scatterv</code> go straight to the communicator ({{cite vllm/distributed/parallel_state.py:774-838}}). <code>broadcast</code> uses <code>torch.distributed.broadcast</code> on the device group ({{cite vllm/distributed/parallel_state.py:840-853}}); <code>broadcast_object</code> prefers the shared-memory broadcaster ({{cite vllm/distributed/parallel_state.py:855-877}}).</p>
+
+<h3><code>isend_tensor_dict</code> and <code>irecv_tensor_dict</code>: the PP hand-off</h3>
+<x-code file="vllm/distributed/parallel_state.py" lines="1201-1245" highlight="1211-1212,1219-1222,1224-1229,1240-1243" />
+<ol>
+  <li><strong>Line 1211.</strong> Clean up finished earlier sends before posting new ones.</li>
+  <li><strong>Line 1212.</strong> The metadata (keys, dtypes, shapes, plain values) goes first, pickled on the gloo group by <code>isend_object</code>.</li>
+  <li><strong>Lines 1219-1222.</strong> The all-gather trick: with <code>all_gather_group</code> (the TP group), each TP rank sends only its 1/TP slice; the receiver rebuilds the full tensor with an all-gather.</li>
+  <li><strong>Lines 1224-1229.</strong> Each tensor goes by <code>isend</code> on the device group (CPU tensors on gloo). <code>record_stream</code> keeps the CUDA memory alive until the send finishes.</li>
+  <li><strong>Lines 1240-1243.</strong> The handles are also kept in <code>_pending_isends</code>, so a caller may drop them safely.</li>
+</ol>
+<p>The receiver posts <code>irecv</code> for each tensor and returns post-processing callbacks for the all-gather case ({{cite vllm/distributed/parallel_state.py:1285-1369}}). The worker uses exactly this pair with <code>all_gather_group=get_tp_group()</code> ({{cite vllm/v1/worker/gpu_worker.py:1336-1347}}, {{cite vllm/v1/worker/gpu_worker.py:1372-1378}}).</p>
+
+<h3><code>init_distributed_environment</code></h3>
+<x-code file="vllm/distributed/parallel_state.py" lines="1855-1873" highlight="1857-1865,1869,1871" />
+<ol>
+  <li><strong>Lines 1857-1865.</strong> The DP/multi-node branch runs only with a config, no external launcher, no elastic EP, and DP &gt; 1 or several nodes. A dense model's engine reset its DP size to 1, so it never enters for DP.</li>
+  <li><strong>Lines 1869-1871.</strong> Shift the rank by <code>dp_rank × world_size</code> and widen the world to all DP ranks.</li>
+</ol>
+<p>Then the default process group starts, with a gloo fallback when the backend is not available ({{cite vllm/distributed/parallel_state.py:1927-1982}}), and the world <code>GroupCoordinator</code> is made once. When one DP replica spans several nodes and DP &gt; 1, an extra <code>inner_dp_world</code> group with a broadcaster is made for the executor's cross-node queue; with DP = 1 the name points to the world group ({{cite vllm/distributed/parallel_state.py:2022-2038}}).</p>
+
+<h3><code>initialize_model_parallel</code></h3>
+<x-code file="vllm/distributed/parallel_state.py" lines="2148-2168" highlight="2157-2163,2168" />
+<p>Every group comes from this one tensor: TP with <code>view(-1, TP)</code>, PP with <code>transpose(2, 4)</code>, DP with <code>transpose(1, 4)</code>, PCP with <code>transpose(3, 4)</code>, and EP (MoE only) with <code>transpose(1, 2)</code> into rows of DP × PCP × TP ({{cite vllm/distributed/parallel_state.py:2256-2345}}). With elastic EP, TP/PP/PCP use a local grid and DP/EP/EPLB become stateless groups ({{cite vllm/distributed/parallel_state.py:2122-2140}}, {{cite vllm/distributed/parallel_state.py:2297-2305}}). The function ends with one INFO log line per rank, logged once ({{cite vllm/distributed/parallel_state.py:2372-2385}}).</p>
+
+<h3>Tear-down</h3>
+<x-code file="vllm/distributed/parallel_state.py" lines="2538-2565" highlight="2544,2557,2559-2560,2565" />
+<p><code>destroy_model_parallel</code> destroys the groups in the order ETP, TP, Engram DP, DCP, PCP, PP, DP, EP, EPLB ({{cite vllm/distributed/parallel_state.py:2480-2525}}). Each <code>GroupCoordinator.destroy</code> first destroys its device communicator, because communicator workspaces may need the groups for their own tear-down ({{cite vllm/distributed/parallel_state.py:1400-1413}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types in and out">
+<table>
+  <thead><tr><th>Value</th><th>Type</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td><code>group_ranks</code></td><td><code>list[list[int]]</code>, global ranks, one list per group</td><td>{{cite vllm/distributed/parallel_state.py:2168-2169}}</td></tr>
+    <tr><td><code>all_ranks</code></td><td><code>torch.Tensor</code> int64, shape <code>(ExternalDP, DP, PP, PCP, TP)</code></td><td>{{cite vllm/distributed/parallel_state.py:2157-2163}}</td></tr>
+    <tr><td>tensor-dict metadata</td><td><code>list[tuple[str, TensorMetadata | Any]]</code>; <code>TensorMetadata(device, dtype, size)</code></td><td>{{cite vllm/distributed/parallel_state.py:116-139}}</td></tr>
+    <tr><td>PP payload for Llama</td><td><code>{"hidden_states": [T, H], "residual": [T, H]}</code>; each TP rank sends <code>T × H / TP</code> elements per tensor when the size divides</td><td>{{cite vllm/distributed/parallel_state.py:1068-1080}}</td></tr>
+    <tr><td><code>all_reduce</code> in/out</td><td>same shape and dtype; out-of-place</td><td>{{cite vllm/distributed/parallel_state.py:207-208}}</td></tr>
+    <tr><td><code>all_gather(x, dim)</code></td><td>size of <code>dim</code> × world size</td><td>{{cite vllm/distributed/parallel_state.py:239-244}}</td></tr>
+    <tr><td><code>reduce_scatter(x, dim)</code></td><td>size of <code>dim</code> ÷ world size</td><td>{{cite vllm/distributed/parallel_state.py:221-226}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Processes, threads and when each part runs">
+<table>
+  <thead><tr><th>When</th><th>Process / thread</th><th>What runs</th></tr></thead>
+  <tbody>
+    <tr><td>module import</td><td>every process that imports <code>vllm.distributed</code></td><td>custom op registration ({{cite vllm/distributed/parallel_state.py:399-425}})</td></tr>
+    <tr><td><code>init_device</code></td><td>each worker, main thread</td><td>world + model-parallel groups, communicators, broadcasters (all collective)</td></tr>
+    <tr><td>forward pass</td><td>each worker, main thread (and the compiled graph)</td><td>collectives on the TP / PP / EP / DP groups</td></tr>
+    <tr><td>CUDA graph capture</td><td>each worker, capture stream</td><td><code>graph_capture</code> contexts</td></tr>
+    <tr><td>shutdown</td><td>each worker</td><td>destroy groups, then the default PG</td></tr>
+  </tbody>
+</table>
+<p>The engine core of an MoE DP rank has its own DP process group, but it does not come from this file: <code>stateless_init_dp_group</code> builds a gloo group "since the engine process might not have cuda device" ({{cite vllm/config/parallel.py:735-743}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: what one TP = 2 worker builds">
+<p><code>vllm serve meta-llama/Llama-3.1-8B-Instruct -tp 2</code>, worker rank 1 (derived from the code above):</p>
+<ol>
+  <li><code>init_distributed_environment(world_size=2, rank=1, "file:///tmp/vllm_dist_…", local_rank=1, "nccl")</code>: no DP branch; default PG of 2 ranks; <code>_WORLD</code> = ranks [0, 1], no device communicator; <code>_NODE_COUNT</code> = 1.</li>
+  <li><code>all_ranks = arange(2).reshape(1, 1, 1, 1, 2)</code>.</li>
+  <li><code>_TP</code> = [0, 1] (<code>tp:0</code>), with a <code>CudaCommunicator</code> and a 6 × 4 MiB <code>MessageQueue</code>. <code>_ETP</code> is the same object.</li>
+  <li><code>_DCP</code>, <code>_PCP</code>, <code>_PP</code>, <code>_DP</code>: two groups of one rank each ([0] and [1]), so this rank's object has no communicator and no broadcaster.</li>
+  <li><code>_EP</code>, <code>_EPLB</code>: <code>None</code>, because Llama is not an MoE model.</li>
+  <li>The log: "rank 1 in world size 2 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 1, ETP rank 1, EP rank N/A, EPLB rank N/A".</li>
+</ol>
+<p>Every <code>new_group</code> call above makes two PyTorch groups (NCCL and gloo), and each rank takes part in both rows of each size-1 group kind. That is 2 + 2 + 4 × 4 = 20 <code>new_group</code> calls for this worker: world and TP have 1 row each, DCP, PCP, PP and DP have 2 rows each, and each row needs two calls. The communicators then do their own setup (derived from lines 501-518 and the group list).</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>a getter before init (or <code>get_ep_group</code> for a dense model)</td><td><code>AssertionError</code> with a hint</td><td>{{cite vllm/distributed/parallel_state.py:1659-1665}}</td></tr>
+    <tr><td>groups built twice</td><td><code>AssertionError</code> "… group is already initialized"</td><td>{{cite vllm/distributed/parallel_state.py:2167}}</td></tr>
+    <tr><td>different sizes on a second <code>ensure_model_parallel_initialized</code></td><td><code>AssertionError</code></td><td>{{cite vllm/distributed/parallel_state.py:2412-2437}}</td></tr>
+    <tr><td>the backend is not available</td><td>WARNING, falls back to gloo</td><td>{{cite vllm/distributed/parallel_state.py:1940-1948}}</td></tr>
+    <tr><td>collective on a group without communicator (size &gt; 1, CPU platform paths)</td><td><code>ValueError("No device communicator found")</code></td><td>{{cite vllm/distributed/parallel_state.py:748-751}}</td></tr>
+    <tr><td>the custom op finds a destroyed group</td><td><code>ValueError("Group … is destroyed.")</code></td><td>{{cite vllm/distributed/parallel_state.py:199-204}}</td></tr>
+    <tr><td>node detection cannot open the segment</td><td>ERROR "Error ignored in is_in_the_same_node", rank counted as another node</td><td>{{cite vllm/distributed/parallel_state.py:2651-2652}}</td></tr>
+    <tr><td>elastic EP with TP/PP across nodes</td><td><code>RuntimeError</code></td><td>{{cite vllm/distributed/parallel_state.py:1983-1994}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_DISTRIBUTED_USE_SPLIT_GROUP</code></td><td>0 ({{cite vllm/envs.py:933-935}})</td><td>{{cite vllm/distributed/parallel_state.py:482}}, {{cite vllm/distributed/parallel_state.py:1954}}</td><td>Use <code>split_group</code> with an eagerly bound device; the default PG then needs both gloo and NCCL ({{cite vllm/distributed/parallel_state.py:1738-1798}}).</td></tr>
+    <tr><td><code>LOCAL_RANK</code></td><td>read only with <code>env://</code></td><td>{{cite vllm/distributed/parallel_state.py:2000-2004}}</td><td>Local rank when the caller passes −1 (torchrun-style launch).</td></tr>
+    <tr><td><code>VLLM_ELASTIC_EP_SCALE_UP_LAUNCH</code></td><td>0</td><td>{{cite vllm/distributed/parallel_state.py:2041-2052}}</td><td>Defers communicator warm-up when joining a live elastic-EP cluster on ROCm.</td></tr>
+  </tbody>
+</table>
+<p>The variables that pick the all-reduce implementation are read in the device communicators; see {{link concepts/distributed-groups}}.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/distributed-groups}}: the rank layout, the communicator chain and the worked 8-GPU example.</li>
+  <li>{{link concepts/tp-layers}}: the layers that call the TP collectives.</li>
+  <li>{{link concepts/expert-parallel-moe}}: the EP group and its all2all managers.</li>
+  <li>{{link code/distributed-device-communicators-shm-broadcast}}: the <code>MessageQueue</code> behind the broadcasters.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">What does <code>GroupCoordinator.all_reduce</code> do in a group of one rank?
+    <x-a><p>It returns the input tensor; no kernel runs ({{cite vllm/distributed/parallel_state.py:739-741}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why must every rank call <code>torch.distributed.new_group</code> for every row, even rows it does not belong to?
+    <x-a><p><code>new_group</code> is a collective call in PyTorch. The constructor loops over all rows of <code>group_ranks</code> and keeps only its own pair ({{cite vllm/distributed/parallel_state.py:501-518}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A PP stage sends a <code>hidden_states</code> tensor of <code>[2048, 4096]</code> BF16 with TP = 4. How many bytes does each TP rank send for it, and how does the receiver get the full tensor?
+    <x-a><p>The size divides by 4, so each rank sends its 1/4 slice: 2048 × 4096 × 2 / 4 = 4 MiB ({{cite vllm/distributed/parallel_state.py:1068-1080}}, {{cite vllm/distributed/parallel_state.py:1219-1222}}). The receiver posts an <code>irecv</code> into its slice and runs an all-gather on the TP group in a post-processing callback ({{cite vllm/distributed/parallel_state.py:1332-1355}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">In the TP = 2 example of the deep dive, which groups of worker 1 have a device communicator, and why does the PP group have none?
+    <x-a><p>Only the TP group (and ETP, the same object). The PP, DP, PCP and DCP groups of this rank have one rank each, and the constructor makes a communicator only when <code>world_size &gt; 1</code> ({{cite vllm/distributed/parallel_state.py:549}}). The world group is built with <code>use_device_communicator=False</code> ({{cite vllm/distributed/parallel_state.py:1507-1516}}).</p></x-a>
+  </x-q>
+</x-quiz>

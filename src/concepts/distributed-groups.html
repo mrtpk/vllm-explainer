@@ -1,0 +1,206 @@
+---
+title: Process groups: how vLLM slices its ranks
+nav_title: Process groups
+level: Advanced
+prerequisites: learn/tp-pp-in-practice, concepts/executors-and-workers
+related: code/distributed-parallel-state, concepts/tp-layers, concepts/data-parallel-serving, concepts/expert-parallel-moe, tours/multi-gpu-step, tours/forward-pass, code/distributed-device-communicators-shm-broadcast
+summary: Each worker puts all ranks into one grid of shape (DP, PP, PCP, TP) and cuts it into process groups. Each group is a GroupCoordinator with a gloo CPU group, an NCCL device group and, for groups of more than one rank, a device communicator that picks the all-reduce implementation.
+---
+<x-sentence>Each worker arranges all ranks in one grid and cuts it into groups; every collective of the model runs inside one of these groups.</x-sentence>
+
+<h2>The idea</h2>
+<p>Parallel inference splits one model over several GPUs, and the GPUs exchange tensors with collectives such as all-reduce ({{deepinfer learn/parallelism | Parallelism basics}}). A collective always runs inside a {{term process-group}}: a fixed set of ranks that take part together. Tensor parallelism needs one group, pipeline parallelism another, and expert parallelism a third.</p>
+<p>vLLM builds all its groups in the same way, in every {{term worker}}. It numbers the ranks and puts them into a grid with one dimension per kind of parallelism. Then it reads each group off one line of the grid. This order is the {{term rank-layout}}. TP is the last dimension, so the ranks of one TP group are neighbours, and they normally sit on one node.</p>
+<p>Each group becomes a {{term group-coordinator}}. It holds two PyTorch groups for the same ranks: a gloo group for small CPU messages and an NCCL group for GPU tensors. When the group has more than one rank, it also holds a {{term device-communicator}}. On CUDA, this object picks the fastest all-reduce for each tensor: for example the {{term custom-all-reduce}}, symmetric memory or plain NCCL.</p>
+<p><strong>An everyday comparison.</strong> Think of the seat plan of a large exam hall. Each seat has a row and a column. "Row 3" and "column 5" are two different teams, but each seat belongs to exactly one row and one column. The hall manager does not invent the teams one by one; she reads them off the plan. The comparison stops here: a vLLM rank belongs to one group of each kind at the same time. Some groups (EP) also span several rows and columns.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b8b_rank_grid" alt="Panel 1: two lanes for DP rank 0 and DP rank 1. Each lane holds a 2 by 2 grid: PP stage 0 has ranks 0 and 1, PP stage 1 has ranks 2 and 3 in DP rank 0; ranks 4 to 7 in DP rank 1. Each rank sits on the GPU with the same number. Panel 2: the groups. TP groups [0,1] [2,3] [4,5] [6,7] from view(-1, TP). PP groups [0,2] [1,3] [4,6] [5,7] from transpose(2,4). DP groups [0,4] [2,6] [1,5] [3,7] from transpose(1,4). EP groups [0,1,4,5] and [2,3,6,7] from transpose(1,2), for MoE models only. Panel 3: the communicators. The TP group gets a CudaCommunicator with pynccl plus custom all-reduce, symmetric memory and FlashInfer, and a MessageQueue broadcaster. PP and DP groups get pynccl only. The EP group gets pynccl and an all2all manager when DP is larger than 1. The world group has no device communicator." caption="Figure: TP = 2, PP = 2, DP = 2 for an MoE model on 8 GPUs. One grid (panel 1), four kinds of groups read off it (panel 2), and the communicator of each group (panel 3)." />
+<p>Read panel 1 as the grid: each orange lane is one DP rank, which is one engine core with its four workers. Panel 2 lists the members of each group; the code moves the group's dimension to the end of the grid and cuts rows. Panel 3 shows that only groups with more than one rank get a device communicator, and only TP groups get the special all-reduce kernels.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the worker sets up the groups in init_device</h3>
+<p>Each worker builds its groups in <code>init_device</code>, before it takes the memory snapshot. The comment says why: the NCCL buffers must exist before vLLM measures the free memory:</p>
+<x-code file="vllm/v1/worker/gpu_worker.py" lines="495-507" highlight="498,501-507" />
+<p><code>init_worker_distributed_environment</code> first prepares the batch-invariant mode and the EPLB environment variables. Then it does four things in order. It sets the custom all-reduce switch from <code>--disable-custom-all-reduce</code>, creates the world group, creates the model-parallel groups, and starts the EC connector ({{cite vllm/v1/worker/gpu_worker.py:1678-1720}}). The rank and the init method come from the {{term multiproc-executor}}: the global rank of a worker is <code>local_world_size × node_rank_within_dp + local_rank</code> ({{cite vllm/v1/executor/multiproc_executor.py:179-192}}). On one node, the init method is a <code>file://</code> store in the temp folder, unless AITER needs a TCP store ({{cite vllm/v1/executor/multiproc_executor.py:139-144}}).</p>
+
+<h3>Step 2: init_distributed_environment makes the world group</h3>
+<p>The first call joins all ranks of this engine into PyTorch's default group. With DP &gt; 1 or several nodes, it first widens the world across the data parallel ranks:</p>
+<x-code file="vllm/distributed/parallel_state.py" lines="1857-1876" highlight="1869,1871,1874-1876" />
+<ol>
+  <li><strong>Line 1869.</strong> The rank is shifted by <code>data_parallel_rank × world_size</code>. So DP rank 1 of a 4-rank engine starts at global rank 4.</li>
+  <li><strong>Line 1871.</strong> The world grows to <code>world_size_across_dp</code> = TP × PP × PCP × DP ({{cite vllm/config/parallel.py:626-629}}).</li>
+  <li><strong>Lines 1874-1876.</strong> With several nodes, the rendezvous goes to <code>--master-addr</code> and <code>--master-port</code>. Otherwise it goes to the DP master address with a fresh port (lines 1878-1920).</li>
+</ol>
+<x-warning title="A dense model never takes this branch for DP">
+<p>For a model without experts, each engine core sets its DP size to 1 before it starts the executor ({{cite vllm/v1/engine/core.py:1534-1543}}, {{cite vllm/config/parallel.py:1192-1201}}). So with <code>-dp 2</code> and a dense model, each engine core has its own world of TP × PP ranks, and the two worlds never talk. Only a {{term fused-moe | MoE}} model builds one world over all DP ranks.</p>
+</x-warning>
+<p>The world group itself is a <code>GroupCoordinator</code> over all ranks, with no device communicator ({{cite vllm/distributed/parallel_state.py:1507-1516}}, {{cite vllm/distributed/parallel_state.py:2010-2012}}).</p>
+
+<h3>Step 3: initialize_model_parallel reads the groups off the grid</h3>
+<x-code file="vllm/distributed/parallel_state.py" lines="2148-2181" highlight="2148,2157-2163,2168,2173-2180" />
+<ol>
+  <li><strong>Lines 2148-2156.</strong> The comment gives the layout order: ExternalDP × DP × PP × PCP × TP. ExternalDP is for frameworks that run several independent copies of vLLM in one world.</li>
+  <li><strong>Lines 2157-2163.</strong> One tensor of all ranks, shaped <code>(-1, DP, PP, PCP, TP)</code>.</li>
+  <li><strong>Line 2168.</strong> TP groups are rows of the last dimension. No transpose is needed.</li>
+  <li><strong>Lines 2173-2180.</strong> The comment says that only the TP group uses a {{term message-queue}} broadcaster. The DCP group also asks for one, but it has one rank by default ({{cite vllm/distributed/parallel_state.py:2248-2254}}).</li>
+</ol>
+<p>The other groups use the comment's recipe: move the dimension to the end, reshape, and unbind. PP uses <code>transpose(2, 4)</code> ({{cite vllm/distributed/parallel_state.py:2278-2280}}), DP uses <code>transpose(1, 4)</code> ({{cite vllm/distributed/parallel_state.py:2295}}). The EP group is only built for MoE models, and it spans DP × PCP × TP ranks of one PP stage:</p>
+<x-code file="vllm/distributed/parallel_state.py" lines="2313-2324" highlight="2314,2316-2321" />
+<p>An EPLB group with the same ranks follows only with <code>--enable-eplb</code>. The comment explains the separate group: EPLB weight transfers must not deadlock with the MoE collectives of the forward pass ({{cite vllm/distributed/parallel_state.py:2347-2368}}). At the end, every rank logs its position, for example "rank 5 in world size 8 is assigned as DP rank 1, …" ({{cite vllm/distributed/parallel_state.py:2372-2385}}).</p>
+
+<h3>Step 4: one GroupCoordinator per group</h3>
+<p>By default, the constructor makes a PyTorch group for every row, so all ranks take part in every <code>new_group</code> call. Each rank keeps the pair for its own row: an NCCL <code>device_group</code> and a gloo <code>cpu_group</code> ({{cite vllm/distributed/parallel_state.py:501-518}}). Then it adds the optional parts:</p>
+<x-code file="vllm/distributed/parallel_state.py" lines="546-574" highlight="549-560,564-567,571-574" />
+<ol>
+  <li><strong>Lines 549-560.</strong> The device communicator class comes from the platform: <code>CudaCommunicator</code> on CUDA and ROCm ({{cite vllm/platforms/cuda.py:581-584}}). A group with one rank gets none.</li>
+  <li><strong>Lines 564-567.</strong> The shared-memory broadcaster has 6 chunks of 4 MiB (<code>1 &lt;&lt; 22</code>). <code>broadcast_object</code> uses it when it exists ({{cite vllm/distributed/parallel_state.py:855-866}}).</li>
+  <li><strong>Lines 571-574.</strong> On platforms that opt in, the collectives go through registered custom ops. CUDA opts in ({{cite vllm/platforms/cuda.py:707-709}}).</li>
+</ol>
+
+<h3>Step 5: the CUDA device communicator picks an all-reduce</h3>
+<p><code>CudaCommunicator</code> always makes a <code>PyNcclCommunicator</code> for a group with more than one rank ({{cite vllm/distributed/device_communicators/cuda_communicator.py:106-113}}). The faster kernels are only for TP groups:</p>
+<x-code file="vllm/distributed/device_communicators/cuda_communicator.py" lines="56-82" highlight="56-64,68-70,73-75" />
+<p>At run time, <code>all_reduce</code> tries the implementations in a fixed order and takes the first that accepts the tensor ({{cite vllm/distributed/device_communicators/cuda_communicator.py:362-446}}). On CUDA the chain has six links. They are NCCL symmetric memory (only with <code>VLLM_USE_NCCL_SYMM_MEM=1</code>), the FlashInfer PCIe all-reduce (opt-in), FlashInfer, the custom all-reduce, PyTorch symmetric memory, and pynccl. The size and dtype checks live in each implementation. The start-up log names the enabled ones for each group: "Using [...] all-reduce backends (in dispatch order) for group 'tp:0'" ({{cite vllm/distributed/device_communicators/cuda_communicator.py:353-360}}). The log puts NCCL symmetric memory after the two FlashInfer entries, but <code>all_reduce</code> tries it first ({{cite vllm/distributed/device_communicators/cuda_communicator.py:307-337}}, {{cite vllm/distributed/device_communicators/cuda_communicator.py:372-379}}).</p>
+
+<h3>Step 6: the collectives that the model calls</h3>
+<p>Model code does not use the groups directly. It calls helpers such as <code>tensor_model_parallel_all_reduce</code>, which forward to the TP group ({{cite vllm/distributed/communication_op.py:12-21}}). The group then calls the registered op:</p>
+<x-code file="vllm/distributed/parallel_state.py" lines="725-751" highlight="740-741,743-744,750-751" />
+<ol>
+  <li><strong>Lines 740-741.</strong> With one rank, the call returns the input. No kernel runs.</li>
+  <li><strong>Lines 743-744.</strong> <code>torch.ops.vllm.all_reduce</code> carries only the group name, a string. The docstring explains why: Dynamo cannot pass the Python object into a custom op (lines 726-737). The op looks the group up by name and calls the device communicator ({{cite vllm/distributed/parallel_state.py:199-204}}, {{cite vllm/distributed/parallel_state.py:399-403}}).</li>
+  <li><strong>Lines 748-751.</strong> The op is out-of-place: it returns a new tensor.</li>
+</ol>
+<p><code>all_gather</code> and <code>reduce_scatter</code> work the same way ({{cite vllm/distributed/parallel_state.py:753-798}}). Pipeline stages use a different pair: <code>isend_tensor_dict</code> and <code>irecv_tensor_dict</code> on the PP group. The worker sends the {{term intermediate-tensors}} without waiting, and the next stage receives them at the start of its step ({{cite vllm/v1/worker/gpu_worker.py:1336-1347}}, {{cite vllm/v1/worker/gpu_worker.py:1371-1378}}). <code>broadcast_tensor_dict</code> also exists, as a TP-group helper ({{cite vllm/distributed/communication_op.py:38-43}}); no code of Model Runner V2 calls it (derived from <code>git grep</code>).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: TP = 2 × PP = 2 × DP = 2 on 8 GPUs">
+<pre><code class="language-bash">vllm serve &lt;an MoE model&gt; -tp 2 -pp 2 -dp 2      # one node, 8 GPUs</code></pre>
+<p>Each engine core has <code>world_size</code> = TP × PP = 4 workers. Engine core <em>d</em> gets GPUs 4<em>d</em> to 4<em>d</em> + 3 ({{cite vllm/v1/engine/utils.py:441-445}}). The global rank of a worker is <code>4 × dp_rank + local rank</code> (Step 2). The grid is <code>arange(8).reshape(1, 2, 2, 1, 2)</code>, so <code>rank = 4·dp + 2·pp + tp</code>.</p>
+<table>
+  <thead><tr><th>Rank (GPU)</th><th>dp</th><th>pp</th><th>tp</th><th>TP group</th><th>PP group</th><th>DP group</th><th>EP group</th></tr></thead>
+  <tbody>
+    <tr><td>0</td><td>0</td><td>0</td><td>0</td><td>[0, 1]</td><td>[0, 2]</td><td>[0, 4]</td><td>[0, 1, 4, 5]</td></tr>
+    <tr><td>1</td><td>0</td><td>0</td><td>1</td><td>[0, 1]</td><td>[1, 3]</td><td>[1, 5]</td><td>[0, 1, 4, 5]</td></tr>
+    <tr><td>2</td><td>0</td><td>1</td><td>0</td><td>[2, 3]</td><td>[0, 2]</td><td>[2, 6]</td><td>[2, 3, 6, 7]</td></tr>
+    <tr><td>3</td><td>0</td><td>1</td><td>1</td><td>[2, 3]</td><td>[1, 3]</td><td>[3, 7]</td><td>[2, 3, 6, 7]</td></tr>
+    <tr><td>4</td><td>1</td><td>0</td><td>0</td><td>[4, 5]</td><td>[4, 6]</td><td>[0, 4]</td><td>[0, 1, 4, 5]</td></tr>
+    <tr><td>5</td><td>1</td><td>0</td><td>1</td><td>[4, 5]</td><td>[5, 7]</td><td>[1, 5]</td><td>[0, 1, 4, 5]</td></tr>
+    <tr><td>6</td><td>1</td><td>1</td><td>0</td><td>[6, 7]</td><td>[4, 6]</td><td>[2, 6]</td><td>[2, 3, 6, 7]</td></tr>
+    <tr><td>7</td><td>1</td><td>1</td><td>1</td><td>[6, 7]</td><td>[5, 7]</td><td>[3, 7]</td><td>[2, 3, 6, 7]</td></tr>
+  </tbody>
+</table>
+<p>How each column is computed (derived from the lines in Step 3):</p>
+<ol>
+  <li><strong>TP:</strong> <code>view(-1, 2)</code> cuts the flat order 0…7 into pairs.</li>
+  <li><strong>PP:</strong> <code>transpose(2, 4)</code> swaps the PP and TP axes. The rows of length 2 are then (dp, tp) fixed, pp varying: [0, 2], [1, 3], [4, 6], [5, 7].</li>
+  <li><strong>DP:</strong> <code>transpose(1, 4)</code> swaps DP and TP. The rows are (tp, pp) fixed, dp varying: [0, 4], [2, 6], [1, 5], [3, 7].</li>
+  <li><strong>EP:</strong> <code>transpose(1, 2)</code> puts PP before DP. Then each row of DP × PCP × TP = 4 ranks is one PP stage: [0, 1, 4, 5] and [2, 3, 6, 7].</li>
+  <li><strong>PCP and DCP:</strong> both sizes are 1, so there are eight groups of one rank each. They have no device communicator.</li>
+</ol>
+<p><strong>The same command with a dense model.</strong> Each engine core is reconfigured to DP = 1 (Step 2). So each engine core has its own world <code>arange(4).reshape(1, 1, 2, 1, 2)</code>. It has TP groups [0, 1] and [2, 3], PP groups [0, 2] and [1, 3], DP groups of one rank, and no EP group. Rank numbers start at 0 in both engines, and the two engines have separate NCCL communicators.</p>
+</x-deepdive>
+
+<x-deepdive title="Which groups exist, and which get a communicator">
+<p>The table is for <code>initialize_model_parallel</code> on CUDA with default flags. "Size" is the number of ranks in one group.</p>
+<table>
+  <thead><tr><th>Group (name)</th><th>Size</th><th>Exists</th><th>Device communicator</th><th>Getter</th></tr></thead>
+  <tbody>
+    <tr><td>world (<code>world</code>)</td><td>all ranks</td><td>always</td><td>none (<code>use_device_communicator=False</code>)</td><td><code>get_world_group</code> ({{cite vllm/distributed/parallel_state.py:1497-1499}})</td></tr>
+    <tr><td>TP (<code>tp</code>)</td><td>TP</td><td>always</td><td>if TP &gt; 1; with custom all-reduce, symmetric memory, FlashInfer; plus a MessageQueue broadcaster</td><td><code>get_tp_group</code> ({{cite vllm/distributed/parallel_state.py:1593-1595}})</td></tr>
+    <tr><td>ETP (<code>etp</code>)</td><td>TP unless an Engram config changes it</td><td>same object as TP by default</td><td>as TP</td><td>{{cite vllm/distributed/parallel_state.py:2183-2200}}</td></tr>
+    <tr><td>DCP (<code>dcp</code>)</td><td>1 by default</td><td>always</td><td>only with <code>--decode-context-parallel-size</code> &gt; 1</td><td>{{cite vllm/distributed/parallel_state.py:2237-2254}}</td></tr>
+    <tr><td>PCP (<code>pcp</code>)</td><td>1 by default</td><td>always</td><td>only with PCP &gt; 1</td><td>{{cite vllm/distributed/parallel_state.py:2256-2272}}</td></tr>
+    <tr><td>PP (<code>pp</code>)</td><td>PP</td><td>always</td><td>if PP &gt; 1 (pynccl only)</td><td>{{cite vllm/distributed/parallel_state.py:2274-2291}}</td></tr>
+    <tr><td>DP (<code>dp</code>)</td><td>DP (1 for a dense model)</td><td>always</td><td>if DP &gt; 1 (MoE)</td><td>{{cite vllm/distributed/parallel_state.py:2293-2309}}</td></tr>
+    <tr><td>EP (<code>ep</code>)</td><td>DP × PCP × TP</td><td>MoE models only</td><td>if size &gt; 1; an all2all manager when <code>use_all2all</code></td><td>{{cite vllm/distributed/parallel_state.py:2311-2345}}</td></tr>
+    <tr><td>EPLB (<code>eplb</code>)</td><td>as EP</td><td>MoE and <code>--enable-eplb</code></td><td>if size &gt; 1</td><td>{{cite vllm/distributed/parallel_state.py:2347-2368}}</td></tr>
+    <tr><td>inner DP world (<code>inner_dp_world</code>)</td><td>TP × PP × PCP</td><td>only when one DP replica spans nodes and DP &gt; 1; with DP = 1 the name points to the world group</td><td>none; MessageQueue broadcaster</td><td>{{cite vllm/distributed/parallel_state.py:2022-2039}}</td></tr>
+  </tbody>
+</table>
+<p>The group names get a counter suffix, so the first TP group object of a process is <code>tp:0</code> ({{cite vllm/distributed/parallel_state.py:145-158}}). The CUDA communicator checks the prefix before the colon, so only groups named exactly <code>tp</code> get the TP-only kernels ({{cite vllm/distributed/device_communicators/cuda_communicator.py:56-57}}). <code>use_all2all</code> is true when DP &gt; 1, for sequence-parallel MoE, or for EP with PCP ({{cite vllm/config/parallel.py:787-793}}); the EP communicator then makes the manager for <code>--all2all-backend</code> ({{cite vllm/distributed/device_communicators/cuda_communicator.py:202-283}}).</p>
+<p>Facts for a dense <code>-tp 2</code> server (derived): each worker builds exactly one device communicator, for its TP group. All other groups have one rank.</p>
+</x-deepdive>
+
+<x-deepdive title="The all-reduce chain on CUDA: conditions and switches">
+<table>
+  <thead><tr><th>Order</th><th>Implementation</th><th>Built when</th><th>Used for a tensor when</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>NCCL symmetric memory (<code>all_reduce_symmetric_with_copy</code>)</td><td><code>VLLM_USE_NCCL_SYMM_MEM=1</code> (default 0, {{cite vllm/envs.py:2088-2090}})</td><td>FlashInfer does not take it, and the size rule of <code>NCCL_SYMM_MEM_ALL_REDUCE_CONFIG</code> allows it: world size 4 or more; at 4 and 8 only small and large tensors, not the middle range ({{cite vllm/distributed/device_communicators/all_reduce_utils.py:109-154}})</td></tr>
+    <tr><td>2</td><td>FlashInfer PCIe IPC</td><td>TP group and <code>VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1</code> (default 0, {{cite vllm/envs.py:1965-1967}})</td><td><code>should_use(input)</code></td></tr>
+    <tr><td>3</td><td>FlashInfer all-reduce</td><td>TP group, <code>VLLM_ALLREDUCE_USE_FLASHINFER=1</code> (default 1, {{cite vllm/envs.py:1959-1961}}), FlashInfer installed, and a size entry for this world size and GPU: only compute capability 9.0 and 10.x have entries, for example 64 MiB at TP = 2 ({{cite vllm/distributed/device_communicators/flashinfer_all_reduce.py:400-449}}, {{cite vllm/config/compilation.py:197-209}}, {{cite vllm/compilation/passes/fusion/allreduce_rms_fusion.py:104-127}})</td><td>2-D, contiguous, FP16/BF16/FP32, and not larger than its workspace ({{cite vllm/distributed/device_communicators/flashinfer_all_reduce.py:469-494}})</td></tr>
+    <tr><td>4</td><td>custom all-reduce (<code>CustomAllreduce</code>)</td><td>TP group, not <code>--disable-custom-all-reduce</code>, world size 2, 4, 6, 8 or 16, P2P works, and NVLink when more than 2 GPUs ({{cite vllm/distributed/device_communicators/custom_all_reduce.py:214-291}})</td><td>world size 8 or less, FP16/BF16/FP32, a multiple of 16 bytes, smaller than <code>max_size</code>. That is 8 MiB by default. When symmetric memory is active, a per-GPU table can only lower it: the code takes the smaller value. For example, it stays 8 MiB at TP = 2 on compute capability 9.0 and becomes 2 MiB at TP = 2 on 10.0 ({{cite vllm/distributed/device_communicators/custom_all_reduce.py:499-513}}, {{cite vllm/distributed/device_communicators/custom_all_reduce.py:240-254}}, {{cite vllm/distributed/device_communicators/custom_all_reduce.py:141}}, {{cite vllm/distributed/device_communicators/all_reduce_utils.py:31-43}})</td></tr>
+    <tr><td>5</td><td>PyTorch symmetric memory</td><td>TP group and <code>VLLM_ALLREDUCE_USE_SYMM_MEM=1</code> (default 1, {{cite vllm/envs.py:1955-1957}})</td><td><code>should_use_symm_mem(input)</code></td></tr>
+    <tr><td>6</td><td>pynccl</td><td>every group with more than one rank</td><td>everything else</td></tr>
+  </tbody>
+</table>
+<p>The chain is the order of the <code>if</code> blocks in {{cite vllm/distributed/device_communicators/cuda_communicator.py:362-446}}. ROCm adds QuickReduce and AITER into the same chain. Which implementation wins for a given tensor depends on the installed libraries and the GPU topology. The code gives no single answer, so read the start-up log line of Step 5.</p>
+</x-deepdive>
+
+<x-deepdive title="Global ranks across nodes">
+<p>A worker's global rank is built in two steps (derived from the cited lines):</p>
+<ol>
+  <li>The executor of one DP rank numbers its workers across the nodes of that replica: <code>rank = local_world_size × node_rank_within_dp + local_rank</code> ({{cite vllm/v1/executor/multiproc_executor.py:179-192}}). <code>local_world_size</code> is <code>world_size // nnodes_within_dp</code> ({{cite vllm/config/parallel.py:838-840}}).</li>
+  <li>If the world spans DP ranks or nodes, <code>init_distributed_environment</code> adds <code>data_parallel_rank × world_size</code> (Step 2).</li>
+</ol>
+<p>So <code>global = dp_rank × (TP·PP·PCP) + node_rank_within_dp × local_world_size + local_rank</code>.</p>
+<p><strong>Example.</strong> <code>-tp 8 -pp 2 --nnodes 2</code> with DP = 1: <code>world_size</code> = 16, <code>local_world_size</code> = 8. Local rank 3 on node 1 has global rank 8 × 1 + 3 = 11. In the grid <code>(1, 1, 2, 1, 8)</code>, rank 11 is PP stage 1, TP rank 3. All TP groups stay inside one node; the PP groups [<em>i</em>, <em>i</em> + 8] cross the nodes (derived). The executor's output rank is <code>16 − 8 = 8</code>, the first TP rank of the last stage ({{cite vllm/v1/executor/multiproc_executor.py:549-563}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Environment variables and NCCL settings">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_HOST_IP</code></td><td>"" ({{cite vllm/envs.py:723}})</td><td>{{cite vllm/utils/network_utils.py:52-63}}</td><td>The IP of this node for vLLM's own sockets. If empty, vLLM asks the OS for the interface that routes to 8.8.8.8. Set it per node on multi-node hosts with several interfaces (comment at {{cite vllm/envs.py:719-722}}). It is not the API server address.</td></tr>
+    <tr><td><code>VLLM_PORT</code></td><td>unset ({{cite vllm/envs.py:517-545}})</td><td>{{cite vllm/utils/network_utils.py:207-240}}</td><td>First port for internal ports; later ports count up from it. Not the HTTP port.</td></tr>
+    <tr><td><code>VLLM_LOOPBACK_IP</code></td><td>""</td><td>{{cite vllm/utils/network_utils.py:104-107}}</td><td>Loopback address for single-node rendezvous.</td></tr>
+    <tr><td><code>VLLM_DISTRIBUTED_USE_SPLIT_GROUP</code></td><td>0 ({{cite vllm/envs.py:933-935}})</td><td>{{cite vllm/distributed/parallel_state.py:480-484}}</td><td>Build the groups with PyTorch <code>split_group</code> instead of <code>new_group</code>.</td></tr>
+    <tr><td><code>VLLM_ALLREDUCE_USE_SYMM_MEM</code>, <code>VLLM_ALLREDUCE_USE_FLASHINFER</code>, <code>VLLM_USE_NCCL_SYMM_MEM</code></td><td>1, 1, 0</td><td>see the all-reduce deep dive</td><td>Switch implementations in the all-reduce chain.</td></tr>
+    <tr><td><code>VLLM_SKIP_P2P_CHECK</code></td><td>read as true when unset ({{cite vllm/envs.py:1207}})</td><td>{{cite vllm/distributed/device_communicators/custom_all_reduce.py:90}}</td><td>Trust the driver's P2P report instead of a test; the type stub says <code>False</code> ({{cite vllm/envs.py:128}}), the reader defaults to "1".</td></tr>
+    <tr><td><code>VLLM_NCCL_SO_PATH</code></td><td>unset</td><td>{{cite vllm/utils/nccl.py:21-28}}</td><td>The NCCL library that pynccl loads.</td></tr>
+  </tbody>
+</table>
+<p><strong>NCCL variables that vLLM sets itself.</strong> Only in special cases:</p>
+<ul>
+  <li><code>NCCL_GRAPH_REGISTER=0</code> (with <code>setdefault</code>) only when CUDA graphs go to the sleep-mode cuMem pool ({{cite vllm/config/vllm.py:2309-2316}}, {{cite vllm/config/vllm.py:697-710}}).</li>
+  <li><code>NCCL_MAX_CTAS=8</code> only for DP + EPLB with an NCCL-based EPLB communicator and the DeepGEMM mega MoE backend, unless you set a number ({{cite vllm/distributed/eplb/eplb_utils.py:97-122}}).</li>
+  <li><code>NCCL_LAUNCH_MODE=GROUP</code> and pinned NCCL variables in batch-invariant mode on CUDA ({{cite vllm/model_executor/determinism/batch_invariant.py:1401-1406}}).</li>
+  <li><code>NCCL_RAS_ENABLE=0</code> (with <code>setdefault</code>) on ROCm ({{cite vllm/platforms/rocm.py:409-412}}).</li>
+  <li>The worker removes <code>NCCL_ASYNC_ERROR_HANDLING</code>, which Ray sets ({{cite vllm/v1/worker/gpu_worker.py:447-449}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="CUDA graph capture and the groups">
+<p>Collectives inside a captured CUDA graph need care, because the custom all-reduce must register the buffers that the graph uses. <code>graph_capture()</code> opens one capture stream and enters the capture context of the TP, PP and DP groups ({{cite vllm/distributed/parallel_state.py:1693-1726}}). For each group, the context enters the custom all-reduce capture, and the FlashInfer PCIe and AITER captures when they exist ({{cite vllm/distributed/parallel_state.py:673-723}}). With the sleep-mode cuMem graph pool, the communicators do not register graph buffers; they copy instead ({{cite vllm/distributed/device_communicators/cuda_communicator.py:123-125}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Custom all-reduce turns itself off.</strong> On more than two PCIe-only GPUs, or when the P2P test fails, the log says "Custom allreduce is disabled …". The chain then falls through to symmetric memory or pynccl ({{cite vllm/distributed/device_communicators/custom_all_reduce.py:270-291}}). The server still works, but small all-reduces are slower.</li>
+  <li><strong>An unsupported TP size.</strong> TP = 3, 5 or 7 is not in the custom all-reduce list; vLLM warns and uses another implementation ({{cite vllm/distributed/device_communicators/custom_all_reduce.py:214-222}}).</li>
+  <li><strong>The wrong network interface.</strong> On a multi-node host, <code>get_ip()</code> may pick an interface that the other nodes cannot reach. Set <code>VLLM_HOST_IP</code> on each node ({{cite vllm/utils/network_utils.py:52-63}}).</li>
+  <li><strong>A rank that does not join.</strong> <code>new_group</code> is collective: every rank must make every group in the same order. If one worker fails before, the others wait until the PyTorch timeout. <code>--distributed-timeout-seconds</code> sets it ({{cite vllm/config/parallel.py:364-368}}, {{cite vllm/v1/worker/gpu_worker.py:1698-1700}}).</li>
+  <li><strong>Calling <code>get_ep_group()</code> for a dense model.</strong> It asserts, because the EP group exists only for MoE models ({{cite vllm/distributed/parallel_state.py:1659-1665}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Every multi-GPU feature of vLLM runs on these groups. When you know the rank layout, you can predict which GPUs talk in each collective, and which of them must sit on one node.</p>
+
+<x-quiz>
+  <x-q level="easy">In which order does vLLM lay out the ranks, and which dimension is the fastest?
+    <x-a><p>ExternalDP × DP × PP × PCP × TP, with TP last. So the ranks of a TP group are neighbours ({{cite vllm/distributed/parallel_state.py:2148-2163}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Which group gets a device communicator?
+    <x-a><p>Every group with more than one rank, except the world group, which is built with <code>use_device_communicator=False</code> ({{cite vllm/distributed/parallel_state.py:549-560}}, {{cite vllm/distributed/parallel_state.py:1507-1516}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>GroupCoordinator.all_reduce</code> call <code>torch.ops.vllm.all_reduce</code> with a group name instead of calling the communicator directly?
+    <x-a><p>Dynamo cannot pass the Python group object into a custom op, so the op takes the group's unique name and looks it up. The custom op also stays one opaque node in the compiled graph. The docstring says this ({{cite vllm/distributed/parallel_state.py:725-746}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">An MoE model runs with <code>-tp 2 -pp 2 -dp 2</code> on 8 GPUs. Which ranks are in the DP group and in the EP group of rank 5?
+    <x-a><p>Rank 5 is dp 1, pp 0, tp 1 (5 = 4·1 + 2·0 + 1). DP group: <code>transpose(1, 4)</code> keeps tp 1, pp 0 and varies dp: [1, 5]. EP group: the DP × PCP × TP ranks of PP stage 0: [0, 1, 4, 5] ({{cite vllm/distributed/parallel_state.py:2295}}, {{cite vllm/distributed/parallel_state.py:2313-2324}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You serve a dense model with <code>-tp 2 -dp 2</code>. Do the two engine cores share one NCCL world? Why?
+    <x-a><p>No. A dense model's engine core calls <code>reconfigure_for_independent_dp_rank()</code>, which sets the DP size to 1 ({{cite vllm/v1/engine/core.py:1534-1543}}, {{cite vllm/config/parallel.py:1192-1201}}). So <code>init_distributed_environment</code> skips the DP widening ({{cite vllm/distributed/parallel_state.py:1857-1871}}), and each engine has its own world of two ranks.</p></x-a>
+  </x-q>
+</x-quiz>

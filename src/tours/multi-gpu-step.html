@@ -1,0 +1,206 @@
+---
+title: Tour: One step across GPUs
+nav_title: One step across GPUs
+level: Advanced
+prerequisites: tours/engine-step, concepts/data-parallel-serving, concepts/distributed-groups
+related: tours/engine-step, tours/forward-pass, tours/serve-startup, concepts/data-parallel-serving, concepts/distributed-groups, concepts/executors-and-workers, concepts/expert-parallel-moe, code/distributed-device-communicators-shm-broadcast, code/v1-executor-multiproc-executor, code/distributed-parallel-state
+summary: Follow two requests through vllm serve -tp 2 -dp 2 in 13 stops: the API servers pick an engine each, two independent engine cores schedule, each broadcasts the step to its two workers through shared memory, the workers meet in 65 all-reduces on their TP group, only rank 0 replies, and the coordinator publishes the new load.
+---
+<x-sentence>We follow two requests through four GPUs. Each lands on its own engine core, whose two workers run one step together.</x-sentence>
+
+<h2>The idea</h2>
+<p>The tour {{link tours/engine-step}} stays inside one engine core with one GPU. This tour adds the two other dimensions of a real deployment. They are several GPUs per engine core (tensor parallelism) and several engine cores per server (data parallelism). It shows which process does what, which channel each message takes, and where the GPUs talk to each other. The model internals are in {{link tours/forward-pass}}; here we only mark where the collectives run.</p>
+<p>Two requests, A and B, arrive at the same time. Request A reaches API server 0 and request B reaches API server 1. Each server picks an engine core. Each engine core plans a step, writes it once into shared memory, and its two workers run the step on two GPUs. At the end, only one worker per engine answers, and the outputs flow back to the API server that sent each request.</p>
+<p><strong>An everyday comparison.</strong> Think of two kitchens in one restaurant, each with two cooks who prepare every dish together, half each. Two hosts at the door send guests to the kitchens. A board in the hall shows how busy each kitchen is. The comparison stops here. The two cooks of a kitchen must finish each half of each layer at the same moment (the all-reduce). The two kitchens never talk for a dense model.</p>
+
+<h3>The example</h3>
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-8B-Instruct -tp 2 -dp 2      # one node, 4 GPUs, dense model</code></pre>
+<ul>
+  <li>A dense model, so each DP rank is an independent engine core ({{link concepts/data-parallel-serving}}).</li>
+  <li>Default flags: internal load balancing, two API servers, async scheduling with the batch queue, Model Runner V2.</li>
+  <li>Both engines are idle when A and B arrive. A has a 300-token prompt, B a 200-token prompt; both are new.</li>
+</ul>
+<x-simplified><p>The prompt lengths are illustrative. The API servers share one listen socket, so the operating system decides which one receives a connection. We assume A reaches API server 0 and B reaches API server 1.</p></x-simplified>
+
+<h2>The picture</h2>
+<x-diagram name="b8b_multi_gpu_step" alt="Panel 1: ApiServer_0 receives request A and picks engine 0 with the DPLB score; ApiServer_1 receives request B and picks engine 1; the DP coordinator collects counts and publishes them; it has no waves for a dense model. A goes over ZMQ to DP rank 0, B to DP rank 1. Each DP rank has an EngineCore_DP process that schedules and calls execute_model and sample_tokens, a shared-memory MessageQueue with one write and two readers, two workers Worker_TP0 and Worker_TP1 on two GPUs that run the forward and sample, of which only TP0 replies, and a TP group [0, 1] bar with 65 all-reduces and one all-gather per step. Stop badges: 2 and 11 on the API servers, 3 and 4 on the engine cores, 5 on the shared-memory queue, 6 on the workers, 7, 8 and 9 on the TP group bar, 10 on worker TP0, 12 on the counts arrow, 13 on the coordinator. Panel 2: the collectives of one step: embedding all-reduce once, o_proj all-reduce 32 times, down_proj all-reduce 32 times, logits all-gather once, all on the TP group; the DP and PP groups have one rank each." caption="Figure: the processes of <code>-tp 2 -dp 2</code> with the tour stops (panel 1), and the collectives of one step (panel 2)." />
+
+<table>
+  <thead><tr><th>Stop</th><th>What happens</th><th>Process: file and function</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>The ten processes and their GPUs</td><td>CLI: <code>entrypoints/cli/serve.py</code>; <code>v1/engine/utils.py</code></td></tr>
+    <tr><td>2</td><td>Each API server picks an engine</td><td>API server: <code>v1/engine/core_client.py</code>: <code>get_core_engine_for_request</code></td></tr>
+    <tr><td>3</td><td>The request crosses ZMQ to its engine core</td><td>API server → engine core: <code>_send_input_message</code>, <code>process_input_sockets</code></td></tr>
+    <tr><td>4</td><td>Each engine core schedules on its own</td><td>engine core: <code>v1/engine/core.py</code>: <code>EngineCoreProc</code></td></tr>
+    <tr><td>5</td><td>One shared-memory write reaches both workers</td><td>engine core: <code>v1/executor/multiproc_executor.py</code>: <code>collective_rpc</code></td></tr>
+    <tr><td>6</td><td>Each worker dequeues and runs <code>execute_model</code></td><td>worker: <code>worker_busy_loop</code>; <code>v1/worker/gpu_worker.py</code></td></tr>
+    <tr><td>7</td><td>The embedding all-reduce</td><td>worker: <code>vocab_parallel_embedding.py</code></td></tr>
+    <tr><td>8</td><td>Two all-reduces per decoder layer</td><td>worker: <code>linear.py</code>; <code>distributed/parallel_state.py</code></td></tr>
+    <tr><td>9</td><td><code>sample_tokens</code>: logits all-gather, both ranks sample</td><td>worker: <code>logits_processor.py</code>; Model Runner V2</td></tr>
+    <tr><td>10</td><td>Only TP rank 0 replies</td><td>worker → engine core: <code>_execute_worker_rpc</code>, <code>WorkerAsyncOutputCopy</code></td></tr>
+    <tr><td>11</td><td>Outputs go back to the API server that sent the request</td><td>engine core → API server: <code>process_output_sockets</code></td></tr>
+    <tr><td>12</td><td>Each engine core reports its new counts</td><td>engine core → coordinator: <code>_maybe_publish_request_counts</code></td></tr>
+    <tr><td>13</td><td>The coordinator publishes the load to both API servers</td><td>coordinator → API servers: <code>coordinator.py</code>; stats task</td></tr>
+  </tbody>
+</table>
+<p>All paths are under <code>vllm/</code>.</p>
+
+<x-stop n="1" title="Ten processes, four GPUs, two separate worlds">
+<p>We start after start-up; the tour {{link tours/serve-startup}} covers it. Two things decide the process layout. First, <code>--api-server-count</code> defaults to the DP size in internal mode, so there are two API servers and the CLI process stays as their supervisor ({{cite vllm/entrypoints/cli/serve.py:124-125}}, {{cite vllm/entrypoints/cli/serve.py:151-152}}). Second, each engine core of a dense model becomes an independent <code>EngineCoreProc</code> with DP size 1:</p>
+<x-code file="vllm/v1/engine/core.py" lines="1534-1543" highlight="1539-1543" />
+<p>Engine 0 gets GPUs 0 and 1, engine 1 gets GPUs 2 and 3 ("[2, 3] for local_dp_rank=1", {{cite vllm/v1/engine/utils.py:441-445}}). Each engine core starts a <code>MultiprocExecutor</code> with two worker processes. The DP size is 1 inside each engine. So each pair of workers builds its own world of two ranks. It has TP group [0, 1], and PP and DP groups of one rank ({{link concepts/distributed-groups}}). The workers rename themselves <code>Worker_TP0</code> and <code>Worker_TP1</code>; the name has a DP part only when the worker's DP group is larger than 1 ({{cite vllm/v1/executor/multiproc_executor.py:1101-1109}}).</p>
+<p>So there are 10 processes: CLI supervisor, 2 API servers, 1 DP coordinator, 2 engine cores and 4 workers (derived; {{link concepts/architecture-overview}} gives the rules).</p>
+</x-stop>
+
+<x-stop n="2" title="Each API server picks an engine with the DPLB score">
+<p>We are in API server 0, in <code>AsyncLLM.add_request</code>, which calls the engine core client. With DP &gt; 1 and internal load balancing, that is a <code>DPLBAsyncMPClient</code>. Before it sends, it stamps the request with the current wave and its own <code>client_index</code>:</p>
+<x-code file="vllm/v1/engine/core_client.py" lines="1599-1609" highlight="1602-1603,1606" />
+<p>The engine choice is the score of {{link concepts/data-parallel-serving}}: <code>max(client_count × in-flight, waiting + running)</code> plus a penalty for waiting requests on a full KV cache ({{cite vllm/v1/engine/core_client.py:1777-1786}}). Both engines are idle, so every score is 0. Ties go to the first engine of the scan, because only a strictly smaller score replaces the minimum (line 1787). The scan starts at a different engine per API server:</p>
+<x-code file="vllm/v1/engine/core_client.py" lines="1739-1741" />
+<ul>
+  <li>API server 0: <code>(2 × 0) // 2 = 0</code>, so request A goes to engine 0.</li>
+  <li>API server 1: <code>(2 × 1) // 2 = 1</code>, so request B goes to engine 1.</li>
+</ul>
+<p>Each server then adds <code>client_count</code> = 2 to the chosen engine's waiting count, adds 1 to its own in-flight count, and rotates its start index ({{cite vllm/v1/engine/core_client.py:1792-1803}}). (Derived from the cited lines.)</p>
+</x-stop>
+
+<x-stop n="3" title="The request crosses ZMQ to its engine core">
+<p>The engine identity is the DP rank as two little-endian bytes ({{cite vllm/v1/engine/core_client.py:748-751}}), so A's frames start with <code>b"\x00\x00"</code> and B's with <code>b"\x01\x00"</code>. The ROUTER socket routes on that frame:</p>
+<x-code file="vllm/v1/engine/core_client.py" lines="1287-1294" highlight="1294" />
+<p>Each engine core connects one DEALER socket per API server. Its input thread receives the frames, decodes the <code>EngineCoreRequest</code>, builds the <code>Request</code>, and queues it for the busy loop ({{cite vllm/v1/engine/core.py:1977-1993}}). The request keeps its <code>client_index</code>, so the outputs can find their way back in stop 11. The page {{link learn/processes-and-ipc}} explains the frames.</p>
+</x-stop>
+
+<x-stop n="4" title="Each engine core schedules on its own">
+<p>Engine core 0 now has request A, engine core 1 has request B. Each runs the normal busy loop of {{link concepts/engine-core-loop}}: <code>step_with_batch_queue</code> schedules the 300 (or 200) prompt tokens, as in {{link tours/engine-step}}. Nothing ties the two engines together:</p>
+<ul>
+  <li>They are plain <code>EngineCoreProc</code> objects, not <code>DPEngineCoreProc</code>, so there are no waves, no dummy batches and no DP all-reduce (stop 1).</li>
+  <li>When an engine has no work, it blocks on its input queue: <code>has_work()</code> is false when nothing is running, waiting or in the batch queue ({{cite vllm/v1/engine/core.py:1596-1602}}).</li>
+  <li>Their steps are not aligned in time. Engine 1 may run three steps while engine 0 runs two.</li>
+</ul>
+</x-stop>
+
+<x-stop n="5" title="One shared-memory write reaches both workers">
+<p>The engine core calls <code>execute_model</code> on its {{term multiproc-executor}}. That is one {{term collective-rpc}} with a reply only from the output rank:</p>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="342-353" highlight="345-347,349" />
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="424-432" highlight="428,431-432" />
+<p>Line 428 is the only write. The {{term message-queue}} pickles <code>("execute_model", (scheduler_output,), {}, 0)</code> once into a 16 MiB chunk of a ring in <code>/dev/shm</code>. Both workers read the same bytes ({{link code/distributed-device-communicators-shm-broadcast}}). Lines 431-432 already decide that the executor will read only the reply queue of rank 0. The step deadline is <code>VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS</code>, 300 s by default ({{cite vllm/envs.py:1861-1863}}).</p>
+</x-stop>
+
+<x-stop n="6" title="Each worker dequeues and runs execute_model">
+<p>We are now in one of the worker processes, in its main thread. It was blocked in the queue and wakes up with the message:</p>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="1041-1060" highlight="1046,1050,1057-1058" />
+<p><code>getattr(self.worker, "execute_model")</code> leads to <code>Worker.execute_model</code>. With PP = 1 this worker is both the first and the last stage, so it receives no intermediate tensors and calls the model runner directly ({{cite vllm/v1/worker/gpu_worker.py:1336-1353}}). From here, both workers run the same Python code on the same batch, each with half of every weight matrix ({{link concepts/tp-layers}}). Model Runner V2 also checks for DP padding, but with a DP size of 1 there is nothing to agree on ({{cite vllm/v1/worker/gpu/dp_utils.py:278-279}}).</p>
+</x-stop>
+
+<x-stop n="7" title="The first collective: the embedding all-reduce">
+<p>Each rank holds half of the vocabulary rows of the embedding table. A rank looks up only the token ids in its half and writes zeros for the others; then the two partial results are summed:</p>
+<x-code file="vllm/model_executor/layers/vocab_parallel_embedding.py" lines="556-564" highlight="558-563" />
+<p>For A's 300 tokens, the tensor is <code>[300, 4096]</code> BF16, 2.34 MiB, and it is summed over the TP group [GPU 0, GPU 1]. Engine 1 does the same for B on GPUs 2 and 3, at its own time. The tour {{link tours/forward-pass}} gives the shapes of every layer (its deep dive "What changes with TP = 2").</p>
+</x-stop>
+
+<x-stop n="8" title="Two all-reduces per decoder layer, on the TP group">
+<p>Inside each of the 32 decoder layers, <code>o_proj</code> and <code>down_proj</code> are row-parallel. Each rank computes a partial sum, and the layer adds them:</p>
+<x-code file="vllm/model_executor/layers/linear.py" lines="1803-1806" />
+<p><code>tensor_model_parallel_all_reduce</code> goes to the TP group ({{cite vllm/distributed/communication_op.py:12-14}}). On CUDA, the group calls the registered op with only its name, so the compiled graph keeps one opaque node:</p>
+<x-code file="vllm/distributed/parallel_state.py" lines="739-746" highlight="740-741,743-744" />
+<p>The op ends in <code>CudaCommunicator.all_reduce</code>, which tries FlashInfer, the custom all-reduce, symmetric memory and pynccl in a fixed order ({{cite vllm/distributed/device_communicators/cuda_communicator.py:362-446}}). Which one takes our 2.34 MiB tensor depends on the GPU (derived from the size rules on {{link concepts/distributed-groups}}):</p>
+<ul>
+  <li>Compute capability 8.x (for example A100), TP = 2 on one node with P2P access: FlashInfer all-reduce has no size entry and stays off. The custom all-reduce takes the tensor, because 2.34 MiB is below its 8 MiB limit.</li>
+  <li>Compute capability 9.0 or 10.x with FlashInfer installed: at O2 the compile pass <code>fuse_allreduce_rms</code> can fuse an all-reduce with the RMSNorm after it. A fused all-reduce does not reach this method ({{cite vllm/config/vllm.py:178-202}}, {{link tours/forward-pass}}). An all-reduce that is not fused goes to FlashInfer first; its limit at TP = 2 is 64 MiB ({{cite vllm/compilation/passes/fusion/allreduce_rms_fusion.py:104-115}}).</li>
+</ul>
+<p>Either way, the step has 1 + 2 × 32 = 65 all-reduces in total, all on the TP group. The DP and PP groups have one rank and run nothing.</p>
+</x-stop>
+
+<x-stop n="9" title="sample_tokens: one all-gather, then both ranks sample">
+<p>The engine core next calls <code>sample_tokens</code>, the second broadcast of the step (same path as stop 5). Each rank computes logits for its half of the vocabulary; the LM head then gathers them:</p>
+<x-code file="vllm/model_executor/layers/logits_processor.py" lines="122-134" highlight="124-131" />
+<p>Every built-in platform uses the all-gather, so both ranks hold the full <code>[num_rows, 128256]</code> logits ({{cite vllm/platforms/interface.py:1275-1278}}). Both ranks run the sampler. They draw the same tokens. After warm-up, every worker resets its random seed to a value that depends only on the model seed and the DP index ({{cite vllm/v1/worker/gpu_worker.py:1083-1087}}, {{cite vllm/utils/torch_utils.py:533-544}}). A different DP index gives a different seed, so engines 0 and 1 do not sample unseeded requests alike (the comment at line 536). Each worker then draws the per-request seed of an unseeded request from this same NumPy state, in the same order ({{cite vllm/v1/worker/gpu/sample/states.py:54-58}}). By default, the code has no other synchronization of the sampled tokens between TP ranks (derived). The opt-in <code>--enable-batch-sharded-sampling</code> changes this: each rank samples a slice of the batch, and the ranks all-gather the results ({{cite vllm/config/parallel.py:192-198}}).</p>
+</x-stop>
+
+<x-stop n="10" title="Only TP rank 0 replies">
+<p>The output rank is <code>world_size − TP × PCP</code>, the first TP rank of the last PP stage ({{cite vllm/v1/executor/multiproc_executor.py:549-563}}); here that is <code>2 − 2 = 0</code>. In each worker, the reply is conditional:</p>
+<x-code file="vllm/v1/executor/multiproc_executor.py" lines="1070-1071" />
+<p>Worker TP0 hands its <code>AsyncOutput</code> to its <code>WorkerAsyncOutputCopy</code> thread. That thread waits for the copy to the CPU and writes <code>(SUCCESS, ModelRunnerOutput)</code> into its own <code>MessageQueue(1, 1)</code> ({{cite vllm/v1/executor/multiproc_executor.py:1014-1039}}, {{cite vllm/v1/executor/multiproc_executor.py:1000-1012}}). Worker TP1 writes nothing; it goes back to its <code>dequeue</code>. The engine core reads the reply when it pops the step from its batch queue, exactly as in {{link tours/engine-step#stop-10 | stop 10 of the engine-step tour}}.</p>
+</x-stop>
+
+<x-stop n="11" title="Outputs go back to the API server that sent the request">
+<p>After <code>update_from_output</code>, the engine core groups its outputs by <code>client_index</code>, and its output thread sends each group on the PUSH socket of that API server:</p>
+<x-code file="vllm/v1/engine/core.py" lines="2087-2091" highlight="2088-2090" />
+<p>Request A was sent by API server 0, so A's first token goes to API server 0's PULL socket; B's goes to API server 1. Each API server detokenizes only its own requests, and its <code>DPLBAsyncMPClient</code> lowers its in-flight count when a request finishes ({{cite vllm/v1/engine/core_client.py:1810-1817}}).</p>
+</x-stop>
+
+<x-stop n="12" title="Each engine core reports its new counts">
+<p>Each engine core compares its waiting and running counts with the last ones it sent. When they changed (here: one new running request), it sends them, with its KV cache usage, to client index −1, the coordinator:</p>
+<x-code file="vllm/v1/engine/core.py" lines="1622-1633" highlight="1627-1633" />
+<p>Separately, the scheduler stats of each step go to only one front end, inside the normal outputs ({{cite vllm/v1/core/sched/scheduler.py:2516-2521}}). Prometheus labels them with <code>engine="0"</code> or <code>engine="1"</code> ({{cite vllm/v1/metrics/loggers.py:499-504}}).</p>
+</x-stop>
+
+<x-stop n="13" title="The coordinator publishes the load to both API servers">
+<p>The coordinator stores the counts per engine and publishes all of them, at most every 100 ms while they change:</p>
+<x-code file="vllm/v1/engine/coordinator.py" lines="277-290" highlight="287-288" />
+<p>Each API server's stats task replaces its <code>lb_engines</code> with the new counts ({{cite vllm/v1/engine/core_client.py:1578-1590}}). Real numbers now replace the local guesses of stop 2 (+2 waiting on the chosen engine). Engine 0 has 1 running request, and engine 1 has 1. The next request on either API server sees both, plus its own in-flight counts. Meanwhile, each engine core is already in its next step.</p>
+</x-stop>
+
+<h2>Deep dive</h2>
+<x-deepdive title="The same tour with an MoE model">
+<pre><code class="language-bash">vllm serve &lt;an MoE model&gt; -tp 2 -dp 2 --enable-expert-parallel      # one node, 4 GPUs</code></pre>
+<ol>
+  <li><strong>Stop 1.</strong> Each engine core is a <code>DPEngineCoreProc</code> ({{cite vllm/v1/engine/core.py:1534-1537}}). The four workers form one world with global rank = 2 × dp + tp. TP groups: [0, 1], [2, 3]. DP groups: [0, 2], [1, 3]. EP group: [0, 1, 2, 3] ({{link concepts/distributed-groups}}). The names become <code>Worker_DP0_TP0</code> … <code>Worker_DP1_TP1</code>, plus <code>_EP&lt;rank&gt;</code> with EP ({{cite vllm/v1/executor/multiproc_executor.py:1101-1115}}).</li>
+  <li><strong>Stop 4.</strong> A arrives at engine 0 while both are idle. Engine 0 starts a wave and tells the coordinator, which sends <code>START_DP_WAVE</code> to engine 1 ({{cite vllm/v1/engine/core.py:2360-2373}}). From now on both step together. If B had not arrived, engine 1 would run a dummy batch each step ({{cite vllm/v1/engine/core.py:2486-2495}}).</li>
+  <li><strong>Stop 6.</strong> Before its forward, each worker joins a CPU all-reduce over its worker DP group. The ranks agree on a padded token count and a CUDA graph mode, so A's 300 tokens and B's 200 get one shared shape ({{cite vllm/v1/worker/gpu/dp_utils.py:65-74}}).</li>
+  <li><strong>Stop 8.</strong> The attention part is unchanged: two engines, TP = 2 each. In the MoE layers, the EP size is DP × TP = 4 ({{cite vllm/model_executor/layers/fused_moe/config.py:1105-1114}}, {{cite vllm/model_executor/layers/fused_moe/config.py:1227-1231}}). With TP &gt; 1, DP &gt; 1 and EP, the MoE input is sequence parallel ({{cite vllm/config/parallel.py:767-785}}). This applies only to a model that passes the setting to its MoE layer, for example Qwen3-MoE ({{cite vllm/model_executor/models/qwen3_moe.py:152}}). Then the default <code>allgather_reducescatter</code> dispatch and combine run on the EP group; otherwise they run on the DP group ({{cite vllm/distributed/device_communicators/all2all.py:76-86}}). So every MoE layer now adds collectives over all four GPUs, across both engines.</li>
+  <li><strong>After the step.</strong> At the first step of the wave and every 16th step, the engine cores agree on "any unfinished requests?" over their own gloo group ({{cite vllm/v1/engine/core.py:2542-2559}}). When both requests finish, the wave ends and both engines pause.</li>
+</ol>
+<p>The page {{link concepts/expert-parallel-moe}} explains the MoE layer and the all2all backends.</p>
+</x-deepdive>
+
+<x-deepdive title="The same tour with PP = 2">
+<pre><code class="language-bash">vllm serve meta-llama/Llama-3.1-8B-Instruct -tp 2 -pp 2      # one engine core, 4 GPUs</code></pre>
+<ol>
+  <li><strong>Groups.</strong> One engine, world size 4. TP groups [0, 1] and [2, 3]; PP groups [0, 2] and [1, 3]. Stage 0 holds layers 0-15 and the embedding; stage 1 holds layers 16-31, the final norm and the LM head ({{link learn/tp-pp-in-practice}}). Workers are named <code>Worker_PP0_TP0</code> etc. ({{cite vllm/v1/executor/multiproc_executor.py:1104-1109}}).</li>
+  <li><strong>Batch queue.</strong> With async scheduling and Model Runner V2, <code>max_concurrent_batches</code> is <code>pp_size + 1</code> = 3, so up to three steps are in flight ({{cite vllm/config/vllm.py:586-597}}).</li>
+  <li><strong>Stop 5.</strong> All four workers read every broadcast. The output rank is <code>4 − 2 = 2</code>, the first TP rank of the last stage ({{cite vllm/v1/executor/multiproc_executor.py:549-563}}).</li>
+  <li><strong>Stop 6, stage 0.</strong> Ranks 0 and 1 run layers 0-15. They send {{term intermediate-tensors}} (<code>hidden_states</code> and <code>residual</code>, <code>[T, 4096]</code> each) to the next stage with <code>isend_tensor_dict</code>, without waiting. With <code>all_gather_group</code> = the TP group, each TP rank sends only half of each tensor ({{cite vllm/v1/worker/gpu_worker.py:1372-1378}}, {{cite vllm/distributed/parallel_state.py:1219-1222}}).</li>
+  <li><strong>Stop 6, stage 1.</strong> Ranks 2 and 3 post <code>irecv_tensor_dict</code>; each receives its half and all-gathers the full tensor in its TP group ({{cite vllm/v1/worker/gpu_worker.py:1336-1347}}). They run layers 16-31.</li>
+  <li><strong>Stop 9.</strong> Only the last stage samples. It broadcasts the sampled tokens to the earlier stage on a separate NCCL group, on a side stream; stage 0 consumes them <code>pp_size</code> steps later ({{cite vllm/v1/worker/gpu/pp_utils.py:56-62}}, {{cite vllm/v1/worker/gpu/model_runner.py:2133-2153}}, {{cite vllm/v1/worker/gpu/model_runner.py:2167-2174}}).</li>
+  <li><strong>Collectives per step (derived).</strong> Stage 0 runs 1 + 2 × 16 = 33 TP all-reduces. Stage 1 runs two TP all-gathers to rebuild the received tensors, 2 × 16 = 32 TP all-reduces and one logits all-gather. Between the stages there is one send/receive of two tensors. Then come two small broadcasts (the sampled tokens and their counts); they are skipped when no request needs them ({{cite vllm/v1/worker/gpu/pp_utils.py:254-278}}).</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Where each wait happens">
+<table>
+  <thead><tr><th>Who waits</th><th>For what</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>API server</td><td>nothing per step; outputs arrive on its PULL socket</td><td>stop 11</td></tr>
+    <tr><td>engine core main thread</td><td>the reply of rank 0, when it pops a step from the full batch queue</td><td>{{cite vllm/v1/executor/multiproc_executor.py:434-450}}</td></tr>
+    <tr><td>worker main thread</td><td>the next broadcast, <code>dequeue(indefinite=True)</code></td><td>{{cite vllm/v1/executor/multiproc_executor.py:1046}}</td></tr>
+    <tr><td>worker GPU stream</td><td>the other TP rank, inside each NCCL or custom all-reduce</td><td>stops 7-9</td></tr>
+    <tr><td>worker copy thread (rank 0)</td><td>the GPU → CPU copy of the sampled tokens</td><td>{{cite vllm/v1/executor/multiproc_executor.py:1000-1005}}</td></tr>
+  </tbody>
+</table>
+<p>The slowest TP rank sets the pace of its engine, because every all-reduce waits for both ranks. The two engines of a dense model never wait for each other.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A worker dies.</strong> The executor's monitor thread sees the process exit and fails the engine core; the API servers then report the engine as dead ({{cite vllm/v1/executor/multiproc_executor.py:314-326}}, {{link concepts/engine-core-loop}}).</li>
+  <li><strong>A collective hangs.</strong> Assume one TP rank stops, for example after an exception that only rank 1 sees. Rank 0 waits in the all-reduce, and the engine core waits for rank 0's reply. After <code>VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS</code> (300 s) the call ends with <code>TimeoutError</code> ({{cite vllm/v1/executor/multiproc_executor.py:437-443}}). A failure on rank 1 is only logged, because rank 1 does not reply ({{cite vllm/v1/executor/multiproc_executor.py:1072-1080}}).</li>
+  <li><strong>Small <code>/dev/shm</code>.</strong> Each engine core's queues need several hundred MiB of shared memory; too little raises at start-up ({{link code/distributed-device-communicators-shm-broadcast}}).</li>
+  <li><strong>Unbalanced engines.</strong> The score uses counts that can be 100 ms old; a burst of long prompts can still pile up on one engine. Watch <code>vllm:num_requests_waiting</code> per <code>engine</code> label.</li>
+</ul>
+<p><strong>Why it matters.</strong> Multi-GPU serving multiplies the processes and the channels. If you know which process waits for which message, you can map a hang, a timeout or a load problem to one stop.</p>
+
+<x-quiz>
+  <x-q level="easy">How many processes does <code>vllm serve -tp 2 -dp 2</code> start for a dense model, and what are they?
+    <x-a><p>Ten: the CLI supervisor, two API servers, the DP coordinator, two engine cores and four workers (stop 1; {{cite vllm/entrypoints/cli/serve.py:124-125}}, {{cite vllm/v1/engine/core.py:1534-1543}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">Which worker answers <code>execute_model</code> in each engine core, and why only one?
+    <x-a><p>TP rank 0: the output rank is <code>world_size − TP × PCP</code> = 0 ({{cite vllm/v1/executor/multiproc_executor.py:549-563}}). Both ranks compute the same output, so one reply is enough; the executor reads only that reply queue ({{cite vllm/v1/executor/multiproc_executor.py:430-432}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Both engines are idle. A request arrives at API server 1 of 2. Which engine gets it, and why?
+    <x-a><p>Engine 1. All scores are 0, and the scan of API server 1 starts at <code>(2 × 1) // 2 = 1</code>. Only a strictly smaller score replaces the first one ({{cite vllm/v1/engine/core_client.py:1739-1741}}, {{cite vllm/v1/engine/core_client.py:1787-1789}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">How many collectives run on GPU 0 in one step of this tour, and on which group? How does that change with an MoE model and <code>--enable-expert-parallel</code>?
+    <x-a><p>Dense: 65 all-reduces and 1 all-gather, all on the TP group [0, 1] (stops 7-9). MoE with EP: the attention part keeps its TP all-reduces. Every MoE layer adds dispatch and combine collectives. They run on the EP group of all four ranks when the model uses sequence-parallel MoE, else on the DP group. Every step adds a CPU all-reduce on the worker DP group for padding ({{cite vllm/v1/worker/gpu/dp_utils.py:65-74}}, {{cite vllm/distributed/device_communicators/all2all.py:76-86}}).</p></x-a>
+  </x-q>
+</x-quiz>

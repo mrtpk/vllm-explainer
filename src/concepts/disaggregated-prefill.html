@@ -1,0 +1,148 @@
+---
+title: Disaggregated prefill: prefill and decode on different instances
+nav_title: Disaggregated prefill (P/D)
+level: Advanced
+prerequisites: concepts/kv-connectors, concepts/scheduler, concepts/openai-server
+related: concepts/kv-connectors, code/distributed-kv-transfer-kv-connector-factory, concepts/data-parallel-serving, concepts/prefix-caching, concepts/scheduler, concepts/metrics-and-observability, concepts/deployment-recipes
+summary: In P/D disaggregation one vLLM instance computes the prompt, a second one decodes, and a KV connector moves the KV blocks between them. vLLM ships the connectors and the kv_transfer_params plumbing; a router outside vLLM sends each request to both instances.
+---
+<x-sentence>A prefill instance computes the prompt's KV cache, a decode instance pulls it and generates; a router outside vLLM joins the two calls.</x-sentence>
+
+<h2>The idea</h2>
+<p>Prefill processes the whole prompt in one go and is compute-bound; decode makes one token at a time and is memory-bound ({{deepinfer learn/prefill-decode | Prefill and decode}}). In one vLLM instance, both share each step. A long prefill chunk in a step makes that step slow, so every running stream waits longer for its next token. The docs give two reasons to split them: tune time-to-first-token (TTFT) and inter-token latency (ITL) separately, and control the tail ITL. They also say that it "DOES NOT improve throughput" ({{cite docs/features/disagg_prefill.md:8-16}}).</p>
+<p>In {{term pd-disaggregation}}, a {{term kv-producer}} instance (P) runs the prefill, and a {{term kv-consumer}} instance (D) runs the decode. A {{term kv-connector}} moves the KV blocks from P to D. The page {{link concepts/kv-connectors}} explains connectors in general; this page follows one request with <code>NixlConnector</code>, the main connector for P/D.</p>
+<p>vLLM does not route requests between instances. Each instance is a normal <code>vllm serve</code>. A router in front sends the request to P first, takes the connector parameters from P's answer, and sends the request again to D. The vLLM repository has only a "toy" router for tests.</p>
+<p><strong>An everyday comparison.</strong> Think of a restaurant with a prep kitchen and a line kitchen. The prep kitchen chops and marinates the whole order and puts it on a labelled shelf. The waiter takes the shelf label to the line kitchen, which picks up the tray and cooks each plate to order. The comparison stops here. The line kitchen pulls the tray itself over a fast link (RDMA). The prep kitchen throws the tray away if nobody picks it up within its lease.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b8b_pd_flow" alt="Panel 1: three boxes. The router, which is not part of vLLM: 1 receives POST /v1/chat/completions, 2 sends a copy to P with max_tokens 1, stream false and kv_transfer_params with do_remote_decode true, 4 sends the original body to D with P's returned kv_transfer_params, 7 streams D's answer to the client. The prefill instance P: 3 computes the 2,000-token prompt, samples 1 token and finishes; request_finished keeps the blocks with a lease of 30 seconds and returns do_remote_prefill true, remote_block_ids, remote_host, remote_port, remote_engine_id. The decode instance D: 5 the connector reports 2000 tokens to load asynchronously, the request goes to WAITING_FOR_REMOTE_KVS, the worker pulls the blocks with a NIXL READ and notifies P, which frees them; 6 finished_recving moves the request to WAITING, the last prompt token is recomputed, and decode continues. Arrows: router to P, P's response back to the router, router to D, KV bytes from P to D, a notification from D to P. Panel 2: the states of the request on D: WAITING, WAITING_FOR_REMOTE_KVS, WAITING, RUNNING. A failed load with the default policy fail gives FINISHED_ERROR; with recompute, num_computed_tokens is cut at the first bad block and D prefills the rest. P keeps the blocks until D's read notification, or until the lease runs out without a heartbeat." caption="Figure: one chat request across a router, a prefill instance and a decode instance with NixlConnector (panel 1), and the request states on the decode side (panel 2)." />
+<p>Follow the numbers 1 to 7. The two HTTP calls are ordinary OpenAI requests; only the <code>kv_transfer_params</code> field links them. The KV bytes never pass through the router: D's worker reads them from P's GPU memory.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: start a producer and a consumer</h3>
+<p>Each instance gets a {{term kv-transfer-config}} with a role. The docs show a minimal pair on one host ({{cite docs/features/nixl_connector_usage.md:68-96}}):</p>
+<pre><code class="language-bash">CUDA_VISIBLE_DEVICES=0 VLLM_NIXL_SIDE_CHANNEL_PORT=5600 vllm serve Qwen/Qwen3-0.6B --port 8100 \
+  --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_producer","kv_load_failure_policy":"fail"}'
+CUDA_VISIBLE_DEVICES=1 VLLM_NIXL_SIDE_CHANNEL_PORT=5601 vllm serve Qwen/Qwen3-0.6B --port 8200 \
+  --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_consumer","kv_load_failure_policy":"fail"}'
+python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py --port 8192 \
+  --prefiller-hosts localhost --prefiller-ports 8100 --decoder-hosts localhost --decoder-ports 8200</code></pre>
+<p>The roles are <code>kv_producer</code>, <code>kv_consumer</code> and <code>kv_both</code> ({{cite vllm/config/kv_transfer.py:11-12}}). For <code>NixlConnector</code>, <code>kv_both</code> is deprecated and logs a warning ({{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:97-103}}). Note what the role does not do: the NIXL scheduler decides "P or D" per request from <code>kv_transfer_params</code>, not from the role ({{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:212-213}}). The role still matters in vLLM itself. For example, a consumer with several batches in flight frees blocks later ({{cite vllm/v1/core/sched/scheduler.py:187-193}}). And a producer counts as a connector that "hands off KV that must be reliably delivered" ({{cite vllm/distributed/kv_transfer/kv_connector/v1/base.py:197-207}}).</p>
+
+<h3>Step 2: the router calls P with do_remote_decode</h3>
+<p>The toy router copies the client's body and changes it for P:</p>
+<x-code file="tests/v1/kv_connector/nixl_integration/toy_proxy_server.py" lines="153-174" highlight="158-165,166-169" />
+<p><code>max_tokens</code> becomes 1, streaming is off, and <code>kv_transfer_params</code> says "the decode runs elsewhere". The request field <code>kv_transfer_params</code> exists on the chat and completion requests ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:513-516}}). The server puts it into <code>SamplingParams.extra_args</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:771-773}}), and the engine core copies it into <code>Request.kv_transfer_params</code> ({{cite vllm/v1/request.py:119-122}}).</p>
+
+<h3>Step 3: P finishes and keeps the blocks</h3>
+<p>P prefills the prompt and samples one token; with <code>max_tokens</code> 1 the request then finishes. When the scheduler frees it, the connector's <code>request_finished</code> decides what happens to the blocks:</p>
+<x-code file="vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py" lines="246-293" highlight="248,251-253,264-266,278-292" />
+<ol>
+  <li><strong>Line 248.</strong> P has blocks, so it delays freeing them.</li>
+  <li><strong>Lines 251-266.</strong> The blocks get an expiry time: the lease, <code>kv_lease_duration</code> in <code>kv_connector_extra_config</code>, 30 s by default ({{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:82-88}}).</li>
+  <li><strong>Lines 278-292.</strong> The parameters for D: <code>do_remote_prefill</code> true, P's block ids, engine id, request id, and the host and port of P's NIXL side channel.</li>
+</ol>
+<p>The scheduler puts these parameters into the request's last output ({{cite vllm/v1/core/sched/scheduler.py:2323-2334}}, {{cite vllm/v1/core/sched/scheduler.py:2376}}), and the chat response returns them as a top-level field ({{cite vllm/entrypoints/openai/chat_completion/serving.py:1203}}). The side-channel port is <code>VLLM_NIXL_SIDE_CHANNEL_PORT</code> (default 5600) plus the DP index ({{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:76-80}}, {{cite vllm/envs.py:1719-1725}}).</p>
+
+<h3>Step 4: the router calls D with P's parameters</h3>
+<x-code file="tests/v1/kv_connector/nixl_integration/toy_proxy_server.py" lines="213-245" highlight="219,222-224,227-231,234,239-245" />
+<p>The router reads <code>kv_transfer_params</code> from P's JSON and puts them into the original body. It picks P and D round-robin and streams D's answer back to the client. Both calls use the same <code>X-Request-Id</code> (lines 177 and 202 of the file).</p>
+
+<h3>Step 5: D waits for the remote KV</h3>
+<p>D's scheduler asks the connector how many tokens it can load. With <code>do_remote_prefill</code>, the answer is the whole prompt, asynchronously:</p>
+<x-code file="vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py" lines="51-65" highlight="59-65" />
+<p><code>_get_remote_prefill_token_count</code> keeps a few trailing tokens on D only for Mamba layers, bounded replay or multi-module MTP. For a plain model it returns the prompt length ({{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:385-410}}). The scheduler then allocates the blocks and parks the request:</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="1384-1411" highlight="1393,1407,1410-1411" />
+<p>The connector puts the request into its "to receive" list with D's new block ids ({{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:130-177}}). In the next step, each D worker starts a non-blocking NIXL <code>READ</code> from P's blocks into its own ({{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:49-77}}, {{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:554-567}}). The transfer carries a notification for P. While the request waits, D's workers send heartbeats that extend P's lease ({{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:123-125}}).</p>
+
+<h3>Step 6: the load finishes, and D decodes</h3>
+<p>When a worker reports <code>finished_recving</code>, the scheduler marks the request ready ({{cite vllm/v1/core/sched/scheduler.py:3324-3331}}). The next <code>schedule()</code> caches the loaded blocks and moves the request back to <code>WAITING</code> ({{cite vllm/v1/core/sched/scheduler.py:3255-3257}}, {{cite vllm/v1/core/sched/scheduler.py:3278-3289}}). If the whole prompt was loaded, <code>num_computed_tokens</code> becomes the prompt length minus one. D recomputes the last prompt token, so the model can sample the first output token ({{cite vllm/v1/core/sched/scheduler.py:3269-3272}}). P's token from Step 3 is not used. On P, the read notification ends the lease, and the scheduler frees the blocks when the worker reports <code>finished_sending</code> ({{cite vllm/v1/core/sched/scheduler.py:3335-3338}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="kv_transfer_params, field by field">
+<table>
+  <thead><tr><th>Key</th><th>Router → P</th><th>P → router → D</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>do_remote_decode</code></td><td>true</td><td>false</td><td>"I am P": keep the blocks for a remote reader</td></tr>
+    <tr><td><code>do_remote_prefill</code></td><td>false</td><td>true</td><td>"I am D": load the prompt from remote</td></tr>
+    <tr><td><code>remote_block_ids</code></td><td>None</td><td>P's block ids, per KV cache group</td><td>what D reads</td></tr>
+    <tr><td><code>remote_engine_id</code>, <code>remote_request_id</code></td><td>None</td><td>P's engine id and internal request id</td><td>who to read from, and which request to notify</td></tr>
+    <tr><td><code>remote_host</code>, <code>remote_port</code></td><td>None</td><td>P's side channel</td><td>NIXL handshake address</td></tr>
+    <tr><td><code>tp_size</code>, <code>dcp_size</code>, <code>pp_size</code></td><td>–</td><td>P's sizes</td><td>lets D map P's ranks to its own (P and D may use different TP)</td></tr>
+    <tr><td><code>remote_num_tokens</code>, <code>remote_blocks_expiry_time</code>, <code>remote_registration_generation</code>, <code>transfer_mode</code></td><td>–</td><td>bookkeeping</td><td>used by the multi-turn and bookkeeping paths</td></tr>
+    <tr><td><code>remote_prefill_cached_tokens</code></td><td>–</td><td>P's prefix-cache hits</td><td>so D can report P's cache hits in its usage ({{cite vllm/v1/core/sched/scheduler.py:2329-2334}})</td></tr>
+  </tbody>
+</table>
+<p>Source: {{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:278-293}}. D's scheduler accepts the transfer only if the block ids and all four remote fields are present. Otherwise it logs "Got invalid KVTransferParams" and does not use KV transfer for the request ({{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:135-184}}). After the first transfer, D sets <code>do_remote_prefill</code> to false, so one request triggers one transfer (lines 187-189).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: a 2,000-token prompt with block size 16">
+<ol>
+  <li>P: 2,000 prompt tokens fill <code>ceil(2000 / 16)</code> = 125 blocks, all full. P never computes KV for its sampled token, because the request ends before the next step (derived). The request finishes after one token, and <code>request_finished</code> keeps all its blocks for 30 s.</li>
+  <li>The router gets P's JSON with 125 block ids (one KV cache group) and sends D the original body.</li>
+  <li>D: no local prefix hit. The connector returns <code>(2000, True)</code>. D allocates 125 blocks and parks the request in <code>WAITING_FOR_REMOTE_KVS</code> with <code>num_computed_tokens</code> = 2000.</li>
+  <li>D's workers read 125 blocks per layer from P. Note the change of model: the Step 1 command serves Qwen/Qwen3-0.6B. For the byte count, this example assumes Llama-3.1-8B with TP = 1 on both sides. Then each block of one layer is <code>8 KV heads × 16 tokens × (128 + 128) × 2 bytes</code> = 64 KiB. One request moves about 125 × 32 layers × 64 KiB = 250 MiB (derived; layer shape from {{link learn/tp-pp-in-practice}}).</li>
+  <li>The read finishes. D's next schedule sets <code>num_computed_tokens</code> = 1999, prefills one token, and samples the first output token.</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="Failures: what happens to a request when the KV load fails">
+<p><code>kv_load_failure_policy</code> decides ({{cite vllm/config/kv_transfer.py:88-91}}):</p>
+<ul>
+  <li><strong><code>"fail"</code> (default).</strong> The scheduler collects the affected requests and finishes them with <code>FINISHED_ERROR</code>. It logs "Failing N request(s) due to KV load failure" and evicts the bad blocks from the prefix cache ({{cite vllm/v1/core/sched/scheduler.py:3513-3527}}, {{cite vllm/v1/core/sched/scheduler.py:2404-2413}}). The client sees an error finish.</li>
+  <li><strong><code>"recompute"</code>.</strong> The scheduler cuts <code>num_computed_tokens</code> at the first bad block, keeps the valid prefix, and lets D compute the rest itself ({{cite vllm/v1/core/sched/scheduler.py:3340-3437}}). It logs "Recovered from KV load failure" ({{cite vllm/v1/core/sched/scheduler.py:3529-3539}}). The docs warn that this puts prefill work on a decode-tuned instance ({{cite docs/features/nixl_connector_usage.md:389-397}}).</li>
+</ul>
+<p>Other failure paths:</p>
+<ul>
+  <li><strong>Lease expiry on P.</strong> If no heartbeat or read notification arrives within the lease, P frees the blocks. The docs list the counter <code>vllm:nixl_num_kv_expired_reqs</code> and advise a longer <code>kv_lease_duration</code> ({{cite docs/features/nixl_connector_usage.md:125-128}}, {{cite docs/features/nixl_connector_usage.md:456-463}}).</li>
+  <li><strong>D rejects the request before the engine sees it.</strong> If the serving layer returns an error, it notifies the connector so P's pinned blocks are freed ({{cite vllm/entrypoints/generate/base/serving.py:266-299}}).</li>
+  <li><strong>An aborted request on D</strong> that never reached the transfer still sends an empty notification, so P does not keep the blocks ({{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:219-230}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="What vLLM ships, and what your router must do">
+<table>
+  <thead><tr><th>Piece</th><th>In vLLM</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>KV connectors (NIXL, Mooncake, LMCache, MoRI-IO, …)</td><td>yes, 17 registered names</td><td>{{link concepts/kv-connectors}}</td></tr>
+    <tr><td><code>kv_transfer_params</code> in requests and responses</td><td>yes (chat, completions, Anthropic, Cohere routes)</td><td>Step 2 and Step 3</td></tr>
+    <tr><td>request states, async loads, failure policy</td><td>yes</td><td>Steps 5-6</td></tr>
+    <tr><td>a router that picks P and D and copies the parameters</td><td>only examples and test tools</td><td><code>tests/v1/kv_connector/nixl_integration/toy_proxy_server.py</code>, <code>examples/disaggregated/</code></td></tr>
+  </tbody>
+</table>
+<p>A production router must do at least these things:</p>
+<ol><li>Choose a P and a D instance.</li><li>Send P a 1-token, non-streaming copy with <code>do_remote_decode</code>.</li><li>Copy the returned <code>kv_transfer_params</code> into the D request.</li><li>Stream D's answer, and handle errors of either call.</li></ol>
+<p>The multi-turn mode also needs a stateful router that caches D's parameters per conversation ({{cite docs/features/nixl_connector_usage.md:135-141}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Encoder disaggregation (E/P/D) with EC connectors">
+<p>Multimodal models can split one more stage: the vision encoder. An encoder instance computes the image embeddings, and an {{term ec-connector}} moves them to the prefill or decode instance ({{cite docs/features/disagg_encoder.md:1-8}}). The config is <code>--ec-transfer-config</code> with <code>ec_role</code> <code>ec_producer</code>, <code>ec_consumer</code> or <code>ec_both</code> ({{cite vllm/config/ec_transfer.py:10-11}}, {{cite vllm/config/ec_transfer.py:41-43}}). The pattern is the same as for KV: a scheduler-side and a worker-side object, and <code>ec_transfer_params</code> in requests and responses ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:518-523}}, {{cite vllm/entrypoints/openai/chat_completion/protocol.py:156-158}}). A consumer instance accepts requests without the image tensors, because it gets the embeddings from the connector ({{cite vllm/config/vllm.py:2840-2846}}). The page {{link concepts/kv-connectors}} lists the three built-in EC connectors; <code>examples/disaggregated/disaggregated_encoder/disagg_epd_proxy.py</code> is an example router.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Port clashes on one host.</strong> Each instance needs its own <code>VLLM_NIXL_SIDE_CHANNEL_PORT</code>, and DP ranks add their index to it ({{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:77-80}}, {{cite docs/features/nixl_connector_usage.md:113-118}}).</li>
+  <li><strong><code>VLLM_NIXL_SIDE_CHANNEL_HOST</code> left at <code>localhost</code></strong> across machines. P reports this host in its parameters, so D cannot reach P ({{cite vllm/envs.py:1719-1721}}, {{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:284-285}}).</li>
+  <li><strong>Lost blocks under load.</strong> Assume D queues a request for longer than the lease, and its heartbeats do not arrive. Then P frees the blocks, the read fails, and the default policy fails the request.</li>
+  <li><strong>Router forgets <code>max_tokens</code> = 1.</strong> P then decodes the whole answer before D starts, and the split gains nothing (derived from the router in Step 2).</li>
+  <li><strong>Docs drift.</strong> <code>disagg_prefill.md</code> says "Now supports 9 types of connectors"; the registry has 17 names ({{cite docs/features/disagg_prefill.md:20}}, {{link concepts/kv-connectors}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> P/D splitting is the main tool when TTFT and ITL targets conflict. Its correctness depends on a few fields of an HTTP body and on two settings, the lease and the load policy. Most production problems come from those.</p>
+
+<x-quiz>
+  <x-q level="easy">Which value of <code>kv_transfer_params</code> does the router send to P, and which does P send back for D?
+    <x-a><p>To P: <code>do_remote_decode: true</code> ({{cite tests/v1/kv_connector/nixl_integration/toy_proxy_server.py:158-165}}). Back: <code>do_remote_prefill: true</code> plus P's block ids, engine id, request id, host and port ({{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py:278-292}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">In which request state does D wait while the KV blocks arrive?
+    <x-a><p><code>WAITING_FOR_REMOTE_KVS</code> ({{cite vllm/v1/core/sched/scheduler.py:1393}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">D loaded the whole 2,000-token prompt. Why does it still run one token of prefill?
+    <x-a><p>To sample the first output token the model needs logits at the last prompt position. The scheduler sets <code>num_computed_tokens</code> to the prompt length minus one when the whole prompt was loaded ({{cite vllm/v1/core/sched/scheduler.py:3269-3272}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">The decode instance is overloaded and requests wait 60 s before D schedules them. What happens with the default settings, and what do you change?
+    <x-a><p>P keeps the blocks for <code>kv_lease_duration</code>, 30 s by default ({{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:82-86}}). D's heartbeats extend the lease while the request waits ({{cite vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:123-125}}). If they do not arrive, P frees the blocks, D's read fails, and the default policy <code>"fail"</code> finishes the request with an error ({{cite vllm/config/kv_transfer.py:88-91}}). Raise <code>kv_lease_duration</code>, add D capacity, and watch <code>vllm:nixl_num_kv_expired_reqs</code>.</p></x-a>
+  </x-q>
+</x-quiz>

@@ -1,0 +1,189 @@
+---
+title: distributed/device_communicators/shm_broadcast.py: MessageQueue
+nav_title: device_communicators/shm_broadcast.py
+level: Advanced
+prerequisites: learn/processes-and-ipc, concepts/executors-and-workers
+related: code/v1-executor-multiproc-executor, concepts/executors-and-workers, learn/processes-and-ipc, code/distributed-parallel-state, concepts/distributed-groups, tours/multi-gpu-step
+summary: vllm/distributed/device_communicators/shm_broadcast.py implements MessageQueue, a one-writer, many-reader queue. Local readers share a lock-free ring of chunks in /dev/shm with one flag byte per reader; large messages and remote readers use ZMQ XPUB sockets. The executor uses it to send every call to its workers, and each worker uses one to reply.
+---
+<h2>Purpose</h2>
+<p><code>vllm/distributed/device_communicators/shm_broadcast.py</code> implements the {{term message-queue}}: one process writes a Python object once, and every reader gets a copy. On one node the bytes go through a ring buffer in shared memory, with no lock and no copy per reader; too-large messages and readers on other nodes go through ZMQ.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/distributed/device_communicators/shm_broadcast.py</code>, 1,148 lines of Python.</td></tr>
+    <tr><th>Main classes</th><td><code>MessageQueue</code> ({{cite vllm/distributed/device_communicators/shm_broadcast.py:483}}), <code>ShmRingBuffer</code> ({{cite vllm/distributed/device_communicators/shm_broadcast.py:265}}), <code>SpinCondition</code> ({{cite vllm/distributed/device_communicators/shm_broadcast.py:116}}), <code>Handle</code> ({{cite vllm/distributed/device_communicators/shm_broadcast.py:465-474}}).</td></tr>
+    <tr><th>Runs in</th><td>The writer: the engine core process (executor broadcast) or a worker (its reply). The readers: the workers, or the engine core for replies. Main threads, plus a worker's <code>WorkerAsyncOutputCopy</code> thread, which enqueues replies.</td></tr>
+    <tr><th>Called by</th><td><code>MultiprocExecutor</code> and <code>WorkerProc</code> ({{cite vllm/v1/executor/multiproc_executor.py:165-172}}, {{cite vllm/v1/executor/multiproc_executor.py:615-645}}); <code>GroupCoordinator</code> broadcasters ({{cite vllm/distributed/parallel_state.py:562-567}}); the Ray executor ({{cite vllm/v1/executor/ray_executor_v2.py:330-338}}).</td></tr>
+    <tr><th>Calls</th><td><code>multiprocessing.shared_memory</code>, <code>pickle</code> (protocol 5 with out-of-band buffers), <code>pyzmq</code> (XPUB/SUB, PUB/SUB, PAIR), <code>torch.distributed</code> to share the handle in a group.</td></tr>
+    <tr><th>Not in this file</th><td>The RPC protocol on top: the message tuple <code>(method, args, kwargs, output_rank)</code> and the reply <code>(status, value)</code> are defined by the executor ({{link code/v1-executor-multiproc-executor}}). The zero-copy tensor arena is in <code>shm_tensor_arena.py</code> (opt-in, <code>--enable-shm-tensor-arena</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link learn/processes-and-ipc}} introduces the queue; this page reads the file.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b8b_shm_ring" alt="Panel 1: the shared memory segment of the executor queue with TP = 2: ten data chunks of 16 MiB, chunk 3 marked as the writer's current index, and under each chunk its three flag bytes: written, read by worker 0, read by worker 1; chunks 0 and 1 show 111, chunk 2 shows 110, the others 000. The data part is 160 MiB and the metadata 30 bytes. Panel 2: one enqueue: step 1 pickle with protocol 5, CPU tensors become PickleBuffers, buffers below 1 MiB inline, others out of band. Step 2a, if it fits: byte 0 is 0, bytes 1 to 2 the buffer count, then a 4-byte length and the bytes of each buffer. Step 2b, if too large: byte 0 is 1 and all buffers go to the XPUB socket. Panel 3: the flag states of one chunk: 0?? writable, the writer writes to 100 written, worker 0 reads to 110, worker 1 reads to 111, which is writable again." caption="Figure: the ring buffer of the executor's broadcast queue (panel 1), the bytes of one message (panel 2), and the flag states of one chunk (panel 3)." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Executor broadcast.</strong> On the leader node of a DP rank, <code>MultiprocExecutor</code> makes <code>MessageQueue(world_size, local_world_size, max_chunk_bytes=16 MiB, connect_ip=…)</code> and passes its handle to each worker process ({{cite vllm/v1/executor/multiproc_executor.py:148-172}}). Each call is one <code>enqueue</code> ({{cite vllm/v1/executor/multiproc_executor.py:428}}).</li>
+  <li><strong>Worker side.</strong> A worker attaches with <code>create_from_handle(handle, rank)</code> and makes its own reply queue <code>MessageQueue(1, 1)</code> ({{cite vllm/v1/executor/multiproc_executor.py:618-625}}). When a replica spans nodes, the workers use the inner-DP world group's broadcaster and single-reader queues instead ({{cite vllm/v1/executor/multiproc_executor.py:626-645}}).</li>
+  <li><strong>Busy loops.</strong> Workers block in <code>dequeue(indefinite=True)</code> ({{cite vllm/v1/executor/multiproc_executor.py:1046}}); the executor reads replies with <code>dequeue(timeout=…)</code> ({{cite vllm/v1/executor/multiproc_executor.py:441}}); a worker replies with <code>enqueue(result)</code> ({{cite vllm/v1/executor/multiproc_executor.py:1011-1012}}).</li>
+  <li><strong>Process groups.</strong> A <code>GroupCoordinator</code> that asks for a broadcaster (TP, DCP) makes one with 6 chunks of 4 MiB; <code>broadcast_object</code> then uses it ({{cite vllm/distributed/parallel_state.py:562-567}}, {{cite vllm/distributed/parallel_state.py:864-866}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>shared_memory.SharedMemory(create=True, size=…)</code> after a free-space check ({{cite vllm/distributed/device_communicators/shm_broadcast.py:335-343}}).</li>
+  <li>ZMQ sockets: XPUB for overflow and remote readers, PUB/SUB for wake-ups, PAIR for cancellation ({{cite vllm/distributed/device_communicators/shm_broadcast.py:508-542}}, {{cite vllm/distributed/device_communicators/shm_broadcast.py:150-176}}).</li>
+  <li><code>in_the_same_node_as</code> and <code>broadcast_object_list</code> to spread the handle in a process group ({{cite vllm/distributed/device_communicators/shm_broadcast.py:1068-1148}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>memory_fence</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:83-100}}</td><td>Lock acquire/release as a full memory barrier around flag writes.</td></tr>
+    <tr><td><code>SpinCondition</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:116-224}}</td><td>Reader wait: spin for 1 s after a read, then sleep on a ZMQ notify socket.</td></tr>
+    <tr><td><code>check_shm_free_space</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:230-262}}</td><td>Raise if <code>/dev/shm</code> (or the cgroup) cannot hold the segment.</td></tr>
+    <tr><td><code>ShmRingBuffer</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:265-401}}</td><td>The segment: data chunks, then flag bytes; create or attach by name.</td></tr>
+    <tr><td><code>_rebuild_tensor</code>, <code>_reduce_tensor</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:404-462}}</td><td>Pickle CPU tensors as out-of-band buffers instead of copying them into the stream.</td></tr>
+    <tr><td><code>Handle</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:465-474}}</td><td>Picklable description of a queue: buffer name, socket addresses, local reader ranks.</td></tr>
+    <tr><td><code>MessageQueue.__init__</code> / <code>create_from_handle</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:484-674}}</td><td>Writer side and reader side of one queue.</td></tr>
+    <tr><td><code>wait_until_ready</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:676-707}}</td><td>Collective start-up: wait for every subscription, then send <code>READY</code>.</td></tr>
+    <tr><td><code>acquire_write</code> / <code>acquire_read</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:716-898}}</td><td>The lock-free protocol on one chunk.</td></tr>
+    <tr><td><code>enqueue</code> / <code>dequeue</code> / <code>recv</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:900-1007}}</td><td>Serialize, write or overflow; read and deserialize.</td></tr>
+    <tr><td><code>broadcast_object</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:1009-1013}}</td><td>Writer enqueues, readers dequeue.</td></tr>
+    <tr><td><code>create_from_process_group</code>, <code>…_single_reader</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:1015-1148}}</td><td>Build a queue for a torch process group and share the handle.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>ShmRingBuffer</code>: layout and the flag rules</h3>
+<p>The docstring is the specification. Data chunks come first, then <code>max_chunks × (1 + n_reader)</code> flag bytes. The first flag of a chunk is "written"; then one "read" flag per reader ({{cite vllm/distributed/device_communicators/shm_broadcast.py:281-302}}). The four states:</p>
+<x-code file="vllm/distributed/device_communicators/shm_broadcast.py" lines="291-315" highlight="299-302,306-308,312-315" />
+<p>The writer creates the segment and zeroes the flags; a reader attaches by name and patches out Python's resource tracker, so a reader process does not unlink a segment it did not create ({{cite vllm/distributed/device_communicators/shm_broadcast.py:332-365}}).</p>
+
+<h3><code>acquire_write</code>: the writer's side of one chunk</h3>
+<x-code file="vllm/distributed/device_communicators/shm_broadcast.py" lines="721-786" highlight="724-728,733-754,760,762-763,770-772,778,780,784-785" />
+<ol>
+  <li><strong>Lines 724-728.</strong> A chunk is writable unless it is written and not yet read by all readers.</li>
+  <li><strong>Lines 733-754.</strong> Not writable: yield the CPU and retry. A timeout raises <code>TimeoutError</code>; every <code>VLLM_RINGBUFFER_WARNING_INTERVAL</code> seconds (60) the writer logs "No available shared memory broadcast block found in 60 seconds".</li>
+  <li><strong>Line 760.</strong> Clear "written" first, so no reader starts on a half-written chunk.</li>
+  <li><strong>Lines 770-784.</strong> After the caller wrote: reset all read flags, fence, set "written", fence. The comment explains why this order matters: the other order passes through the "read by some" state.</li>
+  <li><strong>Line 785.</strong> Advance <code>current_idx</code> around the ring.</li>
+</ol>
+
+<h3><code>acquire_read</code>: one reader</h3>
+<x-code file="vllm/distributed/device_communicators/shm_broadcast.py" lines="870-898" highlight="876-878,880-882,890,894,895-897" />
+<ol>
+  <li><strong>Lines 876-882.</strong> Wait until the current chunk is written and not yet read by this reader. The wait uses <code>SpinCondition</code>: spin with <code>sched_yield</code> for 1 s after the last read, then sleep on the ZMQ notify socket for at most 5 s at a time before it checks the flags again ({{cite vllm/distributed/device_communicators/shm_broadcast.py:205-219}}, {{cite vllm/distributed/device_communicators/shm_broadcast.py:71}}, {{cite vllm/distributed/device_communicators/shm_broadcast.py:802-817}}).</li>
+  <li><strong>Lines 888-894.</strong> After the caller read, set this reader's flag and fence, so the writer sees it.</li>
+  <li><strong>Lines 895-897.</strong> Advance and record the read time (it controls the spin window).</li>
+</ol>
+
+<h3><code>enqueue</code>: serialize, then write or overflow</h3>
+<x-code file="vllm/distributed/device_communicators/shm_broadcast.py" lines="900-966" highlight="906-914,922-923,939-941,943-946,952-961,963,965-966" />
+<ol>
+  <li><strong>Lines 906-914.</strong> Out-of-band buffers of 1 MiB or more stay outside the pickle stream; smaller ones go inline.</li>
+  <li><strong>Lines 922-923.</strong> CPU tensors are reduced by <code>_reduce_tensor</code>, so their bytes become such buffers instead of a copy inside the pickle ({{cite vllm/distributed/device_communicators/shm_broadcast.py:433-462}}).</li>
+  <li><strong>Lines 943-946.</strong> If the total does not fit in one chunk, the chunk carries only the overflow flag, and all buffers go over the local XPUB socket.</li>
+  <li><strong>Lines 952-961.</strong> Otherwise the chunk holds: byte 0 = 0, bytes 1-2 = buffer count (big-endian), then each buffer with a 4-byte length.</li>
+  <li><strong>Line 963.</strong> Wake sleeping readers.</li>
+  <li><strong>Lines 965-966.</strong> Remote readers always get the message over the TCP XPUB socket.</li>
+</ol>
+<p><code>dequeue</code> reverses the steps. It copies each out-of-band buffer into a new <code>bytearray</code>, because the ring slot is reused after the read; on overflow it receives from the SUB socket after it releases the chunk ({{cite vllm/distributed/device_communicators/shm_broadcast.py:968-998}}).</p>
+
+<h3><code>create_from_process_group</code>: one queue for a torch group</h3>
+<x-code file="vllm/distributed/device_communicators/shm_broadcast.py" lines="1109-1148" highlight="1111,1118-1128,1129-1135,1145,1146-1147" />
+<p>The writer counts the ranks on its own node with <code>in_the_same_node_as</code>; those become local readers on the ring, and the others remote readers on TCP. It broadcasts the handle over the gloo group; each reader attaches with it, and <code>wait_until_ready</code> runs the start-up handshake.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Sizes of every queue in a TP = 2 server">
+<table>
+  <thead><tr><th>Queue</th><th>Made at</th><th>Readers</th><th>Chunks × size</th><th>Segment (derived)</th></tr></thead>
+  <tbody>
+    <tr><td>executor broadcast (<code>rpc_broadcast_mq</code>)</td><td>{{cite vllm/v1/executor/multiproc_executor.py:165-171}}</td><td>2 local</td><td>10 × 16 MiB</td><td>160 MiB + 30 flag bytes</td></tr>
+    <tr><td>worker 0 reply (<code>worker_response_mq</code>)</td><td>{{cite vllm/v1/executor/multiproc_executor.py:625}}</td><td>1 local (the engine core)</td><td>10 × 24 MiB (the defaults, {{cite vllm/distributed/device_communicators/shm_broadcast.py:489-492}})</td><td>240 MiB + 20 bytes</td></tr>
+    <tr><td>worker 1 reply</td><td>same</td><td>1 local</td><td>10 × 24 MiB</td><td>240 MiB + 20 bytes</td></tr>
+    <tr><td>TP group broadcaster (<code>tp:0</code>)</td><td>{{cite vllm/distributed/parallel_state.py:564-567}}</td><td>1 local (rank 1)</td><td>6 × 4 MiB</td><td>24 MiB + 12 bytes</td></tr>
+  </tbody>
+</table>
+<p>Each segment size is <code>(max_chunk_bytes + 1 + n_reader) × max_chunks</code> ({{cite vllm/distributed/device_communicators/shm_broadcast.py:326-328}}), and <code>check_shm_free_space</code> raises before it creates one that does not fit ({{cite vllm/distributed/device_communicators/shm_broadcast.py:248-262}}). The comment on the 24 MiB default says it is "large enough to accommodate grammar bitmask tensors for large batches (1024 requests)" ({{cite vllm/distributed/device_communicators/shm_broadcast.py:489-490}}). So a TP = 2 engine asks for about 664 MiB of <code>/dev/shm</code> in total (derived). Docker's default <code>/dev/shm</code> is far smaller; the error text suggests <code>--shm-size</code> or <code>--ipc=host</code>.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: one execute_model call with TP = 2">
+<ol>
+  <li>The executor calls <code>enqueue(("execute_model", (scheduler_output,), {}, 0))</code>. For a decode step of 64 requests the pickle is small (no tensor of 1 MiB or more), so it fits into one 16 MiB chunk (illustrative size).</li>
+  <li><code>acquire_write</code> finds chunk <em>i</em> in state <code>111</code> (read by both workers in an earlier step), clears the written flag, and the payload is copied in: <code>[0][count=1][len][pickle bytes]</code>.</li>
+  <li>Flags become <code>100</code>; the writer sends one byte on the notify PUB socket and moves to chunk <em>i</em> + 1.</li>
+  <li>Both workers spin in <code>dequeue(indefinite=True)</code>. They read within the 1-second spin window, so they see the flag without the socket. Each unpickles its own copy and sets its read flag: <code>110</code>, then <code>111</code>.</li>
+  <li>Worker 0 (the output rank) later replies on its own <code>MessageQueue(1, 1)</code> with <code>(SUCCESS, None)</code>; worker 1 replies nothing ({{cite vllm/v1/executor/multiproc_executor.py:1070-1071}}).</li>
+</ol>
+<p>A multimodal request with a 30 MiB image tensor would not fit: the chunk gets the overflow flag, and the pickle plus the image buffer travel over the XPUB socket as separate ZMQ frames, without a copy into the pickle stream (derived from {{cite vllm/distributed/device_communicators/shm_broadcast.py:906-946}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Processes, threads and waiting">
+<table>
+  <thead><tr><th>Side</th><th>Who</th><th>How it waits</th></tr></thead>
+  <tbody>
+    <tr><td>writer, ring full</td><td>engine core main thread (or a worker's copy thread)</td><td>busy loop with <code>sched_yield</code>; INFO every 60 s; <code>TimeoutError</code> only with a timeout ({{cite vllm/distributed/device_communicators/shm_broadcast.py:733-754}})</td></tr>
+    <tr><td>reader, idle</td><td>worker main thread in <code>dequeue(indefinite=True)</code></td><td>spin 1 s, then <code>poll</code> on the notify SUB socket (<code>CONFLATE</code>, so only one pending ping), rechecking every 5 s; no warnings ({{cite vllm/distributed/device_communicators/shm_broadcast.py:141-168}}, {{cite vllm/distributed/device_communicators/shm_broadcast.py:788-827}})</td></tr>
+    <tr><td>reader, shutdown</td><td>another thread of the reader's process</td><td><code>shutdown()</code> sends on an in-process PAIR socket; the reader raises <code>RuntimeError("cancelled")</code> ({{cite vllm/distributed/device_communicators/shm_broadcast.py:709-714}}, {{cite vllm/distributed/device_communicators/shm_broadcast.py:861-862}})</td></tr>
+  </tbody>
+</table>
+<p>The writer's notify socket has a send high-water mark of 1: under load, extra pings are dropped silently, and the reader's SUB socket keeps only the last one ({{cite vllm/distributed/device_communicators/shm_broadcast.py:169-176}}). <code>VLLM_USE_SPINLOOP_EXT=1</code> replaces the Python spin with an optional C extension, when it can be imported ({{cite vllm/distributed/device_communicators/shm_broadcast.py:48-58}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what only logs">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>not enough <code>/dev/shm</code></td><td><code>RuntimeError</code> "Insufficient space in /dev/shm … Increase /dev/shm (e.g. --shm-size or --ipc=host)"</td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:248-258}}</td></tr>
+    <tr><td>attach on another node</td><td><code>FileNotFoundError</code> suppressed; the object is unused there</td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:361-365}}</td></tr>
+    <tr><td>write timeout</td><td><code>TimeoutError</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:743-745}}</td></tr>
+    <tr><td>read timeout (or ZMQ poll timeout on overflow)</td><td><code>TimeoutError</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:814-816}}, {{cite vllm/distributed/device_communicators/shm_broadcast.py:1001-1007}}</td></tr>
+    <tr><td>long wait without a timeout</td><td>INFO "No available shared memory broadcast block found in 60 seconds. This typically happens when some processes are hanging or doing some time-consuming work …"</td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:107-113}}</td></tr>
+    <tr><td>a non-reader calls <code>dequeue</code></td><td><code>RuntimeError("Only readers can dequeue")</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:996-998}}</td></tr>
+    <tr><td>reader cancelled during shutdown</td><td><code>RuntimeError("cancelled")</code></td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:861-862}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_MQ_MAX_CHUNK_BYTES_MB</code></td><td>16 ({{cite vllm/envs.py:1856-1858}})</td><td>{{cite vllm/v1/executor/multiproc_executor.py:152}}</td><td>Chunk size of the executor's broadcast queue only; replies and group broadcasters use their own sizes.</td></tr>
+    <tr><td><code>VLLM_RINGBUFFER_WARNING_INTERVAL</code></td><td>60 ({{cite vllm/envs.py:745-747}})</td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:67}} (at import)</td><td>Seconds between the "No available shared memory broadcast block" messages.</td></tr>
+    <tr><td><code>VLLM_USE_SPINLOOP_EXT</code></td><td>0 ({{cite vllm/envs.py:2260}})</td><td>{{cite vllm/distributed/device_communicators/shm_broadcast.py:49-56}} (at import)</td><td>Use the optional <code>vllm.spinloop</code> extension for the flag waits.</td></tr>
+    <tr><td><code>VLLM_HOST_IP</code></td><td>""</td><td>through <code>get_ip()</code> ({{cite vllm/distributed/device_communicators/shm_broadcast.py:553-554}})</td><td>The address that remote readers connect to, when the caller gives no <code>connect_ip</code>.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link learn/processes-and-ipc}}: the three channels of <code>vllm serve</code>.</li>
+  <li>{{link code/v1-executor-multiproc-executor}}: the RPC protocol on top of the queue.</li>
+  <li>{{link concepts/executors-and-workers}}: why only one worker replies.</li>
+  <li>{{link code/distributed-parallel-state}}: the group broadcasters.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">In which order does the writer update the flags after it writes a chunk, and why?
+    <x-a><p>It resets every read flag first, then sets "written". The other order would pass through "written and read by some", and a reader could skip the new message ({{cite vllm/distributed/device_communicators/shm_broadcast.py:764-780}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A message pickles to 3 MiB and has one 20 MiB tensor buffer. How does it travel through the executor's queue?
+    <x-a><p>The 20 MiB buffer is out of band (≥ 1 MiB). The total, 23 MiB plus framing, does not fit in a 16 MiB chunk, so the chunk only carries the overflow flag and both buffers go over the local XPUB socket ({{cite vllm/distributed/device_communicators/shm_broadcast.py:906-946}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does an idle worker not print the "No available shared memory broadcast block" message every 60 seconds?
+    <x-a><p>Workers call <code>dequeue(indefinite=True)</code> ({{cite vllm/v1/executor/multiproc_executor.py:1046}}), and <code>acquire_read</code> turns warnings off when <code>indefinite</code> is true ({{cite vllm/distributed/device_communicators/shm_broadcast.py:876-878}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">How much <code>/dev/shm</code> do the queues of one TP = 4 engine core ask for?
+    <x-a><p>Broadcast: 10 × (16 MiB + 5) ≈ 160 MiB. Four reply queues of 10 × (24 MiB + 2) ≈ 240 MiB each = 960 MiB. The TP group broadcaster: 6 × (4 MiB + 4) ≈ 24 MiB. Total about 1,144 MiB (derived from {{cite vllm/distributed/device_communicators/shm_broadcast.py:326-328}}, {{cite vllm/distributed/device_communicators/shm_broadcast.py:489-492}}, {{cite vllm/v1/executor/multiproc_executor.py:152}}, {{cite vllm/distributed/parallel_state.py:564-567}}).</p></x-a>
+  </x-q>
+</x-quiz>

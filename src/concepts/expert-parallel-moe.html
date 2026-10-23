@@ -1,0 +1,187 @@
+---
+title: Expert parallelism and MoE serving
+nav_title: Expert parallel MoE
+level: Advanced
+prerequisites: concepts/distributed-groups, concepts/data-parallel-serving, concepts/tp-layers
+related: concepts/data-parallel-serving, concepts/distributed-groups, concepts/model-definition, concepts/quantization-plugins, concepts/compile-and-cuda-graphs, tours/multi-gpu-step, learn/tp-pp-in-practice
+summary: An MoE layer in vLLM is an MoERunner built by FusedMoEFactory. Its kernel has two exchangeable parts - a prepare/finalize object that dispatches and combines tokens, and an experts object that runs the GEMMs. With --enable-expert-parallel the experts are split over all DP x TP ranks; EPLB moves busy experts, DBO overlaps the communication.
+---
+<x-sentence>vLLM runs each MoE layer as router, dispatch, local experts and combine. Expert parallelism spreads the experts over all DP × TP ranks.</x-sentence>
+
+<h2>The idea</h2>
+<p>A Mixture-of-Experts layer has many expert MLPs, and a router sends each token to its top-k experts ({{deepinfer learn/moe | Mixture of Experts}}). With expert parallelism, each GPU holds only some experts, and tokens travel to the GPUs of their experts and back ({{deepinfer concepts/expert-parallelism | Expert parallelism}}). This page shows how vLLM builds such a layer, how it chooses the communication and the kernels, and which flags change it.</p>
+<p>vLLM splits the work of one MoE layer into four parts. The <strong>router</strong> picks the experts. The <strong>dispatch</strong> moves the tokens. The <strong>experts</strong> compute. The <strong>combine</strong> brings the weighted results back. A {{term modular-kernel}} keeps dispatch and combine in one object and the experts in another, so any communication method can work with any expert kernel. The communication method is the {{term all2all-backend}}.</p>
+<p>Without <code>--enable-expert-parallel</code>, an MoE model still runs on several GPUs, but each expert is split with tensor parallelism over all DP × TP ranks. With the flag, each rank owns whole experts. A large MoE deployment usually runs data parallel attention plus expert parallel MoE: <code>-dp 8 -ep</code>.</p>
+<p><strong>An everyday comparison.</strong> Think of a hospital with specialists on several floors. At the front desk (the router), each patient gets a list of two specialists. Porters (dispatch) take the patients to the right floors, the specialists see them (experts), and the porters bring the patients back with the reports (combine). The comparison stops here. In vLLM, every patient on every floor moves in the same time slot, so a floor with no patients still joins each slot.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b8b_moe_flow" alt="Panel 1: DP = 2, TP = 1, expert parallelism with EP size 2, 8 experts, top-2, rank 0 holds experts 0 to 3 and rank 1 holds experts 4 to 7. Step 1, the router on each rank: rank 0 has 3 tokens and computes logits [3, 8]; tokens t0 to t2 choose experts (1,5), (2,3), (6,7); rank 1 has 2 tokens; t3 and t4 choose (0,4) and (4,5); plus top-2 weights. Step 2, dispatch: the default allgather_reducescatter backend all-gathers over the DP group, so every rank sees all 5 tokens; DeepEP or NIXL-EP send each token only to the ranks of its experts. Step 3, local experts: rank 0 runs experts 0 to 3 on t0, t1 and t3; rank 1 runs experts 4 to 7 on t0, t2, t3 and t4; the expert map turns global ids into local ids. Panel 2: step 4 combine, the default reduce-scatter over DP returns [3, H] to rank 0 and [2, H] to rank 1, each row the weighted sum of expert outputs. Step 5, shared experts, a dense MLP on local tokens that can start before dispatch on a second stream. Step 6, the layer output on each rank. Panel 3: the objects. MoERunner holds the router, RoutedExperts, optional shared experts and gate, and calls torch.ops.vllm.moe_forward. FusedMoEPrepareAndFinalize is the dispatch and combine backend: naive, DeepEP high-throughput, low-latency, v2, NIXL-EP, MoRI, FlashInfer NVLink, MoonEP, passthrough. FusedMoEExperts are the grouped expert GEMMs, picked by an oracle per quantization type." caption="Figure: one MoE layer with DP = 2 and expert parallelism. The token path (panels 1 and 2) and the objects that FusedMoEFactory builds (panel 3)." />
+<p>Follow the token ids. Rank 0's token t0 chose experts 1 and 5. So both ranks compute part of it, and the combine sums the two parts on rank 0. Panel 3 is the code view: the runner owns the layer; the kernel is "prepare/finalize + experts".</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: FusedMoEFactory builds the layer</h3>
+<p>A model builds an MoE layer with <code>FusedMoEFactory</code>. It is a function, not a class, and it returns an <code>MoERunner</code> ({{cite vllm/model_executor/layers/fused_moe/layer.py:92-153}}). It builds the parts in this order:</p>
+<ol>
+  <li>The MoE parallel config from the current TP, DP and PCP sizes ({{cite vllm/model_executor/layers/fused_moe/layer.py:238-244}}).</li>
+  <li>The expert counts: global = model experts + redundant experts ({{cite vllm/model_executor/layers/fused_moe/layer.py:76-89}}).</li>
+  <li>An EPLB layer state, only with EPLB on. Then the experts must divide evenly over the EP ranks ({{cite vllm/model_executor/layers/fused_moe/layer.py:269-284}}).</li>
+  <li>An <code>ExpertMapManager</code> that knows which experts are local ({{cite vllm/model_executor/layers/fused_moe/layer.py:291-302}}).</li>
+  <li>The router, unless the model passes its own ({{cite vllm/model_executor/layers/fused_moe/layer.py:306-346}}).</li>
+  <li>A <code>FusedMoEConfig</code>, the <code>RoutedExperts</code> object that holds the expert weights, and the <code>MoERunner</code> ({{cite vllm/model_executor/layers/fused_moe/layer.py:361-470}}).</li>
+</ol>
+<p>The runner calls the layer through a registered custom op: <code>torch.ops.vllm.moe_forward</code>, or <code>moe_forward_shared</code> with shared experts. So <code>torch.compile</code> sees one opaque node ({{cite vllm/model_executor/layers/fused_moe/runner/moe_runner.py:309-327}}, {{cite vllm/model_executor/layers/fused_moe/runner/moe_runner.py:198-214}}).</p>
+
+<h3>Step 2: does this layer use expert parallelism?</h3>
+<x-code file="vllm/model_executor/layers/fused_moe/config.py" lines="1198-1244" highlight="1198-1201,1207-1209,1211,1230-1231" />
+<ol>
+  <li><strong>Lines 1198-1201.</strong> EP is used only when there is more than one rank and <code>--enable-expert-parallel</code> is set. The flag is off by default ({{cite vllm/config/parallel.py:190-191}}).</li>
+  <li><strong>Lines 1207-1209.</strong> The TP size of the MoE layer is "flattened" over DP and PCP: DP × PCP × TP ranks ({{cite vllm/model_executor/layers/fused_moe/config.py:1105-1114}}).</li>
+  <li><strong>Lines 1211-1226.</strong> Without EP, the experts are split with TP over all those ranks, and <code>ep_size</code> is 1.</li>
+  <li><strong>Lines 1230-1231.</strong> With EP, the flattened TP size becomes the EP size, and the MoE TP size becomes 1: each rank owns whole experts.</li>
+</ol>
+<p>The docstring lists six cases. One is "TP = 2, DP(PCP) = 2 and EP = True … the experts are split between the 4 devices" ({{cite vllm/model_executor/layers/fused_moe/config.py:1187-1195}}). The process group behind it is the EP group, built for every MoE model ({{link concepts/distributed-groups}}).</p>
+
+<h3>Step 3: which experts live on which rank</h3>
+<p><code>--expert-placement-strategy</code> is <code>linear</code> by default: with 4 experts and 2 ranks, rank 0 gets [0, 1] and rank 1 gets [2, 3]. <code>round_robin</code> gives [0, 2] and [1, 3] ({{cite vllm/config/parallel.py:210-219}}). The <code>expert_map</code> is a tensor of shape <code>[global_num_experts]</code> with the local index of each local expert and −1 for the others. It exists only when <code>ep_size</code> &gt; 1 ({{cite vllm/model_executor/layers/fused_moe/expert_map_manager.py:152-180}}).</p>
+
+<h3>Step 4: the modular kernel: prepare/finalize plus experts</h3>
+<p>The design comment in <code>modular_kernel.py</code> names the four parts: "[Router] → [Quantize-Dispatch] → [Permute-Experts-Unpermute] → [Combine]" ({{cite vllm/model_executor/layers/fused_moe/modular_kernel.py:51-84}}). Two abstract classes carry them:</p>
+<ul>
+  <li><code>FusedMoEPrepareAndFinalize</code>: quantize and dispatch the inputs, then combine the outputs. Dispatch and combine sit in one class, because they may use collectives that must match ({{cite vllm/model_executor/layers/fused_moe/modular_kernel.py:186-193}}).</li>
+  <li><code>FusedMoEExperts</code>: the expert GEMMs, with checks such as <code>is_supported_config</code> for the device, quantization, activation and parallel config ({{cite vllm/model_executor/layers/fused_moe/modular_kernel.py:487-526}}, {{cite vllm/model_executor/layers/fused_moe/modular_kernel.py:558-614}}).</li>
+</ul>
+<p><code>FusedMoEKernel</code> joins one of each; both must be "modular" or both "monolithic". A monolithic pair works on the router logits instead of top-k ids ({{cite vllm/model_executor/layers/fused_moe/modular_kernel.py:1678-1710}}).</p>
+
+<h3>Step 5: selecting the experts implementation</h3>
+<p>Each quantization type has an "oracle" that picks the experts class ({{cite vllm/model_executor/layers/fused_moe/oracle/base.py:1-20}}). For BF16 weights on CUDA, the priority list is FlashInfer TRT-LLM, FlashInfer CUTLASS, Triton, batched Triton. On Hopper (compute capability 9.x) both FlashInfer entries move to the back, because they are slower there. With DP &gt; 1 FlashInfer CUTLASS moves back too:</p>
+<x-code file="vllm/model_executor/layers/fused_moe/oracle/unquantized.py" lines="62-86" highlight="69-74,78-80,85-86" />
+<p>The oracle takes the first backend whose kernel class accepts the config, and logs "Using &lt;backend&gt; Unquantized MoE backend out of potential backends: [...]" ({{cite vllm/model_executor/layers/fused_moe/oracle/unquantized.py:263-268}}, {{cite vllm/model_executor/layers/fused_moe/oracle/unquantized.py:359-372}}). <code>--moe-backend</code> forces a choice; its default is <code>auto</code> ({{cite vllm/config/kernel.py:302-306}}). Then the oracle builds the prepare/finalize object and logs its class name too ({{cite vllm/model_executor/layers/fused_moe/oracle/unquantized.py:518-530}}). Kernel internals are out of scope for this site.</p>
+
+<h3>Step 6: selecting dispatch and combine: --all2all-backend</h3>
+<p><code>--all2all-backend</code> defaults to <code>allgather_reducescatter</code> ({{cite vllm/config/parallel.py:220-234}}). The removed names <code>naive</code> and <code>pplx</code> fall back to it with a warning ({{cite vllm/config/parallel.py:537-543}}). <code>maybe_make_prepare_finalize</code> maps the choice to a class:</p>
+<x-code file="vllm/model_executor/layers/fused_moe/all2all_utils.py" lines="182-232" highlight="191-193,195,209-223,225-226,230" />
+<ol>
+  <li><strong>Lines 191-193.</strong> <code>passthrough</code>: the MoE backend dispatches and combines by itself. vLLM binds it automatically for such backends; the CLI does not offer it ({{cite vllm/engine/arg_utils.py:1148-1151}}, {{cite vllm/config/kernel.py:194-229}}).</li>
+  <li><strong>Lines 195-223.</strong> No all2all kernels (no EP, or one rank). With DP &gt; 1 the experts are TP-split over all DP ranks, so each rank still needs every rank's tokens. vLLM logs "Detected DP deployment with no --enable-expert-parallel" and uses the all-gather/reduce-scatter object. Without DP, a local object needs no communication.</li>
+  <li><strong>Lines 225-230 and on.</strong> With EP, the code takes the all2all manager of the EP group's device communicator. Then it builds one class per backend: DeepEP high-throughput, low-latency and v2, MoonEP, MoRI, FlashInfer NVLink, all-gather/reduce-scatter, NIXL-EP (lines 232-420).</li>
+</ol>
+<p>The managers themselves are made by the EP group's <code>CudaCommunicator</code> when <code>use_all2all</code> is true ({{cite vllm/distributed/device_communicators/cuda_communicator.py:202-283}}). The default manager is <code>AgRsAll2AllManager</code>: dispatch is an all-gather, combine a reduce-scatter, over the DP group or, with sequence-parallel MoE, the EP group ({{cite vllm/distributed/device_communicators/all2all.py:67-173}}).</p>
+
+<h3>Step 7: what DP + EP looks like for a large MoE</h3>
+<pre><code class="language-bash">vllm serve &lt;large MoE model&gt; -dp 8 --enable-expert-parallel      # one node, 8 GPUs, TP = 1</code></pre>
+<ul>
+  <li>Eight engine cores, each a <code>DPEngineCoreProc</code> with one worker ({{cite vllm/v1/engine/core.py:1534-1537}}). Each rank runs attention only for its own requests, with its own KV cache.</li>
+  <li>The MoE layers use EP size 8: each GPU owns 1/8 of the experts. The EP group spans all 8 ranks ({{link concepts/distributed-groups}}).</li>
+  <li>All ranks step together in waves; an idle rank runs dummy batches, and the workers agree on the padded batch size each step ({{link concepts/data-parallel-serving}}).</li>
+  <li>With TP &gt; 1, DP &gt; 1 and EP, the MoE input is sequence parallel for most backends. So TP ranks do not compute the same tokens twice ({{cite vllm/config/parallel.py:759-785}}). This applies only to models that pass the setting to their MoE layer, for example Qwen3-MoE ({{cite vllm/model_executor/models/qwen3_moe.py:152}}, {{cite vllm/model_executor/layers/fused_moe/layer.py:59}}).</li>
+</ul>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The all2all backends at a glance">
+<table>
+  <thead><tr><th><code>--all2all-backend</code></th><th>Manager (EP communicator)</th><th>Prepare/finalize</th><th>Notes from the code</th></tr></thead>
+  <tbody>
+    <tr><td><code>allgather_reducescatter</code> (default)</td><td><code>AgRsAll2AllManager</code></td><td>naive DP/EP (all-gather + reduce-scatter)</td><td>works with any EP + DP setup; every rank receives every token</td></tr>
+    <tr><td><code>deepep_high_throughput</code></td><td><code>DeepEPHTAll2AllManager</code></td><td><code>DeepEPHTPrepareAndFinalize</code></td><td>doc string: "deepep high-throughput kernels"</td></tr>
+    <tr><td><code>deepep_low_latency</code></td><td><code>DeepEPLLAll2AllManager</code></td><td><code>DeepEPLLPrepareAndFinalize</code></td><td>batched expert format; FP8 dispatch for block-FP8 models</td></tr>
+    <tr><td><code>deepep_v2</code></td><td><code>DeepEPV2All2AllManager</code></td><td><code>DeepEPV2PrepareAndFinalize</code></td><td>not in the doc list of the field; in the type ({{cite vllm/config/parallel.py:45-60}})</td></tr>
+    <tr><td><code>mori_high_throughput</code>, <code>mori_low_latency</code></td><td><code>MoriAll2AllManager</code></td><td><code>MoriPrepareAndFinalize</code></td><td>MoRI EP for multi-node</td></tr>
+    <tr><td><code>moonep</code></td><td><code>MoonEPAll2AllManager</code></td><td><code>MoonEPPrepareAndFinalize</code></td><td>"balanced EP with dynamic redundant experts (NVLink)"</td></tr>
+    <tr><td><code>nixl_ep</code></td><td><code>NixlEPAll2AllManager</code></td><td>NIXL-EP</td><td>batched expert format</td></tr>
+    <tr><td><code>flashinfer_nvlink_one_sided</code>, <code>flashinfer_nvlink_two_sided</code></td><td>FlashInfer managers</td><td>FlashInfer NVLink</td><td><code>flashinfer_all2allv</code> is a deprecated alias of the two-sided one</td></tr>
+    <tr><td><code>passthrough</code></td><td><code>PassThroughAll2AllManager</code></td><td><code>PassThroughPrepareAndFinalize</code></td><td>bound automatically for MoE backends that communicate themselves</td></tr>
+  </tbody>
+</table>
+<p>Sources: managers {{cite vllm/distributed/device_communicators/cuda_communicator.py:202-283}}; prepare/finalize {{cite vllm/model_executor/layers/fused_moe/all2all_utils.py:182-420}}; descriptions {{cite vllm/config/parallel.py:220-234}}. A backend needs its library to be installed (DeepEP, NIXL, MoRI, FlashInfer); vLLM does not ship them.</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: expert counts and memory with EPLB">
+<p>The EPLB module docstring gives the example: DeepSeek-R1 has 256 logical experts per MoE layer. With 32 redundant experts there are 288 physical experts, and with 32 EP ranks each GPU holds 288 / 32 = 9 ({{cite vllm/distributed/eplb/eplb_state.py:3-25}}).</p>
+<p>The same model with <code>-dp 8 -ep</code> (EP size 8):</p>
+<ol>
+  <li>No EPLB: 256 / 8 = 32 experts per GPU. <code>num_redundant_experts</code> must stay 0, or the config raises ({{cite vllm/config/parallel.py:585-592}}).</li>
+  <li><code>--enable-eplb --eplb-config '{"num_redundant_experts": 8}'</code>: global experts = 256 + 8 = 264 ({{cite vllm/model_executor/layers/fused_moe/layer.py:82}}). 264 / 8 = 33 per GPU; the division must be exact, else <code>ValueError</code> ({{cite vllm/model_executor/layers/fused_moe/layer.py:272-279}}).</li>
+  <li><code>num_redundant_experts</code> counts the extra experts of the whole model, not per rank (derived from line 82). The docs table says "Additional global experts per EP rank beyond equal distribution", which reads differently ({{cite docs/serving/expert_parallel_deployment.md:156}}).</li>
+</ol>
+</x-deepdive>
+
+<x-deepdive title="EPLB: when and how the experts move">
+<p><code>EPLBConfig</code> fields and defaults ({{cite vllm/config/parallel.py:63-119}}):</p>
+<table>
+  <thead><tr><th>Field</th><th>Default</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>window_size</code></td><td>1000</td><td>steps of expert load that are kept</td></tr>
+    <tr><td><code>step_interval</code></td><td>3000</td><td>steps between two rearrangements</td></tr>
+    <tr><td><code>num_redundant_experts</code></td><td>0</td><td>extra physical copies of popular experts</td></tr>
+    <tr><td><code>log_balancedness</code>, <code>log_balancedness_interval</code></td><td>False, 1</td><td>log average/max load per rank (costs a sync)</td></tr>
+    <tr><td><code>use_async</code></td><td>True</td><td>move weights in the background</td></tr>
+    <tr><td><code>policy</code></td><td><code>default</code></td><td>the rebalancing algorithm (adapted from DeepSeek EPLB, {{cite vllm/distributed/eplb/policy/default.py:3-11}})</td></tr>
+    <tr><td><code>communicator</code></td><td>None: XCCL on XPU, else NIXL if present, else gloo</td><td>how expert weights travel</td></tr>
+  </tbody>
+</table>
+<p>Validation: EPLB needs <code>--enable-expert-parallel</code>, a CUDA, ROCm or XPU platform, and TP × PCP × DP &gt; 1 ({{cite vllm/config/parallel.py:563-583}}). Async EPLB refuses the <code>torch_nccl</code> and <code>pynccl</code> communicators ({{cite vllm/config/parallel.py:121-130}}).</p>
+<p><strong>How one cycle runs</strong> (Model Runner V2):</p>
+<ol>
+  <li>The router kernels record how many tokens each physical expert got in this step (<code>expert_load_pass</code>).</li>
+  <li>After each <code>sample_tokens</code> (and each dummy run, marked as dummy), a decorator calls <code>EplbState.step()</code> ({{cite vllm/v1/worker/gpu/eplb_utils.py:46-63}}, {{cite vllm/v1/worker/gpu/model_runner.py:2113-2117}}).</li>
+  <li><code>step()</code> copies the step's load into a sliding window of <code>window_size</code> slots. It records only in the last <code>window_size</code> steps before a rearrangement (or for the balancedness log), and never for dummy steps ({{cite vllm/distributed/eplb/eplb_state.py:647-660}}, {{cite vllm/distributed/eplb/eplb_state.py:697-717}}). It counts every step, dummy or not, so all ranks stay in sync (lines 662-666).</li>
+  <li>When the counter reaches <code>step_interval</code>, <code>rearrange()</code> runs: it sums the window across the EP ranks, runs the policy, and moves expert weights between GPUs ({{cite vllm/distributed/eplb/eplb_state.py:681-693}}, {{cite vllm/distributed/eplb/eplb_state.py:758-800}}).</li>
+</ol>
+<p>The weight moves use the separate EPLB process group, so they do not deadlock with the MoE collectives of the forward pass ({{cite vllm/distributed/parallel_state.py:2347-2350}}).</p>
+</x-deepdive>
+
+<x-deepdive title="DBO: dual batch overlap">
+<p>{{term dbo | DBO}} overlaps the MoE all-to-all with compute. The model runner splits a batch into two microbatches and runs each in its own CPU thread. It switches between them at yield points in the modular kernel. While one microbatch waits for dispatch or combine, the other computes ({{cite docs/design/dbo.md:5-11}}). The design doc shows the schedule (lines 15-28).</p>
+<ul>
+  <li><strong>Flags.</strong> <code>--enable-dbo</code> (off), <code>--dbo-decode-token-threshold</code> (32) and <code>--dbo-prefill-token-threshold</code> (512): a batch smaller than the threshold runs as one batch ({{cite vllm/config/parallel.py:258-271}}).</li>
+  <li><strong>Backends.</strong> On CUDA, microbatching asserts <code>deepep_low_latency</code>, <code>deepep_high_throughput</code> or <code>nixl_ep</code>; ROCm also allows <code>allgather_reducescatter</code> ({{cite vllm/config/vllm.py:2159-2181}}). The design doc names only DeepEP ({{cite docs/design/dbo.md:37}}).</li>
+  <li><strong>Model runner.</strong> Model Runner V2 lists DBO as unsupported unless you set <code>VLLM_USE_V2_MODEL_RUNNER</code> explicitly. So vLLM uses the fallback runner ({{cite vllm/config/vllm.py:3181-3194}}, {{link concepts/model-runner}}). With the variable set, V2 still refuses DBO with LoRA, speculative decoding, PP, context parallelism, multimodal, hybrid models and PIECEWISE CUDA graphs (lines 3196-3218).</li>
+  <li><strong>Lockstep.</strong> All DP ranks must agree to microbatch; the per-step DP sync carries an "allow microbatching" vote ({{cite vllm/v1/worker/gpu/dp_utils.py:69}}, {{cite vllm/v1/worker/gpu/dp_utils.py:96-112}}).</li>
+</ul>
+</x-deepdive>
+
+<x-deepdive title="Elastic EP in one paragraph">
+<p><code>--enable-elastic-ep</code> lets a running MoE deployment change its DP (and so EP) size. The config requires EPLB, no PP and no hybrid load balancing; async EPLB then needs NIXL ({{cite vllm/config/parallel.py:975-997}}). The DP, EP and EPLB groups become stateless groups on a TCP store, so they can be rebuilt ({{cite vllm/distributed/parallel_state.py:2297-2305}}). Only one API server runs: a larger count is capped to 1 with a warning ({{cite vllm/entrypoints/cli/serve.py:138-145}}). You scale with <code>POST /scale_elastic_ep</code> and a body <code>{"new_data_parallel_size": N, "drain_timeout": 120}</code> ({{cite vllm/entrypoints/serve/elastic_ep/api_router.py:28-66}}). In internal load-balancing mode, the scale-up and scale-down code needs <code>--data-parallel-backend ray</code> ({{cite vllm/v1/engine/core_client.py:1920-1922}}).</p>
+<p>The route is registered for every server of a generative model, also without <code>--enable-elastic-ep</code> ({{cite vllm/entrypoints/launchers/api_server/routers.py:55-66}}). Its path is not under the prefixes that <code>--api-key</code> checks ({{cite vllm/entrypoints/serve/middleware/authenticate.py:11}}). Without elastic EP, a call gives these results (traced in the code):</p>
+<ul>
+  <li><strong>Missing or invalid body values:</strong> HTTP 400 ({{cite vllm/entrypoints/serve/elastic_ep/api_router.py:44-61}}).</li>
+  <li><strong>The current DP size:</strong> <code>AsyncLLM</code> logs "Data parallel size is already N, skipping scale" and changes nothing. The route answers 200 ({{cite vllm/v1/engine/async_llm.py:1301-1308}}, {{cite vllm/entrypoints/serve/elastic_ep/api_router.py:65-70}}).</li>
+  <li><strong>Another size, one engine core:</strong> <code>AsyncMPClient</code> keeps the base method, which raises <code>NotImplementedError</code>. The route logs "Scale failed" and answers 500 ({{cite vllm/v1/engine/core_client.py:274-275}}, {{cite vllm/entrypoints/serve/elastic_ep/api_router.py:79-81}}).</li>
+  <li><strong>Another size, DP &gt; 1, external load balancing:</strong> <code>NotImplementedError</code> "Elastic EP scaling requires enable_elastic_ep=True.", HTTP 500 ({{cite vllm/v1/engine/core_client.py:1659-1664}}, {{cite vllm/v1/engine/core_client.py:1674-1683}}).</li>
+  <li><strong>Another size, DP &gt; 1, internal load balancing, default <code>mp</code> DP backend:</strong> the assertion "Only ray DP backend supports scaling elastic EP" fails, HTTP 500 ({{cite vllm/v1/engine/core_client.py:1913-1922}}).</li>
+  <li><strong>The same with the Ray DP backend:</strong> a larger size gives HTTP 400, because without elastic EP the maximum DP size is the start size ({{cite vllm/config/parallel.py:1037-1042}}, {{cite vllm/v1/engine/core_client.py:1924-1929}}). A smaller size gives HTTP 400 when the experts do not fit on fewer engines, which is always true with no redundant experts (lines 1930-1945).</li>
+</ul>
+<p>In these cases the error comes before <code>set_scaling_elastic_ep(True)</code>, so the server does not hold back new requests ({{cite vllm/v1/engine/async_llm.py:1310}}, {{cite vllm/v1/engine/async_llm.py:1329}}). The code in this path does not check <code>--enable-elastic-ep</code> itself ({{cite vllm/v1/engine/core_client.py:1913-1952}}). One case remains: the Ray DP backend and a smaller size that passes the expert check. Then the client sends reconfiguration calls to the engines. This site does not trace that case further.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>EP without DP or TP does nothing.</strong> With one rank, <code>use_ep</code> is false even with the flag ({{cite vllm/model_executor/layers/fused_moe/config.py:1198-1201}}).</li>
+  <li><strong>EPLB flags without EP.</strong> <code>--enable-eplb</code> without <code>--enable-expert-parallel</code> raises "enable_expert_parallel must be True to use EPLB." ({{cite vllm/config/parallel.py:569-570}}).</li>
+  <li><strong>Uneven experts.</strong> With EPLB, global experts must divide by the EP size ({{cite vllm/model_executor/layers/fused_moe/layer.py:272-279}}). Choose <code>num_redundant_experts</code> to fit.</li>
+  <li><strong>Missing library.</strong> DeepEP, NIXL-EP, MoRI or FlashInfer backends need their packages; an unknown backend name raises "Unknown all2all backend" ({{cite vllm/distributed/device_communicators/cuda_communicator.py:277-278}}).</li>
+  <li><strong>The default backend moves every token to every rank.</strong> <code>allgather_reducescatter</code> is simple but sends DP × the tokens of each rank in each layer ({{cite vllm/distributed/device_communicators/all2all.py:128-161}}). At scale, the DeepEP-style backends send only the needed tokens.</li>
+  <li><strong>Unexpected fallback runner.</strong> <code>--enable-dbo</code> moves the model to the fallback model runner unless <code>VLLM_USE_V2_MODEL_RUNNER</code> is set (DBO deep dive).</li>
+</ul>
+<p><strong>Why it matters.</strong> The largest open models are MoE models. Their throughput depends on how tokens move between GPUs, so the all2all backend, the expert kernel and EPLB are among the most important serving choices.</p>
+
+<x-quiz>
+  <x-q level="easy">What does <code>FusedMoEFactory</code> return?
+    <x-a><p>An <code>MoERunner</code>, which holds the router and the <code>RoutedExperts</code> ({{cite vllm/model_executor/layers/fused_moe/layer.py:447-470}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">What is the default <code>--all2all-backend</code>, and how does it dispatch?
+    <x-a><p><code>allgather_reducescatter</code> ({{cite vllm/config/parallel.py:220}}). Dispatch is an all-gather of all tokens; combine is a reduce-scatter ({{cite vllm/distributed/device_communicators/all2all.py:67-173}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With <code>-tp 2 -dp 2 --enable-expert-parallel</code>, what are the MoE TP size and EP size of each layer?
+    <x-a><p>The flattened TP size is DP × PCP × TP = 4. With EP, <code>ep_size</code> = 4 and the MoE TP size = 1 ({{cite vllm/model_executor/layers/fused_moe/config.py:1105-1114}}, {{cite vllm/model_executor/layers/fused_moe/config.py:1227-1244}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">On an H100, which unquantized MoE backend does the oracle try first, and why?
+    <x-a><p>Triton. The CUDA list starts with the two FlashInfer backends. On compute capability 9.x both move to the back, because they are slower than Triton there ({{cite vllm/model_executor/layers/fused_moe/oracle/unquantized.py:68-80}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">EPLB is on with the defaults. A server runs 2,000 steps per minute. How often are the experts rearranged, and how much history is used?
+    <x-a><p>Every 3,000 steps, so about every 90 seconds, using the load of the last 1,000 recorded steps ({{cite vllm/config/parallel.py:67-75}}, {{cite vllm/distributed/eplb/eplb_state.py:681-693}}). Dummy steps advance the counter but record no load ({{cite vllm/distributed/eplb/eplb_state.py:587-590}}, {{cite vllm/distributed/eplb/eplb_state.py:662-666}}).</p></x-a>
+  </x-q>
+</x-quiz>
