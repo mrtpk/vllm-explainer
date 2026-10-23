@@ -1,0 +1,186 @@
+---
+title: Structured outputs: JSON schemas, grammars and token bitmasks in vLLM
+nav_title: Structured outputs
+level: Advanced
+prerequisites: concepts/openai-server, concepts/engine-core-loop, concepts/async-scheduling
+related: concepts/tool-and-reasoning-parsers, concepts/openai-server, concepts/scheduler, concepts/async-scheduling, concepts/model-runner, concepts/speculative-decoding, concepts/sampling-and-logits-processors, learn/openai-api
+summary: How a JSON schema, regex, choice list or grammar in a request becomes a per-step token bitmask - the request fields, the backend choice, grammar compilation in the engine core, the bitmask on the worker, and the interplay with async scheduling, speculative decoding and reasoning.
+---
+<x-sentence>vLLM compiles a request's constraint into a grammar in the engine core. Every step then masks the logits, so only allowed tokens can be sampled.</x-sentence>
+
+<h2>The idea</h2>
+<p>Structured outputs force the answer into a format. Examples are valid JSON for a schema, a string that matches a regex, one of a list of choices, or text of a grammar. The method is a token mask. At each step, a grammar state machine says which tokens may come next, and the sampler sees <code>-inf</code> for all others ({{deepinfer concepts/structured-outputs | Structured outputs: token masks}}). This page shows how vLLM splits that work between its processes.</p>
+<p>The API server turns the request fields into one constraint and picks a {{term structured-output-backend}} for it. The engine core compiles the constraint into a grammar matcher, in a thread pool, while the request waits. In every step, the engine core fills a {{term grammar-bitmask}} row for each constrained request; the worker applies it to the logits on the GPU. After the step, the engine core feeds the sampled token to the matcher.</p>
+<p><strong>An everyday comparison.</strong> Think of a form with boxes that accept only digits. Before the clerk starts, someone prints the form (compile). For every character, the form shows which keys still work (the bitmask), and the clerk can press only those. The comparison stops being true in one place: vLLM's clerk may write freely for a while first. While a reasoning model thinks, the mask allows every token; the form starts only after the thinking ends.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b7a_structured_flow" alt="Panel 1, API server: request fields (response_format json_schema or json_object, structured_outputs with json, regex, choice, grammar or structural_tag, tool_choice required or named set by the tool parser) become StructuredOutputsParams with exactly one constraint, validated in the InputProcessor; the backend choice with auto tries xgrammar, else guidance, else outlines, and stores the result in params._backend. Panel 2, engine core once: the input thread runs grammar_init and sets the status WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR; the first request builds the one backend of the engine; a ThreadPoolExecutor with (CPUs + 1) // 2 workers compiles with the xgrammar GrammarCompiler and its 512 MB cache into a GrammarMatcher; the scheduler's waiting pass skips the request until the future is done, then sets WAITING, or finishes it with an error. Panel 3, every decode step: get_grammar_bitmask in the engine core fills one row per structured request, a full row while reasoning; sample_tokens on the worker copies the bitmask to the GPU and a kernel writes -inf where the bit is 0 before the sampler; update_from_output calls accept_tokens to advance the matcher, latches reasoning_ended at the end of thinking, and stops masking when the matcher is terminated." caption="Figure: the API server builds and validates the constraint (panel 1), the engine core compiles it once (panel 2), and every step masks the logits with a fresh bitmask row (panel 3)." />
+<p>Read the panels from top to bottom; each panel runs in a different place. Blue is the API server, violet and teal are the engine core process, amber is the worker on the GPU. The parameter strip shows the bitmask size for a 151,936-token vocabulary: 4,748 int32 words, 18,992 bytes per row.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the request fields</h3>
+<p>Three fields lead to a constraint. All end in one <code>StructuredOutputsParams</code> inside <code>SamplingParams</code>:</p>
+<ul>
+  <li><strong><code>response_format</code></strong> (OpenAI). <code>json_object</code> becomes <code>json_object=True</code>; {{term json-schema-response-format | <code>json_schema</code>}} becomes <code>json=&lt;schema&gt;</code>; <code>structural_tag</code> stays a structural tag. <code>text</code> means no constraint ({{cite vllm/entrypoints/generate/base/protocol.py:181-211}}). A <code>json_schema</code> without the schema gives HTTP 400 ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:827-838}}).</li>
+  <li><strong><code>structured_outputs</code></strong> (vLLM extra field) with exactly one of <code>json</code>, <code>regex</code>, <code>choice</code>, <code>grammar</code>, <code>json_object</code>, <code>structural_tag</code> ({{cite vllm/sampling_params.py:102-141}}). <code>response_format</code> overrides the matching fields when both are set ({{cite vllm/entrypoints/generate/base/protocol.py:208-211}}).</li>
+  <li><strong><code>tool_choice</code></strong> <code>"required"</code> or a named function: the tool parser writes a constraint into <code>structured_outputs</code> during rendering ({{link concepts/tool-and-reasoning-parsers}}).</li>
+</ul>
+<x-warning title="The old guided_* fields are ignored">
+<p><code>guided_json</code>, <code>guided_regex</code>, <code>guided_choice</code>, <code>guided_grammar</code> and <code>guided_decoding_backend</code> are no longer request fields. A request that still sends them gets HTTP 200 and unconstrained output; the server only logs a warning once ({{cite vllm/entrypoints/serve/engine/protocol.py:21-34}}, {{cite vllm/entrypoints/serve/engine/protocol.py:62-71}}). Use <code>structured_outputs</code> or <code>response_format</code>.</p>
+</x-warning>
+<p>The sampling parameters are made with <code>structured_outputs=self.extract_structured_outputs()</code> for chat and for completions ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:801}}, {{cite vllm/entrypoints/openai/completion/protocol.py:427}}).</p>
+
+<h3>Step 2: StructuredOutputsConfig and the backend choice</h3>
+<x-code file="vllm/config/structured_outputs.py" lines="11-41" highlight="11-13,20,25,34,40" />
+<p>The backend is set with <code>--structured-outputs-config.backend</code>; the default is <code>auto</code>. A search of <code>vllm/</code> finds no other assignment to this field; <code>EngineArgs</code> merges only the reasoning parser into this config ({{cite vllm/engine/arg_utils.py:2187-2204}}). The choice happens per request, when <code>InputProcessor</code> validates the sampling parameters inside <code>AsyncLLM.add_request</code> ({{cite vllm/v1/engine/input_processor.py:157-162}}):</p>
+<x-code file="vllm/sampling_params.py" lines="1390-1441" highlight="1397-1399,1421-1425,1427-1439,1441" />
+<ol>
+  <li>Lines 1397-1399: <code>auto</code> tries xgrammar first. If xgrammar accepts the constraint, the request uses xgrammar.</li>
+  <li>Lines 1405-1425: else outlines, for a non-Tekken Mistral tokenizer or a JSON schema with features that guidance does not support.</li>
+  <li>Lines 1427-1439: else guidance, if the tokenizer is a fast Hugging Face tokenizer; else HTTP 400.</li>
+  <li>Line 1441: <code>_backend_was_auto</code> remembers that the choice was automatic.</li>
+</ol>
+<p>A Tekken Mistral tokenizer with a Lark grammar goes to guidance directly ({{cite vllm/sampling_params.py:1374-1389}}). A fixed backend (not <code>auto</code>) validates with that backend only and has no fallback ({{cite vllm/sampling_params.py:1336-1373}}).</p>
+<x-note title="When the validation error becomes visible">
+<p>This check runs in <code>add_request</code>, so it runs when the generator starts. For a non-streaming request that is still before any HTTP byte, so the client gets a plain HTTP 400. For a stream, the HTTP 200 is already out, so the client gets an error chunk ({{link concepts/openai-server}}, Step 6).</p>
+</x-note>
+
+<h3>Step 3: compile in the engine core, wait in the scheduler</h3>
+<p>The engine core's input thread turns the <code>EngineCoreRequest</code> into a <code>Request</code> and starts the grammar at once ({{cite vllm/v1/engine/core.py:1128-1135}}). A request with a constraint starts in the status <code>WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR</code>, not <code>WAITING</code> ({{cite vllm/v1/request.py:112-117}}).</p>
+<x-code file="vllm/v1/structured_output/__init__.py" lines="141-204" highlight="143-150,157-159,193,196-197" />
+<ol>
+  <li>Lines 143-150: the engine has one backend. A request with another backend than the one already built gets <code>VLLMValidationError</code>. The input thread finishes the request with a validation error, which the client sees as HTTP 400, or as an error chunk in a stream ({{cite vllm/v1/engine/core.py:1999-2005}}, {{cite vllm/v1/engine/core.py:2158-2167}}).</li>
+  <li>Lines 157-193: the first constrained request builds the backend.</li>
+  <li>Lines 196-197: the compile runs in a <code>ThreadPoolExecutor</code> with <code>(CPU count + 1) // 2</code> workers ({{cite vllm/v1/structured_output/__init__.py:95-96}}); the request keeps a <code>Future</code>. With the <code>external_launcher</code> executor the compile runs at once instead, so that every rank switches state at the same time ({{cite vllm/v1/structured_output/__init__.py:65-74}}).</li>
+</ol>
+<p>The scheduler's waiting pass skips the request until the <code>Future</code> is done ({{cite vllm/v1/core/sched/scheduler.py:3291-3303}}). Then the status becomes <code>WAITING</code>, and the request is scheduled like any other. A compile error finishes the request with <code>FINISHED_ERROR</code> and a <code>validation_error</code>, which the front end turns into <code>VLLMValidationError</code> ({{cite vllm/v1/core/sched/scheduler.py:2399-2425}}, {{cite vllm/outputs.py:30-35}}).</p>
+<p>The xgrammar backend keeps two compilers with a cache. One is for JSON, regex, choice and EBNF grammars; it never allows special tokens. The other is for structural tags and Lark grammars, which may need special tokens ({{cite vllm/v1/structured_output/backend_xgrammar.py:84-112}}). The cache is limited by <code>VLLM_XGRAMMAR_CACHE_MB</code>, 512 MB by default ({{cite vllm/v1/structured_output/backend_xgrammar.py:215-224}}, {{cite vllm/envs.py:1689}}). So the same schema compiles fast the second time (cache inside xgrammar; library behaviour).</p>
+
+<h3>Step 4: the bitmask of each step</h3>
+<p>In the default engine loop, the engine core schedules a step, starts the forward pass, and then asks for the bitmask while the GPU runs ({{cite vllm/v1/engine/core.py:724-745}}):</p>
+<x-code file="vllm/v1/core/sched/scheduler.py" lines="2086-2115" highlight="2094-2099,2103-2107" />
+<p>Only requests that sample in this step get a row. A chunk of a long prefill that is not the last one gets none (line 2098). <code>grammar_bitmask</code> fills the rows ({{cite vllm/v1/structured_output/__init__.py:382-531}}):</p>
+<ul>
+  <li>The bitmask has <code>max_num_seqs × (1 + num_speculative_tokens)</code> rows, allocated once (lines 397-406). Each structured request owns <code>mask_stride</code> rows: one per draft position plus one for the bonus token (line 395).</li>
+  <li>A request that is still thinking gets a full row of ones: no constraint (lines 241-247 and 466-469).</li>
+  <li>A request in its format gets the matcher's mask for the next token (line 242).</li>
+  <li>Above 128 structured requests and without speculative decoding, up to 8 threads fill the rows in batches of 16 (lines 79-87 and 416-448).</li>
+</ul>
+<p>The result goes to the worker as a <code>GrammarOutput</code> with a numpy array ({{cite vllm/v1/structured_output/__init__.py:523-531}}).</p>
+
+<h3>Step 5: masking on the worker</h3>
+<p>Model Runner V2 applies the mask after <code>compute_logits</code> and before the sampler ({{link concepts/model-runner}}):</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1637-1665" highlight="1643-1651,1663-1665" />
+<p><code>StructuredOutputsWorker</code> keeps an <code>int32 [max_num_logits, cdiv(vocab_size, 32)]</code> buffer on the GPU ({{cite vllm/v1/worker/gpu/structured_outputs.py:60-68}}). It copies the rows on a side CUDA stream, then a Triton kernel writes <code>-inf</code> into each logit whose bit is 0 ({{cite vllm/v1/worker/gpu/structured_outputs.py:80-124}}, {{cite vllm/v1/worker/gpu/structured_outputs.py:162-171}}). The sampler then sees only allowed tokens.</p>
+
+<h3>Step 6: after the step</h3>
+<p><code>update_from_output</code> feeds the new tokens to the matcher ({{cite vllm/v1/core/sched/scheduler.py:2279-2290}}):</p>
+<x-code file="vllm/v1/structured_output/__init__.py" lines="533-553" highlight="545-553" />
+<p>Tokens before the end of the thinking are not fed. When the end token is among the new tokens, <code>reasoning_ended</code> is latched, and the grammar starts after it (lines 545-552). If the matcher rejects a token, the request finishes with an error; the log says "Unexpected", because the mask should make this impossible ({{cite vllm/v1/core/sched/scheduler.py:2282-2290}}). The matcher is built with the request's stop tokens ({{cite vllm/v1/structured_output/__init__.py:216-223}}, {{cite vllm/v1/structured_output/backend_xgrammar.py:198-203}}). Two parts are library behaviour of xgrammar. At the end of the format, the mask allows a stop token. After the matcher accepts a stop token, it reports <code>is_terminated()</code>. vLLM then stops feeding the matcher, and any later row would be a full row ({{cite vllm/v1/structured_output/backend_xgrammar.py:271-286}}, {{cite vllm/v1/structured_output/__init__.py:241-247}}).</p>
+
+<h3>Step 7: async scheduling, speculative decoding and reasoning</h3>
+<ul>
+  <li><strong>Async scheduling.</strong> The bitmask for step k+1 needs the token of step k, but with async scheduling that token may still be on the GPU. The scheduler sets <code>pending_structured_output_tokens</code> for such a step ({{cite vllm/v1/core/sched/async_scheduler.py:37-39}}). The engine core still starts the forward pass of step k+1. But it calls <code>sample_tokens</code> only after it has processed the output of step k ({{cite vllm/v1/engine/core.py:737-749}}, {{cite vllm/v1/engine/core.py:789-810}}). The flag is for the whole batch. So one structured request in decode delays the sampling of every request in that step (derived from line 37). See {{link concepts/async-scheduling}}.</li>
+  <li><strong>Speculative decoding.</strong> Draft tokens are checked against the grammar before they are scheduled; the longest valid prefix stays, and the rest becomes <code>-1</code> padding ({{cite vllm/v1/core/sched/scheduler.py:2663-2666}}, {{cite vllm/v1/core/sched/scheduler.py:2691-2699}}). The bitmask has one row per draft position; the manager advances the matcher through the drafts to fill the rows and rolls it back afterwards ({{cite vllm/v1/structured_output/__init__.py:476-521}}). The matcher allows a rollback of <code>num_speculative_tokens</code> tokens ({{cite vllm/v1/structured_output/backend_xgrammar.py:198-203}}).</li>
+  <li><strong>Reasoning.</strong> With a reasoning parser, the grammar starts only after the thinking ends, unless <code>enable_in_reasoning</code> is set ({{cite vllm/v1/structured_output/__init__.py:300-319}}). The front end tells the engine core whether the prompt already ended the thinking. With <code>reasoning_ended</code> unset, the engine core checks the prompt with its own parser (lines 312-319). Some engine-based parsers end the thinking with a content token, for example a tool-call start. Such a token stays masked during the thinking if the grammar cannot start with it ({{cite vllm/v1/structured_output/__init__.py:258-281}}).</li>
+</ul>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: one JSON-schema request, step by step">
+<p>Server: <code>vllm serve Qwen/Qwen2.5-0.5B-Instruct</code> on one GPU, default flags (<code>max_num_seqs</code> from the GPU size, async scheduling on, no reasoning parser). Request (example):</p>
+<pre><code class="language-json">{"messages": [{"role": "user", "content": "Give me a city as JSON."}],
+ "response_format": {"type": "json_schema",
+   "json_schema": {"name": "city", "schema": {"type": "object",
+      "properties": {"name": {"type": "string"}}, "required": ["name"]}}}}</code></pre>
+<ol>
+  <li><strong>API server.</strong> <code>to_sampling_params</code> makes <code>StructuredOutputsParams(json={...schema...})</code> ({{cite vllm/entrypoints/generate/base/protocol.py:192-195}}). In <code>add_request</code>, the input processor validates with xgrammar; it accepts, so <code>_backend = "xgrammar"</code> and <code>_backend_was_auto = True</code>.</li>
+  <li><strong>Input thread.</strong> <code>Request</code> starts as <code>WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR</code>. This is the first constrained request, so the manager builds <code>XgrammarBackend</code>: two compilers, each with <code>max_threads=8</code> ({{cite vllm/v1/structured_output/backend_xgrammar.py:215-224}}). The compile job goes to the pool.</li>
+  <li><strong>Scheduler.</strong> While the <code>Future</code> runs, each waiting pass skips the request. When it is done, the request becomes <code>WAITING</code> and is admitted.</li>
+  <li><strong>Prefill step.</strong> The whole prompt fits into one step, so the request is not a partial prefill chunk; it gets bitmask row 0. The matcher allows only tokens that can start a JSON object of the schema; every other token gets <code>-inf</code>.</li>
+  <li><strong>Size of the mask.</strong> The Qwen2.5 vocabulary has 151,936 entries (inferred from its <code>config.json</code>). One row is <code>cdiv(151936, 32)</code> = 4,748 int32 words = 18,992 bytes. With 3 structured requests in a step, the array is <code>int32 [3, 4748]</code>, about 57 KB, copied to the GPU once per step.</li>
+  <li><strong>Decode steps.</strong> With async scheduling, the next step is scheduled while the token of this step is in flight, so <code>pending_structured_output_tokens</code> is true. The engine core starts the forward pass and processes the previous output, which feeds the token to the matcher. Only then does it fill the row and sample.</li>
+  <li><strong>End.</strong> After <code>{"name": "Paris"}</code>, the format is complete. The mask then allows a stop token of the request (here <code>&lt;|im_end|&gt;</code>), and the request finishes with <code>finish_reason: "stop"</code> when the model samples it.</li>
+</ol>
+<x-simplified><p>The order of tokens and the exact allowed set come from xgrammar (library behaviour); the steps above follow vLLM's calls. Whitespace rules depend on <code>disable_any_whitespace</code>.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Costs: where structured outputs spend time">
+<table>
+  <thead><tr><th>Cost</th><th>Where</th><th>When</th><th>Lines</th></tr></thead>
+  <tbody>
+    <tr><td>validation of the constraint</td><td>API server, in <code>add_request</code></td><td>every request</td><td>{{cite vllm/sampling_params.py:1336-1441}}</td></tr>
+    <tr><td>grammar compile</td><td>engine core thread pool</td><td>per request; repeat schemas hit the xgrammar cache</td><td>{{cite vllm/v1/structured_output/__init__.py:195-204}}</td></tr>
+    <tr><td>wait for the compile</td><td>scheduler</td><td>until the <code>Future</code> is done: adds to TTFT</td><td>{{cite vllm/v1/core/sched/scheduler.py:3291-3295}}</td></tr>
+    <tr><td>fill the bitmask</td><td>engine core main thread (threads above 128 requests)</td><td>every step with constrained requests</td><td>{{cite vllm/v1/structured_output/__init__.py:416-521}}</td></tr>
+    <tr><td>copy and apply the mask</td><td>worker, GPU</td><td>every step</td><td>{{cite vllm/v1/worker/gpu/structured_outputs.py:70-128}}</td></tr>
+    <tr><td>deferred sampling</td><td>engine core loop</td><td>async scheduling with a constrained request in decode</td><td>{{cite vllm/v1/engine/core.py:737-749}}</td></tr>
+    <tr><td>advance the matcher</td><td>engine core, <code>update_from_output</code></td><td>every new token</td><td>{{cite vllm/v1/structured_output/__init__.py:533-553}}</td></tr>
+  </tbody>
+</table>
+<p>The code gives no measured numbers for these costs. Measure with and without the constraint on your own workload (<code>vllm bench serve</code>, {{link concepts/benchmarking}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Errors: what fails where">
+<table>
+  <thead><tr><th>Situation</th><th>Where</th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td>two of <code>json</code>, <code>regex</code> and <code>choice</code> in one request</td><td>request validator</td><td>400 ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:931-945}})</td></tr>
+    <tr><td>a constraint and a named <code>tool_choice</code></td><td>request validator</td><td>400 ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:946-955}})</td></tr>
+    <tr><td>empty choice list, empty grammar or schema, NUL in a regex</td><td>input processor</td><td>400 ({{cite vllm/sampling_params.py:1266-1308}})</td></tr>
+    <tr><td>no backend accepts the constraint (auto)</td><td>input processor</td><td>400 ({{cite vllm/sampling_params.py:1428-1434}})</td></tr>
+    <tr><td>a model loaded without a tokenizer (<code>--skip-tokenizer-init</code>)</td><td>input processor</td><td>400 ({{cite vllm/sampling_params.py:1242-1245}})</td></tr>
+    <tr><td>request resolves to another backend than the engine's</td><td>engine core input thread</td><td>validation error: 400, or an error chunk in a stream ({{cite vllm/v1/structured_output/__init__.py:143-150}})</td></tr>
+    <tr><td>compile fails</td><td>engine core thread pool</td><td>request finished with a validation error ({{cite vllm/v1/core/sched/scheduler.py:3296-3301}})</td></tr>
+    <tr><td>the matcher rejects a sampled token</td><td><code>update_from_output</code></td><td>request finished with an error, logged as unexpected ({{cite vllm/v1/core/sched/scheduler.py:2279-2290}})</td></tr>
+    <tr><td>old <code>guided_*</code> field</td><td>pydantic model</td><td>no error, no constraint, a warning in the log</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Flags and environment variables">
+<table>
+  <thead><tr><th>Setting</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--structured-outputs-config.backend</code></td><td><code>auto</code> ({{cite vllm/config/structured_outputs.py:20}})</td><td>Fix one backend; no fallback then.</td></tr>
+    <tr><td><code>--structured-outputs-config.disable_any_whitespace</code></td><td>false ({{cite vllm/config/structured_outputs.py:25}})</td><td>Compact JSON; only xgrammar and guidance, else <code>ValueError</code> at start-up ({{cite vllm/config/structured_outputs.py:62-66}}).</td></tr>
+    <tr><td><code>--structured-outputs-config.disable_additional_properties</code></td><td>false</td><td>Guidance only.</td></tr>
+    <tr><td><code>--structured-outputs-config.enable_in_reasoning</code></td><td>false ({{cite vllm/config/structured_outputs.py:40}})</td><td>Constrain the thinking too.</td></tr>
+    <tr><td><code>--reasoning-parser</code></td><td>""</td><td>Lets the engine core find the end of the thinking.</td></tr>
+    <tr><td><code>VLLM_XGRAMMAR_CACHE_MB</code></td><td>512 ({{cite vllm/envs.py:1689}})</td><td>Size limit of the xgrammar compile cache. The type stub at {{cite vllm/envs.py:226}} says 0; the reader returns 512.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="Mixed schemas with backend auto can be rejected">
+<p>The API server picks a backend per request, but the engine core keeps the first one it built ({{cite vllm/v1/structured_output/__init__.py:143-150}}). If the first constrained request used xgrammar, a later schema that only guidance supports is rejected with a validation error, and the other way around. Set <code>--structured-outputs-config.backend</code> to one backend if your clients send mixed schemas. (Derived from the two code paths.)</p>
+</x-warning>
+<ul>
+  <li><strong>Unconstrained output with HTTP 200.</strong> The request uses <code>guided_json</code> or another removed field (Step 1).</li>
+  <li><strong>JSON appears only after a long thinking text.</strong> With a reasoning parser, the grammar starts after the thinking (Step 7). Set <code>enable_in_reasoning</code> or turn the thinking off.</li>
+  <li><strong>The JSON is cut off.</strong> <code>max_tokens</code> ended the request before the matcher reached a final state; check <code>finish_reason: "length"</code>.</li>
+  <li><strong>Slow first token for new schemas.</strong> The request waits for its compile (Step 3). Repeat schemas hit the cache.</li>
+  <li><strong>Lower throughput with async scheduling.</strong> One constrained decode request defers the sampling of the whole step (Step 7).</li>
+</ul>
+<p><strong>Why it matters.</strong> Structured outputs make agent and tool pipelines reliable, but they add a compile wait, a per-step CPU job and, with async scheduling, less overlap. Knowing where each part runs tells you what to tune.</p>
+
+<x-quiz>
+  <x-q level="easy">Which field of the OpenAI API asks for JSON that matches a schema, and what does vLLM turn it into?
+    <x-a><p><code>response_format</code> with <code>type: "json_schema"</code>. vLLM turns it into <code>StructuredOutputsParams(json=&lt;schema&gt;)</code> ({{cite vllm/entrypoints/generate/base/protocol.py:192-195}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">In which process and on which thread does the grammar compile, and what does the request do meanwhile?
+    <x-a><p>In the engine core process, in the <code>ThreadPoolExecutor</code> of the structured output manager; the input thread submits the job ({{cite vllm/v1/engine/core.py:1128-1135}}, {{cite vllm/v1/structured_output/__init__.py:196-197}}). The request waits in the status <code>WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR</code>, and the scheduler skips it until the <code>Future</code> is done ({{cite vllm/v1/core/sched/scheduler.py:3291-3303}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">How large is one bitmask row for a vocabulary of 151,936 tokens? How many rows does a structured request own with 3 speculative tokens?
+    <x-a><p><code>cdiv(151936, 32)</code> = 4,748 int32 words, 18,992 bytes ({{cite vllm/v1/worker/gpu/structured_outputs.py:63-65}}). With 3 speculative tokens, <code>mask_stride</code> = 3 + 1 = 4 rows per request ({{cite vllm/v1/structured_output/__init__.py:393-395}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">The server uses async scheduling. A batch has 200 normal requests and 1 JSON-schema request in decode. What happens to the sampling of that step, and why?
+    <x-a><p>The step is scheduled while the previous token of the JSON request is still in flight, so the scheduler sets <code>pending_structured_output_tokens</code> for the step ({{cite vllm/v1/core/sched/async_scheduler.py:37-39}}). The engine core starts the forward pass but defers <code>sample_tokens</code> for the whole batch. It first processes the previous step's output, then fills the bitmask and samples ({{cite vllm/v1/engine/core.py:737-749}}, {{cite vllm/v1/engine/core.py:789-810}}). The flag is per batch, so all 201 requests wait (derived).</p></x-a>
+  </x-q>
+  <x-q level="hard">A reasoning model with <code>--reasoning-parser deepseek_r1</code> gets a JSON-schema request. Which tokens does the grammar see, and what is the bitmask while the model thinks?
+    <x-a><p>While the thinking is not ended, the constraint bounds start after the thinking, so the rows are full rows: every token is allowed ({{cite vllm/v1/structured_output/__init__.py:300-319}}, {{cite vllm/v1/structured_output/__init__.py:241-247}}). <code>accept_tokens</code> ignores the tokens before the end; when <code>&lt;/think&gt;</code> arrives, it latches <code>reasoning_ended</code> and feeds only the tokens after it to the matcher ({{cite vllm/v1/structured_output/__init__.py:545-553}}).</p></x-a>
+  </x-q>
+</x-quiz>

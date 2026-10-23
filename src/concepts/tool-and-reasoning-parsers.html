@@ -1,0 +1,198 @@
+---
+title: Tool and reasoning parsers: from model text to tool_calls and reasoning
+nav_title: Tool and reasoning parsers
+level: Intermediate
+prerequisites: learn/openai-api, concepts/openai-server, concepts/renderers-and-chat-templates
+related: concepts/structured-outputs, concepts/frontend-plugins, concepts/openai-server, concepts/renderers-and-chat-templates, code/entrypoints-openai-chat-completion-serving, learn/openai-api
+summary: How vllm serve turns the model's raw text into the OpenAI fields reasoning, content and tool_calls - the flags, the parser registries, the Parser object that composes them, how each tool_choice mode is enforced, streaming deltas, reasoning-end detection, the reasoning parser in the engine core and the declarative parser engine.
+---
+<x-sentence>Parsers split the model's raw text into reasoning, content and tool calls; tool_choice "required" or a named tool is also enforced with a grammar.</x-sentence>
+
+<h2>The idea</h2>
+<p>A model writes everything as text. A reasoning model writes its thinking first, for example between <code>&lt;think&gt;</code> and <code>&lt;/think&gt;</code>. A model with tools writes a tool call in its own format, for example <code>&lt;tool_call&gt;{"name": ..., "arguments": ...}&lt;/tool_call&gt;</code>. The OpenAI API wants three separate fields: <code>reasoning</code> ({{term reasoning-content}}), <code>content</code> and <code>tool_calls</code> ({{link learn/openai-api}}).</p>
+<p>Two kinds of classes do the split in the API server. A {{term reasoning-parser}} finds where the thinking ends. A {{term tool-parser}} finds tool calls in the rest. Each family of models has its own format, so vLLM has many of each, chosen by name with <code>--reasoning-parser</code> and <code>--tool-call-parser</code>. One <code>Parser</code> object per choice runs both, first the reasoning parser and then the tool parser.</p>
+<p>Parsing only reads what the model wrote. To force a tool call ({{term tool-choice}} <code>"required"</code> or a named function), vLLM also constrains the generation with a grammar ({{link concepts/structured-outputs}}). The engine core needs to know when the thinking ends, because the grammar applies only after it. So the reasoning parser runs in the engine core process too.</p>
+<p><strong>An everyday comparison.</strong> Think of a secretary who sorts a dictated message into three trays: private notes, the letter, and order forms. The secretary knows each writer's habits, for example that one writer always starts notes with "NB". The comparison stops being true in two places. The secretary cannot fix an order form that the writer filled in wrongly; a malformed tool call stays text. And for "required", vLLM does not only sort: it stops the writer from writing anything other than an order form.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b7a_parser_flow" alt="Panel 1: three boxes. The output of one engine step (delta_text, delta_token_ids, finish_reason) goes to ChatStreamProcessor.step and parser.parse_delta. The reasoning phase lasts until the end-of-thinking token id is in a delta; a start or end marker alone gives None; text gives DeltaMessage with reasoning; the first call checks whether the prompt already ended reasoning. An arrow labelled </think> leads to the tool phase: the Hermes parser re-parses the full text; text before <tool_call> becomes content; a complete name gives id, type and name; new argument text gives arguments; nothing new gives None. Panel 2: a table of ten rows of engine outputs for a reply with reasoning and a tool call. <think> gives None. Weather and ' is needed.' give reasoning deltas. </think> gives None at the phase switch. Two newlines give a content delta. <tool_call> gives None. The name part gives a tool_calls delta with index 0, an id, type function and the name get_weather. The arguments part gives a tool_calls delta with the arguments text. </tool_call> gives None. The final EOS output gives an empty delta with finish_reason tool_calls." caption="Figure: the order in which the parsers see each output (panel 1), and what the client gets for each output of a reply that thinks and then calls a tool (panel 2)." />
+<p>Read panel 2 from top to bottom; it is the worked example of the first deep dive. Rows that say "None" send no SSE chunk at all. The text of the markers reaches the parsers because the Hermes parser turns off <code>skip_special_tokens</code> for requests with tools ({{cite vllm/tool_parsers/hermes_tool_parser.py:59-68}}).</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the flags</h3>
+<ul>
+  <li><code>--enable-auto-tool-choice</code> plus <code>--tool-call-parser NAME</code> turn on tool parsing. The first without the second stops the start-up with <code>TypeError</code> ({{cite vllm/entrypoints/common/cli_args.py:523-525}}). An unknown parser name with auto tool choice raises <code>KeyError</code> at start-up ({{cite vllm/entrypoints/common/cli_args.py:586-594}}).</li>
+  <li><code>--reasoning-parser NAME</code> turns on reasoning parsing; <code>none</code> means unset ({{cite vllm/engine/arg_utils.py:188-190}}). The flag is a field of <code>StructuredOutputsConfig</code>, because the engine core needs it too ({{cite vllm/config/structured_outputs.py:34-39}}, {{cite vllm/engine/arg_utils.py:2187-2204}}). For gpt-oss models, an empty value becomes <code>openai_gptoss</code> ({{cite vllm/model_executor/models/config.py:543-546}}).</li>
+  <li><code>--tool-parser-plugin</code> and <code>--reasoning-parser-plugin</code> import your own parser module ({{link concepts/frontend-plugins}}).</li>
+  <li><code>--tool-strict-level auto|function|parameter</code> sets how strictly tool calls are constrained (Step 4).</li>
+</ul>
+
+<h3>Step 2: the registries</h3>
+<p><code>ToolParserManager</code> registers 58 built-in names lazily: module path and class name, imported on first use ({{cite vllm/tool_parsers/__init__.py:24-270}}). Examples are <code>hermes</code>, <code>llama3_json</code>, <code>mistral</code>, <code>pythonic</code>, <code>qwen3_coder</code>, <code>deepseek_v3</code> and <code>openai</code>. <code>ReasoningParserManager</code> registers 42 names the same way, for example <code>deepseek_r1</code>, <code>qwen3</code>, <code>granite</code>, <code>mistral</code> and <code>openai_gptoss</code> ({{cite vllm/reasoning/__init__.py:22-198}}). (Counts of the dict entries at this commit.) The lookup, the lazy import and the plugin flags are on {{link concepts/frontend-plugins}}.</p>
+
+<h3>Step 3: one Parser class for both</h3>
+<p><code>ParserManager.get_parser</code> composes the two named classes into one <code>Parser</code> class. <code>OpenAIServingChat</code> calls it once at start-up ({{cite vllm/entrypoints/openai/chat_completion/serving.py:167-175}}), and so does <code>OnlineRenderer</code> ({{cite vllm/renderers/online_renderer.py:180-188}}). The tool half has a condition:</p>
+<x-code file="vllm/parser/parser_manager.py" lines="23-54" highlight="34-35,47-53" />
+<x-warning title="--tool-call-parser alone does nothing">
+<p>Without <code>--enable-auto-tool-choice</code>, <code>get_tool_parser</code> returns <code>None</code> (line 34). Then there is no tool parser for any <code>tool_choice</code>, also not for <code>"required"</code> or a named function. Such a request gets the error "tool_choice=... requires --tool-call-parser to be set", even when the flag is set ({{cite vllm/renderers/online_renderer.py:253-281}}). Set both flags.</p>
+</x-warning>
+<p><code>_compose_parser</code> then picks the class ({{cite vllm/parser/parser_manager.py:151-274}}):</p>
+<ol>
+  <li>gpt-oss (Harmony format): always <code>HarmonyParser</code> (lines 179-185).</li>
+  <li>Parsers that read a response template from the tokenizer: one template class. A reasoning parser and a tool parser of two different template kinds cannot be combined (lines 187-220).</li>
+  <li>Three families with their own composite class: <code>kimi_k3</code>, <code>cohere_command3</code>/<code>4</code> and <code>minicpmv</code> (lines 222-262).</li>
+  <li>Everything else: a subclass of <code>DelegatingParser</code> that holds the reasoning class and the tool class (lines 264-274).</li>
+</ol>
+<p>At start-up, <code>validate_parser_tokenizer</code> builds one instance with the model's tokenizer. A parser that cannot find its marker tokens stops the server with <code>TypeError</code> ({{cite vllm/parser/parser_manager.py:74-95}}). For example, a <code>&lt;think&gt;</code>-based reasoning parser raises when the vocabulary has no such token ({{cite vllm/reasoning/basic_parsers.py:61-67}}).</p>
+
+<h3>Step 4: the tool_choice modes and how each is enforced</h3>
+<p>The request validators set and check <code>tool_choice</code> before anything runs: <code>tools</code> without <code>tool_choice</code> means <code>"auto"</code>, and a named function must be one of <code>tools</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:975-1042}}). After rendering, the parser's <code>adjust_request</code> may add a constraint ({{cite vllm/renderers/online_renderer.py:824-859}}, {{cite vllm/parser/abstract_parser.py:493-501}}):</p>
+<table>
+  <thead><tr><th>tool_choice</th><th>Prompt</th><th>Generation</th><th>Parsing of the output</th></tr></thead>
+  <tbody>
+    <tr><td><code>"none"</code></td><td>tools are in the prompt, unless <code>--exclude-tools-when-tool-choice-none</code></td><td>free</td><td>no tool calls; the text stays content ({{cite vllm/parser/abstract_parser.py:401-405}})</td></tr>
+    <tr><td><code>"auto"</code></td><td>tools in the prompt</td><td>free, unless a tool has <code>strict: true</code> or the strict level is <code>function</code>/<code>parameter</code> ({{cite vllm/tool_parsers/structural_tag_registry.py:175-197}})</td><td>the tool parser decides; no call → content</td></tr>
+    <tr><td><code>"required"</code></td><td>tools in the prompt</td><td>constrained: a structural tag of the model's format, or a JSON array of calls</td><td>parsed from the constrained text</td></tr>
+    <tr><td>named function</td><td>tools in the prompt</td><td>constrained to that function's call or its argument schema</td><td>one call with that name; <code>finish_reason</code> stays <code>"stop"</code> ({{cite vllm/entrypoints/serve/utils/tool_calls_utils.py:59-65}})</td></tr>
+  </tbody>
+</table>
+<p>There are two ways to build the constraint for <code>"required"</code> and named calls:</p>
+<ol>
+  <li><strong>Structural tag.</strong> Some tool parsers set <code>structural_tag_model</code>, for example <code>hermes</code>, <code>llama3_json</code>, <code>qwen3_coder</code>, <code>kimi_k2</code> and <code>deepseek_v3</code>. They get a grammar of their own call syntax from xgrammar's templates ({{cite vllm/tool_parsers/abstract_tool_parser.py:180-199}}). <code>_apply_structural_tag</code> writes it into <code>request.structured_outputs</code> and clears <code>response_format</code> ({{cite vllm/parser/abstract_parser.py:503-608}}). This needs <code>VLLM_ENFORCE_STRICT_TOOL_CALLING</code>, which is on by default ({{cite vllm/envs.py:1845-1847}}).</li>
+  <li><strong>JSON schema.</strong> Other parsers get a JSON schema: an array of <code>{name, parameters}</code> objects for <code>"required"</code>, or the function's parameter schema for a named call ({{cite vllm/tool_parsers/utils.py:449-490}}, {{cite vllm/tool_parsers/abstract_tool_parser.py:122-178}}). The output is then plain JSON, and the serving layer reads it without the model's own markers ({{cite vllm/parser/abstract_parser.py:423-451}}).</li>
+</ol>
+<p>With <code>"parallel_tool_calls": false</code>, the grammar stops after the first call, and the serving layer drops any call with an index above 0 ({{cite vllm/parser/abstract_parser.py:531-535}}, {{cite vllm/entrypoints/serve/utils/tool_calls_utils.py:24-44}}).</p>
+
+<h3>Step 5: a full response</h3>
+<p>Without a stream, the full generator calls <code>parser.parse</code> once per choice, on the whole output text ({{cite vllm/entrypoints/openai/chat_completion/serving.py:1007-1019}}). <code>DelegatingParser.parse</code> splits the reasoning first and looks for tool calls in the rest:</p>
+<x-code file="vllm/parser/abstract_parser.py" lines="841-855" highlight="849-854" />
+<p>The serving class then builds the message with <code>reasoning</code>, <code>content</code> and <code>tool_calls</code>. Each call gets an id, <code>chatcmpl-tool-&lt;uuid&gt;</code> by default ({{cite vllm/renderers/chat_utils/tool_call.py:27-32}}). <code>finish_reason</code> becomes <code>"tool_calls"</code> when the message has calls and the engine stopped normally ({{cite vllm/entrypoints/openai/chat_completion/serving.py:1110-1117}}). A call cut by <code>max_tokens</code> keeps <code>finish_reason: "length"</code>, so the client can see that it is incomplete ({{cite vllm/entrypoints/serve/utils/tool_calls_utils.py:52-58}}).</p>
+
+<h3>Step 6: streaming deltas</h3>
+<p>In a stream, each choice has a <code>ChatStreamProcessor</code> with its own parser ({{cite vllm/entrypoints/openai/chat_completion/serving.py:540-555}}). For each engine output it calls <code>parse_delta</code> ({{cite vllm/entrypoints/openai/chat_completion/stream_processor.py:63-72}}). <code>DelegatingParser.parse_delta</code> works in three parts:</p>
+<x-code file="vllm/parser/abstract_parser.py" lines="869-910" highlight="869-882,889-897,904-909" />
+<ol>
+  <li>Lines 869-882: on the first call, check the prompt. If the prompt already ended the thinking, skip the reasoning phase. For example, the Hunyuan example template writes an empty <code>&lt;think&gt;\n\n&lt;/think&gt;</code> when <code>enable_thinking</code> is false ({{cite examples/tool_chat_template_hunyuan_a13b.jinja:110-111}}).</li>
+  <li>Lines 889-897: in the reasoning phase, the reasoning parser turns the delta into <code>reasoning</code> text.</li>
+  <li>Lines 904-909: the phase ends when the end-of-thinking token id is in the delta; the text after it goes on to the tool phase.</li>
+</ol>
+<p>In the tool phase, the tool parser gets the text since the end of the thinking ({{cite vllm/parser/abstract_parser.py:938-964}}). A tool parser's <code>extract_tool_calls_streaming</code> returns <code>None</code> when it has nothing new. Then the serving layer sends no chunk, unless logprobs or token ids must go out ({{cite vllm/entrypoints/openai/chat_completion/serving.py:731-741}}). Tool-call deltas follow the OpenAI stream form. The first delta of a call has <code>index</code>, <code>id</code>, <code>type</code> and the name. Later deltas have only <code>index</code> and more <code>arguments</code> text ({{cite vllm/tool_parsers/hermes_tool_parser.py:229-262}}).</p>
+<p>With <code>"include_reasoning": false</code>, reasoning deltas are dropped, and a delta with only reasoning sends nothing ({{cite vllm/parser/abstract_parser.py:998-1005}}). Logprobs and token ids are hidden for the whole stream, because they would leak the hidden thinking ({{cite vllm/entrypoints/openai/chat_completion/stream_processor.py:35-37}}).</p>
+
+<h3>Step 7: how the end of the thinking is found</h3>
+<p>Most reasoning parsers with a start and an end marker derive from <code>BaseThinkingReasoningParser</code>:</p>
+<x-code file="vllm/reasoning/basic_parsers.py" lines="71-93" highlight="75-80,85-86" />
+<ul>
+  <li><code>is_reasoning_end(ids)</code> reads the ids backwards: an end token before a start token means "ended" (lines 71-80). It is used on the prompt and in the engine core.</li>
+  <li><code>is_reasoning_end_streaming</code> only asks whether the end token is in the new ids (lines 82-86).</li>
+  <li><code>extract_content_ids</code> returns the ids after the end token (lines 88-93).</li>
+</ul>
+<p>The reasoning parser also counts the thinking tokens, between start and end markers ({{cite vllm/reasoning/basic_parsers.py:178-196}}). The serving layer reports the count as <code>usage.completion_tokens_details.reasoning_tokens</code>, when a reasoning parser is set ({{cite vllm/entrypoints/openai/chat_completion/serving.py:1154-1163}}). In the response, the thinking is in the vLLM field <code>reasoning</code>. An old client may send <code>reasoning_content</code> in earlier messages; the request validator renames it to <code>reasoning</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:590-592}}).</p>
+
+<h3>Step 8: the reasoning parser in the engine core</h3>
+<p>A grammar must not constrain the thinking. So the engine core loads the same reasoning parser class for its structured output manager ({{cite vllm/v1/structured_output/__init__.py:100-112}}). The front end helps it twice:</p>
+<ol>
+  <li>It computes <code>reasoning_ended</code> from the rendered prompt and sends it in the <code>EngineCoreRequest</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:616-633}}, {{cite vllm/entrypoints/openai/chat_completion/serving.py:242-262}}, {{cite vllm/v1/engine/async_llm.py:516-519}}).</li>
+  <li>It sends the same <code>chat_template_kwargs</code> as <code>reasoning_parser_kwargs</code>, so the engine core's parser instance reads the output like the front end's one ({{cite vllm/v1/structured_output/__init__.py:118-131}}).</li>
+</ol>
+<p>With <code>include_reasoning: false</code>, <code>reasoning_ended</code> is <code>True</code> from the start, so the grammar applies from the first token ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:625-626}}). The page {{link concepts/structured-outputs}} shows the engine side.</p>
+
+<h3>Step 9: the declarative parser engine (vllm/parser/)</h3>
+<p>Newer parsers do not write their own streaming code. A <code>ParserEngineConfig</code> describes a format with terminals (marker strings or token ids), state transitions and the event that text produces in each state ({{cite vllm/parser/engine/parser_engine_config.py:50-79}}). <code>ParserEngine</code> runs one such config for both reasoning and tool calls, streaming and non-streaming ({{cite vllm/parser/engine/parser_engine.py:111-123}}). The folder's guide summarizes the layout: one file per model family, and adapters that expose an engine through the old reasoning-parser and tool-parser interfaces ({{cite vllm/parser/AGENTS.md:1-26}}).</p>
+<p>The adapters are what the registries load. For example, the reasoning name <code>qwen3</code> loads <code>Qwen3ParserReasoningAdapter</code> ({{cite vllm/reasoning/__init__.py:168-171}}, {{cite vllm/parser/engine/registered_adapters.py:1-33}}). Adapters set <code>engine_based_streaming = True</code> ({{cite vllm/parser/engine/adapters.py:35-45}}), and <code>DelegatingParser</code> then feeds them deltas, not the growing full text ({{cite vllm/parser/abstract_parser.py:83-105}}, {{cite vllm/parser/abstract_parser.py:152-155}}). For a user, nothing changes: the flags and names stay the same.</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: a streamed reply with reasoning, then a tool call">
+<p>Server: <code>vllm serve &lt;DeepSeek-R1-style model&gt; --reasoning-parser deepseek_r1 --enable-auto-tool-choice --tool-call-parser hermes</code>. The request has one tool <code>get_weather(city)</code>, <code>tool_choice</code> unset (so <code>"auto"</code>) and <code>"stream": true</code>. The prompt has no <code>&lt;think&gt;</code> marker at its end. The model writes:</p>
+<pre><code class="language-none">&lt;think&gt;Weather is needed.&lt;/think&gt;\n\n&lt;tool_call&gt;{"name": "get_weather", "arguments": {"city": "Paris"}}&lt;/tool_call&gt;&lt;EOS&gt;</code></pre>
+<p><strong>Before the first token.</strong> <code>adjust_request</code> runs: no strict tool and the default strict level, so <code>resolve_tool_strictness</code> returns <code>None</code>, and no grammar is added ({{cite vllm/tool_parsers/structural_tag_registry.py:186-191}}). Hermes sets <code>skip_special_tokens = False</code>. With <code>VLLM_ENFORCE_STRICT_TOOL_CALLING</code> on, Hermes has <code>supports_required_and_named = False</code>, because it has a structural tag model ({{cite vllm/tool_parsers/abstract_tool_parser.py:68-74}}); for <code>"auto"</code> this changes nothing.</p>
+<p><strong>Output by output</strong> (the numbers match the figure):</p>
+<ol>
+  <li><code>&lt;think&gt;</code>: the first <code>parse_delta</code> checks the prompt: no marker, so the reasoning phase is on. A single start token gives <code>None</code> ({{cite vllm/reasoning/basic_parsers.py:108-112}}). No chunk.</li>
+  <li><code>Weather</code>: the start id is in the previous ids and no end id is anywhere, so <code>DeltaMessage(reasoning="Weather")</code> ({{cite vllm/reasoning/basic_parsers.py:116-133}}). Chunk <code>{"reasoning": "Weather"}</code>.</li>
+  <li><code> is needed.</code>: the same branch. Chunk <code>{"reasoning": " is needed."}</code>.</li>
+  <li><code>&lt;/think&gt;</code>: a single end token gives <code>None</code>, but <code>is_reasoning_end_streaming</code> is true. The state switches; the content ids after the marker are <code>[]</code>, so the tool parser gets empty text and returns <code>None</code> ({{cite vllm/parser/abstract_parser.py:904-936}}). No chunk.</li>
+  <li><code>\n\n</code>: tool phase. Hermes finds no <code>&lt;tool_call&gt;</code> and no partial tag at the end, so it sends the new text as content ({{cite vllm/tool_parsers/hermes_tool_parser.py:122-139}}). Chunk <code>{"content": "\n\n"}</code>.</li>
+  <li><code>&lt;tool_call&gt;</code>: content stops at the tag; the call body is empty, so no name yet ({{cite vllm/tool_parsers/hermes_tool_parser.py:229-239}}). No chunk.</li>
+  <li><code>{"name": "get_weather",</code>: the name regex needs the closing quote of the name ({{cite vllm/tool_parsers/hermes_tool_parser.py:169-172}}). The outputs before that quote give <code>None</code>. The output with the quote gives a chunk with <code>index</code> 0, a new id, <code>type: "function"</code> and <code>name</code> ({{cite vllm/tool_parsers/hermes_tool_parser.py:234-250}}).</li>
+  <li><code> "arguments": {"city": "Paris"}}</code>: after the key <code>"arguments":</code>, each output that adds argument text gives an <code>arguments</code> delta with only the new part. When the call body is complete JSON, the parser strips the outer <code>}</code>. In total the client gets the argument text <code>{"city": "Paris"}</code> ({{cite vllm/tool_parsers/hermes_tool_parser.py:175-202}}).</li>
+  <li><code>&lt;/tool_call&gt;</code>: the arguments did not grow. No chunk.</li>
+  <li>EOS with <code>finish_reason: "stop"</code>: the end token is not detokenized, so the text is empty and the parser returns <code>None</code>. Because a tool call was streamed, the processor changes the reason to <code>"tool_calls"</code> ({{cite vllm/entrypoints/openai/chat_completion/stream_processor.py:79-82}}). The serving layer sends an empty delta with that reason ({{cite vllm/entrypoints/openai/chat_completion/serving.py:731-741}}).</li>
+</ol>
+<p>The same output without a stream gives one message. <code>reasoning</code> is "Weather is needed.", and there is one tool call with the arguments <code>{"city": "Paris"}</code> and <code>finish_reason: "tool_calls"</code> ({{cite vllm/reasoning/basic_parsers.py:153-176}}, {{cite vllm/tool_parsers/hermes_tool_parser.py:70-114}}). <code>content</code> is <code>null</code>: the text before the tag is only whitespace, and the non-streaming path turns whitespace-only content into <code>None</code> ({{cite vllm/parser/abstract_parser.py:468-470}}). The stream sent that whitespace as a content delta (output 5), so the two forms differ slightly.</p>
+<x-simplified><p>Rows 2, 3, 7 and 8 group several one-token outputs. In rows 2 and 3, each output gives a reasoning delta. In row 7, only the output with the closing quote of the name gives a chunk. In row 8, the outputs before the argument text give <code>None</code>, and the others give argument deltas. The client sees the same total text. The order of events is derived from the code, not from a run. Some templates end the prompt with an open <code>&lt;think&gt;</code> marker. Then the model output has no start marker, and the prompt check of step 1 decides the phase.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Strict levels for tool calls">
+<p><code>--tool-strict-level</code> is a server-side floor; when it is unset, the tool parser's default applies, which is <code>auto</code> for most parsers ({{cite vllm/entrypoints/common/cli_args.py:130-137}}, {{cite vllm/tool_parsers/abstract_tool_parser.py:62-65}}).</p>
+<table>
+  <thead><tr><th>Level</th><th>tool_choice auto</th><th>required / named</th></tr></thead>
+  <tbody>
+    <tr><td><code>auto</code> (0)</td><td>no grammar, unless some tool has <code>strict: true</code></td><td>call envelope constrained; arguments only for strict tools</td></tr>
+    <tr><td><code>function</code> (1)</td><td>call envelope constrained for every request with tools</td><td>same</td></tr>
+    <tr><td><code>parameter</code> (2)</td><td>envelope and argument schemas, as if every tool were strict</td><td>same</td></tr>
+  </tbody>
+</table>
+<p>Sources: {{cite vllm/tool_parsers/tool_strict_level.py:10-22}}, {{cite vllm/tool_parsers/structural_tag_registry.py:175-197}}. <code>parallel_tool_calls: false</code> raises the level to at least <code>function</code>, because the grammar must see the call envelope to stop after one call ({{cite vllm/parser/abstract_parser.py:531-535}}). With <code>tool_choice: "auto"</code> and a <code>response_format</code>, the grammar allows either a tool call or the response format ({{cite vllm/parser/abstract_parser.py:549-594}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Where the parsers run, and how often they are built">
+<table>
+  <thead><tr><th>Object</th><th>Process</th><th>Made</th><th>Lines</th></tr></thead>
+  <tbody>
+    <tr><td>Parser class (composed)</td><td>API server</td><td>once in <code>OpenAIServingChat.__init__</code>, once in <code>OnlineRenderer.__init__</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:167-175}}, {{cite vllm/renderers/online_renderer.py:180-188}}</td></tr>
+    <tr><td>Parser for <code>adjust_request</code></td><td>API server</td><td>per request, after rendering</td><td>{{cite vllm/renderers/online_renderer.py:848-859}}</td></tr>
+    <tr><td>Parser for the output</td><td>API server</td><td>per request, and per choice for <code>n &gt; 1</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:545-551}}, {{cite vllm/entrypoints/openai/chat_completion/serving.py:984-988}}</td></tr>
+    <tr><td>reasoning parser class</td><td>engine core</td><td>once, in <code>StructuredOutputManager.__init__</code></td><td>{{cite vllm/v1/structured_output/__init__.py:106-112}}</td></tr>
+    <tr><td>reasoning parser instance</td><td>engine core</td><td>per structured request, on first use</td><td>{{cite vllm/v1/structured_output/__init__.py:118-131}}</td></tr>
+  </tbody>
+</table>
+<p>The engine core imports a reasoning parser plugin itself, so the plugin path must work in that process too ({{cite vllm/v1/structured_output/__init__.py:100-104}}). The parsers count their calls in the Prometheus counter <code>vllm:tool_call_parser_invocations_total</code>, which exists only when <code>--tool-call-parser</code> is set ({{cite vllm/parser/metrics.py:15}}, {{cite vllm/entrypoints/launchers/api_server/app_state.py:32-37}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Flags and environment variables">
+<table>
+  <thead><tr><th>Flag or variable</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--enable-auto-tool-choice</code></td><td>false ({{cite vllm/entrypoints/common/cli_args.py:115-117}})</td><td>Needed for any tool parser (Step 3).</td></tr>
+    <tr><td><code>--tool-call-parser</code></td><td>none ({{cite vllm/entrypoints/common/cli_args.py:121-125}})</td><td>Name in <code>ToolParserManager</code>.</td></tr>
+    <tr><td><code>--reasoning-parser</code></td><td>"" ({{cite vllm/config/structured_outputs.py:34-36}})</td><td>Name in <code>ReasoningParserManager</code>; front end and engine core.</td></tr>
+    <tr><td><code>--tool-strict-level</code></td><td>none → parser default ({{cite vllm/entrypoints/common/cli_args.py:130-137}})</td><td>Floor for tool-call grammars.</td></tr>
+    <tr><td><code>--exclude-tools-when-tool-choice-none</code></td><td>false</td><td>Leave tools out of the prompt for <code>"none"</code>.</td></tr>
+    <tr><td><code>--structured-outputs-config.enable_in_reasoning</code></td><td>false ({{cite vllm/config/structured_outputs.py:40-41}})</td><td>Apply the grammar during the thinking too.</td></tr>
+    <tr><td><code>VLLM_ENFORCE_STRICT_TOOL_CALLING</code></td><td>true ({{cite vllm/envs.py:1845-1847}})</td><td>Allow structural tags for tool calls; off → JSON schema path or no grammar.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>Tool calls arrive as plain text in <code>content</code>.</strong> <code>--enable-auto-tool-choice</code> is missing, or the parser does not match the model's format ({{cite vllm/parser/parser_manager.py:34-35}}).</li>
+  <li><strong>"tool_choice=... requires --tool-call-parser to be set", but it is set.</strong> The tool parser needs <code>--enable-auto-tool-choice</code> as well (warning in Step 3).</li>
+  <li><strong>The thinking text is in <code>content</code>.</strong> No <code>--reasoning-parser</code>, or the template already opened the thinking in the prompt and the parser does not handle that case.</li>
+  <li><strong>A client reads an empty <code>reasoning_content</code>.</strong> The response field is <code>reasoning</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:79-80}}); <code>docs/features/reasoning_outputs.md</code> describes the rename ({{cite docs/features/reasoning_outputs.md:8-9}}).</li>
+  <li><strong>The server does not start with a reasoning parser.</strong> The tokenizer has no matching marker token; check that the parser fits the model ({{cite vllm/parser/parser_manager.py:84-95}}).</li>
+  <li><strong>A tool call is cut off.</strong> <code>finish_reason: "length"</code> means <code>max_tokens</code> ended the call; the arguments may be invalid JSON.</li>
+</ul>
+<p><strong>Why it matters.</strong> Agents depend on <code>tool_calls</code> and on a clean <code>content</code>. Most "the model does not call tools" reports are a flag or a parser that does not match the model's format, not a model problem.</p>
+
+<x-quiz>
+  <x-q level="easy">Which two flags turn on tool-call parsing, and what happens with only one of them?
+    <x-a><p><code>--enable-auto-tool-choice</code> and <code>--tool-call-parser NAME</code>. The first alone stops the start-up with <code>TypeError</code> ({{cite vllm/entrypoints/common/cli_args.py:523-525}}). The second alone starts, but no tool parser is used, because <code>get_tool_parser</code> returns <code>None</code> without auto tool choice ({{cite vllm/parser/parser_manager.py:34-35}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">With the Hermes parser and default settings, how is <code>tool_choice: "required"</code> enforced?
+    <x-a><p>With a structural tag: Hermes has <code>structural_tag_model = "hermes"</code> ({{cite vllm/tool_parsers/hermes_tool_parser.py:35}}), and <code>VLLM_ENFORCE_STRICT_TOOL_CALLING</code> is on by default. <code>_apply_structural_tag</code> puts the tag grammar into <code>request.structured_outputs</code> ({{cite vllm/parser/abstract_parser.py:601-607}}). The output is in Hermes' own format, so Hermes parses it like an <code>"auto"</code> reply, because <code>supports_required_and_named</code> is false ({{cite vllm/tool_parsers/abstract_tool_parser.py:68-74}}, {{cite vllm/parser/abstract_parser.py:413-420}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">How does a <code>&lt;think&gt;</code>-based reasoning parser decide that a prompt has already ended the thinking?
+    <x-a><p><code>is_reasoning_end</code> reads the ids from the end: it returns true if it finds the end token before any start token, and false otherwise ({{cite vllm/reasoning/basic_parsers.py:71-80}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">In the worked example, why does the <code>&lt;/think&gt;</code> output produce no chunk, although the parser changes state?
+    <x-a><p>A single end token makes <code>extract_reasoning_streaming</code> return <code>None</code> ({{cite vllm/reasoning/basic_parsers.py:108-112}}). The transition sets the content ids to the ids after the marker, an empty list. So the tool parser gets empty text and returns <code>None</code> ({{cite vllm/parser/abstract_parser.py:904-936}}). The pass-through is skipped because the reasoning just ended (lines 984-990), and the serving layer skips a <code>None</code> delta ({{cite vllm/entrypoints/openai/chat_completion/serving.py:731-740}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A request sets <code>"include_reasoning": false</code> and a JSON schema <code>response_format</code> on a reasoning model. When does the grammar start to constrain the output, and what does the client see of the thinking?
+    <x-a><p>From the first generated token: <code>resolve_reasoning_ended</code> returns <code>True</code> when <code>include_reasoning</code> is false ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:625-626}}), and the engine core then applies the grammar at once ({{cite vllm/v1/structured_output/__init__.py:305-306}}). The client sees no thinking: reasoning deltas are dropped, and logprobs and token ids are hidden ({{cite vllm/parser/abstract_parser.py:998-1005}}, {{cite vllm/entrypoints/openai/chat_completion/stream_processor.py:35-37}}).</p></x-a>
+  </x-q>
+</x-quiz>

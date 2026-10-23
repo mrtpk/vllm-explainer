@@ -1,0 +1,199 @@
+---
+title: entrypoints/cli/serve.py: the vllm serve subcommand and its launch modes
+nav_title: entrypoints/cli/serve.py
+level: Intermediate
+prerequisites: concepts/openai-server, concepts/architecture-overview
+related: concepts/openai-server, concepts/architecture-overview, concepts/data-parallel-serving, code/entrypoints-openai-chat-completion-serving, code/v1-engine-async-llm, code/v1-engine-core-client, tours/serve-startup
+summary: vllm/entrypoints/cli/serve.py defines the serve subcommand of the vllm CLI. It builds the parser, checks the arguments, and picks the launch mode - one API server in the CLI process, several API server processes, headless engines, the DP supervisor or gRPC.
+---
+<h2>Purpose</h2>
+<p><code>vllm/entrypoints/cli/serve.py</code> turns <code>vllm serve ...</code> into running processes: it decides how many {{term api-server | API servers}} to start and which function starts them.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/entrypoints/cli/serve.py</code>, 407 lines of Python. One class and three functions.</td></tr>
+    <tr><th>Main class</th><td><code>ServeSubcommand(CLISubcommand)</code> ({{cite vllm/entrypoints/cli/serve.py:48-174}}).</td></tr>
+    <tr><th>Main functions</th><td><code>cmd_init</code> ({{cite vllm/entrypoints/cli/serve.py:177-178}}), <code>run_headless</code> ({{cite vllm/entrypoints/cli/serve.py:181-266}}), <code>run_multi_api_server</code> ({{cite vllm/entrypoints/cli/serve.py:269-407}}).</td></tr>
+    <tr><th>Runs in</th><td>The CLI process, the first process of <code>vllm serve</code>, on the main thread. With one API server, this process then becomes the API server.</td></tr>
+    <tr><th>Called by</th><td><code>vllm/entrypoints/cli/main.py</code>: it collects the subcommands, parses <code>sys.argv</code>, validates and dispatches ({{cite vllm/entrypoints/cli/main.py:100-117}}).</td></tr>
+    <tr><th>Calls</th><td><code>make_arg_parser</code>, <code>validate_parsed_serve_args</code>, <code>run_server</code>, <code>run_dp_supervisor</code>, <code>serve_grpc</code>, <code>CoreEngineProcManager</code>, <code>launch_core_engines</code>, <code>APIServerProcessManager</code>, <code>RustFrontendProcessManager</code>, <code>wait_for_completion_or_failure</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The flags themselves (<code>FrontendArgs</code> and <code>EngineArgs</code>), the HTTP server (<code>launchers/api_server/entry.py</code>, <code>launchers/launcher.py</code>), the engine start (<code>v1/engine/utils.py</code>), the API server processes (<code>v1/utils.py</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/openai-server}} explains what each launch mode serves. This page reads the file line by line.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b7a_serve_modes" alt="Panel 1: five step cards checked in order: --grpc runs serve_grpc; multi-port load balancing runs run_dp_supervisor; a count below 1 (from --headless) runs run_headless; a count above 1 or the Rust frontend runs run_multi_api_server, where the CLI process supervises N API server processes; otherwise uvloop.run(run_server(args)) runs one HTTP server in the CLI process. Panel 2: the processes of three modes: TP 1 single server (CLI process is the API server, plus one engine core process), -dp 2 dense (CLI supervisor, two API server processes on one socket, two engine cores with one worker each), and --headless (engine cores only)." caption="Figure: the five branches of ServeSubcommand.cmd (panel 1) and the processes of three common modes (panel 2)." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><code>cli/main.py</code> imports this module at start-up ({{cite vllm/entrypoints/cli/main.py:43-51}}) and calls <code>cmd_init()</code> for the subcommand object ({{cite vllm/entrypoints/cli/main.py:100-109}}).</li>
+  <li><code>subparser_init</code> is called for every <code>vllm</code> command, not only for <code>serve</code>, because all subparsers are built before parsing (same lines). Building the serve parser loads the general plugins, through <code>make_arg_parser</code> and <code>AsyncEngineArgs.add_cli_args</code> ({{link concepts/plugin-loading}}).</li>
+  <li>After parsing, <code>main</code> calls <code>validate(args)</code> and then <code>args.dispatch_function(args)</code>, which is <code>ServeSubcommand.cmd</code> ({{cite vllm/entrypoints/cli/main.py:111-117}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>make_arg_parser</code>: the positional <code>model_tag</code>, <code>--headless</code>, <code>--api-server-count</code>, <code>--config</code>, <code>--grpc</code>, then all <code>FrontendArgs</code> and <code>AsyncEngineArgs</code> flags ({{cite vllm/entrypoints/common/cli_args.py:422-468}}).</li>
+  <li><code>validate_parsed_serve_args</code>: early checks that need no model ({{cite vllm/entrypoints/common/cli_args.py:503-549}}).</li>
+  <li>One of the five starters, by mode ({{cite vllm/entrypoints/cli/serve.py:147-156}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>DESCRIPTION</code></td><td>{{cite vllm/entrypoints/cli/serve.py:39-45}}</td><td>Help text; the default model is <code>Qwen/Qwen3-0.6B</code> ({{cite vllm/config/model.py:155}}).</td></tr>
+    <tr><td><code>ServeSubcommand.cmd</code></td><td>{{cite vllm/entrypoints/cli/serve.py:54-156}}</td><td>Resolves the mode and the API server count, then starts.</td></tr>
+    <tr><td><code>ServeSubcommand.validate</code></td><td>{{cite vllm/entrypoints/cli/serve.py:158-159}}</td><td>Calls <code>validate_parsed_serve_args</code>.</td></tr>
+    <tr><td><code>ServeSubcommand.subparser_init</code></td><td>{{cite vllm/entrypoints/cli/serve.py:161-174}}</td><td>Adds the <code>serve</code> subparser with all flags.</td></tr>
+    <tr><td><code>cmd_init</code></td><td>{{cite vllm/entrypoints/cli/serve.py:177-178}}</td><td>Returns <code>[ServeSubcommand()]</code> for <code>cli/main.py</code>.</td></tr>
+    <tr><td><code>run_headless</code></td><td>{{cite vllm/entrypoints/cli/serve.py:181-266}}</td><td>Starts engine cores (or workers of a multi-node rank) with no API server.</td></tr>
+    <tr><td><code>run_multi_api_server</code></td><td>{{cite vllm/entrypoints/cli/serve.py:269-407}}</td><td>Starts the engines and N API server processes (or the Rust frontend), then supervises them.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>cmd</code>, part 1: model, gRPC, headless</h3>
+<x-code file="vllm/entrypoints/cli/serve.py" lines="54-77" highlight="56-57,59-63,65-67,69-77" />
+<ol>
+  <li><strong>Lines 56-57.</strong> The positional model (<code>vllm serve MODEL</code>) wins over <code>--model</code>.</li>
+  <li><strong>Lines 59-63.</strong> <code>--grpc</code> runs the gRPC server and returns; none of the checks below apply to it.</li>
+  <li><strong>Lines 65-67.</strong> The Rust frontend path is set only when <code>VLLM_USE_RUST_FRONTEND</code> is on.</li>
+  <li><strong>Lines 69-77.</strong> <code>--headless</code> forces the API server count to 0; an explicit positive count with it raises <code>ValueError</code>.</li>
+</ol>
+
+<h3><code>cmd</code>, part 2: the data-parallel load-balancing mode</h3>
+<x-code file="vllm/entrypoints/cli/serve.py" lines="79-105" highlight="83-85,90-97,99-105" />
+<ol>
+  <li><strong>Lines 83-85.</strong> External load balancing: <code>--data-parallel-external-lb</code>, or any <code>--data-parallel-rank</code>.</li>
+  <li><strong>Lines 90-97.</strong> Hybrid load balancing: <code>--data-parallel-hybrid-lb</code>, or <code>--data-parallel-start-rank</code> when neither hybrid nor multi-port is set.</li>
+  <li><strong>Lines 99-105.</strong> Two modes at once raise <code>ValueError</code>.</li>
+</ol>
+
+<h3><code>cmd</code>, part 3: the API server count and the dispatch</h3>
+<x-code file="vllm/entrypoints/cli/serve.py" lines="113-156" highlight="114-115,116-117,124-125,131-136,139-145,147-156" />
+<ol>
+  <li><strong>Lines 114-115.</strong> Multi-port, external load balancing and the Rust frontend default to 1 API server.</li>
+  <li><strong>Lines 116-117.</strong> Hybrid: the local DP size.</li>
+  <li><strong>Lines 124-125.</strong> Otherwise (internal load balancing, the normal case): the full DP size. So <code>-dp 4</code> on one node gives 4 API servers.</li>
+  <li><strong>Lines 131-136.</strong> The Rust frontend ignores an explicit count above 1, with a warning.</li>
+  <li><strong>Lines 139-145.</strong> Elastic EP caps the count at 1.</li>
+  <li><strong>Lines 147-156.</strong> The dispatch. Only the last branch keeps the server in this process; it sets the count back to <code>None</code> first.</li>
+</ol>
+
+<h3><code>run_headless</code></h3>
+<x-code file="vllm/entrypoints/cli/serve.py" lines="181-233" highlight="185-186,189-194,202-203,218-233" />
+<ol>
+  <li><strong>Lines 185-186.</strong> A reasoning parser plugin is imported here, because the engine cores need the reasoning parser for structured outputs ({{link concepts/structured-outputs}}).</li>
+  <li><strong>Lines 189-194.</strong> The config is made with <code>headless=True</code> and the API server usage context.</li>
+  <li><strong>Lines 202-203.</strong> A node with no local DP ranks cannot run headless.</li>
+  <li><strong>Lines 218-233.</strong> On a secondary node of one DP rank (multi-node TP or PP), this process starts only the workers of its node, through <code>MultiprocExecutor</code>, and blocks in the worker monitor.</li>
+</ol>
+<p>Otherwise it starts the local engine cores with <code>CoreEngineProcManager</code>, which connect to the head node's handshake address, and waits on their liveness ({{cite vllm/entrypoints/cli/serve.py:235-266}}). SIGTERM and SIGINT raise <code>SystemExit</code> once, and the shutdown then waits up to <code>shutdown_timeout</code> seconds (lines 205-216 and 260-266).</p>
+
+<h3><code>run_multi_api_server</code></h3>
+<x-code file="vllm/entrypoints/cli/serve.py" lines="282-318" highlight="282-283,298,307-310,313,315-318" />
+<ol>
+  <li><strong>Lines 282-283.</strong> More than one API server needs Prometheus multiprocess mode; a temporary directory is made unless the user set <code>PROMETHEUS_MULTIPROC_DIR</code> ({{cite vllm/v1/metrics/prometheus.py:17-36}}).</li>
+  <li><strong>Line 298.</strong> One listen socket, with <code>SO_REUSEPORT</code> when there are several servers ({{cite vllm/entrypoints/launchers/launcher.py:340-355}}).</li>
+  <li><strong>Lines 307-310.</strong> The engine config records the API process count; rank <code>-1</code> marks the parent.</li>
+  <li><strong>Line 313.</strong> The <code>VllmConfig</code> is made here, in the supervisor, once.</li>
+  <li><strong>Lines 315-318.</strong> Runtime LoRA updates are refused with several API servers.</li>
+</ol>
+<x-code file="vllm/entrypoints/cli/serve.py" lines="331-390" highlight="333,336-338,354,368-377,382,386-390" />
+<ol>
+  <li><strong>Line 333.</strong> One input and one output ZMQ listener per API server, bound here.</li>
+  <li><strong>Lines 336-338.</strong> <code>launch_core_engines</code> is a context manager: it starts the engine cores (and the DP coordinator if needed) on entry, and waits for their handshake on exit ({{cite vllm/v1/engine/utils.py:1384-1395}}).</li>
+  <li><strong>Line 354 / lines 368-377.</strong> Inside the block, the Rust frontend or the Python API servers start. So the API servers start while the engines load.</li>
+  <li><strong>Line 382.</strong> If an API server dies during the engine start-up, the start-up is aborted.</li>
+  <li><strong>Lines 386-390.</strong> The supervisor waits; any child that exits with a non-zero code raises <code>RuntimeError</code> ({{cite vllm/v1/utils.py:575-594}}).</li>
+</ol>
+<p>The <code>finally</code> block shuts down the API servers, then the engines, then the coordinator, all within one <code>shutdown_timeout</code> deadline after a signal ({{cite vllm/entrypoints/cli/serve.py:391-407}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: vllm serve M -dp 2 on one node">
+<p>A dense model, one node, two GPUs, <code>-dp 2</code>, no other DP flags.</p>
+<ol>
+  <li><code>cmd</code>: no gRPC, no Rust, not headless. <code>is_external_lb</code>, <code>is_hybrid_lb</code> and <code>is_multi_port</code> are all false (lines 83-97).</li>
+  <li><code>api_server_count</code> is <code>None</code>, so it becomes the DP size, 2, and the log says "Defaulting api_server_count to data_parallel_size (2)." (lines 124-130).</li>
+  <li>2 &gt; 1, so <code>run_multi_api_server</code> runs (line 152).</li>
+  <li>The supervisor makes the Prometheus directory, binds port 8000 with <code>SO_REUSEPORT</code>, and builds the <code>VllmConfig</code> with <code>_api_process_count = 2</code> (lines 282-313).</li>
+  <li><code>bind_engine_zmq_listeners(vllm_config, 2)</code> binds two input and two output listeners (line 333).</li>
+  <li><code>launch_core_engines</code> starts 2 engine core processes and, because this is internal load balancing, the DP coordinator ({{cite vllm/v1/engine/utils.py:1226-1232}}). Each engine core starts one worker process (TP = 1 with DP &gt; 1).</li>
+  <li><code>APIServerProcessManager</code> spawns <code>ApiServer_0</code> and <code>ApiServer_1</code>, each with its listener pair and <code>client_index</code> 0 or 1 ({{cite vllm/v1/utils.py:230-254}}).</li>
+  <li>On leaving the <code>with</code> block, the supervisor waits for both engines' ready messages, while it watches the two API server processes (line 382).</li>
+  <li>Each API server builds its own AsyncLLM, which connects to both engines, and then serves HTTP.</li>
+</ol>
+<p>Result: 8 processes: the supervisor, 2 API servers, the DP coordinator, 2 engine cores and 2 workers. This matches the count in {{link concepts/architecture-overview}}.</p>
+</x-deepdive>
+
+<x-deepdive title="Processes and threads">
+<table>
+  <thead><tr><th>Mode</th><th>What the CLI process does</th><th>Children it starts</th></tr></thead>
+  <tbody>
+    <tr><td>one API server</td><td>runs the asyncio loop of the API server (<code>uvloop.run</code>)</td><td>engine core processes, through AsyncLLM ({{cite vllm/entrypoints/launchers/api_server/entry.py:93-103}})</td></tr>
+    <tr><td>several API servers</td><td>supervisor: waits on process sentinels ({{cite vllm/v1/utils.py:550-594}})</td><td>engine cores, DP coordinator, <code>ApiServer_i</code> (spawn)</td></tr>
+    <tr><td>Rust frontend</td><td>supervisor</td><td>engine cores, the Rust binary</td></tr>
+    <tr><td>headless</td><td>engine manager: waits on engine liveness</td><td>local engine cores, or workers of a multi-node rank</td></tr>
+    <tr><td>multi-port external LB</td><td><code>DPSupervisor</code> with its own aggregated health server ({{cite vllm/entrypoints/launchers/dp_supervisor.py:562-564}})</td><td>one full server per local DP rank</td></tr>
+    <tr><td>gRPC</td><td>runs the gRPC server with AsyncLLM ({{cite vllm/entrypoints/launchers/grpc_server.py:56-85}})</td><td>engine core processes</td></tr>
+  </tbody>
+</table>
+<p>The API server processes always use the <code>spawn</code> start method ({{cite vllm/v1/utils.py:204}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Error paths">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Lines</th></tr></thead>
+  <tbody>
+    <tr><td><code>--headless</code> with <code>--api-server-count</code> &gt; 0</td><td><code>ValueError</code></td><td>{{cite vllm/entrypoints/cli/serve.py:69-75}}</td></tr>
+    <tr><td>two DP load-balancing modes</td><td><code>ValueError</code></td><td>{{cite vllm/entrypoints/cli/serve.py:99-105}}</td></tr>
+    <tr><td>headless with hybrid load balancing</td><td><code>ValueError</code></td><td>{{cite vllm/entrypoints/cli/serve.py:196-197}}</td></tr>
+    <tr><td>headless with no local DP ranks</td><td><code>ValueError</code></td><td>{{cite vllm/entrypoints/cli/serve.py:202-203}}</td></tr>
+    <tr><td>Rust frontend with more than one API server</td><td><code>ValueError</code> (only if reached; <code>cmd</code> caps it first)</td><td>{{cite vllm/entrypoints/cli/serve.py:277-280}}</td></tr>
+    <tr><td><code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code> with several API servers</td><td><code>ValueError</code></td><td>{{cite vllm/entrypoints/cli/serve.py:315-318}}</td></tr>
+    <tr><td><code>--enable-auto-tool-choice</code> without a parser</td><td><code>TypeError</code> in <code>validate</code></td><td>{{cite vllm/entrypoints/common/cli_args.py:523-525}}</td></tr>
+    <tr><td>a child process dies</td><td><code>RuntimeError</code> "Process ... died with exit code ..."</td><td>{{cite vllm/v1/utils.py:584-589}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Environment variables">
+<table>
+  <thead><tr><th>Variable</th><th>Default</th><th>Read at</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>VLLM_USE_RUST_FRONTEND</code></td><td>off ({{cite vllm/envs.py:1454-1456}})</td><td>{{cite vllm/entrypoints/cli/serve.py:65-67}}</td><td>Use the Rust frontend binary instead of Python API servers.</td></tr>
+    <tr><td><code>VLLM_RUST_FRONTEND_PATH</code></td><td><code>auto</code> ({{cite vllm/envs.py:593}})</td><td>same</td><td>Path of the Rust binary; <code>auto</code> means the <code>vllm-rs</code> file in the package folder ({{cite vllm/envs.py:604-615}}).</td></tr>
+    <tr><td><code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code></td><td>off ({{cite vllm/envs.py:1197-1200}})</td><td>{{cite vllm/entrypoints/cli/serve.py:315}}</td><td>Refused with several API servers.</td></tr>
+    <tr><td><code>PROMETHEUS_MULTIPROC_DIR</code></td><td>unset</td><td>{{cite vllm/v1/metrics/prometheus.py:21}}</td><td>Kept if you set it (with a warning); else a temporary directory.</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/openai-server}}: what the started API server does.</li>
+  <li>{{link concepts/architecture-overview}}: the processes and the ZMQ links between them.</li>
+  <li>{{link concepts/data-parallel-serving}}: the load-balancing modes in depth.</li>
+  <li>{{link concepts/plugin-loading}}: why building the parser loads the general plugins.</li>
+  <li>{{link tours/serve-startup}}: the full start-up of <code>vllm serve</code>.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">With <code>vllm serve M</code> and no DP flags, where does the HTTP server run?
+    <x-a><p>In the CLI process itself: <code>api_server_count</code> defaults to the DP size, 1, so the last branch runs <code>uvloop.run(run_server(args))</code> ({{cite vllm/entrypoints/cli/serve.py:124-125}}, {{cite vllm/entrypoints/cli/serve.py:153-156}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">What is the default number of API servers for <code>-dp 4 --data-parallel-external-lb</code>, and why?
+    <x-a><p>1. With an external load balancer, each <code>vllm serve</code> serves its own rank, so the default is one API server ({{cite vllm/entrypoints/cli/serve.py:83-85}}, {{cite vllm/entrypoints/cli/serve.py:114-115}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">In <code>run_multi_api_server</code>, do the API server processes start before or after the engines are ready?
+    <x-a><p>Before. They start inside the <code>with launch_core_engines(...)</code> block, and the wait for the engines' ready messages runs when the block exits ({{cite vllm/entrypoints/cli/serve.py:336-382}}, {{cite vllm/v1/engine/utils.py:1384-1395}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">On a second node you run <code>vllm serve M --headless --data-parallel-size 4 --data-parallel-size-local 2 --data-parallel-start-rank 2 --data-parallel-address HEAD</code> (TP = 1). What does this process start, and what does it not start?
+    <x-a><p><code>--headless</code> sets the API server count to 0 before the load-balancing checks, so the dispatch runs <code>run_headless</code> ({{cite vllm/entrypoints/cli/serve.py:69-77}}, {{cite vllm/entrypoints/cli/serve.py:149-150}}). The start rank makes the local variable <code>is_hybrid_lb</code> true, but the count is already set, and <code>run_headless</code> checks only the explicit <code>--data-parallel-hybrid-lb</code> flag ({{cite vllm/entrypoints/cli/serve.py:90-94}}, {{cite vllm/entrypoints/cli/serve.py:196-197}}). With TP = 1 this node is the first node of its DP ranks, so it starts the two local engine cores with <code>CoreEngineProcManager</code>; they connect to the head's handshake address ({{cite vllm/entrypoints/cli/serve.py:235-256}}). It starts no API server and opens no HTTP socket.</p></x-a>
+  </x-q>
+</x-quiz>

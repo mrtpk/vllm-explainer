@@ -1,0 +1,244 @@
+---
+title: The OpenAI-compatible server: launch modes, app, serving classes and streaming
+nav_title: The OpenAI-compatible server
+level: Intermediate
+prerequisites: learn/openai-api, concepts/engine-client
+related: tours/life-of-a-chat-request, concepts/engine-client, concepts/renderers-and-chat-templates, concepts/tool-and-reasoning-parsers, concepts/structured-outputs, concepts/frontend-plugins, concepts/data-parallel-serving, code/entrypoints-cli-serve, code/entrypoints-openai-chat-completion-serving, learn/openai-api
+summary: How vllm serve builds its HTTP front end: the launch modes, the FastAPI app with its middleware, routers and exception handlers, the serving objects in app.state, the request flow down to AsyncLLM, streaming, n > 1, request ids, priorities and admission limits.
+---
+<x-sentence>vllm serve runs a FastAPI app on uvicorn; each route hands the request to a serving class, which renders it and calls AsyncLLM.</x-sentence>
+
+<h2>The idea</h2>
+<p>The page {{link learn/openai-api}} shows the API from the outside: routes, fields and the stream format. This page shows the inside of the {{term api-server}}. The API server is one process (or several) with an asyncio event loop. uvicorn reads HTTP, FastAPI matches the {{term route}}, and a route function calls a {{term serving-class}}. The serving class checks the request, asks the renderer for token ids, makes the sampling parameters and calls {{term async-llm | AsyncLLM}}, the {{term engine-client}} ({{link concepts/engine-client}}).</p>
+<p>The server makes one object per serving class at start-up and keeps it in the {{term app-state}}. So a route function is short: it takes the serving object from <code>app.state</code>, calls one method, and turns the result into an HTTP response. The result is an error, a full JSON body, or an async generator of SSE strings.</p>
+<p>Some work is the same for every route. {{term middleware | Middleware}} checks CORS and the API key. Exception handlers turn Python exceptions into HTTP status codes. Decorators on the route functions watch for a client disconnect and count the load.</p>
+<p><strong>An everyday comparison.</strong> Think of the front desk of a large office. A guard at the door checks the visitor's badge (middleware). Signs send the visitor to the right counter (the router). The clerk at the counter checks the form and copies it onto the internal form (renderer and sampling parameters). Then the clerk puts it into the internal mail (AsyncLLM). The comparison stops being true for streams. The clerk promises the answer piece by piece before the mail has left the building. So a stream starts with HTTP 200 before the engine sees the request.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b7a_server_layers" alt="Panel 1: six boxes in two rows. Row 1, HTTP layers: uvicorn (NoSignalServer) with the socket bound before the engine starts, h11 limits of 256 headers and 4 MiB, and an HTTP keep-alive of 5 seconds from VLLM_HTTP_TIMEOUT_KEEP_ALIVE; the middleware stack with CORS, the API-key middleware, the X-Request-Id middleware, the scaling middleware and user middleware; the FastAPI route function with pydantic parsing, with_cancellation and load_aware_call, which takes app.state.openai_serving_chat. An arrow labelled create_chat_completion goes down to row 2, vLLM code: the serving class OpenAIServingChat (_check_model with 404 for a wrong name, _preflight, max_tokens and to_sampling_params, the request id chatcmpl plus X-Request-Id); the renderer (tool_choice check, arrival_time, chat template, tokenization in a thread pool, length check, EngineInput); the engine client AsyncLLM.generate, an async generator that does no work until the first pull. Panel 2: the three return types and the HTTP response for each: ErrorResponse becomes JSONResponse with the error code; ChatCompletionResponse becomes JSONResponse 200; an async generator becomes a StreamingResponse with media type text/event-stream, wrapped by with_sse_keep_alive." caption="Figure: the six layers that one chat request crosses in the API server (panel 1), and the three things a serving class can return (panel 2)." />
+<p>Read panel 1 along the arrows: the top row first, then the bottom row. Blue boxes are library code (uvicorn, Starlette, FastAPI); violet boxes are vLLM code; the amber box is the boundary to the engine. All six layers run in one process, on one event loop.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: the launch modes of vllm serve</h3>
+<p><code>ServeSubcommand.cmd</code> picks one of five ways to start ({{cite vllm/entrypoints/cli/serve.py:54-156}}). The page {{link code/entrypoints-cli-serve}} reads it line by line; the short form is:</p>
+<x-diagram name="b7a_serve_modes" alt="Panel 1: five step cards checked in order. 1 --grpc runs serve_grpc: AsyncLLM with a gRPC servicer and no HTTP routes. 2 multi-port external load balancing runs run_dp_supervisor with one server per local DP rank. 3 api_server_count below 1, set by --headless, runs run_headless with engine cores only. 4 api_server_count above 1 or the Rust frontend runs run_multi_api_server: the CLI process is a supervisor of N API server processes; the count defaults to the DP size. 5 otherwise uvloop.run(run_server(args)) runs one HTTP server in the CLI process; this is the default for any TP with DP 1. Panel 2: processes per mode. vllm serve with TP 1: the CLI process is the API server, plus one engine core process with the worker inside it, 2 processes. vllm serve with -dp 2 dense: the CLI process is only a supervisor, ApiServer_0 and ApiServer_1 share one listen socket, 2 engine core processes with one worker process each. vllm serve --headless: the CLI process manages local engine cores; API servers run on another node and connect over ZMQ." caption="Figure: the checks of ServeSubcommand.cmd in order (panel 1) and the processes of three common modes (panel 2)." />
+<ul>
+  <li><strong>One API server</strong> (the default when the DP size is 1). The CLI process itself runs <code>uvloop.run(run_server(args))</code> ({{cite vllm/entrypoints/cli/serve.py:153-156}}). <code>run_server</code> binds the socket first and then builds the engine client and the app ({{cite vllm/entrypoints/launchers/api_server/entry.py:164-201}}). The comment gives the reason for the early bind: it avoids a race with Ray ({{cite vllm/entrypoints/launchers/launcher.py:372-379}}).</li>
+  <li><strong>Several API servers.</strong> <code>--api-server-count</code> defaults to the DP size with internal load balancing ({{cite vllm/entrypoints/cli/serve.py:113-130}}). Then the CLI process becomes a supervisor. It binds one socket with <code>SO_REUSEPORT</code>, starts the engine cores and spawns <code>ApiServer_i</code> processes ({{cite vllm/entrypoints/cli/serve.py:298}}, {{cite vllm/v1/utils.py:248-254}}). Each process runs the same app with its own AsyncLLM. A process that has more open connections than another one waits up to 5 ms before it accepts a new connection ({{cite vllm/entrypoints/launchers/launcher.py:103-125}}).</li>
+  <li><strong>Headless.</strong> <code>--headless</code> sets the count to 0 and starts only engine cores, for multi-node data parallelism ({{cite vllm/entrypoints/cli/serve.py:69-77}}, {{cite vllm/entrypoints/cli/serve.py:181-266}}).</li>
+  <li><strong>gRPC.</strong> <code>--grpc</code> starts a gRPC server on <code>--port</code> instead of HTTP. It wraps AsyncLLM with the <code>VllmEngineServicer</code> of the external <code>smg-grpc-servicer</code> package ({{cite vllm/entrypoints/cli/serve.py:59-63}}, {{cite vllm/entrypoints/launchers/grpc_server.py:56-85}}).</li>
+</ul>
+<p><strong>The Rust frontend (one paragraph).</strong> <code>rust/</code> holds an experimental OpenAI-compatible frontend in Rust. It talks to the same engine core processes over the same ZMQ boundary ({{cite rust/README.md:1-5}}). With <code>VLLM_USE_RUST_FRONTEND=1</code>, <code>vllm serve</code> takes the multi-server path, forces the API server count to 1, and starts the Rust binary instead of Python API servers ({{cite vllm/entrypoints/cli/serve.py:131-136}}, {{cite vllm/entrypoints/cli/serve.py:346-365}}). The README calls it experimental and not feature-complete, and this site does not explain it further.</p>
+
+<h3>Step 2: build_app makes the FastAPI app</h3>
+<p>After AsyncLLM is ready, <code>build_and_serve</code> asks the engine for the supported tasks, builds the app, fills the app state and starts uvicorn ({{cite vllm/entrypoints/launchers/api_server/entry.py:115-161}}):</p>
+<x-code file="vllm/entrypoints/launchers/app.py" lines="34-56" highlight="45,51,53-55" />
+<ol>
+  <li>Lines 34-41: <code>--disable-fastapi-docs</code> removes <code>/docs</code>, <code>/redoc</code> and the OpenAPI schema; <code>--enable-offline-docs</code> serves the bundled Swagger files.</li>
+  <li>Line 45: <code>register_api_routers</code> adds the {{term router | routers}} by task and flag ({{cite vllm/entrypoints/launchers/api_server/routers.py:12-90}}). The route table is on {{link learn/openai-api}}.</li>
+  <li>Line 51: endpoint plugins attach their routes after the core routes, so they can replace one ({{link concepts/frontend-plugins}}).</li>
+  <li>Line 53: the exception handlers, in four layers ({{cite vllm/entrypoints/serve/exception_handling/register.py:26-42}}).</li>
+  <li>Line 54: the middleware ({{cite vllm/entrypoints/serve/middleware/register.py:19-75}}):
+    <ul>
+      <li><code>CORSMiddleware</code>, always. <code>--allowed-origins</code> is empty by default, so browsers on other origins are refused ({{cite vllm/entrypoints/common/cli_args.py:318-325}}).</li>
+      <li><code>AuthenticationMiddleware</code>, only with <code>--api-key</code> or <code>VLLM_API_KEY</code>. It compares SHA-256 hashes in constant time and guards only <code>/v1</code>, <code>/v2</code>, <code>/inference</code> and <code>/cohere</code> paths ({{cite vllm/entrypoints/serve/middleware/authenticate.py:11}}, {{cite vllm/entrypoints/serve/middleware/authenticate.py:28-45}}). All other paths need no key, also <code>/invocations</code> (see "What can go wrong").</li>
+      <li><code>XRequestIdMiddleware</code>, only with <code>--enable-request-id-headers</code>. It copies the request's <code>X-Request-Id</code>, or a new UUID, into the response header ({{cite vllm/entrypoints/serve/middleware/x_request_id.py:26-36}}).</li>
+      <li><code>ScalingMiddleware</code> for the generate task (elastic EP), and the classes or functions named by <code>--middleware</code>.</li>
+    </ul>
+  </li>
+  <li>Line 55: the external package <code>model_hosting_container_standards</code> wraps the app for SageMaker hosting ({{cite vllm/entrypoints/serve/sagemaker/api_router.py:145-159}}). The SageMaker routes <code>/ping</code> and <code>/invocations</code> are already registered on every server ({{cite vllm/entrypoints/launchers/api_server/routers.py:40-44}}). <code>/invocations</code> picks a handler by the type of the body and runs the same serving objects as the <code>/v1</code> routes ({{cite vllm/entrypoints/serve/sagemaker/api_router.py:98-132}}).</li>
+</ol>
+<p><code>serve_http</code> then prints every route and runs uvicorn with <code>NoSignalServer</code>, which leaves SIGINT and SIGTERM to vLLM's own shutdown handler ({{cite vllm/entrypoints/launchers/launcher.py:47-72}}, {{cite vllm/entrypoints/launchers/launcher.py:251-291}}). A watchdog task checks the engine every 5 seconds ({{cite vllm/entrypoints/launchers/launcher.py:314-337}}).</p>
+
+<h3>Step 3: init_app_state makes the serving objects</h3>
+<x-code file="vllm/entrypoints/launchers/api_server/app_state.py" lines="63-104" highlight="63,81-85,88-89" />
+<p>The state holds the engine client, the args, and the objects that every server needs. These are <code>OpenAIServingModels</code> (for <code>/v1/models</code> and LoRA names), the <code>OnlineRenderer</code> and the <code>ServingTokenization</code> object ({{cite vllm/entrypoints/launchers/api_server/app_state.py:122-130}}). For the generate task, <code>init_generate_state</code> adds one object per generate API ({{cite vllm/entrypoints/generate/api_router.py:104-172}}):</p>
+<table>
+  <thead><tr><th><code>app.state</code> attribute</th><th>Class</th><th>Routes</th></tr></thead>
+  <tbody>
+    <tr><td><code>openai_serving_chat</code></td><td><code>OpenAIServingChat</code></td><td><code>/v1/chat/completions</code></td></tr>
+    <tr><td><code>openai_serving_chat_batch</code></td><td><code>OpenAIServingChatBatch</code></td><td><code>/v1/chat/completions/batch</code></td></tr>
+    <tr><td><code>openai_serving_completion</code></td><td><code>OpenAIServingCompletion</code></td><td><code>/v1/completions</code></td></tr>
+    <tr><td><code>openai_serving_responses</code></td><td><code>OpenAIServingResponses</code></td><td><code>/v1/responses</code></td></tr>
+    <tr><td><code>anthropic_serving_messages</code></td><td><code>AnthropicServingMessages</code></td><td><code>/v1/messages</code></td></tr>
+    <tr><td><code>serving_embedding</code>, <code>serving_pooling</code>, ...</td><td>pooling classes</td><td><code>/v1/embeddings</code>, <code>/pooling</code>, ... (only pooling models, {{cite vllm/entrypoints/pooling/factories.py:177-220}})</td></tr>
+    <tr><td><code>serving_tokenization</code></td><td><code>ServingTokenization</code></td><td><code>/tokenize</code>, <code>/detokenize</code></td></tr>
+    <tr><td><code>openai_serving_models</code></td><td><code>OpenAIServingModels</code></td><td><code>/v1/models</code>, LoRA routes</td></tr>
+  </tbody>
+</table>
+<p>Each object reads its flags once, at construction. For example, <code>OpenAIServingChat</code> reads the model's default sampling parameters and builds its parser class in <code>__init__</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:167-187}}). So a change of the model's <code>generation_config.json</code> needs a restart.</p>
+
+<h3>Step 4: the serving class hierarchy</h3>
+<x-diagram name="b7a_serving_classes" alt="Panel 1: a class tree. BaseServing at serve/engine/serving.py line 31 has three children: GenerateBaseServing (generate/base/serving.py line 129, with BeamSearchOnlineMixin, for routes that call generate), PoolingBaseServing (embeddings, pooling, classify, score, rerank) and other direct subclasses (ServingTokenization, ServingRender, ServingDerender, decisions, generative scoring). GenerateBaseServing has three children: OpenAIServingChat (with the children Anthropic, Cohere v2 and chat batch), OpenAIServingCompletion (raw prompt or token ids, no chat template) and more (OpenAIServingResponses, ServingTokens, speech-to-text, realtime). OpenAIServingModels is a helper object, not a subclass. Panel 2: what each layer adds. BaseServing: _check_model with 404 for a wrong name, create_error_response, _base_request_id from X-Request-Id, _log_inputs, _maybe_get_adapters. GenerateBaseServing: holds engine_client and renderer, _preflight with errored and check_admission, _get_priority from X-Vllm-Priority, _get_data_parallel_rank, _raise_if_error, system_fingerprint. OpenAIServingChat: parser_cls, render_chat_request, _create_chat_completion, the stream and full generators, _create_chat_logprobs." caption="Figure: the serving classes as a tree (panel 1) and the helpers that each layer adds (panel 2)." />
+<p>The three layers split the work:</p>
+<ol>
+  <li><strong><code>BaseServing</code></strong> knows the model names. <code>_check_model</code> accepts the served name, a loaded LoRA name, or (with <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code>) a name that a LoRA resolver can load. Any other name gives HTTP 404 <code>NotFoundError</code> ({{cite vllm/entrypoints/serve/engine/serving.py:49-84}}). <code>create_error_response</code> maps an exception class to a status code ({{cite vllm/entrypoints/serve/exception_handling/error_response.py:14-96}}).</li>
+  <li><strong><code>GenerateBaseServing</code></strong> knows the engine. It takes the renderer and the input processor from the engine client ({{cite vllm/entrypoints/generate/base/serving.py:148-151}}). Its <code>_preflight</code> runs the engine checks that must come before a stream starts:
+    <x-code file="vllm/entrypoints/generate/base/serving.py" lines="169-181" highlight="179-181" />
+  </li>
+  <li><strong><code>OpenAIServingChat</code></strong> (and its siblings) knows one API format: the fields, the chunks and the full response.</li>
+</ol>
+
+<h3>Step 5: the request flow inside one serving call</h3>
+<p>For <code>/v1/chat/completions</code>, <code>_create_chat_completion</code> runs these steps in order ({{cite vllm/entrypoints/openai/chat_completion/serving.py:302-438}}). <code>/v1/completions</code> has the same shape without the chat template ({{cite vllm/entrypoints/openai/completion/serving.py:131-296}}).</p>
+<ol>
+  <li><strong>Validate.</strong> Pydantic and the model validators of the request class have already run in FastAPI. Errors there give HTTP 400 ({{link learn/openai-api}}, errors deep dive).</li>
+  <li><strong>Check the model and the engine.</strong> <code>_check_model</code>, then <code>_preflight(n)</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:278-283}}).</li>
+  <li><strong>Render.</strong> The online renderer applies the chat template and tokenizes; the prompt length check runs here ({{cite vllm/entrypoints/openai/chat_completion/serving.py:285}}). See {{link concepts/renderers-and-chat-templates}}.</li>
+  <li><strong>Request id.</strong> <code>"chatcmpl-"</code> + the <code>X-Request-Id</code> header, else the body field <code>request_id</code> (a random UUID by default) ({{cite vllm/entrypoints/openai/chat_completion/serving.py:320-322}}, {{cite vllm/entrypoints/serve/engine/serving.py:132-142}}).</li>
+  <li><strong>Sampling parameters.</strong> <code>get_max_tokens</code>, then <code>to_sampling_params</code> with <code>output_kind</code> DELTA for a stream and FINAL_ONLY otherwise ({{cite vllm/entrypoints/openai/chat_completion/serving.py:349-369}}).</li>
+  <li><strong>Make the generator.</strong> <code>engine_client.generate(...)</code> with the priority, the DP rank header and the reasoning flags ({{cite vllm/entrypoints/openai/chat_completion/serving.py:396-408}}). This only makes an async generator; the engine sees nothing yet.</li>
+  <li><strong>Answer.</strong> For a stream, return <code>chat_completion_stream_generator</code>; else await <code>chat_completion_full_generator</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:415-438}}).</li>
+</ol>
+<p>Step 2 and step 6 meet: <code>check_admission</code> runs in <code>_preflight</code> and again inside <code>AsyncLLM.add_request</code>, when the generator starts ({{cite vllm/v1/engine/async_llm.py:551}}, {{cite vllm/v1/engine/async_llm.py:575-578}}). The first check gives a clean HTTP 503 before a stream starts; the second one sees the requests that other tasks added in between.</p>
+
+<h3>Step 6: streaming</h3>
+<p>The route wraps the generator of SSE strings in a <code>StreamingResponse</code> ({{cite vllm/entrypoints/openai/chat_completion/api_router.py:80-85}}). Three details matter in production:</p>
+<ul>
+  <li><strong>Status first.</strong> The HTTP status 200 goes out with the first bytes. Later errors become a <code>data:</code> error chunk, and <code>data: [DONE]</code> always ends the stream ({{cite vllm/entrypoints/openai/chat_completion/serving.py:485-508}}).</li>
+  <li><strong>Keep-alive comments.</strong> With <code>--sse-keep-alive-interval N</code> (default 0, off), <code>with_sse_keep_alive</code> sends <code>: keep-alive</code> after N idle seconds. Then a proxy does not close the connection during a long queue or prefill ({{cite vllm/entrypoints/serve/utils/sse_keep_alive.py:18-33}}, {{cite vllm/entrypoints/common/cli_args.py:156-162}}).</li>
+  <li><strong>Disconnect means abort.</strong> Before the route returns, <code>with_cancellation</code> runs the handler and a disconnect listener as two tasks; the first to finish cancels the other ({{cite vllm/entrypoints/serve/utils/api_utils.py:92-111}}). After the route returns a <code>StreamingResponse</code>, Starlette watches for the disconnect. Either way <code>AsyncLLM.generate()</code> gets the cancel and sends ABORT to the engine core ({{cite vllm/v1/engine/async_llm.py:807-812}}). Tour 1 follows this path in its cancellation deep dive ({{link tours/life-of-a-chat-request}}).</li>
+</ul>
+
+<h3>Step 7: non-streaming answers, n &gt; 1, logprobs and usage</h3>
+<p>Without a stream, the output kind is FINAL_ONLY. The output processor makes no <code>RequestOutput</code> until the request is finished ({{cite vllm/v1/engine/output_processor.py:364-369}}). With <code>n &gt; 1</code>, AsyncLLM sends <code>n</code> child requests, and the parent collects their final outputs. It returns one <code>RequestOutput</code> with all <code>n</code> outputs when the last child finishes ({{cite vllm/v1/engine/parallel_sampling.py:117-128}}). The full generator then reads one result:</p>
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="957-971" highlight="961-964" />
+<p>It builds one choice per output, with a new parser per choice because parsers keep state ({{cite vllm/entrypoints/openai/chat_completion/serving.py:980-990}}). Logprobs are built only when <code>logprobs</code> is true ({{cite vllm/entrypoints/openai/chat_completion/serving.py:994-1005}}). The usage counts the prompt once and the tokens of all choices ({{cite vllm/entrypoints/openai/chat_completion/serving.py:1147-1163}}). With <code>--enable-prompt-tokens-details</code>, it adds the cached prompt tokens ({{cite vllm/entrypoints/openai/chat_completion/serving.py:1164-1169}}).</p>
+
+<h3>Step 8: request ids, priority and admission limits</h3>
+<ul>
+  <li><strong>Request id.</strong> The <code>X-Request-Id</code> header wins over the body field, with or without <code>--enable-request-id-headers</code>; that flag only echoes the id in the response header (Step 2). The engine adds 8 random characters to make the internal id ({{link concepts/data-contracts}}, deep dive "The three request ids").</li>
+  <li><strong>Priority.</strong> The header <code>X-Vllm-Priority</code> overrides the body field <code>priority</code>, if it parses as an integer ({{cite vllm/entrypoints/generate/base/serving.py:42}}, {{cite vllm/entrypoints/generate/base/serving.py:253-265}}). Only the priority scheduling policy uses it ({{link concepts/scheduler}}).</li>
+  <li><strong>Admission limits.</strong> <code>--max-num-queued-reqs</code> and <code>--max-num-queued-tokens</code> are off by default ({{cite vllm/config/scheduler.py:92}}, {{cite vllm/config/scheduler.py:105}}). When set, a full queue gives HTTP 503 with <code>QueueOverflowError</code> or <code>MaxQueuedTokensError</code>, so a load balancer can retry elsewhere ({{cite vllm/exceptions.py:162-189}}). The details are on {{link concepts/engine-client}}.</li>
+  <li><strong>DP rank.</strong> A router can pin a request to one data-parallel engine with the header <code>X-data-parallel-rank</code> ({{cite vllm/entrypoints/generate/base/serving.py:215-228}}).</li>
+</ul>
+
+<h3>Step 9: the other routes</h3>
+<p>The full route table is on {{link learn/openai-api}}. Some routes have rules that the table does not show:</p>
+<ul>
+  <li><code>GET /health</code> calls <code>check_health()</code> on the engine client: 200, or 503 after <code>EngineDeadError</code> ({{cite vllm/entrypoints/serve/instrumentator/health.py:22-33}}).</li>
+  <li><code>GET /load</code> returns <code>server_load_metrics</code> ({{cite vllm/entrypoints/serve/instrumentator/basic.py:30-50}}). The counter changes only with <code>--enable-server-load-tracking</code> (default off), so without the flag it stays 0 ({{cite vllm/entrypoints/serve/utils/api_utils.py:196-197}}, {{cite vllm/entrypoints/launchers/api_server/app_state.py:175-176}}).</li>
+  <li><code>GET /v1/models</code> lists the base model names and the loaded LoRA adapters ({{cite vllm/entrypoints/openai/models/serving.py:149-151}}).</li>
+  <li><code>POST /tokenize</code> and <code>/detokenize</code> use the same renderer as the chat route ({{cite vllm/entrypoints/launchers/api_server/app_state.py:122-130}}). <code>GET /tokenizer_info</code> exists only with <code>--enable-tokenizer-info-endpoint</code> ({{cite vllm/entrypoints/serve/tokenize/api_router.py:86-90}}).</li>
+  <li><code>/start_profile</code> and <code>/stop_profile</code> exist only when a profiler is configured ({{cite vllm/entrypoints/serve/profile/api_router.py:56-65}}).</li>
+  <li>Development routes such as <code>/sleep</code>, <code>/reset_prefix_cache</code>, <code>/collective_rpc</code> and <code>/server_info</code> exist only with <code>VLLM_SERVER_DEV_MODE=1</code>, and the server logs a security warning ({{cite vllm/entrypoints/launchers/api_server/routers.py:46-49}}, {{cite vllm/entrypoints/serve/__init__.py:43-65}}).</li>
+  <li><code>/metrics</code> is the Prometheus endpoint ({{link concepts/metrics-and-observability}}).</li>
+</ul>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: one non-streaming completion with n = 2">
+<p>Start <code>vllm serve Qwen/Qwen2.5-0.5B</code> (one GPU, default flags) and send this request (example, not in the repo):</p>
+<pre><code class="language-bash">curl http://localhost:8000/v1/completions -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen2.5-0.5B", "prompt": "The capital of France is",
+       "n": 2, "max_tokens": 8, "temperature": 0.8}'</code></pre>
+<ol>
+  <li><strong>HTTP layers.</strong> uvicorn parses the request; CORS passes (no <code>Origin</code> header); there is no API key. FastAPI builds a <code>CompletionRequest</code> and calls <code>create_completion</code> under <code>with_cancellation</code> ({{cite vllm/entrypoints/openai/completion/api_router.py:37-60}}).</li>
+  <li><strong>Model and engine checks.</strong> The name matches the served name. <code>_preflight(2)</code> checks that the engine is alive and calls <code>check_admission(2)</code>, which does nothing because no queue limit is set ({{cite vllm/entrypoints/openai/completion/serving.py:107-113}}, {{cite vllm/v1/engine/async_llm.py:352-383}}).</li>
+  <li><strong>Render.</strong> <code>render_cmpl_async</code> sets <code>arrival_time</code> and tokenizes in the thread pool ({{cite vllm/renderers/base.py:1304-1329}}). The prompt has 5 tokens, <code>[785, 6722, 315, 9625, 374]</code>, with the Qwen2.5 tokenizer (measured outside the repo; Qwen2.5 adds no BOS token).</li>
+  <li><strong>Ids and parameters.</strong> The request id is <code>cmpl-&lt;uuid&gt;</code>, and the one prompt gets the item id <code>cmpl-&lt;uuid&gt;-0</code> ({{cite vllm/entrypoints/openai/completion/serving.py:147}}, {{cite vllm/entrypoints/openai/completion/serving.py:183}}). <code>get_max_tokens</code> gives min(max_model_len − 5, 8) = 8 ({{cite vllm/entrypoints/serve/utils/api_utils.py:253-270}}). The output kind is FINAL_ONLY ({{cite vllm/entrypoints/openai/completion/protocol.py:423-425}}).</li>
+  <li><strong>Generator.</strong> <code>generate()</code> makes a generator, and <code>merge_async_iterators</code> wraps it; with one prompt it takes the fast path ({{cite vllm/entrypoints/openai/completion/serving.py:210-223}}, {{cite vllm/utils/async_utils.py:91-103}}). The handler then iterates it at once, because there is no stream ({{cite vllm/entrypoints/openai/completion/serving.py:244-248}}).</li>
+  <li><strong>Fan-out in AsyncLLM.</strong> The internal id becomes <code>cmpl-&lt;uuid&gt;-0-k3m9q2zv</code> (8 random characters). Because <code>n</code> = 2, a <code>ParentRequest</code> makes the children <code>0_cmpl-…-k3m9q2zv</code> and <code>1_cmpl-…-k3m9q2zv</code>. With no seed, both share one copy of the parameters with <code>n</code> = 1. <code>check_admission(2)</code> runs again, and both children go to the engine core ({{cite vllm/v1/engine/async_llm.py:538-565}}, {{cite vllm/v1/engine/parallel_sampling.py:69-96}}).</li>
+  <li><strong>Engine core.</strong> The scheduler sees two independent requests with the same 5-token prompt. The prompt is shorter than one block of 16 tokens, and only full blocks can hit the prefix cache, so both compute the prefill ({{cite vllm/v1/core/kv_cache_manager.py:264-266}}). Each request runs 1 prefill step and then decode steps, until 8 tokens or an end token.</li>
+  <li><strong>Collect.</strong> Each child output is held back until it is finished ({{cite vllm/v1/engine/output_processor.py:364-369}}). When child 0 finishes first, the parent stores it and returns nothing. When child 1 finishes, the parent returns both outputs, and the output processor makes one <code>RequestOutput</code> with the external id <code>cmpl-&lt;uuid&gt;-0</code> ({{cite vllm/v1/engine/parallel_sampling.py:117-128}}, {{cite vllm/v1/engine/output_processor.py:406-420}}).</li>
+  <li><strong>Build the body.</strong> <code>request_output_to_completion_response</code> makes choice 0 and choice 1 in output order. If both stop at <code>max_tokens</code>, the usage is prompt 5 (counted once per prompt), completion 8 + 8 = 16, total 21 ({{cite vllm/entrypoints/openai/completion/serving.py:581-661}}). The response id is <code>cmpl-&lt;uuid&gt;</code>, without <code>-0</code> ({{cite vllm/entrypoints/openai/completion/serving.py:697-707}}).</li>
+  <li><strong>Answer.</strong> The route returns a <code>JSONResponse</code> with status 200 ({{cite vllm/entrypoints/openai/completion/api_router.py:66-70}}).</li>
+</ol>
+<pre><code class="language-json">{"id": "cmpl-3f9c...", "object": "text_completion", "model": "Qwen/Qwen2.5-0.5B",
+ "choices": [{"index": 0, "text": " Paris. It is the largest city", "finish_reason": "length", ...},
+             {"index": 1, "text": " Paris, which is known for its", "finish_reason": "length", ...}],
+ "usage": {"prompt_tokens": 5, "completion_tokens": 16, "total_tokens": 21, ...},
+ "system_fingerprint": "vllm-&lt;version&gt;-&lt;hash8&gt;"}</code></pre>
+<x-simplified><p>The texts are illustrative, and "..." stands for fields such as <code>logprobs</code> and <code>stop_reason</code>. The timing of the two children depends on the batch. The 5-token count is measured with the Qwen2.5 tokenizer; it is not in the repo.</p></x-simplified>
+<p>The client waits for the slower child: with FINAL_ONLY, no byte goes out before both children finish. If the client disconnects while it waits, <code>with_cancellation</code> cancels the handler task. <code>generate()</code> then aborts the parent and both children, and the route returns an empty response ({{cite vllm/entrypoints/serve/utils/api_utils.py:106-109}}, {{cite vllm/v1/engine/output_processor.py:599-661}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Exceptions and HTTP status codes in the server">
+<p>The error body and the four handler layers are on {{link learn/openai-api}}. This table adds where each status comes from in the serving code:</p>
+<table>
+  <thead><tr><th>Status</th><th>Cause</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>400</td><td>invalid fields, prompt too long, chat template error, bad tool choice, invalid structured output</td><td>{{cite vllm/entrypoints/serve/exception_handling/error_response.py:43-46}}, {{cite vllm/renderers/params.py:518-538}}</td></tr>
+    <tr><td>401</td><td>wrong or missing <code>Authorization: Bearer</code> on a guarded path</td><td>{{cite vllm/entrypoints/serve/middleware/authenticate.py:59-61}}</td></tr>
+    <tr><td>403</td><td>scale-out route without <code>--enable-scale-out</code></td><td>{{cite vllm/entrypoints/scale_out/factories.py:100-127}}</td></tr>
+    <tr><td>404</td><td>unknown model name</td><td>{{cite vllm/entrypoints/serve/engine/serving.py:75-84}}</td></tr>
+    <tr><td>500</td><td>engine dead, or a request finished with reason <code>error</code></td><td>{{cite vllm/entrypoints/serve/exception_handling/error_response.py:60-77}}</td></tr>
+    <tr><td>501</td><td>the model does not support the route (handler is <code>None</code>)</td><td>{{cite vllm/entrypoints/openai/chat_completion/api_router.py:63-65}}</td></tr>
+    <tr><td>503</td><td>queue limits (<code>GracefulHTTPError</code>), retryable request error, <code>/health</code> after engine death</td><td>{{cite vllm/entrypoints/serve/exception_handling/error_response.py:39-42}}, {{cite vllm/entrypoints/serve/exception_handling/error_response.py:60-66}}, {{cite vllm/entrypoints/serve/instrumentator/health.py:29-33}}</td></tr>
+  </tbody>
+</table>
+<p>In a stream, all of these after the first byte become one <code>data:</code> chunk with the same JSON body and the status code inside it ({{cite vllm/entrypoints/openai/chat_completion/serving.py:937-943}}).</p>
+</x-deepdive>
+
+<x-deepdive title="Flags and environment variables of the API server">
+<table>
+  <thead><tr><th>Flag or variable</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--host</code>, <code>--port</code>, <code>--uds</code></td><td>all addresses, 8000, none ({{cite vllm/entrypoints/common/cli_args.py:284-305}})</td><td>Listen address; a Unix socket replaces host and port.</td></tr>
+    <tr><td><code>--api-server-count</code></td><td>DP size, 1, local DP size or 0 by mode ({{cite vllm/entrypoints/cli/serve.py:113-136}})</td><td>Number of API server processes.</td></tr>
+    <tr><td><code>--api-key</code> / <code>VLLM_API_KEY</code></td><td>none</td><td>Bearer token check on <code>/v1</code>, <code>/v2</code>, <code>/inference</code>, <code>/cohere</code>; the flag wins ({{cite vllm/entrypoints/serve/middleware/register.py:32-36}}).</td></tr>
+    <tr><td><code>--allowed-origins</code>, <code>--allowed-methods</code>, <code>--allowed-headers</code>, <code>--allow-credentials</code></td><td><code>[]</code>, <code>["*"]</code>, <code>["*"]</code>, false ({{cite vllm/entrypoints/common/cli_args.py:318-325}})</td><td>CORS rules.</td></tr>
+    <tr><td><code>--enable-request-id-headers</code></td><td>false ({{cite vllm/entrypoints/common/cli_args.py:358-359}})</td><td>Echo <code>X-Request-Id</code> in the response.</td></tr>
+    <tr><td><code>--enable-server-load-tracking</code></td><td>false ({{cite vllm/entrypoints/common/cli_args.py:152-153}})</td><td>Count in-flight requests for <code>/load</code>.</td></tr>
+    <tr><td><code>--sse-keep-alive-interval</code></td><td>0 ({{cite vllm/entrypoints/common/cli_args.py:156}})</td><td>Seconds between keep-alive comments; negative raises at start-up ({{cite vllm/entrypoints/common/cli_args.py:529-534}}).</td></tr>
+    <tr><td><code>--middleware</code></td><td>none ({{cite vllm/entrypoints/common/cli_args.py:352-357}})</td><td>Import path of an ASGI class or an HTTP middleware function; anything else raises <code>ValueError</code> ({{cite vllm/entrypoints/serve/middleware/register.py:65-75}}).</td></tr>
+    <tr><td><code>--h11-max-incomplete-event-size</code>, <code>--h11-max-header-count</code></td><td>4,194,304 bytes, 256 ({{cite vllm/entrypoints/launchers/utils/constants.py:6-7}})</td><td>Header abuse limits of the h11 parser.</td></tr>
+    <tr><td><code>--max-num-queued-reqs</code>, <code>--max-num-queued-tokens</code></td><td>none ({{cite vllm/config/scheduler.py:92}}, {{cite vllm/config/scheduler.py:105}})</td><td>Admission limits; HTTP 503 when full.</td></tr>
+    <tr><td><code>--enable-force-include-usage</code></td><td>false ({{cite vllm/entrypoints/common/cli_args.py:154}})</td><td>Usage in every stream, also per chunk ({{cite vllm/entrypoints/serve/utils/api_utils.py:276-277}}).</td></tr>
+    <tr><td><code>VLLM_HTTP_TIMEOUT_KEEP_ALIVE</code></td><td>5 s ({{cite vllm/envs.py:1134-1136}})</td><td>uvicorn's idle time for a kept-alive connection ({{cite vllm/entrypoints/launchers/api_server/entry.py:152}}).</td></tr>
+    <tr><td><code>VLLM_SERVER_DEV_MODE</code></td><td>0 ({{cite vllm/envs.py:1466}})</td><td>Adds the development routes.</td></tr>
+    <tr><td><code>VLLM_SKIP_MODEL_NAME_VALIDATION</code></td><td>false ({{cite vllm/envs.py:2200-2203}})</td><td>Accept any <code>model</code> value ({{cite vllm/entrypoints/serve/engine/serving.py:86-91}}).</td></tr>
+    <tr><td><code>VLLM_KEEP_ALIVE_ON_ENGINE_DEATH</code></td><td>0 ({{cite vllm/envs.py:1107-1109}})</td><td>Keep uvicorn up after the engine dies ({{cite vllm/entrypoints/launchers/launcher.py:325-337}}).</td></tr>
+  </tbody>
+</table>
+<p>The uvicorn settings that <code>build_and_serve</code> passes contain one time limit only: <code>timeout_keep_alive</code> ({{cite vllm/entrypoints/launchers/api_server/entry.py:141-161}}). It closes an idle connection between two requests; it does not limit a running request. A long request is limited by <code>max_tokens</code> and by the client or proxy timeout.</p>
+</x-deepdive>
+
+<x-deepdive title="Several API servers: what changes for one request">
+<p>With <code>N</code> API servers, all of the above runs in each <code>ApiServer_i</code> process. Each process has its own AsyncLLM, renderer and serving objects, and its own client index ({{cite vllm/v1/utils.py:230-252}}). Four points change:</p>
+<ol>
+  <li>A connection lands on the process with the fewest open connections. A worker that is not the least loaded waits up to 5 × 1 ms before it accepts ({{cite vllm/entrypoints/launchers/launcher.py:39-44}}, {{cite vllm/entrypoints/launchers/launcher.py:103-125}}).</li>
+  <li>Prometheus uses a multiprocess directory, so <code>/metrics</code> of any process shows all of them ({{cite vllm/entrypoints/cli/serve.py:282-283}}).</li>
+  <li>The admission counters are shared through a <code>RawArray</code>, but only when <code>--max-num-queued-reqs</code> is set ({{cite vllm/v1/utils.py:207-214}}).</li>
+  <li>Runtime LoRA loading is refused at start-up, because each process would load its own copy ({{cite vllm/entrypoints/cli/serve.py:315-318}}).</li>
+</ol>
+<p>The engine core sends each output only to the API server that sent the request ({{link concepts/data-parallel-serving}}).</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<x-warning title="--api-key does not protect every route">
+<p>The API key guards only paths that start with <code>/v1</code>, <code>/v2</code>, <code>/inference</code> or <code>/cohere</code> ({{cite vllm/entrypoints/serve/middleware/authenticate.py:11}}, {{cite vllm/entrypoints/serve/middleware/authenticate.py:59-61}}). Every other path answers without a key. Examples are <code>/health</code>, <code>/metrics</code>, <code>/tokenize</code>, the development routes, and the SageMaker routes <code>/ping</code> and <code>/invocations</code>. Every server registers the SageMaker routes ({{cite vllm/entrypoints/launchers/api_server/routers.py:40-44}}). <code>/invocations</code> runs the same serving objects as the <code>/v1</code> routes, so a client without the key can still generate text ({{cite vllm/entrypoints/serve/sagemaker/api_router.py:98-132}}). This is a documented limitation: the help text of <code>--api-key</code> says so, and it names <code>/invocations</code> ({{cite vllm/entrypoints/common/cli_args.py:326-336}}). Do not use <code>--api-key</code> as the only protection. Put a proxy or a network rule in front of the server that allows only the routes you need.</p>
+</x-warning>
+<x-warning title="An HTTP 200 does not mean that the stream worked">
+<p>Errors after the first byte are <code>data:</code> chunks with an error object, followed by <code>data: [DONE]</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:937-943}}). Check every chunk for <code>error</code>.</p>
+</x-warning>
+<ul>
+  <li><strong>404 "The model ... does not exist".</strong> The <code>model</code> field must be a served name (<code>--served-model-name</code>, else the model path) or a LoRA name ({{cite vllm/entrypoints/serve/engine/serving.py:75-84}}).</li>
+  <li><strong>401 on <code>/v1</code> only.</strong> This is the expected behaviour of <code>--api-key</code>; the paths outside the guarded prefixes are open (warning above). <code>OPTIONS</code> requests are never checked ({{cite vllm/entrypoints/serve/middleware/authenticate.py:48-54}}).</li>
+  <li><strong>A browser client fails with a CORS error.</strong> No origin is allowed by default; set <code>--allowed-origins</code> ({{cite vllm/entrypoints/common/cli_args.py:320-321}}).</li>
+  <li><strong>A proxy closes slow streams.</strong> Nothing is sent during a long queue or prefill. Set <code>--sse-keep-alive-interval</code>.</li>
+  <li><strong>503 under load with queue limits set.</strong> This is the intended behaviour of <code>--max-num-queued-reqs</code>; the token limit counts whole prompts and can reject early ({{cite vllm/v1/engine/async_llm.py:337-341}}).</li>
+  <li><strong>The event loop is the bottleneck.</strong> Rendering, detokenization and JSON for all requests share one event loop per API server. More API servers split this work (Step 1).</li>
+  <li><strong><code>/load</code> always shows 0.</strong> Turn on <code>--enable-server-load-tracking</code>.</li>
+</ul>
+<p><strong>Why it matters.</strong> Every request of <code>vllm serve</code> crosses these layers twice. Most serving problems (wrong status codes, early 503s, lost streams behind proxies, an overloaded front end) are visible here before they reach the engine.</p>
+
+<x-quiz>
+  <x-q level="easy">Which object does the route function of <code>/v1/chat/completions</code> call, and where does it come from?
+    <x-a><p><code>app.state.openai_serving_chat</code>, an <code>OpenAIServingChat</code> object ({{cite vllm/entrypoints/openai/chat_completion/api_router.py:35-36}}). <code>init_generate_state</code> makes it at start-up, only when the model supports the generate task ({{cite vllm/entrypoints/generate/api_router.py:149-151}}).</p></x-a>
+  </x-q>
+  <x-q level="easy">A client sends <code>"model": "gpt-4"</code> to a server that serves Qwen. Which status does it get, and from which class?
+    <x-a><p>HTTP 404 with <code>NotFoundError</code>, from <code>BaseServing._check_model</code> ({{cite vllm/entrypoints/serve/engine/serving.py:75-84}}), unless <code>VLLM_SKIP_MODEL_NAME_VALIDATION</code> is set or a LoRA resolver loads an adapter with that name.</p></x-a>
+  </x-q>
+  <x-q level="medium">A client sends the header <code>X-Request-Id: abc</code> to a server without <code>--enable-request-id-headers</code>. Which id does the chat response carry, and does the response have an <code>X-Request-Id</code> header?
+    <x-a><p>The response id is <code>chatcmpl-abc</code>, because <code>_base_request_id</code> reads the header in every case ({{cite vllm/entrypoints/serve/engine/serving.py:132-142}}, {{cite vllm/entrypoints/openai/chat_completion/serving.py:320-322}}). The response has no <code>X-Request-Id</code> header, because only <code>XRequestIdMiddleware</code> adds it, and only with the flag ({{cite vllm/entrypoints/serve/middleware/register.py:38-41}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A non-streaming completion asks for <code>n</code> = 2. The first child finishes after 3 tokens with EOS; the second after 8 tokens. When does the client get bytes, and what is <code>completion_tokens</code>?
+    <x-a><p>Only after the second child finishes. With FINAL_ONLY each child gives no output before it finishes, and the parent returns nothing until all children are done ({{cite vllm/v1/engine/output_processor.py:364-369}}, {{cite vllm/v1/engine/parallel_sampling.py:117-128}}). <code>completion_tokens</code> is the sum of the token ids of both outputs: 3 + 8 = 11 (the EOS token counts as an output token) ({{cite vllm/entrypoints/openai/completion/serving.py:653}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">You start <code>vllm serve M -dp 2</code> on one node. How many API server processes run, where does <code>vllm serve</code> itself go, and how does a new connection pick a process?
+    <x-a><p>Two API servers, because the count defaults to the DP size with internal load balancing ({{cite vllm/entrypoints/cli/serve.py:124-130}}). The CLI process runs <code>run_multi_api_server</code> and only supervises ({{cite vllm/entrypoints/cli/serve.py:151-152}}, {{cite vllm/entrypoints/cli/serve.py:384-390}}). Both processes share one socket, and each publishes its number of open connections in a shared array. A process accepts when its count is the smallest, or after 5 checks of 1 ms ({{cite vllm/entrypoints/launchers/launcher.py:103-125}}).</p></x-a>
+  </x-q>
+</x-quiz>

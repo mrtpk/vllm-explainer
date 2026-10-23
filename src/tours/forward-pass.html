@@ -1,0 +1,379 @@
+---
+title: Tour: One forward pass
+nav_title: One forward pass
+level: Advanced
+prerequisites: tours/engine-step, concepts/model-runner, concepts/forward-context, concepts/compile-and-cuda-graphs
+related: concepts/model-runner, concepts/forward-context, concepts/attention-backends, concepts/compile-and-cuda-graphs, concepts/model-definition, concepts/tp-layers, concepts/custom-ops, concepts/attention-backend-selection, code/v1-worker-gpu-model-runner, code/forward-context, code/model-executor-layers-attention-attention, code/model-executor-models-llama, code/model-executor-layers-linear, tours/engine-step, tours/multi-gpu-step
+summary: Follow one forward pass of Llama-3-8B on one H100 in 14 stops, for a batch of two decodes and one 298-token prompt: Model Runner V2 inputs, the PIECEWISE CUDA graph, one decoder layer with its shapes, FlashAttention, logits and the sampler.
+---
+<x-sentence>We follow one batch of 300 tokens from execute_model, through 32 Llama decoder layers and FlashAttention, to three sampled tokens.</x-sentence>
+
+<h2>The idea</h2>
+<p>The tour {{link tours/engine-step}} shows one {{term engine-step | engine step}} from the side of the engine core. There, the forward pass is one line: the executor calls <code>execute_model</code>, and later <code>sample_tokens</code>. This tour opens that line. It walks the real code in the order it runs. It goes from the {{term model-runner | model runner}} into the model file, into one attention layer and the backend, and back to the sampler.</p>
+<p>The forward pass has three layers of code. Model Runner V2 turns the plan of the scheduler into GPU tensors. The model code (<code>llama.py</code>) runs 32 decoder layers on these tensors. Inside each layer, the attention layer calls the {{term attention-backend | attention backend}}, here FlashAttention. The transformer layers themselves are the ones of {{deepinfer learn/transformer | Inside a transformer}}; this tour shows only what vLLM adds around them.</p>
+<p>Each stop links to the concept page that explains its part in depth. The tour does not repeat those deep dives. It shows how the parts connect, with the real shapes of one step.</p>
+<p><strong>An everyday comparison.</strong> Think of a car factory with a recorded robot line. The planning office (the model runner) prints the work order and lays out the parts in fixed bins. The robot line (the compiled pieces) replays its recorded moves. Between two robot cells, a human worker (the attention op) does the one task that changes with every car. At the end, the inspector (the sampler) picks the next order. The comparison stops here. The robots record their moves for a fixed list of batch sizes, so a batch is padded up to the next recorded size.</p>
+
+<h3>The example</h3>
+<pre><code class="language-bash">vllm serve meta-llama/Meta-Llama-3-8B-Instruct     # one H100 80 GiB GPU, default settings</code></pre>
+<ul>
+  <li><strong>Model.</strong> These values come from the model's Hugging Face <code>config.json</code>, not from the vLLM repository. 32 layers, hidden size 4096, intermediate size 14336. 32 query heads and 8 KV heads of size 128, vocabulary 128256, BF16 weights.</li>
+  <li><strong>Engine.</strong> TP = 1, so the {{term uni-executor}} runs the worker inside the engine core process ({{cite vllm/config/parallel.py:1099-1100}}). Model Runner V2 is the default runner ({{cite vllm/config/vllm.py:713-748}}).</li>
+  <li><strong>Compile and graphs.</strong> The default {{term optimization-level}} is O2 ({{cite vllm/config/vllm.py:434}}). It gives the compile mode <code>VLLM_COMPILE</code> and the CUDA graph mode <code>FULL_AND_PIECEWISE</code> ({{cite vllm/config/vllm.py:1806-1810}}, {{cite vllm/config/vllm.py:310}}).</li>
+  <li><strong>Attention backend.</strong> On an H100 (compute capability 9.0) the priority list starts with <code>FLASH_ATTN</code>, and it accepts this layer ({{cite vllm/platforms/cuda.py:170-181}}). FlashAttention prefers version 3 on Hopper ({{cite vllm/v1/attention/backends/fa_utils.py:99-101}}). The page {{link concepts/attention-backend-selection}} explains the choice.</li>
+  <li><strong>Budget.</strong> <code>max_num_seqs = 1024</code> and <code>max_num_batched_tokens = 8192</code>, because the GPU has 70 GiB or more and is not an A100 ({{cite vllm/engine/arg_utils.py:2960-2993}}).</li>
+</ul>
+<p><strong>The batch of our step.</strong> Three requests are scheduled, 300 tokens in total:</p>
+<table>
+  <thead><tr><th>Request</th><th>State</th><th>Tokens this step</th><th>Positions</th><th>Request slot</th></tr></thead>
+  <tbody>
+    <tr><td>R1</td><td>decodes; 540 tokens have KV in the cache</td><td>1</td><td>540</td><td>1023</td></tr>
+    <tr><td>R2</td><td>decodes; 129 tokens have KV in the cache</td><td>1</td><td>129</td><td>1022</td></tr>
+    <tr><td>R3</td><td>new; a 298-token prompt, no prefix cache hit</td><td>298 (the whole prompt in one chunk)</td><td>0 to 297</td><td>1021</td></tr>
+  </tbody>
+</table>
+<x-simplified><p>The prompt lengths, the positions and the slot numbers are illustrative. The slots assume that R1, R2 and R3 arrived in this order on a fresh server. Slots are taken from the end of a free list ({{link concepts/model-runner}}). We assume block size 16, no LoRA, no speculative decoding, no structured output and no KV connector. The rules and the shapes are from the code.</p></x-simplified>
+
+<h3>What you will see</h3>
+<ul>
+  <li>Why this batch runs as a PIECEWISE CUDA graph of 304 tokens. Why the mode is chosen before any input exists (stop 2).</li>
+  <li>How the inputs are built on the GPU from the persistent request rows (stops 3 to 5).</li>
+  <li>Where the forward context is set, and how the call reaches the compiled model (stop 6).</li>
+  <li>One decoder layer with its shapes, and which implementation runs for each small op by default (stops 7 to 12).</li>
+  <li>Why the logits have only 3 rows, and which sampler draws the tokens (stops 13 and 14).</li>
+</ul>
+
+<h2>The picture</h2>
+<x-diagram name="b6t_stop_map" alt="Panel 1, stops 1 to 6 in Model Runner V2: apply the plan (add R3, update R1 and R2), sort the batch and pick the CUDA graph mode (R1, R2, R3; PIECEWISE, 300 tokens padded to 304), prepare_inputs (query_start_loc 0, 1, 2, 300; input ids int32 304; positions int64 304; logits rows 0, 1, 299), prepare_attn (block tables, slot mapping int64 1 by 304 with padding -1), attention metadata (CommonAttentionMetadata to the FlashAttention builder, one object for 32 layer names, drawn as the backend), forward context (PIECEWISE, 304 tokens, run_pw_graph calls the model). Panel 2, stops 7 to 12 inside the model: LlamaModel.forward with the embedding from 304 ids to 304 by 4096 and the loop over 32 layers; fused add and RMSNorm as an IR op lowered to native code; QKV from 304 by 4096 to 304 by 6144 and RoPE; the attention ops unified_kv_cache_update and unified_attention_with_output that run eagerly and call FlashAttentionImpl with FA3; o_proj and the MLP with no all-reduce; the final norm and the stored hidden states, then execute_model returns None. Stops 8 to 11 repeat for each of the 32 layers. Panel 3, stops 13 and 14: compute_logits on rows 0, 1 and 299 gives bf16 logits 3 by 128256; the sampler (FlashInfer top-k/top-p or Gumbel) gives ids 3 by 1 and starts a copy to pinned CPU memory; later the engine core calls get_output." caption="Figure: the 14 stops of this tour, colored by the layer of code where they run. Blue stops queue GPU work in Model Runner V2; green stops are model code inside compiled pieces; the amber stop runs eagerly between two pieces." />
+<p>Read panel 1 as CPU work that only queues kernels. Panel 2 is what the GPU then runs, piece by piece. Panel 3 happens in the second call, <code>sample_tokens</code>.</p>
+
+<table>
+  <thead><tr><th>Stop</th><th>What happens</th><th>File and function</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td><code>execute_model</code> starts and applies the plan</td><td><code>v1/worker/gpu_worker.py</code>; <code>v1/worker/gpu/model_runner.py</code>: <code>execute_model</code></td></tr>
+    <tr><td>2</td><td>The batch is sorted, and the CUDA graph mode is chosen</td><td><code>model_runner.py</code>: <code>gather_batch_req_state</code>; <code>gpu/cudagraph_utils.py</code>: <code>dispatch</code></td></tr>
+    <tr><td>3</td><td>The input tensors are built on the GPU</td><td><code>model_runner.py</code>: <code>prepare_inputs</code></td></tr>
+    <tr><td>4</td><td>Block tables and slot mappings</td><td><code>model_runner.py</code>: <code>prepare_attn</code></td></tr>
+    <tr><td>5</td><td>The attention metadata of the KV cache group</td><td><code>gpu/attn_utils.py</code>: <code>build_attn_metadata</code>; <code>v1/attention/backends/flash_attn.py</code></td></tr>
+    <tr><td>6</td><td>The forward context, and the call into the model</td><td><code>model_runner.py</code>: <code>execute_model</code>; <code>vllm/forward_context.py</code></td></tr>
+    <tr><td>7</td><td>The compiled <code>LlamaModel</code>: embedding and layer loop</td><td><code>model_executor/models/llama.py</code>: <code>LlamaModel.forward</code></td></tr>
+    <tr><td>8</td><td>Fused add + RMSNorm</td><td><code>llama.py</code>: <code>LlamaDecoderLayer.forward</code>; <code>layers/layernorm.py</code></td></tr>
+    <tr><td>9</td><td><code>QKVParallelLinear</code> and the rotary embedding</td><td><code>llama.py</code>: <code>LlamaAttention.forward</code></td></tr>
+    <tr><td>10</td><td>The attention layer, its two custom ops, and FlashAttention</td><td><code>layers/attention/attention.py</code>; <code>flash_attn.py</code></td></tr>
+    <tr><td>11</td><td><code>o_proj</code> and the MLP</td><td><code>llama.py</code>; <code>layers/linear.py</code>; <code>layers/activation.py</code></td></tr>
+    <tr><td>12</td><td>The final norm; the hidden states are kept</td><td><code>llama.py</code>; <code>model_runner.py</code>: <code>execute_model</code></td></tr>
+    <tr><td>13</td><td>Logits for three rows</td><td><code>model_runner.py</code>: <code>sample</code>; <code>layers/logits_processor.py</code></td></tr>
+    <tr><td>14</td><td>The sampler and the <code>AsyncOutput</code></td><td><code>gpu/sample/sampler.py</code>; <code>model_runner.py</code>: <code>sample_tokens</code></td></tr>
+  </tbody>
+</table>
+<p>All paths are under <code>vllm/</code>. All stops run in the engine core process, on its main thread; the GPU runs the queued kernels later, in order.</p>
+
+<x-stop n="1" title="execute_model starts and applies the plan">
+<p>We are at stop 5 of {{link tours/engine-step}}. The uni executor called <code>Worker.execute_model</code>, which hands the {{term scheduler-output | SchedulerOutput}} to the model runner ({{cite vllm/v1/worker/gpu_worker.py:1350-1353}}). <code>Model Runner V2</code> keeps every running request in a fixed row, its {{term request-slot}}. So it first applies the changes of the plan to those rows:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1753-1771" highlight="1758-1760" />
+<ul>
+  <li><strong>R3 is new.</strong> <code>add_requests</code> gives it a slot, stores its 298 prompt ids, overwrites its block table row, and registers its sampling parameters with the sampler ({{cite vllm/v1/worker/gpu/model_runner.py:1214-1220}}, {{cite vllm/v1/worker/gpu/model_runner.py:1238-1245}}).</li>
+  <li><strong>R1 and R2 run already.</strong> <code>update_requests</code> writes their computed-token counts into the CPU mirror. It appends new block ids only when the scheduler gave new blocks ({{cite vllm/v1/worker/gpu/model_runner.py:1257-1269}}).</li>
+  <li><strong>Block tables.</strong> <code>apply_staged_writes()</code> copies all staged rows to the GPU tables in one go (line 1760).</li>
+</ul>
+<p>The step has 300 tokens, so it does not return early at line 1766. The persistent rows and the staged writes are explained on {{link concepts/model-runner}}.</p>
+<p><strong>What the data looks like now:</strong></p>
+<pre><code class="language-python">req_states.req_id_to_index = {"R1": 1023, "R2": 1022, "R3": 1021}
+num_computed_tokens_np[[1023, 1022, 1021]] = [540, 129, 0]
+prefill_len[1021] = 298                       # R3 has a prompt to fill
+block table row 1021 = 19 block ids           # ceil(298 / 16) = 19 (derived)</code></pre>
+</x-stop>
+
+<x-stop n="2" title="Sort the batch, then pick the CUDA graph mode">
+<p>Next, <code>gather_batch_req_state</code> puts the requests in batch order: requests with draft tokens first, then decodes, then the others by size ({{cite vllm/v1/worker/gpu/model_runner.py:2471-2483}}). R1 and R2 have 1 token each, which equals the decode query length, so the order is R1, R2, R3. The function also maps each batch row to its slot (<code>idx_mapping_np</code>) and finds that R3 is still in its prefill ({{cite vllm/v1/worker/gpu/model_runner.py:1310-1326}}).</p>
+<p>A batch with a real prefill is not eligible for a decode graph, so the uniform decode token count is <code>None</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1343-1373}}, {{cite vllm/v1/worker/utils.py:967-975}}). Then the runner asks the CUDA graph manager for a descriptor, before it builds any input:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1806-1821" highlight="1806,1810,1813" />
+<p>With DP = 1 this is one call of <code>CudaGraphManager.dispatch</code> ({{cite vllm/v1/worker/gpu/dp_utils.py:265-279}}). The manager keeps a list of candidates for every token count up to 512. For 300 tokens, the candidates are the graphs of the next {{term capture-size}}, 304: the FULL decode graph first, then the PIECEWISE graph ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:380-394}}).</p>
+<x-code file="vllm/v1/worker/gpu/cudagraph_utils.py" lines="125-138" highlight="127-128,134-135" />
+<ol>
+  <li><strong>FULL, 304 tokens.</strong> Its <code>uniform_token_count</code> is 1, but our batch has <code>None</code>. Line 128 fails.</li>
+  <li><strong>PIECEWISE, 304 tokens.</strong> It has no uniform count and no request limit, and 304 ≥ 300. It matches.</li>
+</ol>
+<p>So the step runs as a {{term piecewise-cuda-graph}} of 304 tokens. The capture sizes on this GPU go up to <code>min(1024 × 1 × 2, 512) = 512</code>, in steps of 16 above 256 ({{cite vllm/config/vllm.py:2440-2449}}, {{cite vllm/config/vllm.py:2566-2570}}). A batch above 512 tokens has no candidate and runs eagerly (lines 547-553 there). The rule and its reasons are on {{link concepts/compile-and-cuda-graphs}}.</p>
+<p><strong>What the data looks like now:</strong></p>
+<pre><code class="language-python">req_ids        = ["R1", "R2", "R3"]
+idx_mapping_np = [1023, 1022, 1021]
+has_prefill    = True;  uniform_tok_count = None
+batch_desc     = BatchExecutionDescriptor(cg_mode=PIECEWISE, num_tokens=304, num_reqs=None, ...)</code></pre>
+<x-note title="Why the mode comes first">
+<p>The padded size decides the length of every input slice, and the FULL mode needs metadata with padded sizes. So <code>dispatch</code> runs before <code>prepare_inputs</code>, and both later stops read <code>batch_desc</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1835-1838}}, {{cite vllm/v1/worker/gpu/model_states/default.py:179-186}}).</p>
+</x-note>
+</x-stop>
+
+<x-stop n="3" title="prepare_inputs builds the input tensors on the GPU">
+<p><code>prepare_inputs</code> fills the persistent input buffers. Only two small arrays come from the CPU: {{term idx-mapping}}, copied as int64 ({{cite vllm/v1/worker/gpu/model_runner.py:1393-1395}}), and <code>query_start_loc</code>:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1446-1456" highlight="1448,1451,1454" />
+<p>The PIECEWISE descriptor has no request count, so <code>num_reqs_padded</code> stays 3 (line 1448). The token count is padded to 304 ({{cite vllm/v1/worker/gpu/model_runner.py:1383}}). Without draft tokens, each request gets exactly one logits row ({{cite vllm/v1/worker/gpu/model_runner.py:1401-1412}}). Then three GPU kernels read the request rows through <code>idx_mapping</code>:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1469-1504" highlight="1470-1471,1482,1493" />
+<ol>
+  <li><strong>Lines 1470-1479.</strong> The batch has a prefill, so a kernel copies R3's 298 prompt ids from <code>all_token_ids</code> into <code>input_ids</code>.</li>
+  <li><strong>Lines 1482-1488.</strong> A kernel writes the positions and <code>seq_lens = num_computed_tokens + query_len</code> of each request.</li>
+  <li><strong>Lines 1493-1504.</strong> A kernel writes the last sampled token of R1 and R2 into <code>input_ids</code>, from <code>last_sampled_tokens</code> on the GPU. It also returns <code>logits_indices</code>, the last row of each request.</li>
+</ol>
+<p>The CPU does not know the last tokens of R1 and R2 yet; the step before writes them on the GPU (engine-step tour, stop 6). The varlen layout is the one of {{deepinfer concepts/input-metadata | Input metadata}}.</p>
+<p><strong>What the data looks like now</strong> (derived from our numbers):</p>
+<pre><code class="language-python">query_start_loc int32 [4]   = [0, 1, 2, 300]           # entries 4..1024 of the buffer are also 300
+input_ids       int32 [304] = [last token of R1, last token of R2, R3 prompt ids 0..297, 4 padding rows]
+positions       int64 [304] = [540, 129, 0, 1, ..., 297, 4 padding rows]
+seq_lens        int32 [3]   = [541, 130, 298]
+logits_indices  int64 [3]   = [0, 1, 299]
+is_padding      bool  [304] = 300 x False, 4 x True</code></pre>
+<p>The kernels do not write the 4 padding rows. <code>is_padding</code> marks them when <code>VLLM_MOE_SKIP_PADDING</code> is on, which is the default ({{cite vllm/v1/worker/gpu/model_runner.py:1385-1388}}, {{cite vllm/envs.py:1640}}), and the input buffers have fixed addresses, which the CUDA graphs need ({{cite vllm/v1/worker/gpu/input_batch.py:19-31}}).</p>
+</x-stop>
+
+<x-stop n="4" title="prepare_attn: block tables and slot mappings">
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1577-1597" highlight="1584-1588,1591-1596" />
+<p>Llama-3-8B has one {{term kv-cache-group}}, so both results have one entry. <code>gather_block_tables</code> copies the {{term block-table}} rows of slots 1023, 1022 and 1021 into a second tensor, in batch order. <code>compute_slot_mappings</code> gives each token its {{term slot-mapping | slot}} in the KV cache: <code>block_number × block_size + offset</code> ({{cite vllm/v1/worker/gpu/block_table.py:409}}). The 4 padding rows get <code>PAD_SLOT_ID = -1</code> ({{cite vllm/v1/worker/gpu/block_table.py:257-260}}, {{cite vllm/v1/attention/backends/utils.py:53}}).</p>
+<p><strong>What the data looks like now</strong> (block size 16, derived):</p>
+<pre><code class="language-python">block_tables[0]  int32 [3, max_num_blocks]    # rows of R1, R2, R3
+slot_mappings    int64 [1, 304]
+  R1, position 540 -> block index 33, offset 12  (540 = 33 x 16 + 12)
+  R2, position 129 -> block index 8,  offset 1   (129 = 8 x 16 + 1)
+  R3, positions 0..297 -> block indexes 0..18, the last one holds 10 tokens
+  rows 300..303 -> -1</code></pre>
+<p>The block ids themselves come from the scheduler's {{term block-pool}} ({{link concepts/kv-cache-manager}}). The runner only mirrors them.</p>
+</x-stop>
+
+<x-stop n="5" title="The attention metadata: one object for 32 layers">
+<p>Back in <code>execute_model</code>, the runner makes a dict from layer name to slot mapping ({{cite vllm/v1/worker/gpu/model_runner.py:1924-1928}}, {{cite vllm/v1/worker/gpu/attn_utils.py:447-455}}). Then the default model state builds the {{term attention-metadata}} ({{cite vllm/v1/worker/gpu/model_runner.py:1940-1951}}). In PIECEWISE and eager mode it uses the unpadded sizes, 3 requests and 300 tokens ({{cite vllm/v1/worker/gpu/model_states/default.py:179-186}}). For each KV cache group, <code>build_attn_metadata</code> makes one {{term common-attention-metadata}}:</p>
+<x-code file="vllm/v1/worker/gpu/attn_utils.py" lines="527-548" highlight="528-537" />
+<p>The {{term metadata-builder}} of the FlashAttention backend turns it into <code>FlashAttentionMetadata</code>. It copies most fields straight from the common metadata ({{cite vllm/v1/attention/backends/flash_attn.py:812-829}}). All 32 layers share one backend and one KV cache spec, so they form one attention group. The same object goes under all 32 layer names ({{cite vllm/v1/worker/gpu/attn_utils.py:574-580}}).</p>
+<p><strong>What the data looks like now:</strong></p>
+<pre><code class="language-python">CommonAttentionMetadata(num_reqs=3, num_actual_tokens=300,
+    query_start_loc=[0, 1, 2, 300], seq_lens=[541, 130, 298],
+    max_query_len=298, max_seq_len=541,
+    block_table_tensor=int32 [3, max_num_blocks], slot_mapping=int64 [304], causal=True)
+attn_metadata = {"model.layers.0.self_attn.attn": m, ..., "model.layers.31.self_attn.attn": m}</code></pre>
+<p><code>max_query_len</code> and <code>max_seq_len</code> come from CPU arrays, so this stop needs no GPU-to-CPU copy ({{cite vllm/v1/worker/gpu/model_states/default.py:191-199}}). The three classes of a backend are explained on {{link concepts/attention-backends}}.</p>
+</x-stop>
+
+<x-stop n="6" title="set_forward_context, and the call into the model">
+<p>The model inputs are the ids and the positions; <code>inputs_embeds</code> and <code>intermediate_tensors</code> are <code>None</code>, and the model state adds nothing for Llama ({{cite vllm/v1/worker/gpu/model_runner.py:1984-1992}}). The metadata does not go into the call. The runner puts it into the {{term forward-context}} around the call:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="2033-2070" highlight="2035-2039,2041-2045,2050,2060-2067" />
+<ol>
+  <li><strong>Lines 2035-2039.</strong> The {{term batch-descriptor}} holds the padded token count, 304, and the LoRA flags.</li>
+  <li><strong>Lines 2041-2053.</strong> <code>set_forward_context</code> installs the metadata dict, the slot mapping dict, the mode PIECEWISE and the descriptor for the duration of the <code>with</code> block ({{cite vllm/forward_context.py:345-360}}).</li>
+  <li><strong>Lines 2060-2067.</strong> In PIECEWISE mode, <code>run_pw_graph</code> calls the model object directly, because breakable CUDA graphs are off for Llama ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:578-583}}). They turn on by default only for the architectures in a fixed list, and <code>LlamaForCausalLM</code> is not in it ({{cite vllm/config/vllm.py:75-107}}, {{cite vllm/config/vllm.py:824-833}}).</li>
+</ol>
+<p><code>self.model</code> is <code>LlamaForCausalLM</code>. Its <code>forward</code> only calls the inner <code>LlamaModel</code> with the four arguments ({{cite vllm/model_executor/models/llama.py:534-544}}). The page {{link concepts/forward-context}} explains the two dicts and why the attention ops read them by name.</p>
+</x-stop>
+
+<x-stop n="7" title="The compiled LlamaModel: embedding and layer loop">
+<p><code>LlamaModel</code> carries <code>@support_torch_compile</code>, with dimension 0 of the ids and positions dynamic ({{cite vllm/model_executor/models/llama.py:337-346}}). The first call, in the profile run at start-up, compiled the model ({{cite vllm/v1/worker/gpu_worker.py:680-697}}, {{link concepts/compile-and-cuda-graphs}}). So this call goes to the compiled code ({{cite vllm/compilation/decorators.py:533-551}}). The compiled graph is cut at the attention ops into 33 pieces. Each piece sits in a <code>CUDAGraphWrapper</code>. A wrapper replays its graph only when the forward context says PIECEWISE ({{cite vllm/compilation/cuda_graph.py:242-256}}):</p>
+<x-code file="vllm/compilation/cuda_graph.py" lines="358-362" />
+<p>So the GPU work of this stop is 33 graph replays for the 304-token descriptor, with 32 eager attention calls between them (stop 10). The source code that was traced is this:</p>
+<x-code file="vllm/model_executor/models/llama.py" lines="414-438" highlight="418,432-438" />
+<ul>
+  <li><strong>Line 418.</strong> On TP = 1, the embedding is a plain lookup ({{cite vllm/model_executor/layers/vocab_parallel_embedding.py:522-525}}). It turns <code>input_ids [304]</code> into <code>hidden_states [304, 4096]</code> BF16.</li>
+  <li><strong>Line 419.</strong> There is no residual yet. Layer 0 starts it (stop 8).</li>
+  <li><strong>Lines 432-438.</strong> The loop runs all 32 layers, because with PP = 1 this rank owns layers 0 to 31. Each layer returns <code>(hidden_states, residual)</code>.</li>
+</ul>
+<p>Piece 0 holds the embedding and the start of layer 0. Each later piece holds the end of one layer and the start of the next; the facts are on {{link concepts/compile-and-cuda-graphs}}. The diagram below shows one layer.</p>
+<x-diagram name="b6t_decoder_layer" alt="Panel 1, the attention half of layer i with T = 304 rows: input_layernorm does a fused add and RMSNorm on hidden and residual [304, 4096]; qkv_proj with weight [6144, 4096] gives [304, 6144]; the split gives q [304, 4096], k and v [304, 1024], and RoPE changes q and k. These boxes are in compiled piece i. Attention.forward makes the output [304, 4096] and views q as [304, 32, 128] and k, v as [304, 8, 128], still in piece i. The two attention ops run eagerly: the update writes k and v to their KV cache slots (padding rows have slot -1), and attention runs on 300 query rows over the per-layer KV view [num_blocks, 8, 16, 256]. o_proj with weight [4096, 4096] gives [304, 4096] and starts piece i + 1; with TP = 1 there is no all-reduce. Panel 2, the MLP half in piece i + 1: post_attention_layernorm (fused add and RMSNorm), gate_up_proj with weight [28672, 4096] gives [304, 28672], SiluAndMul gives [304, 14336], down_proj with weight [4096, 14336] gives [304, 4096], then the pair (hidden, residual) goes to layer i + 1. Panel 3, which code runs: in the compiled piece, RMSNorm is a disabled CustomOp whose forward_native calls an IR op that is lowered to its native body, RoPE and SiluAndMul use forward_native, and the linear layers use F.linear. The eager ops call impl.do_kv_cache_update (reshape_and_cache_flash) and impl.forward (flash_attn_varlen_func, FA3 on H100). With --enforce-eager, the CustomOps are on: RMSNorm uses the IR op with vllm_c first, SiluAndMul uses _C.silu_and_mul, RoPE uses ops.rotary_embedding, and there is no compile and no CUDA graph." caption="Figure: one decoder layer of our step with the shape of every tensor (panels 1 and 2), and which code runs for each op by default and with --enforce-eager (panel 3)." />
+</x-stop>
+
+<x-stop n="8" title="Inside a decoder layer: fused add + RMSNorm">
+<x-code file="vllm/model_executor/models/llama.py" lines="313-330" highlight="324,328" />
+<p>The layer keeps the residual outside the norm. Layer 0 has no residual, so it calls a plain RMSNorm (lines 320-322). Layers 1 to 31 call <code>input_layernorm(hidden_states, residual)</code>, which adds and normalizes in one call (line 324). <code>post_attention_layernorm</code> does the same after attention (line 328).</p>
+<p><code>RMSNorm</code> is a {{term custom-op | CustomOp}}. With Inductor compilation, the default of <code>vllm serve</code>, vLLM adds <code>"none"</code> to the custom op list, so the op is disabled ({{cite vllm/config/vllm.py:1819-1826}}). A disabled op uses {{term forward-native}} ({{cite vllm/model_executor/custom_op.py:189-192}}). For RMSNorm, that method calls an {{term ir-op}}:</p>
+<x-code file="vllm/model_executor/layers/layernorm.py" lines="79-99" highlight="86,93" />
+<p>The IR op is one node in the traced graph. During compilation, a lowering pass replaces each IR node with the implementation that the priority list selects ({{cite vllm/compilation/passes/ir/lowering_pass.py:41-67}}, {{cite vllm/compilation/passes/pass_manager.py:122-124}}). On CUDA with Inductor, the list for <code>fused_add_rms_norm</code> is <code>["native"]</code> ({{cite vllm/platforms/cuda.py:716-732}}). So the native PyTorch body runs, compiled by Inductor inside the piece, and not the <code>vllm_c</code> kernel. The native body adds in FP32, keeps the sum as the new residual, and normalizes ({{cite vllm/ir/ops/layernorm.py:43-62}}).</p>
+<p><strong>What the data looks like now:</strong> <code>x [304, 4096]</code> BF16 (normalized) and <code>residual [304, 4096]</code> BF16 (the sum). The two switches are explained on {{link concepts/custom-ops}}.</p>
+</x-stop>
+
+<x-stop n="9" title="QKVParallelLinear and the rotary embedding">
+<x-code file="vllm/model_executor/models/llama.py" lines="224-234" highlight="229-231" />
+<ol>
+  <li><strong>Line 229.</strong> <code>qkv_proj</code> is a {{term qkv-parallel-linear}}. With TP = 1 its weight is <code>[6144, 4096]</code>: 32 query heads plus 2 × 8 KV heads, times 128 ({{link concepts/tp-layers}}). The forward is one GEMM through the quantize method, and no collective ({{cite vllm/model_executor/layers/linear.py:616-634}}). For BF16 on CUDA, the default GEMM is <code>torch.nn.functional.linear</code> ({{cite vllm/model_executor/layers/utils.py:83-89}}, {{cite vllm/model_executor/layers/utils.py:689-691}}).</li>
+  <li><strong>Line 230.</strong> The split uses the per-rank sizes: <code>q_size = 32 × 128 = 4096</code>, <code>kv_size = 8 × 128 = 1024</code> ({{cite vllm/model_executor/models/llama.py:156-161}}).</li>
+  <li><strong>Line 231.</strong> The rotary embedding rotates q and k by the positions of stop 3. It is a CustomOp too ({{cite vllm/model_executor/layers/rotary_embedding/base.py:14-15}}), so by default it runs <code>forward_native</code>: a lookup in <code>cos_sin_cache</code> by position, then the rotation of each head ({{cite vllm/model_executor/layers/rotary_embedding/base.py:160-219}}). The model's <code>config.json</code> on the Hugging Face Hub has no <code>rope_scaling</code>, so <code>get_rope</code> takes the default branch and builds a plain <code>RotaryEmbedding</code> ({{cite vllm/model_executor/layers/rotary_embedding/__init__.py:63-65}}, {{cite vllm/model_executor/layers/rotary_embedding/__init__.py:147-155}}).</li>
+</ol>
+<p><strong>What the data looks like now:</strong> <code>qkv [304, 6144]</code> → <code>q [304, 4096]</code>, <code>k [304, 1024]</code>, <code>v [304, 1024]</code>, all BF16. RoPE keeps the shapes. RoPE itself is explained in {{deepinfer learn/transformer | Inside a transformer}}.</p>
+</x-stop>
+
+<x-stop n="10" title="Attention: two custom ops, a lookup by name, and FlashAttention">
+<p><code>self.attn(q, k, v)</code> calls <code>Attention.forward</code>. It makes the output buffer <code>[304, 4096]</code> and views the inputs per head: q as <code>[304, 32, 128]</code>, k and v as <code>[304, 8, 128]</code> ({{cite vllm/model_executor/layers/attention/attention.py:525-540}}). CUDA wants one opaque op for attention, so <code>use_direct_call</code> is false ({{cite vllm/model_executor/layers/attention/attention.py:436-440}}), and the layer calls two registered ops:</p>
+<x-code file="vllm/model_executor/layers/attention/attention.py" lines="561-581" highlight="570-572,573-580" />
+<p>These two ops are {{term splitting-op | splitting ops}}, so this part runs eagerly between piece i and piece i + 1. Both ops resolve the layer name in the forward context of stop 6:</p>
+<x-code file="vllm/model_executor/layers/attention/attention.py" lines="705-723" highlight="709,716-717,722" />
+<ol>
+  <li><strong><code>unified_kv_cache_update</code>.</strong> FlashAttention writes the cache in a separate op ({{cite vllm/v1/attention/backends/flash_attn.py:367}}). The op calls <code>impl.do_kv_cache_update</code> with the slot mapping of stop 4 ({{cite vllm/model_executor/layers/attention/attention.py:734-748}}). That method scatters the new keys and values into this layer's cache view by slot ({{cite vllm/v1/attention/backends/flash_attn.py:1443-1464}}). A comment there says that the slot mapping is not padded (lines 1450-1454). This comment is stale: here the slot mapping has 304 entries, and rows 300 to 303 hold -1 (stop 4).</li>
+  <li><strong><code>unified_attention_with_output</code>.</strong> It takes the empty tensor of the first op as a dummy argument, so the compiler keeps the order. Then it calls <code>impl.forward(self, query, key, value, kv_cache, attn_metadata, output=output)</code> ({{cite vllm/model_executor/layers/attention/attention.py:779-796}}).</li>
+</ol>
+<p><code>FlashAttentionImpl.forward</code> splits the cache view <code>[num_blocks, 8, 16, 256]</code> into a key half and a value half ({{cite vllm/v1/attention/backends/flash_attn.py:1254-1255}}). It reads the batch layout from the metadata, then calls the kernel with the first <code>num_actual_tokens</code> rows only:</p>
+<x-code file="vllm/v1/attention/backends/flash_attn.py" lines="1402-1415" highlight="1403,1406-1410,1415" />
+<p>The arguments come from stop 5: <code>cu_seqlens_q</code> is <code>query_start_loc</code>, <code>seqused_k</code> is <code>seq_lens</code>, and the block table maps each request to its blocks ({{cite vllm/v1/attention/backends/flash_attn.py:1279-1284}}). The wrapper object ends in <code>flash_attn_varlen_func</code> ({{cite vllm/v1/attention/backends/flash_attn.py:275-283}}, {{cite vllm/v1/attention/backends/flash_attn.py:113-116}}). The kernel itself is out of scope. For our batch it computes causal attention for 300 query rows: R1 reads 541 keys, R2 130 keys and R3 298 keys. Attention itself is explained in {{deepinfer learn/attention | Attention}}.</p>
+<p><strong>What the data looks like now:</strong> the KV cache of this layer holds the new keys and values at the 300 slots. <code>output [304, 4096]</code> holds the attention result in its first 300 rows. In this step, <code>get_attention_context</code> runs 64 times: two ops in each of 32 layers.</p>
+</x-stop>
+
+<x-stop n="11" title="o_proj and the MLP">
+<p><code>o_proj</code> starts piece i + 1. It is a {{term row-parallel}} layer with weight <code>[4096, 4096]</code>. It calls the {{term all-reduce}} only with TP &gt; 1, so on our one GPU it is one GEMM ({{cite vllm/model_executor/layers/linear.py:1797-1806}}). Then <code>post_attention_layernorm</code> does the second fused add + RMSNorm (stop 8), and the MLP runs:</p>
+<x-code file="vllm/model_executor/models/llama.py" lines="118-122" />
+<ol>
+  <li><strong>Line 119.</strong> <code>gate_up_proj</code> is a {{term column-parallel}} <code>MergedColumnParallelLinear</code> with weight <code>[28672, 4096]</code>: gate and up stacked. Output <code>[304, 28672]</code>.</li>
+  <li><strong>Line 120.</strong> <code>maybe_fused_act_quant</code> fuses the activation with a quantization of the next input only when <code>down_proj</code> wants a quantized input. For BF16 it just calls <code>act_fn(x)</code> ({{cite vllm/model_executor/layers/fusion/fused_act_quant.py:206-213}}). <code>SiluAndMul</code> is a disabled CustomOp, so it runs <code>forward_native</code>: <code>silu(x[..., :d]) * x[..., d:]</code> ({{cite vllm/model_executor/layers/activation.py:140-144}}). Output <code>[304, 14336]</code>.</li>
+  <li><strong>Line 121.</strong> <code>down_proj</code> is row-parallel with weight <code>[4096, 14336]</code>. Output <code>[304, 4096]</code>, again without an all-reduce.</li>
+</ol>
+<p>The layer returns <code>(hidden_states, residual)</code>, both <code>[304, 4096]</code>, to the loop of stop 7. Stops 8 to 11 repeat for each of the 32 layers. The layer classes and their slices are on {{link concepts/tp-layers}}; the weights in them were loaded at start-up ({{link concepts/weight-loading}}).</p>
+</x-stop>
+
+<x-stop n="12" title="The final norm; the hidden states are kept">
+<p>After layer 31, the last piece applies the final norm. It is the last fused add + RMSNorm, and the new residual is not used ({{cite vllm/model_executor/models/llama.py:452-457}}). The model returns <code>hidden_states [304, 4096]</code>, not logits: <code>compute_logits</code> is a method of the outer class and stays outside the compiled graph ({{link concepts/model-definition}}).</p>
+<p>Back in the runner, the forward context closes. The runner does not return the hidden states. It stores them with the input batch and the metadata, and returns <code>None</code>:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="2089-2110" highlight="2090,2094,2110" />
+<p>The Python code returns as soon as all kernels are queued. The GPU may still run the first layers. The uni executor wraps <code>None</code> in a finished future, and the engine core goes on (engine-step tour, stops 7 and 8).</p>
+<p><strong>What the data looks like now:</strong></p>
+<pre><code class="language-python">execute_model_state = ExecuteModelState(input_batch=..., attn_metadata={32 names: m},
+                                        hidden_states=bf16 [304, 4096], ...)   # 2,490,368 bytes</code></pre>
+</x-stop>
+
+<x-stop n="13" title="sample_tokens: logits for three rows">
+<p>The engine core calls <code>sample_tokens(None)</code> (no grammar bitmask). The runner takes the stored state, and on the last PP rank it calls <code>self.sample</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2117-2131}}, {{cite vllm/v1/worker/gpu/model_runner.py:2163-2165}}). Batch-sharded sampling is off, so the plain path runs:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="1636-1638" />
+<p><code>hidden_states[logits_indices]</code> keeps rows 0, 1 and 299: the last row of each request. The other 301 rows never become logits. <code>compute_logits</code> calls the <code>LogitsProcessor</code> with the LM head ({{cite vllm/model_executor/models/llama.py:546-551}}):</p>
+<x-code file="vllm/model_executor/layers/logits_processor.py" lines="180-199" highlight="188,193-194,198" />
+<p>The head runs in the model dtype by default for a generation model ({{cite vllm/config/model.py:2540-2545}}, {{cite vllm/model_executor/layers/logits_processor.py:143-146}}). With TP = 1 there is no gather (line 193). The vocabulary 128256 is a multiple of 64, so the slice at line 198 cuts nothing ({{link concepts/tp-layers}}).</p>
+<p><strong>What the data looks like now:</strong> <code>sample_hidden_states [3, 4096]</code> and <code>logits [3, 128256]</code> BF16 (769,536 bytes).</p>
+</x-stop>
+
+<x-stop n="14" title="The sampler and the AsyncOutput">
+<p>Without draft tokens, the plain <code>Sampler</code> runs ({{cite vllm/v1/worker/gpu/model_runner.py:1663-1665}}). Our requests send no sampling fields, so the server defaults come from the model's <code>generation_config.json</code> ({{link learn/openai-api}}). For this model that file sets temperature 0.6 and top-p 0.9 (from the Hugging Face Hub, not from the vLLM repository). Temperature 0.6 needs processing, so the sampler copies the logits to FP32 and applies the temperature ({{cite vllm/v1/worker/gpu/sample/states.py:67-72}}, {{cite vllm/v1/worker/gpu/sample/sampler.py:238-265}}). Then it picks the sampling method:</p>
+<x-code file="vllm/v1/worker/gpu/sample/sampler.py" lines="304-326" highlight="307-312,313-315" />
+<ul>
+  <li>Top-p is set, and no request is greedy, seeded or asks for processed logprobs. So the batch is eligible for the fused sampler.</li>
+  <li><code>use_flashinfer</code> needs two things. First, the sampling mask is off, which is the default. Second, FlashInfer's sampler supports the GPU: CUDA, a supported compute capability, more than 16 SMs, and a working FlashInfer JIT build. <code>VLLM_USE_FLASHINFER_SAMPLER</code> defaults to on ({{cite vllm/v1/worker/gpu/sample/sampler.py:88-90}}, {{cite vllm/envs.py:886-890}}, {{cite vllm/v1/sample/ops/topk_topp_sampler.py:118-150}}). An H100 has more than 100 SMs. Then FlashInfer's fused top-k/top-p sampler draws the tokens ({{cite vllm/v1/worker/gpu/sample/sampler.py:339-343}}).</li>
+  <li>Otherwise, top-k/top-p masking and the Gumbel sampler run (lines 346-359).</li>
+</ul>
+<p>R3's sequence length equals its prompt length, so R3 is not in a chunked prefill and samples its first token. All three rows count ({{cite vllm/v1/worker/gpu/sample/sampler.py:190-199}}). The runner then starts the copy to the CPU before it updates its own state, and returns the <code>AsyncOutput</code>:</p>
+<x-code file="vllm/v1/worker/gpu/model_runner.py" lines="2209-2218" />
+<p>The copy waits for the main stream on a second stream, copies into pinned CPU memory, and records <code>copy_event</code> ({{cite vllm/v1/worker/gpu/async_utils.py:137-171}}). <code>postprocess_sampled</code> writes the three new tokens into <code>last_sampled_tokens</code> on the GPU, for the next step ({{cite vllm/v1/worker/gpu/model_runner.py:2244-2255}}). The function returns <code>async_output</code> without a wait ({{cite vllm/v1/worker/gpu/model_runner.py:2311}}). The engine core calls <code>get_output()</code> later, which is the only wait for the GPU ({{cite vllm/v1/worker/gpu/async_utils.py:173-184}}; engine-step tour, stop 10). Sampling methods are explained in {{deepinfer learn/sampling | Sampling}}.</p>
+<p><strong>What the data looks like now:</strong></p>
+<pre><code class="language-python">sampled_token_ids int64 [3, 1] = [[t_R1], [t_R2], [t_R3]]     # on the GPU
+num_sampled             [3]    = [1, 1, 1]
+last_sampled_tokens[[1023, 1022, 1021]] = [t_R1, t_R2, t_R3]  # inputs of the next step</code></pre>
+</x-stop>
+
+<h2>Deep dive</h2>
+<p>The sections below change one thing in the example at a time. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="The whole step in one table">
+<p>Our batch: 300 tokens, padded to T = 304, PIECEWISE. BF16 unless the table says otherwise. Shapes are derived from the code of each stop and the model config.</p>
+<table>
+  <thead><tr><th>Stop</th><th>Tensor</th><th>Shape, type</th><th>Bytes</th></tr></thead>
+  <tbody>
+    <tr><td>3</td><td><code>input_ids</code>, <code>positions</code></td><td>int32 <code>[304]</code>, int64 <code>[304]</code></td><td>1,216; 2,432</td></tr>
+    <tr><td>3</td><td><code>query_start_loc</code>, <code>seq_lens</code>, <code>logits_indices</code></td><td>int32 <code>[4]</code>, int32 <code>[3]</code>, int64 <code>[3]</code></td><td>small</td></tr>
+    <tr><td>4</td><td><code>slot_mapping</code></td><td>int64 <code>[1, 304]</code></td><td>2,432</td></tr>
+    <tr><td>7</td><td>embedding output</td><td><code>[304, 4096]</code></td><td>2,490,368</td></tr>
+    <tr><td>9</td><td><code>qkv</code>; q; k and v</td><td><code>[304, 6144]</code>; <code>[304, 4096]</code>; <code>[304, 1024]</code> each</td><td>3,735,552 for qkv</td></tr>
+    <tr><td>10</td><td>q, k, v views; output</td><td><code>[304, 32, 128]</code>, <code>[304, 8, 128]</code>; <code>[304, 4096]</code></td><td>views share memory</td></tr>
+    <tr><td>10</td><td>KV cache view of one layer</td><td><code>[num_blocks, 8, 16, 256]</code></td><td>65,536 per block</td></tr>
+    <tr><td>11</td><td><code>gate_up</code> output; <code>SiluAndMul</code> output</td><td><code>[304, 28672]</code>; <code>[304, 14336]</code></td><td>17,432,576; 8,716,288</td></tr>
+    <tr><td>12</td><td>hidden states (kept)</td><td><code>[304, 4096]</code></td><td>2,490,368</td></tr>
+    <tr><td>13</td><td>rows that sample; logits</td><td><code>[3, 4096]</code>; <code>[3, 128256]</code></td><td>24,576; 769,536</td></tr>
+    <tr><td>14</td><td>FP32 logits copy; sampled ids</td><td>float32 <code>[3, 128256]</code>; int64 <code>[3, 1]</code></td><td>1,539,072; 24</td></tr>
+  </tbody>
+</table>
+<p>Inside a compiled piece, Inductor may fuse ops and never make some of these tensors. The table lists what the Python code describes. The KV block size per layer comes from {{link concepts/attention-backends}}.</p>
+</x-deepdive>
+
+<x-deepdive title="What changes with TP = 2">
+<p>With <code>--tensor-parallel-size 2</code>, two worker processes run stops 1 to 14, one per GPU. Only worker 0 replies ({{link tours/engine-step}}, its deep dive "What changes with TP = 2"). Each rank holds half of the heads and half of the MLP ({{link concepts/tp-layers}}). Per rank, for T = 304:</p>
+<table>
+  <thead><tr><th>Stop</th><th>TP = 1</th><th>TP = 2, per rank</th><th>Collective</th></tr></thead>
+  <tbody>
+    <tr><td>7, embedding</td><td><code>[304, 4096]</code></td><td>lookup in 64,128 rows, then <code>[304, 4096]</code></td><td>all-reduce ({{cite vllm/model_executor/layers/vocab_parallel_embedding.py:558-563}})</td></tr>
+    <tr><td>9, <code>qkv_proj</code></td><td><code>[304, 6144]</code></td><td><code>[304, 3072]</code>: q 2048, k 512, v 512</td><td>none</td></tr>
+    <tr><td>10, attention</td><td>32 query heads, 8 KV heads</td><td>16 query heads, 4 KV heads; KV view <code>[num_blocks, 4, 16, 256]</code></td><td>none</td></tr>
+    <tr><td>11, <code>o_proj</code></td><td><code>[304, 4096]</code></td><td>input <code>[304, 2048]</code>, partial sum <code>[304, 4096]</code></td><td>all-reduce ({{cite vllm/model_executor/layers/linear.py:1803-1806}})</td></tr>
+    <tr><td>11, MLP</td><td><code>[304, 28672]</code> → <code>[304, 14336]</code></td><td><code>[304, 14336]</code> → <code>[304, 7168]</code></td><td>all-reduce after <code>down_proj</code></td></tr>
+    <tr><td>13, logits</td><td><code>[3, 128256]</code></td><td>local <code>[3, 64128]</code>, then <code>[3, 128256]</code></td><td>all-gather ({{cite vllm/model_executor/layers/logits_processor.py:122-134}})</td></tr>
+  </tbody>
+</table>
+<p>So one step has 2 × 32 + 1 = 65 all-reduces of <code>[304, 4096]</code> BF16 (2.375 MiB each) and one all-gather of the logits. Every built-in platform uses the all-gather ({{cite vllm/platforms/interface.py:1275-1278}}). Batch-sharded sampling, which would change the logits step, is off by default ({{cite vllm/config/parallel.py:192-198}}). On CUDA the all-reduce is the registered op <code>torch.ops.vllm.all_reduce</code>, so it sits inside the compiled pieces as one opaque node ({{cite vllm/distributed/parallel_state.py:740-746}}).</p>
+<p>At O2, the pass <code>fuse_allreduce_rms</code> turns on only with TP &gt; 1 on CUDA with FlashInfer and compute capability 9.0 or the 10.x family ({{cite vllm/config/vllm.py:178-202}}, {{cite vllm/config/vllm.py:301}}). On an H100 with FlashInfer installed, the pass can fuse an all-reduce with the RMSNorm after it. For TP = 2 on compute capability 9.0 its size limit is 64 MiB, which covers all batches up to 8192 tokens ({{cite vllm/compilation/passes/fusion/allreduce_rms_fusion.py:104-108}}, {{cite vllm/compilation/passes/fusion/allreduce_rms_fusion.py:1023-1028}}, {{cite vllm/compilation/passes/fusion/allreduce_rms_fusion.py:1128-1132}}). The tour {{link tours/multi-gpu-step}} follows such a step across the processes.</p>
+</x-deepdive>
+
+<x-deepdive title="What changes with --enforce-eager">
+<p><code>--enforce-eager</code> sets the compile mode and the CUDA graph mode to <code>NONE</code> ({{cite vllm/config/vllm.py:1745-1747}}). Four stops change:</p>
+<ol>
+  <li><strong>Stop 2.</strong> The CUDA graph manager builds no candidates when the mode is <code>NONE</code> ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:256-260}}), and the worker does not capture graphs ({{cite vllm/v1/worker/gpu_worker.py:983-985}}). So <code>dispatch</code> returns <code>NONE</code> for every batch, and the token count is not padded: T = 300.</li>
+  <li><strong>Stop 6.</strong> The runner calls <code>self.model(**model_inputs)</code> directly (line 2070). The forward context is still set, with mode <code>NONE</code>.</li>
+  <li><strong>Stop 7.</strong> With compile mode <code>NONE</code>, <code>@support_torch_compile</code> sets <code>do_not_compile</code> ({{cite vllm/compilation/decorators.py:411-418}}). So <code>LlamaModel.forward</code> runs as Python, op by op, and there are no pieces.</li>
+  <li><strong>Stops 8, 9 and 11.</strong> Without Inductor, the custom op list gets <code>"all"</code> ({{cite vllm/config/vllm.py:1819-1826}}). So the CustomOps are enabled and use <code>forward_cuda</code> ({{cite vllm/model_executor/custom_op.py:194-205}}):
+    <ul>
+      <li>RMSNorm: <code>forward_cuda</code> calls <code>forward_native</code>, which calls the IR op at run time ({{cite vllm/model_executor/layers/layernorm.py:101-120}}). The CUDA priority is now <code>["vllm_c", "native"]</code>, so the <code>vllm_c</code> kernel runs when it accepts the arguments ({{cite vllm/platforms/cuda.py:716-720}}).</li>
+      <li>SiluAndMul: <code>torch.ops._C.silu_and_mul</code> writes into a new <code>[300, 14336]</code> tensor ({{cite vllm/model_executor/layers/activation.py:138}}, {{cite vllm/model_executor/layers/activation.py:146-151}}).</li>
+      <li>RoPE: <code>ops.rotary_embedding</code> changes q and k in place ({{cite vllm/model_executor/layers/rotary_embedding/base.py:221-250}}).</li>
+    </ul>
+  </li>
+</ol>
+<p>The attention ops of stop 10 do not change: they are the same custom ops, called through <code>torch.ops.vllm</code>. Every kernel is now a separate launch from Python, so the CPU cost of a step grows. The page {{link concepts/compile-and-cuda-graphs}} compares the levels.</p>
+</x-deepdive>
+
+<x-deepdive title="What changes in a FULL decode-only step">
+<p>Take the next step: R1, R2 and R3 all decode, so the batch has 3 tokens, 1 per request. (Derived from stop 14: R3 sampled its first token.)</p>
+<ol>
+  <li><strong>Stop 2.</strong> The batch has no prefill and a uniform count of 1, which equals the decode query length. The candidates for 3 tokens are the graphs of size 4. The FULL graph has <code>uniform_token_count = 1</code> and 4 request slots, so it matches first ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:125-138}}).</li>
+  <li><strong>Stop 3.</strong> The FULL descriptor has a request count, so <code>num_reqs_padded = 4</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1448}}). The positions are <code>[541, 130, 298]</code>; the fourth request is padding with <code>seq_len = 0</code> ({{cite vllm/v1/worker/gpu/input_batch.py:393-394}}).</li>
+  <li><strong>Stop 5.</strong> The metadata is built with the padded sizes: 4 requests, 4 tokens ({{cite vllm/v1/worker/gpu/model_states/default.py:179-182}}).</li>
+  <li><strong>Stops 6 to 12.</strong> The runner replays one captured graph and does not call <code>set_forward_context</code> ({{cite vllm/v1/worker/gpu/model_runner.py:2024-2032}}). No Python code of the model runs, so <code>get_attention_context</code> runs 0 times. The graph reads the persistent input buffers, which stops 3 and 4 just wrote (comment at lines 2026-2027).</li>
+  <li><strong>Stops 13 and 14.</strong> No change: logits for 3 rows, 3 sampled tokens.</li>
+</ol>
+<p>FlashAttention 3 reports <code>ALWAYS</code> as its CUDA graph support, so the FULL graphs stay after start-up ({{cite vllm/v1/attention/backends/flash_attn.py:617-621}}). The page {{link concepts/forward-context}} explains why the context is not needed during replay.</p>
+</x-deepdive>
+
+<x-deepdive title="What changes with a prefix-cache hit">
+<p>Suppose an earlier request had the same first 288 prompt tokens as R3. {{link concepts/prefix-caching}} then finds 18 full cached blocks. The hit never covers the whole prompt, because the last token must be computed again for its logits ({{cite vllm/v1/core/kv_cache_manager.py:289-295}}).</p>
+<ol>
+  <li><strong>Scheduler.</strong> R3 arrives with <code>num_computed_tokens = 288</code> and gets 10 tokens. The batch has 1 + 1 + 10 = 12 tokens.</li>
+  <li><strong>Stop 1.</strong> <code>add_requests</code> stores 288 as the computed count of slot 1021 ({{cite vllm/v1/worker/gpu/model_runner.py:1214-1220}}). R3's block table row lists the 18 cached blocks first, then 1 new block (derived). The scheduler sends all blocks of the request ({{cite vllm/v1/core/sched/scheduler.py:1432-1434}}). The KV cache manager adds the cached blocks before the new ones ({{cite vllm/v1/core/single_type_kv_cache_manager.py:314}}, {{cite vllm/v1/core/single_type_kv_cache_manager.py:407}}).</li>
+  <li><strong>Stop 2.</strong> 12 tokens, still a prefill: PIECEWISE with the next capture size, 16.</li>
+  <li><strong>Stop 3.</strong> <code>query_start_loc = [0, 1, 2, 12]</code>, R3's positions 288 to 297, <code>seq_lens = [541, 130, 298]</code>, <code>logits_indices = [0, 1, 11]</code> (derived).</li>
+  <li><strong>Stop 10.</strong> For R3, the update op writes only 10 new key and value rows per layer, into block index 18. The attention for R3 still reads all 298 keys: 288 from the cached blocks and 10 new ones.</li>
+</ol>
+<p>The model computes 16 rows (12 real, 4 padding) instead of 304 in every linear layer. R3 still samples its first token in this step, because the step ends its prompt.</p>
+</x-deepdive>
+
+<x-deepdive title="What changes with an MLA model">
+<p>Models with multi-head latent attention, such as DeepSeek-V3, do not use the <code>Attention</code> layer. Their attention module builds an <code>MLAAttention</code> layer ({{cite vllm/model_executor/layers/mla.py:122}}). On an H100 the MLA priority list picks <code>FLASH_ATTN_MLA</code> ({{link concepts/attention-backend-selection}}). Stop 10 changes most:</p>
+<ul>
+  <li>The custom ops are <code>unified_mla_kv_cache_update</code> and <code>unified_mla_attention_with_output</code> ({{cite vllm/model_executor/layers/attention/mla_attention.py:1475-1479}}, {{cite vllm/model_executor/layers/attention/mla_attention.py:1524-1530}}). They are splitting ops too, so the piece structure stays.</li>
+  <li>The cache holds one compressed latent vector per token, with a head size of 576 = 512 + 64 ({{cite vllm/v1/attention/backends/fa_utils.py:338-339}}).</li>
+  <li>The layer sends the first <code>num_decode_tokens</code> rows to <code>forward_mqa</code> and the rest to <code>forward_mha</code> ({{cite vllm/model_executor/layers/attention/mla_attention.py:984-985}}, {{cite vllm/model_executor/layers/attention/mla_attention.py:1017-1020}}, {{cite vllm/model_executor/layers/attention/mla_attention.py:1132}}). The builder finds the split with <code>split_decodes_and_prefills</code> ({{cite vllm/model_executor/layers/attention/mla_attention.py:2605-2612}}).</li>
+</ul>
+<p>For our batch, R1 and R2 would be the 2 decode rows, and R3's 298 rows would take the prefill path. This works only because stop 2 puts the decodes first ({{cite vllm/v1/worker/gpu/model_runner.py:2476-2483}}). The two paths are described on {{link concepts/attention-backends}}.</p>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>A large batch loses its CUDA graph.</strong> A step above 512 tokens has no candidate and runs eagerly ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:547-553}}). Each of the 33 pieces then launches its Inductor kernels one by one, without a graph. For long prefill chunks the GPU time is much larger, so this costs little.</li>
+  <li><strong>A model call outside the runner.</strong> If you call the model in a script without <code>set_forward_context</code>, the attention op fails: "Forward context is not set" ({{cite vllm/forward_context.py:210-213}}).</li>
+  <li><strong>A GPU-to-CPU wait in the forward path.</strong> A <code>.item()</code> or <code>.cpu()</code> in stops 1 to 14 stops the CPU until the GPU is done, and the overlap of async scheduling is lost. The worker methods have a debug check for this ({{cite vllm/v1/worker/gpu_worker.py:1316-1327}}). Batch-size logging with <code>VLLM_LOG_BATCHSIZE_INTERVAL</code> also synchronizes, in the eager and PIECEWISE steps ({{cite vllm/forward_context.py:295}}, {{cite vllm/forward_context.py:363-370}}).</li>
+  <li><strong>An IR op that does not lower.</strong> If the lowering pass leaves an IR node in the graph, it logs the warning "Failed to lower vLLM IR ops" ({{cite vllm/compilation/passes/ir/lowering_pass.py:99-111}}).</li>
+  <li><strong>Another activation.</strong> <code>LlamaMLP</code> accepts only <code>silu</code>; any other <code>hidden_act</code> raises <code>ValueError</code> when the model is built ({{cite vllm/model_executor/models/llama.py:112-115}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> Every token that <code>vllm serve</code> returns comes out of this path. When you read a profile, you can now map each kernel to a stop. Stops 1 to 5 give small kernels and copies. Stops 7 to 12 give graph replays and eager attention. Stops 13 and 14 give logits and sampling. When you change TP, <code>--enforce-eager</code> or the batch size, the deep dives tell you which stops change.</p>
+
+<x-quiz>
+  <x-q level="easy">Why does the step of this tour run as a PIECEWISE graph and not as a FULL graph?
+    <x-a><p>R3 is in its prefill, so the batch is not eligible for a decode graph, and the uniform decode token count is <code>None</code> ({{cite vllm/v1/worker/gpu/model_runner.py:1343-1373}}). The FULL graph of size 304 needs a uniform count of 1, so <code>_is_compatible</code> fails. The PIECEWISE graph of 304 has no such condition and matches ({{cite vllm/v1/worker/gpu/cudagraph_utils.py:125-138}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">How many rows of logits does the step compute, and which rows of the hidden states are they?
+    <x-a><p>Three: rows 0, 1 and 299 of <code>hidden_states [304, 4096]</code>, the last row of each request. <code>combine_sampled_and_draft_tokens</code> returns them as <code>logits_indices</code>, and <code>sample</code> calls <code>compute_logits</code> on <code>hidden_states[logits_indices]</code> only ({{cite vllm/v1/worker/gpu/model_runner.py:1493-1504}}, {{cite vllm/v1/worker/gpu/model_runner.py:1636-1638}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Which implementation of the fused add + RMSNorm runs by default, and why not the <code>vllm_c</code> kernel?
+    <x-a><p>The native PyTorch body of the IR op <code>fused_add_rms_norm</code>, compiled by Inductor inside the piece. RMSNorm is a disabled CustomOp under Inductor, so it uses <code>forward_native</code>, which calls the IR op ({{cite vllm/config/vllm.py:1819-1826}}, {{cite vllm/model_executor/layers/layernorm.py:79-99}}). The lowering pass picks the provider from the priority list, which is <code>["native"]</code> on CUDA with Inductor ({{cite vllm/platforms/cuda.py:716-732}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">How does <code>unified_attention_with_output</code> find the KV cache and the metadata, when <code>LlamaAttention.forward</code> passes only q, k and v?
+    <x-a><p>The layer passes its name to the op. <code>get_attention_context</code> reads the metadata from <code>forward_context.attn_metadata[name]</code>, the layer from <code>no_compile_layers[name]</code>, and the KV cache from <code>layer.kv_cache</code> ({{cite vllm/model_executor/layers/attention/attention.py:705-723}}). The runner set the context around the model call ({{cite vllm/v1/worker/gpu/model_runner.py:2041-2053}}), and the same metadata object is stored under all 32 names ({{cite vllm/v1/worker/gpu/attn_utils.py:579-580}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With TP = 2, how many all-reduces does our step need, and what happens to the logits?
+    <x-a><p>65: two per layer (<code>o_proj</code> and <code>down_proj</code>, {{cite vllm/model_executor/layers/linear.py:1803-1806}}) times 32, plus one in the embedding ({{cite vllm/model_executor/layers/vocab_parallel_embedding.py:558-563}}). Each rank computes logits <code>[3, 64128]</code> for its half of the vocabulary, and an all-gather makes <code>[3, 128256]</code> on every rank ({{cite vllm/model_executor/layers/logits_processor.py:122-134}}).</p></x-a>
+  </x-q>
+</x-quiz>

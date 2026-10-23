@@ -50,6 +50,10 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 
 ## Issues log
 
+- FINAL-PASS TODO (B7a/B6t FC): learn/openai-api ~69, ~207 and reference/serve-flags --api-key row need the /invocations, /ping limitation; concepts/model-runner ~173 cite vllm.py:713-734 → 713-748; STE warning in learn/processes-and-ipc.
+
+- FINAL-PASS TODO (B7a): learn/openai-api tool deep dive — required/named also need --enable-auto-tool-choice; Tour 1 stop 3 template resolution incomplete (add processor + built-in fallback or link renderers page). B9 must include the --api-key / /invocations limitation in deployment/production pages.
+
 - FINAL-PASS TODO (B6b FC): reference/env-vars VLLM_LOG_BATCHSIZE_INTERVAL text ('after every forward' wrong); any page saying an mp worker always uses WorkerAsyncOutputCopy.
 
 - FINAL-PASS TODO (B5t FC, supervisor verified): pre_register_and_update runs 4× in the vllm serve front end, not twice: fix concepts/platform-interface ~49, ~101-102, ~118; concepts/quantization-plugins ~136; diagram b4a_platform_hooks (used on platform-interface and code/platforms-interface ~25); also facts docstring note.
@@ -132,12 +136,14 @@ See plan.md §2 (rows marked *Proposed*) and §4.6.
 | 2026-10-23 02:36 | B5 fact check (+ 3 plugin-map row fixes) | done ~03:00: ~270 claims, 34 defects; chooser all 640 combos OK |
 | 2026-10-23 03:01 | B5t writer (life-of-a-plugin, build-a-toy-plugin) | done ~03:35; 2 diagrams |
 | 2026-10-23 03:36 | B5t fact check | done ~03:55: ~190 claims, 27 defects; pre_register_and_update ×4 (supervisor verified) |
-| 2026-10-23 03:57 | B7a writer | running |
+| 2026-10-23 03:57 | B7a writer | done ~04:45; 6 diagrams, b7a.json 13 terms |
+| 2026-10-23 04:46 | B7a fact check | done: ~330 claims, 26 defects + 2 extra fixes (openai-api, Tour 1 stop 3) |
 | 2026-10-23 02:11 | B6a writer | done ~02:50; 3 diagrams, b6a.json 13 terms |
 | 2026-10-23 02:51 | B6a fact check | done ~03:15: ~175 claims, 26 defects |
 | 2026-10-23 03:16 | B6b writer | done ~04:00; 6 diagrams, b6b.json 18 terms |
 | 2026-10-23 04:01 | B6b fact check | done ~04:30: ~330 claims, 47 defects |
-| 2026-10-23 04:31 | B6t writer (tours/forward-pass) | running |
+| 2026-10-23 04:31 | B6t writer (tours/forward-pass) | done ~04:55; 2 diagrams |
+| 2026-10-23 04:56 | B6t fact check | done: ~125 claims, 16 defects |
 | 2026-10-22 22:47 | B4a writer (plugin-map, platform-plugins, platform-interface + 2 modules + plugin timeline) | done ~23:25; 3 diagrams, b4a.json 5 terms |
 | 2026-10-22 23:26 | B4a fact check | done ~23:55: ~270 claims, 24 defects; OOT quant open question answered |
 | 2026-10-22 23:56 | B4b writer | cut off ~00:05, resumed 01:01, done ~01:45; 3 diagrams, b4b.json 11 terms |

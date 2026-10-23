@@ -1,0 +1,200 @@
+---
+title: Renderers and chat templates: from messages to token ids
+nav_title: Renderers and chat templates
+level: Intermediate
+prerequisites: learn/openai-api, concepts/openai-server
+related: tours/life-of-a-chat-request, concepts/openai-server, concepts/tool-and-reasoning-parsers, concepts/multimodal-serving, concepts/engine-client, concepts/data-contracts, learn/serving-metrics, code/entrypoints-openai-chat-completion-serving
+summary: The renderer is the front-end layer that turns a chat or completion request into token ids. This page shows which renderer vLLM picks, how it finds and fills the chat template, the thread pool and its timeout, the length check, multimodal placeholders, and the derender and token-in token-out paths.
+---
+<x-sentence>A renderer turns the messages of a request into token ids. It fills the chat template, tokenizes in a thread pool and checks the length.</x-sentence>
+
+<h2>The idea</h2>
+<p>The model reads one list of token ids. A chat request has a list of messages, maybe images, maybe tools. Something in between must write the messages into one text with the model's special markers and turn that text into ids. The {{term chat-template}} (a Jinja program from the model's files) does the writing; the tokenizer does the cutting ({{deepinfer learn/tokens | Tokens and tokenizers}}). In vLLM, the object that drives both is the <strong>renderer</strong>.</p>
+<p>The renderer has two layers. <code>OnlineRenderer</code> knows the OpenAI API: it checks <code>tool_choice</code>, refuses untrusted templates, merges the template variables and lets the parsers adjust the request ({{cite vllm/renderers/online_renderer.py:225-318}}). Under it, a <code>BaseRenderer</code> subclass knows the model family: <code>HfRenderer</code> for Hugging Face tokenizers, <code>MistralRenderer</code> for <code>mistral-common</code>, and a few others. Both layers run in the API server process ({{term front-end}}); the engine core gets token ids only.</p>
+<p>The renderer also starts the clock. <code>arrival_time</code> is taken at the start of rendering, before the template runs. The TTFT metric of vLLM starts there ({{link learn/serving-metrics}}).</p>
+<p><strong>An everyday comparison.</strong> Think of a clerk who copies a customer's letter onto a fixed form, then types the form into a machine code. The form layout comes from the model's owner, not from the clerk. The comparison stops being true in one place: the "form" is a small program (Jinja) that can branch on variables such as <code>add_generation_prompt</code> or <code>tools</code>. So the same messages can give different prompts.</p>
+
+<h2>The picture</h2>
+<x-diagram name="b7a_render_flow" alt="Panel 1: three boxes. The request has 3 messages: system 'You are a helpful assistant.', user 'What is the capital of France?', assistant 'The capital of France is', with continue_final_message true and add_generation_prompt false. The chat template box lists the resolution order: 1 the request template or --chat-template, 2 the processor template when there are no tools, 3 the tokenizer template, 4 a built-in fallback by model type; request kwargs override server defaults and unknown names are dropped; HF renderer timeout 30 s. The prompt string box shows the ChatML text with im_start and im_end markers and the open assistant turn 'The capital of France is'. Panel 2: the tokenizer in the thread pool with add_special_tokens False makes 31 token ids starting 151644, 8948, 198, 2610; the length check compares with max_model_len and raises VLLMValidationError (HTTP 400) when the prompt is longer; the EngineInput dict has type token, the 31 ids, the prompt string and arrival_time, taken before the template." caption="Figure: a 3-message chat becomes a ChatML prompt string (panel 1), then 31 token ids in an EngineInput (panel 2). Token ids are from the Qwen2.5 tokenizer." />
+<p>Read each panel from left to right. Violet boxes run in the renderer's thread pool. The amber box is the length check; it can stop the request with HTTP 400 before the engine sees it.</p>
+
+<h2>In the code</h2>
+
+<h3>Step 1: which renderer</h3>
+<p>AsyncLLM makes one renderer at start-up ({{cite vllm/v1/engine/async_llm.py:167}}). The choice uses the tokenizer mode as the renderer mode:</p>
+<x-code file="vllm/renderers/registry.py" lines="22-34" />
+<x-code file="vllm/renderers/registry.py" lines="84-90" />
+<p>The default <code>--tokenizer-mode auto</code> is resolved in two places:</p>
+<ol>
+  <li><code>ModelConfig</code> sets a family mode for some architectures: for example <code>DeepseekV32ForCausalLM</code> → <code>deepseek_v32</code>, <code>DeepseekV4ForCausalLM</code> → <code>deepseek_v4</code>, <code>KimiK3ForConditionalGeneration</code> → <code>kimi_k3</code> ({{cite vllm/config/model.py:746-766}}).</li>
+  <li>If the mode is still <code>auto</code>, a Mistral repository with <code>tekken.json</code> or <code>tokenizer.model.v*</code> files gets <code>mistral</code>. Everything else gets <code>hf</code> ({{cite vllm/tokenizers/registry.py:145-164}}).</li>
+</ol>
+<p>So most models use <code>HfRenderer</code>; a few families get their own renderer without a flag, and <code>cohere</code> needs <code>--tokenizer-mode cohere</code>. <code>RendererRegistry.register</code> can add or overwrite a mode, with a warning ({{cite vllm/renderers/registry.py:42-54}}).</p>
+
+<h3>Step 2: OnlineRenderer prepares the chat</h3>
+<p><code>OpenAIServingChat</code> calls <code>OnlineRenderer.render_chat</code> after the model and engine checks ({{cite vllm/entrypoints/openai/chat_completion/serving.py:278-285}}). Before any template work, it checks the tools and the template:</p>
+<x-code file="vllm/renderers/online_renderer.py" lines="260-298" highlight="265,272,283-288,292-296" />
+<ol>
+  <li>Lines 260-281: without a tool parser, <code>tool_choice</code> <code>"auto"</code>, <code>"required"</code> or a named function gives an error response. Mistral tokenizers and gpt-oss (Harmony) models skip this check ({{cite vllm/renderers/online_renderer.py:253-258}}). The page {{link concepts/tool-and-reasoning-parsers}} explains when the parser exists.</li>
+  <li>Lines 283-288: the tool definitions become plain dicts for the template. With <code>tool_choice: "none"</code> and <code>--exclude-tools-when-tool-choice-none</code>, the template gets no tools.</li>
+  <li>Lines 292-296: a template in the request (field <code>chat_template</code>, or the key <code>chat_template</code> in <code>chat_template_kwargs</code>) is refused unless the server runs with <code>--trust-request-chat-template</code> ({{cite vllm/renderers/online_renderer.py:679-698}}).</li>
+</ol>
+<p><code>preprocess_chat</code> then merges the variables and calls the model-level renderer ({{cite vllm/renderers/online_renderer.py:774-815}}). After rendering, it builds a parser object and calls its <code>adjust_request</code>, if a tool or reasoning parser is set ({{cite vllm/renderers/online_renderer.py:824-859}}). A tool parser can add a structured-output constraint there ({{link concepts/structured-outputs}}).</p>
+
+<h3>Step 3: render_chat_async, step by step</h3>
+<x-code file="vllm/renderers/base.py" lines="1371-1411" highlight="1380,1385-1388,1396,1402-1409" />
+<ol>
+  <li>Line 1380: <code>arrival_time = time.time()</code>, before anything else.</li>
+  <li>Lines 1385-1394: <code>render_messages_async</code> for each conversation (the chat route sends one). It parses the content parts and applies the template; the result is a dict prompt with text or ids.</li>
+  <li>Line 1396: <code>tokenize_prompts_async</code>. A prompt that already has <code>prompt_token_ids</code> skips the tokenizer, but still gets the length check ({{cite vllm/renderers/base.py:756-769}}).</li>
+  <li>Lines 1398-1400: the extras <code>cache_salt</code>, <code>mm_processor_kwargs</code> and <code>media_io_kwargs</code> go into the prompt.</li>
+  <li>Lines 1402-1409: <code>process_for_engine_async</code> runs the multimodal processor if needed and writes <code>arrival_time</code> into the engine input ({{cite vllm/renderers/base.py:1255-1276}}).</li>
+</ol>
+
+<h3>Step 4: which template</h3>
+<p><code>HfRenderer</code> resolves the template for every request, in this order:</p>
+<x-code file="vllm/renderers/hf.py" lines="264-319" highlight="272-275,278-290,293-294,303-313" />
+<ol>
+  <li><strong>Given.</strong> The request template (only when trusted) or <code>--chat-template</code> ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:656}}). A name such as <code>tool_use</code> selects a named template of the tokenizer (line 275).</li>
+  <li><strong>Processor.</strong> The template of the model's <code>AutoProcessor</code>, but only when the request has no tools (lines 278-290). Multimodal models often keep their template there.</li>
+  <li><strong>Tokenizer.</strong> The template in the tokenizer files (line 294).</li>
+  <li><strong>Fallback.</strong> A template that vLLM ships, chosen by model type, for example <code>template_basic.jinja</code> for CLIP or <code>template_chatml.jinja</code> for older MiniCPM-V ({{cite vllm/transformers_utils/chat_templates/registry.py:25-40}}).</li>
+</ol>
+<p>No template at all raises <code>ChatTemplateResolutionError</code>, a client error, so the request gets HTTP 400 ({{cite vllm/renderers/hf.py:842-847}}, {{cite vllm/exceptions.py:65-68}}). <code>--chat-template</code> accepts a file path, a built-in file name, or the template text itself ({{cite vllm/renderers/chat_utils/chat_template.py:56-101}}). A path-like value that does not exist stops the server at start-up ({{cite vllm/renderers/chat_utils/chat_template.py:21-53}}, {{cite vllm/entrypoints/common/cli_args.py:510-511}}).</p>
+
+<h3>Step 5: the template variables</h3>
+<p>The template sees <code>messages</code>, <code>tools</code> and a set of keyword variables. The request builds them first:</p>
+<x-code file="vllm/entrypoints/openai/chat_completion/protocol.py" lines="635-669" highlight="640-645,652-653,658-661" />
+<ul>
+  <li>{{term add-generation-prompt | <code>add_generation_prompt</code>}} (default true) and <code>continue_final_message</code> (default false) always go in. A request that sets both to true gets HTTP 400 ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:1045-1055}}).</li>
+  <li><code>reasoning_effort</code> also sets <code>enable_thinking</code>: false for <code>"none"</code>, true for any other value. This does not happen when the request sets <code>enable_thinking</code> itself (lines 652-653).</li>
+  <li>{{term chat-template-kwargs | <code>chat_template_kwargs</code>}} from the request win over <code>--default-chat-template-kwargs</code>. The merge drops request values that are <code>None</code> or <code>"auto"</code> ({{cite vllm/renderers/params.py:36-48}}, {{cite vllm/renderers/params.py:104-134}}).</li>
+</ul>
+<p>Before the call, <code>resolve_chat_template_kwargs</code> keeps only the names that the template reads, that <code>apply_chat_template</code> accepts, or that the Hugging Face base class knows ({{cite vllm/renderers/hf.py:778-789}}). So a misspelled kwarg is dropped with no error. Two more fixes happen in <code>safe_apply_chat_template</code>. A <code>developer</code> message becomes a <code>system</code> message when the template does not know that role. An exception inside the template becomes <code>VLLMValidationError</code>, HTTP 400 ({{cite vllm/renderers/hf.py:848-861}}, {{cite vllm/renderers/hf.py:871-886}}).</p>
+<p><strong>Content format.</strong> Some templates read <code>message.content</code> as a string; others loop over a list of parts in OpenAI form. vLLM parses the template's syntax tree to find out, unless <code>--chat-template-content-format</code> sets it ({{cite vllm/renderers/hf.py:537-554}}, {{cite vllm/renderers/hf.py:678-710}}). With the string format, all text parts of a message are joined with newlines ({{cite vllm/renderers/chat_utils/chat_message.py:396-411}}).</p>
+
+<h3>Step 6: the thread pool and the timeout</h3>
+<p>Template rendering and tokenization are blocking Python work. The renderer runs them in a thread pool, so the event loop stays free for other requests:</p>
+<x-code file="vllm/renderers/base.py" lines="140-158" highlight="143-144,149,156-158" />
+<x-code file="vllm/renderers/hf.py" lines="1038-1056" highlight="1044-1046,1050" />
+<ul>
+  <li>The pool has <code>--renderer-num-workers</code> threads, 1 by default ({{cite vllm/config/model.py:412-421}}). With one thread, renders of different requests queue behind each other. Multimodal work has its own one-thread pool.</li>
+  <li>The HF tokenizer gets a pool of <code>renderer_num_workers + 1</code> deep copies, so that calls from several threads do not share one Rust tokenizer object ({{cite vllm/renderers/hf.py:1015-1018}}, {{cite vllm/tokenizers/hf.py:27-47}}).</li>
+  <li>The template call has a timeout: <code>VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT</code>, 30 s by default, 0 or less for none ({{cite vllm/envs.py:817-819}}). On a timeout, the pool's threads are replaced, because Python cannot stop the stuck thread. The client gets a <code>TimeoutError</code>, which the generic handler turns into HTTP 500 ({{cite vllm/entrypoints/serve/exception_handling/error_response.py:93-96}}).</li>
+  <li>Only <code>HfRenderer</code> has this timeout wrapper. <code>MistralRenderer</code> calls its template through the same pool with no timeout ({{cite vllm/renderers/mistral.py:58-60}}, {{cite vllm/renderers/mistral.py:104-108}}).</li>
+</ul>
+<p>At start-up, <code>init_app_state</code> renders one warm-up message to compile the template ({{cite vllm/entrypoints/launchers/api_server/app_state.py:104}}, {{cite vllm/renderers/base.py:356-383}}). A model with no template only logs this at DEBUG level, so the first chat request is where the error shows.</p>
+
+<h3>Step 7: tokenization and the length check</h3>
+<p>For chat, the tokenizer adds no special tokens of its own, because the template already writes them ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:342-351}}). The request field <code>add_special_tokens</code> can turn them on. The limit is the context length:</p>
+<x-code file="vllm/entrypoints/openai/chat_completion/protocol.py" lines="671-689" highlight="680-684" />
+<x-code file="vllm/renderers/params.py" lines="518-538" highlight="524,530-538" />
+<p>A prompt of exactly <code>max_model_len</code> tokens passes this check. Then <code>get_max_tokens</code> computes 0 tokens of room ({{cite vllm/entrypoints/serve/utils/api_utils.py:248-253}}), and the sampling parameters reject <code>max_tokens</code> 0 with HTTP 400 ({{cite vllm/sampling_params.py:691-696}}). With <code>truncate_prompt_tokens</code>, the prompt is cut first, from the side that <code>truncation_side</code> names (left by default for generate models, {{cite vllm/tokenizers/registry.py:137-143}}). Generative requests keep one token free ({{cite vllm/renderers/params.py:225-244}}).</p>
+
+<h3>Step 8: multimodal content parts</h3>
+<p>An <code>image_url</code>, <code>input_audio</code> or <code>video_url</code> part is fetched and stored in a tracker. The tracker asks the model class for its placeholder text, for example <code>&lt;image&gt;</code> ({{cite vllm/renderers/chat_utils/item_tracker.py:294}}). With the string content format and <code>--interleave-mm-strings</code> off (the default, {{cite vllm/config/multimodal.py:420}}), the placeholders go in front of the message text ({{cite vllm/renderers/chat_utils/chat_message.py:188-195}}). With the OpenAI format, the parts stay a list, and the template places them. The data goes into the prompt as <code>multi_modal_data</code> ({{cite vllm/renderers/hf.py:1263-1266}}). Later, the multimodal processor expands each placeholder into the real number of tokens. The page {{link concepts/multimodal-serving}} covers that part.</p>
+
+<h3>Step 9: the derenderer and token-in token-out</h3>
+<p>The renderer has a mirror image, <code>OnlineDerenderer</code> ({{cite vllm/renderers/online_derenderer.py:69-86}}). It turns generated token ids back into an OpenAI response: detokenization plus reasoning and tool parsing, with no GPU. It serves <code>/v1/chat/completions/derender</code> and <code>/v1/completions/derender</code> ({{cite vllm/entrypoints/scale_out/derender/api_router.py:31-33}}, {{cite vllm/entrypoints/scale_out/derender/api_router.py:81-83}}). Together with <code>/v1/chat/completions/render</code> and the {{term token-in-token-out}} route <code>/inference/v1/generate</code>, it splits serving into render, generate and derender. A front end on another machine can then do the CPU work.</p>
+<p>These scale-out routes are off on a normal <code>vllm serve</code>. Without <code>--enable-scale-out</code> (or <code>--tokens-only</code>), they answer HTTP 403 ({{cite vllm/entrypoints/scale_out/factories.py:94-127}}). The docs describe the request formats: <code>docs/serving/online_serving/renderer.md</code>, <code>derenderer.md</code> and <code>token_in_token_out.md</code> ({{cite docs/serving/online_serving/token_in_token_out.md:1-9}}).</p>
+<p>Two other ways skip the template on the normal routes. <code>/v1/completions</code> accepts token ids as the prompt ({{cite vllm/entrypoints/openai/completion/protocol.py:53-59}}). A chat request in disaggregated serving can carry the prefill's ids in <code>kv_transfer_params["prompt_token_ids"]</code>; the renderer then skips templating and tokenization, but not the checks ({{cite vllm/renderers/online_renderer.py:106-151}}, {{cite vllm/renderers/online_renderer.py:794-803}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Worked example: three messages, one ChatML template, 31 tokens">
+<p>The example uses the ChatML template of the repository (start the server with <code>--chat-template examples/template_chatml.jinja</code>) and the Qwen2.5 tokenizer. This is the whole template:</p>
+<x-code file="examples/template_chatml.jinja" lines="1-2" />
+<p>The request has three messages and asks the model to continue the last one (a "prefill" of the answer):</p>
+<pre><code class="language-json">{"messages": [
+   {"role": "system",    "content": "You are a helpful assistant."},
+   {"role": "user",      "content": "What is the capital of France?"},
+   {"role": "assistant", "content": "The capital of France is"}],
+ "continue_final_message": true, "add_generation_prompt": false}</code></pre>
+<ol>
+  <li><code>build_chat_params</code> sets <code>add_generation_prompt=False</code> and <code>continue_final_message=True</code>. Both pass the kwargs filter, because the template reads <code>add_generation_prompt</code> and the Hugging Face base method knows both names ({{cite vllm/renderers/hf.py:778-789}}).</li>
+  <li>Line 1 of the template writes each message as <code>&lt;|im_start|&gt;role\ncontent</code>. It adds <code>&lt;|im_end|&gt;\n</code> after every message except the last one, because <code>loop.last and add_generation_prompt</code> is false and <code>not loop.last</code> is false.</li>
+  <li>Line 2 adds no new assistant turn, because <code>add_generation_prompt</code> is false.</li>
+</ol>
+<p>The prompt string is (newlines shown as <code>\n</code>):</p>
+<pre><code class="language-none">&lt;|im_start|&gt;system\nYou are a helpful assistant.&lt;|im_end|&gt;\n&lt;|im_start|&gt;user\nWhat is the capital of France?&lt;|im_end|&gt;\n&lt;|im_start|&gt;assistant\nThe capital of France is</code></pre>
+<p>The tokenizer gives 31 ids (measured with the Qwen2.5 <code>tokenizer.json</code>, outside the repo):</p>
+<pre><code class="language-none">[151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198,
+ 151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30, 151645, 198,
+ 151644, 77091, 198, 785, 6722, 315, 9625, 374]
+ &lt;|im_start|&gt; = 151644   &lt;|im_end|&gt; = 151645   "\n" = 198</code></pre>
+<p>Now take the default flags instead (<code>add_generation_prompt: true</code>) and drop the assistant message. The last user turn then ends with <code>&lt;|im_end|&gt;\n</code>, and line 2 adds <code>&lt;|im_start|&gt;assistant\n</code>. That prompt has 26 tokens: the same first 26 ids as above. The model starts a new answer instead of continuing "The capital of France is".</p>
+<x-simplified><p>The token ids depend on the tokenizer. Another model with a ChatML template (for example a Qwen chat model) gives the same structure; a model with another template gives another string. Hugging Face's <code>apply_chat_template</code> also has its own handling of <code>continue_final_message</code>; it is library code and not described here.</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Precedence of template variables, with numbers">
+<p>Server started with <code>--default-chat-template-kwargs '{"enable_thinking": false, "documents_style": "short"}'</code>. A request sends <code>"chat_template_kwargs": {"enable_thinking": true, "foo": 1}</code> and <code>"reasoning_effort": null</code>.</p>
+<ol>
+  <li><code>build_chat_params</code> merges the request kwargs with <code>add_generation_prompt=True</code>, <code>continue_final_message=False</code>, <code>documents=None</code>, <code>reasoning_effort=None</code>. Values that are <code>None</code> are dropped by <code>merge_kwargs</code> ({{cite vllm/renderers/params.py:48}}). Result: <code>{enable_thinking: true, foo: 1, add_generation_prompt: true, continue_final_message: false}</code>.</li>
+  <li><code>with_defaults</code> puts the server defaults under it: <code>enable_thinking</code> stays <code>true</code> (request wins); <code>documents_style: "short"</code> is added ({{cite vllm/renderers/params.py:117-123}}).</li>
+  <li><code>preprocess_chat</code> adds <code>tools</code> and <code>tokenize=False</code> as defaults under that ({{cite vllm/renderers/online_renderer.py:774-792}}).</li>
+  <li><code>resolve_chat_template_kwargs</code> keeps <code>enable_thinking</code> only if the template reads it, and drops <code>foo</code> and <code>documents_style</code> unless the template reads them ({{cite vllm/renderers/hf.py:778-789}}).</li>
+</ol>
+<p>The same merged dict also goes to the reasoning parser of the request ({{cite vllm/entrypoints/openai/chat_completion/serving.py:310-313}}). So <code>enable_thinking: false</code> changes both the prompt and how the parser reads the output.</p>
+</x-deepdive>
+
+<x-deepdive title="Errors of the render step">
+<table>
+  <thead><tr><th>Situation</th><th>Exception or response</th><th>HTTP</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>template in the request, server not trusting</td><td>error response "Refused request with untrusted chat template"</td><td>400</td><td>{{cite vllm/renderers/online_renderer.py:686-697}}</td></tr>
+    <tr><td><code>tool_choice: "auto"</code> without auto tool choice</td><td>error response</td><td>400</td><td>{{cite vllm/renderers/online_renderer.py:265-271}}</td></tr>
+    <tr><td>no template found</td><td><code>ChatTemplateResolutionError</code></td><td>400</td><td>{{cite vllm/renderers/hf.py:842-847}}</td></tr>
+    <tr><td>the template raises (for example an unknown <code>reasoning_effort</code>)</td><td><code>VLLMValidationError</code> with the template's message</td><td>400</td><td>{{cite vllm/renderers/hf.py:879-886}}</td></tr>
+    <tr><td>template render takes longer than the timeout</td><td><code>TimeoutError</code>; the pool is replaced</td><td>500</td><td>{{cite vllm/renderers/hf.py:1047-1056}}</td></tr>
+    <tr><td>prompt longer than <code>max_model_len</code></td><td><code>VLLMValidationError</code>, parameter <code>input_tokens</code></td><td>400</td><td>{{cite vllm/renderers/params.py:524-538}}</td></tr>
+    <tr><td>more placeholders in the text than media items</td><td><code>VLLMValidationError</code></td><td>400</td><td>{{cite vllm/renderers/chat_utils/chat_message.py:171-184}}</td></tr>
+  </tbody>
+</table>
+<p>All of these happen before the serving class returns, so even a streaming request gets a real HTTP status, not an error chunk.</p>
+</x-deepdive>
+
+<x-deepdive title="Flags and environment variables">
+<table>
+  <thead><tr><th>Flag or variable</th><th>Default</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>--chat-template</code></td><td>none ({{cite vllm/entrypoints/common/cli_args.py:85-87}})</td><td>Template file, built-in name or text; first in the resolution order.</td></tr>
+    <tr><td><code>--chat-template-content-format</code></td><td><code>auto</code> ({{cite vllm/entrypoints/common/cli_args.py:88-93}})</td><td><code>string</code> or <code>openai</code>; <code>auto</code> detects it from the template.</td></tr>
+    <tr><td><code>--trust-request-chat-template</code></td><td>false ({{cite vllm/entrypoints/common/cli_args.py:94-97}})</td><td>Allow a template in the request.</td></tr>
+    <tr><td><code>--default-chat-template-kwargs</code></td><td>none ({{cite vllm/entrypoints/common/cli_args.py:103-108}})</td><td>Server defaults under the request's kwargs.</td></tr>
+    <tr><td><code>--exclude-tools-when-tool-choice-none</code></td><td>false ({{cite vllm/entrypoints/common/cli_args.py:118-120}})</td><td>Leave tools out of the prompt for <code>tool_choice: "none"</code>.</td></tr>
+    <tr><td><code>--renderer-num-workers</code></td><td>1 ({{cite vllm/config/model.py:412}})</td><td>Threads for template and tokenizer work.</td></tr>
+    <tr><td><code>--tokenizer-mode</code></td><td><code>auto</code></td><td>Also selects the renderer (Step 1).</td></tr>
+    <tr><td><code>VLLM_CHAT_TEMPLATE_RENDER_TIMEOUT</code></td><td>30 s ({{cite vllm/envs.py:817-819}})</td><td>Time limit of one HF template render; 0 or less turns it off ({{cite vllm/renderers/hf.py:1044-1046}}).</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<h2>What can go wrong</h2>
+<ul>
+  <li><strong>The model answers in the wrong format or rambles.</strong> The template may not be the one the model was trained with, for example a processor template chosen over the tokenizer template. Pass the right one with <code>--chat-template</code> (Step 4).</li>
+  <li><strong>A template variable has no effect.</strong> Misspelled or unused names in <code>chat_template_kwargs</code> are dropped with no error ({{cite vllm/renderers/hf.py:778-789}}).</li>
+  <li><strong>"Cannot set both continue_final_message and add_generation_prompt".</strong> To continue an assistant message, send <code>"add_generation_prompt": false</code> too ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:1050-1054}}).</li>
+  <li><strong>Slow first token under many concurrent requests.</strong> With the default single render thread, long templates or long prompts queue. Raise <code>--renderer-num-workers</code> or add API servers ({{link concepts/openai-server}}).</li>
+  <li><strong>HTTP 500 after 30 seconds.</strong> The template render timed out; a complex request template is the usual cause (Step 6).</li>
+  <li><strong>A double BOS token.</strong> <code>"add_special_tokens": true</code> on a chat request adds the tokenizer's BOS in front of the template's BOS ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:342-351}}).</li>
+</ul>
+<p><strong>Why it matters.</strong> The prompt that the model sees is made here, and so is the start of the latency clock. Wrong templates give wrong answers with HTTP 200, and slow rendering shows up as TTFT that the engine cannot explain.</p>
+
+<x-quiz>
+  <x-q level="easy">Which renderer class does a normal Hugging Face model use, and how is it chosen?
+    <x-a><p><code>HfRenderer</code>. The renderer mode is the tokenizer mode ({{cite vllm/renderers/registry.py:84-90}}). For an architecture without a family mode, <code>auto</code> becomes <code>hf</code>, unless the repository is a Mistral repository with Mistral tokenizer files ({{cite vllm/config/model.py:746-766}}, {{cite vllm/tokenizers/registry.py:145-164}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">A request has tools, and the model has both a processor template and a tokenizer template. No <code>--chat-template</code> is set. Which template renders it, and why?
+    <x-a><p>The tokenizer template. The processor template is tried only when <code>tools</code> is <code>None</code> ({{cite vllm/renderers/hf.py:277-290}}); with tools, resolution goes on to the tokenizer template ({{cite vllm/renderers/hf.py:292-294}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does the chat route tokenize with <code>add_special_tokens=False</code>, while <code>/v1/completions</code> uses <code>True</code>?
+    <x-a><p>The chat template already writes the special tokens, such as BOS and the turn markers. Adding them again would double them ({{cite vllm/entrypoints/openai/chat_completion/protocol.py:342-351}}). A raw completion prompt has no template, so the completion request's field <code>add_special_tokens</code> defaults to true ({{cite vllm/entrypoints/openai/completion/protocol.py:118-124}}, {{cite vllm/entrypoints/openai/completion/protocol.py:299-310}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">With the ChatML template, a request sends two messages (system and user) with the default flags. How many tokens does the prompt of the worked example have, and what is the last token?
+    <x-a><p>26 tokens with the Qwen2.5 tokenizer. The last user turn ends with <code>&lt;|im_end|&gt;\n</code> because <code>add_generation_prompt</code> is true, and line 2 of the template adds <code>&lt;|im_start|&gt;assistant\n</code> ({{cite examples/template_chatml.jinja:1-2}}). So the last token is <code>\n</code> (198), after the <code>assistant</code> token 77091 (deep dive "Worked example").</p></x-a>
+  </x-q>
+  <x-q level="hard">The server runs with the default <code>--renderer-num-workers</code>. 50 chat requests arrive at the same moment, and each needs 20 ms of pool work (template plus tokenizer). About how long does the last request wait before its own render starts, and is that wait inside vLLM's TTFT metric?
+    <x-a><p>About 49 × 20 ms ≈ 1 s. The pool has one thread by default, and the template and the tokenizer of every request run in it ({{cite vllm/config/model.py:412}}, {{cite vllm/renderers/base.py:143-158}}, {{cite vllm/renderers/hf.py:1011-1013}}). The wait is inside the metric, because <code>arrival_time</code> is taken at the start of <code>render_chat_async</code>, before the request waits for the pool ({{cite vllm/renderers/base.py:1380}}). (Derived; real render times depend on the template and the prompt.)</p></x-a>
+  </x-q>
+</x-quiz>

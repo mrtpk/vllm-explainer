@@ -1,0 +1,228 @@
+---
+title: entrypoints/openai/chat_completion/serving.py: OpenAIServingChat
+nav_title: openai/chat_completion/serving.py
+level: Intermediate
+prerequisites: concepts/openai-server, concepts/engine-client
+related: concepts/openai-server, concepts/renderers-and-chat-templates, concepts/tool-and-reasoning-parsers, concepts/structured-outputs, tours/life-of-a-chat-request, code/v1-engine-async-llm, code/entrypoints-cli-serve, learn/openai-api
+summary: vllm/entrypoints/openai/chat_completion/serving.py defines OpenAIServingChat, the serving class of POST /v1/chat/completions. It renders the chat, makes the sampling parameters, starts AsyncLLM.generate and turns the RequestOutputs into SSE chunks or one ChatCompletionResponse.
+---
+<h2>Purpose</h2>
+<p><code>vllm/entrypoints/openai/chat_completion/serving.py</code> holds the {{term serving-class}} of <code>POST /v1/chat/completions</code>: it turns one chat request into one engine generator and turns the engine's outputs back into the OpenAI chat format.</p>
+
+<table>
+  <tbody>
+    <tr><th>File</th><td><code>vllm/entrypoints/openai/chat_completion/serving.py</code>, 1,332 lines of Python. Three module helpers and one class.</td></tr>
+    <tr><th>Main class</th><td><code>OpenAIServingChat(GenerateBaseServing)</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:124}}). Subclasses: <code>OpenAIServingChatBatch</code>, <code>AnthropicServingMessages</code>, <code>CohereServingChatV2</code>.</td></tr>
+    <tr><th>Runs in</th><td>The API server process ({{term front-end}}), on its asyncio event loop. Template and tokenizer work goes to the renderer's thread pool.</td></tr>
+    <tr><th>Called by</th><td>The route <code>create_chat_completion</code> ({{cite vllm/entrypoints/openai/chat_completion/api_router.py:63-67}}); the object comes from <code>app.state.openai_serving_chat</code>.</td></tr>
+    <tr><th>Calls</th><td><code>OnlineRenderer.render_chat</code>, <code>get_max_tokens</code>, <code>ChatCompletionRequest.to_sampling_params</code>, <code>EngineClient.generate</code> (AsyncLLM), <code>ChatStreamProcessor</code> and the composed <code>Parser</code>.</td></tr>
+    <tr><th>Not in this file</th><td>The route and the HTTP response types (<code>api_router.py</code>), the request fields and validators (<code>protocol.py</code>), template and tokenizer (<code>vllm/renderers/</code>), tool and reasoning parsing (<code>vllm/parser/</code>, <code>vllm/tool_parsers/</code>, <code>vllm/reasoning/</code>), the stream step logic (<code>stream_processor.py</code>), detokenization (<code>vllm/v1/engine/</code>).</td></tr>
+  </tbody>
+</table>
+<p>The page {{link concepts/openai-server}} explains the server around this class. Stops 2 and 16 of {{link tours/life-of-a-chat-request}} run its code for one streaming request. This page reads the file method by method.</p>
+
+<h2>Where it sits</h2>
+<x-diagram name="b7a_serving_classes" alt="Panel 1: the class tree. BaseServing has the children GenerateBaseServing, PoolingBaseServing and other direct subclasses. GenerateBaseServing has the children OpenAIServingChat (with Anthropic, Cohere v2 and chat batch below it), OpenAIServingCompletion and more. Panel 2: BaseServing adds model checks and error responses; GenerateBaseServing adds the engine client, _preflight, priority and DP rank headers and the fingerprint; OpenAIServingChat adds the parser class, render_chat_request, _create_chat_completion and the two generators." caption="Figure: OpenAIServingChat in the class tree of the serving classes (panel 1), and the methods that each layer gives it (panel 2)." />
+
+<h3>Who calls it</h3>
+<ul>
+  <li><strong>Start-up.</strong> <code>init_generate_state</code> makes one <code>OpenAIServingChat</code> with the CLI flags, only for models with the generate task ({{cite vllm/entrypoints/generate/api_router.py:127-151}}).</li>
+  <li><strong>The route.</strong> <code>create_chat_completion</code> awaits <code>handler.create_chat_completion(request, raw_request)</code>. It sends an <code>ErrorResponse</code> or a <code>ChatCompletionResponse</code> as JSON, and wraps a generator in a <code>StreamingResponse</code> ({{cite vllm/entrypoints/openai/chat_completion/api_router.py:67-85}}).</li>
+  <li><strong>Subclasses.</strong> The Anthropic <code>/v1/messages</code> and Cohere v2 handlers reuse its generators, and the hooks <code>_create_chat_message</code> and <code>_finalize_response_message</code> exist for them ({{cite vllm/entrypoints/openai/chat_completion/serving.py:445-471}}).</li>
+</ul>
+
+<h3>What it calls</h3>
+<ul>
+  <li><code>ParserManager.get_parser</code> once at start-up ({{cite vllm/entrypoints/openai/chat_completion/serving.py:167-175}}).</li>
+  <li><code>self.online_renderer.render_chat(request)</code> for each request ({{cite vllm/entrypoints/openai/chat_completion/serving.py:285}}).</li>
+  <li><code>self.engine_client.generate(...)</code>, or <code>self.beam_search(...)</code> for beam search ({{cite vllm/entrypoints/openai/chat_completion/serving.py:385-408}}).</li>
+  <li><code>ChatStreamProcessor.step</code> for each output of a stream ({{cite vllm/entrypoints/openai/chat_completion/serving.py:705-710}}).</li>
+</ul>
+
+<h2>Key classes and functions</h2>
+<table>
+  <thead><tr><th>Name</th><th>Line</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>_get_mm_token_counts</code>, <code>_make_prompt_tokens_details</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:79-115}}</td><td>Count multimodal placeholder tokens and cached tokens for <code>usage.prompt_tokens_details</code>.</td></tr>
+    <tr><td><code>OpenAIServingChat.__init__</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:125-196}}</td><td>Stores the flags, builds the parser class, reads the default sampling parameters.</td></tr>
+    <tr><td><code>_effective_chat_template_kwargs</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:198-208}}</td><td>Request kwargs over server defaults; also given to the parser.</td></tr>
+    <tr><td><code>_make_parser</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:210-222}}</td><td>One parser instance with the request's tools.</td></tr>
+    <tr><td><code>_engine_reasoning_kwargs</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:242-262}}</td><td><code>reasoning_ended</code> and <code>reasoning_parser_kwargs</code> for the engine core.</td></tr>
+    <tr><td><code>render_chat_request</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:264-285}}</td><td>Model check, <code>_preflight(n)</code>, render.</td></tr>
+    <tr><td><code>create_chat_completion</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:287-300}}</td><td>Public entry. With a KV connector and a remote prefill, it tells the connector when the request fails before the engine.</td></tr>
+    <tr><td><code>_create_chat_completion</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:302-438}}</td><td>The main flow: render, ids, sampling parameters, generator, stream or full.</td></tr>
+    <tr><td><code>get_chat_request_role</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:440-443}}</td><td><code>--response-role</code>, or the role of the last message.</td></tr>
+    <tr><td><code>chat_completion_stream_generator</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:473-508}}</td><td>Turns chunks into <code>data: ...</code> strings; always ends with <code>[DONE]</code>.</td></tr>
+    <tr><td><code>chat_completion_stream_generator_raw</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:510-943}}</td><td>Role chunk, delta chunks, final chunk, usage chunk, errors.</td></tr>
+    <tr><td><code>chat_completion_full_generator</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:945-1240}}</td><td>Waits for the final output and builds one <code>ChatCompletionResponse</code>.</td></tr>
+    <tr><td><code>_get_top_logprobs</code>, <code>_create_chat_logprobs</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:1242-1332}}</td><td>OpenAI-format logprobs, with <code>-inf</code> clamped to <code>-9999.0</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2>Walk through the main methods</h2>
+
+<h3><code>__init__</code>: what is fixed at start-up</h3>
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="165-187" highlight="166-175,181,183-187" />
+<ol>
+  <li><strong>Lines 166-175.</strong> The parser class combines the tool parser (only with <code>--enable-auto-tool-choice</code>) and the reasoning parser. gpt-oss models are flagged as Harmony ({{link concepts/tool-and-reasoning-parsers}}).</li>
+  <li><strong>Line 166.</strong> With a reasoning parser, usage reports <code>reasoning_tokens</code>.</li>
+  <li><strong>Line 181.</strong> The server's default sampling parameters come from the model's generation config, read once here ({{link learn/openai-api}}, defaults deep dive).</li>
+  <li><strong>Lines 183-187.</strong> The <code>max_tokens</code> override: from <code>--override-generation-config</code> for the modes <code>auto</code> and <code>vllm</code>, else from the generation config folder.</li>
+</ol>
+<p>Lines 191-196 turn off browsing and the code interpreter for this route; the comments point to the Responses API for those.</p>
+
+<h3><code>render_chat_request</code>: checks, then render</h3>
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="264-285" highlight="278-283,285" />
+<ol>
+  <li><strong>Line 278.</strong> <code>_check_model</code>: a wrong model name returns HTTP 404 here.</li>
+  <li><strong>Line 283.</strong> <code>_preflight(n)</code> raises the engine's dead error, or a 503 from <code>check_admission</code> ({{cite vllm/entrypoints/generate/base/serving.py:169-181}}). These are exceptions, not error responses; the route's exception handlers turn them into HTTP errors.</li>
+  <li><strong>Line 285.</strong> The renderer returns the parsed conversation and a list with one <code>EngineInput</code> ({{link concepts/renderers-and-chat-templates}}).</li>
+</ol>
+
+<h3><code>_create_chat_completion</code>: from request to generator</h3>
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="308-333" highlight="310-313,314-316,320-322,328" />
+<ol>
+  <li><strong>Lines 310-313.</strong> The parser is made before rendering; it needs the effective template kwargs.</li>
+  <li><strong>Lines 314-316.</strong> An error response from the checks or the renderer returns at once.</li>
+  <li><strong>Lines 320-322.</strong> The request id: <code>"chatcmpl-"</code> plus the <code>X-Request-Id</code> header or the body's <code>request_id</code>.</li>
+  <li><strong>Line 328.</strong> The LoRA adapter: by model name, or a default multimodal adapter that matches the request's content types.</li>
+</ol>
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="339-369" highlight="345-347,349-358,366-369" />
+<ol>
+  <li><strong>Line 339.</strong> The loop handles one engine input; the chat renderer always returns one (line 412 asserts it).</li>
+  <li><strong>Lines 349-358.</strong> <code>max_completion_tokens</code> wins over the deprecated <code>max_tokens</code>; <code>get_max_tokens</code> takes the smallest limit.</li>
+  <li><strong>Lines 366-369.</strong> Sampling parameters: request value, else server default, else OpenAI default; DELTA for a stream, FINAL_ONLY otherwise.</li>
+</ol>
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="395-438" highlight="396-408,415-426,428" />
+<ol>
+  <li><strong>Lines 396-408.</strong> <code>generate()</code> makes an async generator; nothing reaches the engine yet. The priority comes from the <code>X-Vllm-Priority</code> header or the body. <code>_engine_reasoning_kwargs</code> adds the two reasoning fields.</li>
+  <li><strong>Lines 415-426.</strong> For a stream, the method returns the SSE generator. The route sends HTTP 200 when it starts iterating it.</li>
+  <li><strong>Line 428.</strong> Without a stream, the method awaits the full generator, so the route gets a finished response.</li>
+</ol>
+
+<h3><code>chat_completion_stream_generator</code>: the SSE framing</h3>
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="485-508" highlight="497-503,504-507,508" />
+<ol>
+  <li><strong>Lines 497-498.</strong> An error chunk is serialized in full.</li>
+  <li><strong>Lines 500-502.</strong> A normal chunk keeps only the fields that the code set; a chunk without choices (the usage chunk) also drops <code>None</code> fields.</li>
+  <li><strong>Lines 504-507.</strong> An exception during serialization still gives one error chunk.</li>
+  <li><strong>Line 508.</strong> <code>data: [DONE]</code> ends every stream, also after an error.</li>
+</ol>
+
+<h3><code>chat_completion_stream_generator_raw</code>: chunks per output</h3>
+<p>Set-up: one <code>ChatStreamProcessor</code> per choice, each with its own parser; usage flags from <code>stream_options</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:528-564}}). Then the loop over <code>RequestOutput</code>s:</p>
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="672-710" highlight="676-677,679,694-703,705-710" />
+<ol>
+  <li><strong>Lines 676-677.</strong> A choice that already sent its finish reason is skipped.</li>
+  <li><strong>Line 679.</strong> A finish reason <code>"error"</code> raises <code>GenerationError</code>.</li>
+  <li><strong>Lines 696-703.</strong> An output with no text and no tokens, before the first token, is a chunked-prefill step: no chunk.</li>
+  <li><strong>Lines 705-710.</strong> The processor runs the parser and maps the finish reason (<code>"tool_calls"</code> when tools were streamed).</li>
+</ol>
+<p>The first output also makes one role chunk per choice, with <code>delta = {"role": ..., "content": ""}</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:578-629}}). A <code>None</code> delta sends nothing, unless the output has a finish reason, logprobs, or token ids to return ({{cite vllm/entrypoints/openai/chat_completion/serving.py:731-741}}). The final chunk of a choice carries <code>finish_reason</code> and <code>stop_reason</code>, and the fingerprint when no usage chunk follows ({{cite vllm/entrypoints/openai/chat_completion/serving.py:787-824}}).</p>
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="852-871" highlight="854-856,866-871" />
+<ol>
+  <li><strong>Lines 854-856.</strong> The usage chunk sums the output tokens of all choices; the prompt counts once.</li>
+  <li><strong>Lines 866-871.</strong> <code>prompt_tokens_details</code> only with <code>--enable-prompt-tokens-details</code>.</li>
+</ol>
+<p>The method ends with two handlers: a <code>GenerationError</code> becomes an error chunk with its own status code, and any other exception becomes an error chunk with the code from <code>create_error_response</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:937-943}}).</p>
+
+<h3><code>chat_completion_full_generator</code>: one response</h3>
+<x-code file="vllm/entrypoints/openai/chat_completion/serving.py" lines="957-1024" highlight="961-964,966-971,984-990,1007-1019" />
+<ol>
+  <li><strong>Lines 961-964.</strong> Only the last output is kept. With FINAL_ONLY there is normally just one. A client disconnect gives the error response "Client disconnected".</li>
+  <li><strong>Lines 966-971.</strong> No output at all gives HTTP 500.</li>
+  <li><strong>Lines 984-990.</strong> A new parser for each further choice; parsers keep state.</li>
+  <li><strong>Lines 1007-1019.</strong> One <code>parse</code> call splits reasoning, content and tool calls. With <code>include_reasoning: false</code>, the reasoning and the logprobs are dropped.</li>
+</ol>
+<p>Lines 1026-1095 choose how the message is built, by <code>tool_choice</code> and auto tool choice; lines 1110-1128 build the choice with <code>resolve_finish_reason</code> and the <code>parallel_tool_calls</code> filter. Usage and the response object follow ({{cite vllm/entrypoints/openai/chat_completion/serving.py:1147-1206}}).</p>
+
+<h2>Deep dive</h2>
+<p>The sections below give the full detail. Open them one at a time, or use <em>Open all deep dives</em> at the top of the page.</p>
+
+<x-deepdive title="Data flow: types in and out">
+<table>
+  <thead><tr><th>Value</th><th>Type</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>input</td><td><code>ChatCompletionRequest</code> (pydantic), <code>fastapi.Request</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:287-291}}</td></tr>
+    <tr><td>after render</td><td><code>list[ConversationMessage]</code>, <code>list[EngineInput]</code> (one item)</td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:264-267}}</td></tr>
+    <tr><td>to the engine</td><td><code>SamplingParams</code> or <code>BeamSearchParams</code>, request id <code>chatcmpl-…</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:360-408}}</td></tr>
+    <tr><td>from the engine</td><td><code>AsyncGenerator[RequestOutput]</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:337}}</td></tr>
+    <tr><td>stream output</td><td><code>AsyncGenerator[str]</code> of <code>data: ...\n\n</code> lines</td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:473-484}}</td></tr>
+    <tr><td>full output</td><td><code>ChatCompletionResponse</code> or <code>ErrorResponse</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:945-956}}</td></tr>
+  </tbody>
+</table>
+<p>The method also stores <code>RequestResponseMetadata</code> with the final usage on <code>raw_request.state</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:324-326}}, {{cite vllm/entrypoints/openai/chat_completion/serving.py:905-916}}). The comment says it is for middleware; a search of <code>vllm/entrypoints/</code> finds no code that reads <code>final_usage_info</code>, so it serves user middleware only (open question for in-tree use).</p>
+</x-deepdive>
+
+<x-deepdive title="Worked example: a stream with n = 2 and include_usage">
+<p>Request: the two ChatML messages (system and user) of the renderer worked example, <code>"n": 2</code>, <code>"stream": true</code>, <code>"stream_options": {"include_usage": true}</code>. The prompt has 26 tokens ({{link concepts/renderers-and-chat-templates}}). Choice 0 writes 2 text tokens and EOS (3 tokens). Choice 1 writes 3 text tokens and EOS (4 tokens).</p>
+<ol>
+  <li><code>_preflight(2)</code>: <code>check_admission(2)</code> counts two slots ({{cite vllm/entrypoints/openai/chat_completion/serving.py:283}}).</li>
+  <li><code>num_choices</code> = 2, so two <code>ChatStreamProcessor</code>s (no parser configured) ({{cite vllm/entrypoints/openai/chat_completion/serving.py:528}}, {{cite vllm/entrypoints/openai/chat_completion/serving.py:552-555}}).</li>
+  <li>The first <code>RequestOutput</code> triggers two role chunks, <code>index</code> 0 and 1, before any text ({{cite vllm/entrypoints/openai/chat_completion/serving.py:590-629}}).</li>
+  <li>Each later <code>RequestOutput</code> holds the new outputs of one or both children; the collector merges outputs of the same index and keeps indexes apart ({{cite vllm/outputs.py:217-255}}). The loop sends one chunk per output, with its <code>index</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:672-674}}). So chunks of choice 0 and choice 1 can interleave.</li>
+  <li>Choice 0 ends first. Its EOS output has empty text, so the chunk has <code>delta: {"content": ""}</code> and <code>finish_reason: "stop"</code>, and <code>finish_reason_sent[0]</code> becomes true ({{cite vllm/entrypoints/openai/chat_completion/serving.py:787-806}}). Choice 1 goes on.</li>
+  <li>After the last output, the usage chunk: <code>prompt_tokens</code> 26, <code>completion_tokens</code> = 3 + 4 = 7 (each processor counts the token ids it saw, EOS included), <code>total_tokens</code> 33 ({{cite vllm/entrypoints/openai/chat_completion/serving.py:854-859}}, {{cite vllm/entrypoints/openai/chat_completion/stream_processor.py:75}}).</li>
+  <li><code>data: [DONE]</code>.</li>
+</ol>
+<p>In total the client gets 2 role chunks, 2 + 3 text chunks (one per text token, with the default <code>stream_interval</code> 1), 2 final chunks, 1 usage chunk and <code>[DONE]</code>: 11 events. (Derived; a chunk can carry more than one token when the reader is slower than the engine.)</p>
+<x-simplified><p>The texts and token counts are illustrative. The fingerprint is on the usage chunk, not on the final chunks, because usage is on ({{cite vllm/entrypoints/openai/chat_completion/serving.py:815-824}}).</p></x-simplified>
+</x-deepdive>
+
+<x-deepdive title="Error paths: what raises, what becomes a chunk">
+<table>
+  <thead><tr><th>Situation</th><th>Result</th><th>Where</th></tr></thead>
+  <tbody>
+    <tr><td>wrong model name</td><td><code>ErrorResponse</code> 404, returned before any stream</td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:278-281}}</td></tr>
+    <tr><td>engine dead, queue full</td><td>exception from <code>_preflight</code> → 500 / 503 by the handlers</td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:283}}</td></tr>
+    <tr><td>template or length error</td><td>exception or error response from the renderer → 400</td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:285}}</td></tr>
+    <tr><td>parser cannot be built in a stream</td><td>one error chunk, then <code>[DONE]</code></td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:556-559}}</td></tr>
+    <tr><td>finish reason <code>error</code></td><td><code>GenerationError</code> → error chunk (stream) or 500 (full)</td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:679}}, {{cite vllm/entrypoints/openai/chat_completion/serving.py:983}}</td></tr>
+    <tr><td>any exception in the stream loop</td><td>error chunk with the mapped status code</td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:941-943}}</td></tr>
+    <tr><td>client disconnect, full response</td><td>error response "Client disconnected"</td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:963-964}}</td></tr>
+    <tr><td>no output from the engine</td><td>500 "No output received from the engine."</td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:966-971}}</td></tr>
+    <tr><td>logprobs asked but missing</td><td><code>AssertionError</code> ("Did not output logprobs")</td><td>{{cite vllm/entrypoints/openai/chat_completion/serving.py:681-682}}</td></tr>
+  </tbody>
+</table>
+</x-deepdive>
+
+<x-deepdive title="Flags that reach this class">
+<table>
+  <thead><tr><th>Constructor argument</th><th>CLI flag</th><th>Effect here</th></tr></thead>
+  <tbody>
+    <tr><td><code>response_role</code></td><td><code>--response-role</code> (default <code>assistant</code>)</td><td>Role of the answer with <code>add_generation_prompt</code> ({{cite vllm/entrypoints/openai/chat_completion/serving.py:440-443}}).</td></tr>
+    <tr><td><code>enable_auto_tools</code>, <code>tool_parser</code>, <code>reasoning_parser</code></td><td><code>--enable-auto-tool-choice</code>, <code>--tool-call-parser</code>, <code>--reasoning-parser</code></td><td>The parser class (line 167).</td></tr>
+    <tr><td><code>enable_force_include_usage</code></td><td><code>--enable-force-include-usage</code></td><td>Usage on every stream, per chunk too ({{cite vllm/entrypoints/openai/chat_completion/serving.py:562-564}}).</td></tr>
+    <tr><td><code>enable_prompt_tokens_details</code></td><td><code>--enable-prompt-tokens-details</code></td><td>Cached and multimodal prompt tokens in usage.</td></tr>
+    <tr><td><code>enable_per_request_metrics</code></td><td><code>--enable-per-request-metrics</code></td><td>Timing metrics in the response, only for <code>n</code> = 1 ({{cite vllm/entrypoints/openai/chat_completion/serving.py:1173-1186}}).</td></tr>
+    <tr><td><code>enable_log_outputs</code>, <code>enable_log_deltas</code></td><td><code>--enable-log-outputs</code>, <code>--enable-log-deltas</code></td><td>Log the generated text, per delta and in full.</td></tr>
+    <tr><td><code>return_tokens_as_token_ids</code></td><td><code>--return-tokens-as-token-ids</code></td><td>Logprob tokens as <code>token_id:N</code> ({{cite vllm/entrypoints/generate/base/serving.py:322-323}}).</td></tr>
+  </tbody>
+</table>
+<p>The class reads no environment variable itself. The arguments are listed at {{cite vllm/entrypoints/generate/api_router.py:127-148}}.</p>
+</x-deepdive>
+
+<h2>Related concepts</h2>
+<ul>
+  <li>{{link concepts/openai-server}}: the app, the routes and the serving class tree.</li>
+  <li>{{link concepts/renderers-and-chat-templates}}: what <code>render_chat</code> does.</li>
+  <li>{{link concepts/tool-and-reasoning-parsers}}: the parser that the stream processor and the full generator call.</li>
+  <li>{{link concepts/structured-outputs}}: the constraint in the sampling parameters.</li>
+  <li>{{link code/v1-engine-async-llm}}: the other side of <code>generate()</code>.</li>
+  <li>{{link tours/life-of-a-chat-request}}: stops 1, 2 and 16.</li>
+</ul>
+
+<x-quiz>
+  <x-q level="easy">Which method returns the async generator of SSE strings, and which line always ends the stream?
+    <x-a><p><code>chat_completion_stream_generator</code>; line 508 yields <code>data: [DONE]\n\n</code>, after the loop and after any error chunk ({{cite vllm/entrypoints/openai/chat_completion/serving.py:485-508}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">Why does <code>_create_chat_completion</code> build a parser before it renders the request?
+    <x-a><p>The parser needs the effective <code>chat_template_kwargs</code>, and its reasoning half decides <code>reasoning_ended</code> for the engine from the prompt ids ({{cite vllm/entrypoints/openai/chat_completion/serving.py:310-313}}, {{cite vllm/entrypoints/openai/chat_completion/serving.py:242-262}}).</p></x-a>
+  </x-q>
+  <x-q level="medium">An output arrives with empty text, no token ids and no finish reason, before the first token of a choice. What does the stream send?
+    <x-a><p>Nothing: the code treats it as a chunked-prefill step and skips it ({{cite vllm/entrypoints/openai/chat_completion/serving.py:696-703}}).</p></x-a>
+  </x-q>
+  <x-q level="hard">A non-streaming request with <code>n</code> = 2 sets <code>--enable-per-request-metrics</code> on the server. Does the response carry the timing metrics?
+    <x-a><p>No. The code builds per-request metrics only when <code>n</code> is 1, because the stats belong to one of the sequences ({{cite vllm/entrypoints/openai/chat_completion/serving.py:1173-1181}}).</p></x-a>
+  </x-q>
+</x-quiz>
