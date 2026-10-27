@@ -1,7 +1,7 @@
 # vLLM Explainer — Progress
 
 Last update: 2026-10-22 19:10
-Current phase: **Final pass** — all batches B1a–B9 written + fact-checked + committed; B10 writer and F1 consistency pass running. Then: B10 fact check, F2 site check, README. — plan approved ("go", 2026-10-22 19:13). Running (4/4): foundation agent, reference-generators agent, 1b basics samples (learn/ml-basics-recap, learn/serving-metrics), 1b Tour 1 (tours/life-of-a-chat-request + request_stepper visual). The two 1b writers started early, in parallel with 1a (they may need small fixes after STYLE.md lands).
+Current phase: **Final pass, PAUSED (2026-10-27 ~18:05)** — weekly usage limit hit on 10-23; user commit 961e7df holds unchecked partial work (B10 drafts: reference/extension-points, vllm-vs-deepinfer, faq; F1 consistency pass partly applied). Pending: finish B10 + B10 fact check; finish F1 (notes/final-pass-todo.md, check which items are done); F2 site check; README; final commit.
 
 This file is the memory of the project. A new session must be able to continue from it alone.
 
@@ -16,6 +16,8 @@ This file is the memory of the project. A new session must be able to continue f
 | F Final pass | not started | |
 
 ## RESUME NOTES
+
+- 2026-10-27: USER INSTRUCTION: be careful with usage; run subagents with Opus 4.8, effort high, context < 500k. Created .claude/agents/explainer-worker.md (model: claude-opus-4-8, effort: high) — NOT yet tested: agent definitions load at session start. Next session: test it with one no-tool reply first; if the model ID is rejected, ask the user before falling back to opus/5.5. Hourly cron 3603c11b deleted by the supervisor (user wants manual quota control). Old subagents cannot be resumed; start new ones with the list of partial files.
 
 (none — both cut-off writers were resumed at 01:01; B3b finished.)
 
