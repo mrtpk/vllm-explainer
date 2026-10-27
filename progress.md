@@ -1,7 +1,7 @@
 # vLLM Explainer — Progress
 
-Last update: 2026-10-22 19:10
-Current phase: **Final pass, PAUSED (2026-10-27 ~18:05)** — weekly usage limit hit on 10-23; user commit 961e7df holds unchecked partial work (B10 drafts: reference/extension-points, vllm-vs-deepinfer, faq; F1 consistency pass partly applied). Pending: finish B10 + B10 fact check; finish F1 (notes/final-pass-todo.md, check which items are done); F2 site check; README; final commit.
+Last update: 2026-10-27
+Current phase: **DONE (2026-10-27).** 107 pages, 82 diagrams, 6 visuals, 270 glossary terms. All batches fact-checked; final consistency pass done; site check 214/214 clean; README written. Not pushed or published.
 
 This file is the memory of the project. A new session must be able to continue from it alone.
 
@@ -12,12 +12,12 @@ This file is the memory of the project. A new session must be able to continue f
 | 0a Survey | done | 4 surveys in `notes/survey/` (core-engine, plugins, model-execution, serving-config-distributed); spot-checked |
 | 0b Plan approval | done | approved 2026-10-22 ("go"); committed dd25917 |
 | 1 Foundation + samples | done 20:35 (all samples written + fact-checked) | 1a foundation agent (STYLE, nav, core glossary, {{deepinfer}} tag, concepts/plugin-loading); generators agent (tools/gen_env_vars, gen_serve_flags, gen_config_classes, gen_metrics → notes/generated/*.json) |
-| Full build (plan §12) | not started | |
-| F Final pass | not started | |
+| Full build (plan §12) | done 2026-10-23 → 10-27 | B1a–B10 written + fact-checked + committed |
+| F Final pass | done 2026-10-27 | F1 consistency (3636cae), B10 FC (34fcb79), site check: 107 pages × 1280/390 px, 0 overflow, 0 JS errors; README |
 
 ## RESUME NOTES
 
-- 2026-10-27: explainer-worker tested OK (claude-opus-4-8, standard context). USER INSTRUCTION: "Stay under 50% of weekly limit. whenever you hit 50% of weekly, stop and wait for me. other than this condition, please proceed." Supervisor cannot read the usage meter → runs ONE subagent at a time and pauses after each for the user to check /usage. Step 1 (F1 consistency, explainer-worker) DONE ~19:00: most items were already done in 961e7df; fixed tp-pp 64→65 all-reduces, O2 compile exceptions on 3 pages, 6 STE warnings; supervisor added model-runner drafts/CPU for structured outputs, LoRA capture cases on compile page, add_request cost note on engine-hooks. Not re-verified (low risk, budget): TODO items 10, 13, 19, 20, 21. Generators --check clean. Build: only error = src/reference/faq.html:14 malformed {{cite}} (B10 draft). User said continue (2026-10-27). Step 2 (finish B10) DONE: only fix needed was an unescaped {{cite}} in faq.html; build 0 errors. FAQ docs-vs-code table has 54 rows (not re-verified by the writer). User said continue. Step 3 (B10 fact check) DONE: ~200 citations, 0 defects (all 54 docs-vs-code rows confirmed); supervisor spot-checked 7 claims: all correct. B10 complete. Next: step 4 site check (supervisor plans to script it with shot.js instead of a subagent), README, final commit.
+- 2026-10-27: explainer-worker tested OK (claude-opus-4-8, standard context). USER INSTRUCTION: "Stay under 50% of weekly limit. whenever you hit 50% of weekly, stop and wait for me. other than this condition, please proceed." Supervisor cannot read the usage meter → runs ONE subagent at a time and pauses after each for the user to check /usage. Step 1 (F1 consistency, explainer-worker) DONE ~19:00: most items were already done in 961e7df; fixed tp-pp 64→65 all-reduces, O2 compile exceptions on 3 pages, 6 STE warnings; supervisor added model-runner drafts/CPU for structured outputs, LoRA capture cases on compile page, add_request cost note on engine-hooks. Not re-verified (low risk, budget): TODO items 10, 13, 19, 20, 21. Generators --check clean. Build: only error = src/reference/faq.html:14 malformed {{cite}} (B10 draft). User said continue (2026-10-27). Step 2 (finish B10) DONE: only fix needed was an unescaped {{cite}} in faq.html; build 0 errors. FAQ docs-vs-code table has 54 rows (not re-verified by the writer). User said continue. Step 4 (site check, supervisor script) DONE: 214/214 clean. Step 5 README DONE. Step 3 (B10 fact check) DONE: ~200 citations, 0 defects (all 54 docs-vs-code rows confirmed); supervisor spot-checked 7 claims: all correct. B10 complete. Next: step 4 site check (supervisor plans to script it with shot.js instead of a subagent), README, final commit.
 
 - 2026-10-27: USER INSTRUCTION: be careful with usage; run subagents with Opus 4.8, effort high, context < 500k. Created .claude/agents/explainer-worker.md (model: claude-opus-4-8, effort: high) — NOT yet tested: agent definitions load at session start. Next session: test it with one no-tool reply first; if the model ID is rejected, ask the user before falling back to opus/5.5. Hourly cron 3603c11b deleted by the supervisor (user wants manual quota control). Old subagents cannot be resumed; start new ones with the list of partial files.
 
@@ -46,7 +46,7 @@ This file is the memory of the project. A new session must be able to continue f
 
 ## Next step
 
-Wait for the foundation + generators agents. Review, build, commit Phase 1a. Then Phase 1b samples (plan §11): max 4 parallel before 19:56, else max 2. After 1b: fact checks (1c), supervisor review, then continue straight into the full build (plan §12) — no user stop (user instruction 19:20).
+Nothing pending. Optional follow-ups: re-verify FINAL-PASS items 10, 13, 19, 20, 21 (not re-checked in F1 to save quota; spot checks were fine); add a diagram to learn/ml-basics-recap (only build warning); publish when the user asks.
 
 ## Questions for the user
 
