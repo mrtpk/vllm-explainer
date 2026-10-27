@@ -17,6 +17,8 @@ This file is the memory of the project. A new session must be able to continue f
 
 ## RESUME NOTES
 
+- 2026-10-27: explainer-worker tested OK (claude-opus-4-8, standard context). USER INSTRUCTION: "Stay under 50% of weekly limit. whenever you hit 50% of weekly, stop and wait for me. other than this condition, please proceed." Supervisor cannot read the usage meter → runs ONE subagent at a time and pauses after each for the user to check /usage. Step 1 (F1 consistency, explainer-worker) started.
+
 - 2026-10-27: USER INSTRUCTION: be careful with usage; run subagents with Opus 4.8, effort high, context < 500k. Created .claude/agents/explainer-worker.md (model: claude-opus-4-8, effort: high) — NOT yet tested: agent definitions load at session start. Next session: test it with one no-tool reply first; if the model ID is rejected, ask the user before falling back to opus/5.5. Hourly cron 3603c11b deleted by the supervisor (user wants manual quota control). Old subagents cannot be resumed; start new ones with the list of partial files.
 
 (none — both cut-off writers were resumed at 01:01; B3b finished.)
