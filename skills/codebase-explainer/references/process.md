@@ -40,6 +40,9 @@ The main session is the supervisor. It does **not** write pages.
 - It decides on its own only when a safe default exists; it writes the open question for the user in
   `progress.md` "Questions for the user" and continues.
 - It does not change the target repo. It does not push or publish without a user request.
+- It verifies every claim that the target code has a bug before it goes on a page or into the FAQ. It
+  re-reads the control flow (indentation, caller and callee). If the claim holds, the page still says
+  only what the code does, in neutral words; the supervisor tells the user, who decides whether to report it upstream.
 
 ### 7.3 Batches and waves
 
@@ -50,17 +53,45 @@ The main session is the supervisor. It does **not** write pages.
 - Name batches B1, B2, B3a, B3b ... Use the batch name as the prefix for its diagram scripts
   (`b3a_sched_decide.py`) and as its glossary file (`b3a.json`).
 - Put the batch table in `plan.md` (pages and visual per batch) and the wave list.
-- **Waves.** Run 6-7 subagents at the same time at most. Wave 1 = batches with no dependency (basics,
+- **Waves.** Run at most the number of subagents that the user allowed (DeepInfer: 6-7; vLLM: 4, then 2
+  after a usage limit, then 1 under a usage ceiling). Wave 1 = batches with no dependency (basics,
   core engine, model core, the hardest feature). Wave 2 = batches that build on wave 1. Wave 3 = scale,
   platform, start-up tour, reference. Then F.
 - **Order of priority** if time is short: Basics → Tour 1 → core concepts → code map → reference.
-- **Pipeline per batch:** writer → `build.py` 0 errors (`--preview` while others are broken) →
-  **separate** fact-check subagent (fixes in place) → build 0 errors → supervisor reviews → commit.
+- **Pipeline per batch:** writer → `build.py` 0 errors (`--preview` while others are broken) → commit
+  "(fact check pending)" → **separate** fact-check subagent (fixes in place) → build 0 errors →
+  supervisor reviews → commit "fact-checked".
   Start the fact check as soon as the writer finishes. Do not wait for the wave.
 - Fact checks are not optional. In DeepInfer, the fact checkers found and fixed about 480 defects in
   about 7,000 claims (about 7 %; 16 to 43 per batch). Most were citations (wrong lines), then wrong
   defaults, wrong call order, over-general claims, and claims that only the docs supported.
 - The fact checker is **never** the agent that wrote the batch.
+- vLLM Explained had more defects: 30-40 % of the Phase 1 sample claims needed a fix, and later batches
+  had 16-73 defects each. The fact checkers' main finds were defaults that a config class sets but that
+  argument parsing changes later, "always" where the code has a condition, and off-by-one line ranges.
+  Put each repeated defect type in the shared briefs as an "accuracy lesson" as soon as you see it.
+
+### 7.3a Budget
+
+A full fact check costs about as much as the writing. A site of about 100 pages uses a large part of a
+weekly usage allowance. vLLM Explained hit usage limits more than once, including the weekly limit.
+Agree on a budget with the user before the full build (goal-and-questions.md, question 13).
+
+- **Shared briefs.** Put the stable rules in `notes/brief-writer.md` and `notes/brief-factcheck.md`. A
+  subagent prompt then gives only the batch-specific parts (pages, scope, owned files, visual).
+- **Model and effort.** If the user names a model and effort for subagents, make a project agent
+  definition (`.claude/agents/<name>.md` with `model:` and `effort:` in the front matter). Test it first
+  (SKILL.md, "Keep the project resumable"). If the model is not accepted, ask the user before you use another model.
+- **Budget mode** (only with the user's yes):
+  - fewer pages, or shorter deep dives on module and reference pages;
+  - full fact checks for tours, concept pages and pages with defaults, numbers or call order; a sample
+    check (for example 1 claim in 5) for module and reference pages;
+  - the site check as a supervisor script, not a subagent;
+  - the final consistency pass limited to the FINAL-PASS TODO list.
+- **Record every skipped check** in `progress.md` and in the README ("items 10, 13 were not checked
+  again"). The reader must know what was checked.
+- **Under a usage ceiling** the supervisor cannot read the meter: run one subagent at a time and stop
+  after each one so that the user can check the usage.
 
 ### 7.4 Ownership rules for parallel writers
 
@@ -84,6 +115,12 @@ The main session is the supervisor. It does **not** write pages.
   (diagram scripts, facts) and write in `plan.md` "Deferred pages" what exists. Continue the other pages.
 - If the user gives an instruction about usage (for example "let the running agents finish, then build,
   commit, push and pause"), write it in `progress.md` as a USER INSTRUCTION with the date.
+- A usage cut-off can leave uncommitted, unchecked work. If the user commits it (vLLM: "not fact checked.
+  limited by usage"), list the unchecked batches in RESUME NOTES and check them before the final pass.
+- Unattended resume: a scheduled job (cron) that reads `progress.md` every hour works, but it exists only
+  in its session and stops at the end of the session. Delete it when the user wants manual control.
+- Unknown agents that run while you work may be forks of your own subagents. Ask each one for its task,
+  tell the user, and add the "no subagents" rule to the briefs.
 
 ## 9. Git and publishing rules
 

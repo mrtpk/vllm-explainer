@@ -27,6 +27,7 @@ the pages and learns step by step. After the basics, the site also works as a re
 - Fact checks are done for every batch. The FINAL-PASS TODO list is empty.
 - Each interactive visual works at desktop and phone width, with mouse, keyboard and touch.
 - A beginner can follow the path Home → Basics → Tour 1 with no dead end.
+- Any check that was skipped to save budget is listed in `progress.md` and the README.
 
 ---
 
@@ -48,7 +49,9 @@ Do not start Phase 1 before the user approves `plan.md`.
 | 9 | Look? Show the sample look or a reference site. | Avoids a restyle (pitfalls.md). | Light article look like Sebastian Raschka's Substack (`magazine.sebastianraschka.com`). Never auto dark mode. |
 | 10 | Which commit to pin? | All line numbers depend on it. | The newest commit on the default branch on the day you start. |
 | 11 | Git: local commits per stage? Push? Which author identity? | Git rules (process.md). | Commit per stage. Push only when asked. Ask for the author name and email; set them repo-local. |
-| 12 | Stop after Phase 1 for a review? | The user checks look and depth early. | Yes. Always stop after Phase 1. |
+| 12 | Stop after Phase 1 for a review? | The user checks look and depth early. | Yes. Always stop after Phase 1. (The vLLM user skipped it: same look as the approved DeepInfer site.) |
+| 13 | Budget: subagents at the same time? Usage ceiling? Model and effort for subagents? Full fact checks or budget mode? | A ~100-page site uses a large part of a weekly allowance (process.md 7.3a). | 2 at a time; full fact checks; stop and wait at the user's ceiling. |
+| 14 | Is there a sibling explainer site? | Avoids pages that repeat its basics. | One-line recap + link to the sibling page; list them in `basics-covered.md`. |
 
 Before you ask, run the codebase survey (subagent-prompts.md, template A). Then you can propose a concrete
 page list with the questions. The user answers faster when there is a draft.

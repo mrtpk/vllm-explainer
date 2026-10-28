@@ -46,6 +46,7 @@ What the kit contains:
 | `src/nav/*.json`, `src/glossary/core.json` | nav and glossary examples | list every planned page; add core terms |
 | `STYLE.md`, `instructions-svg.md` | writer's guide and diagram guide | `<Project>` names, vocabulary table, out-of-scope list |
 | `plan.md`, `progress.md`, `notes/facts.md`, `README.md` | skeletons | fill in |
+| `notes/brief-writer.md`, `notes/brief-factcheck.md` | shared subagent briefs | paths, SHA, reader, scope, model pages, agent limit |
 
 Test the kit after you fill in `explainer.json`:
 
@@ -69,6 +70,8 @@ parent/
     plan.md  progress.md       plan and progress log (tracking-files.md)
     README.md                  what the site is, code version, how to build
     notes/facts.md             shared verified facts (tracking-files.md)
+    notes/brief-writer.md      shared writer brief (subagent-prompts.md)
+    notes/brief-factcheck.md   shared fact-checker brief
     assets/                    site.css, site.js, favicon.svg
       viz/                     viz.css + one <name>.js per visual
       img/                     images for <x-img src="img/...">
@@ -247,6 +250,8 @@ For every page, at 1280 px and 390 px width, with all deep dives open:
 - every glossary term link has an entry;
 - each visual renders and reacts to a click;
 - screenshots of a sample (light and dark) for the supervisor to look at.
+The supervisor can run this check itself with one script (cheaper than a subagent). `/tmp` can be empty
+after a restart: write the setup commands (npm package, browser path, library folder) in `progress.md`.
 Known false alarms: a headless browser may lack a CJK font (Chinese shows as boxes in screenshots only);
 `loading="lazy"` images may be blank in full-page screenshots.
 

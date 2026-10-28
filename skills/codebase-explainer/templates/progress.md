@@ -21,6 +21,10 @@ Update it after every subagent finishes and after every user decision.
 |---|---|---|---|
 | B1 <name> | – | – | – |
 
+## USER INSTRUCTIONS
+
+(One dated line per user rule about usage, subagent limits, models, stops or publishing. Quote the user.)
+
 ## RESUME NOTES
 
 (Only while work is interrupted, for example by a usage limit: which subagents were cut off, which files

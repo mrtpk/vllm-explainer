@@ -76,6 +76,7 @@ glossary term is wrong.
 | `assets/` | Site CSS and JavaScript, and the interactive visuals (`assets/viz/`) |
 | `tools/` | Generators for reference tables and the folder tree |
 | `notes/facts.md` | Facts that were checked in the code and that all pages share |
+| `notes/brief-writer.md`, `notes/brief-factcheck.md` | The shared briefs for the writer and fact-checker agents |
 | `build.py` | The site generator |
 | `site/` | The built site. Do not edit it |
 | `STYLE.md`, `instructions-svg.md` | The writer's guide and the diagram style guide |

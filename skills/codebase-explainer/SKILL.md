@@ -8,7 +8,8 @@ description: Plan and build a static HTML study site ("<Project> Explained") tha
 This skill makes a static website that teaches one open-source codebase. The reader starts with no
 knowledge of the code. Each page starts simple, then gives a full "Deep dive". The model project is
 *DeepInfer Explained* (106 pages, 91 diagrams, 8 interactive visuals, 321 glossary terms; fact checkers
-corrected about 7 % of about 7,000 claims).
+corrected about 7 % of about 7,000 claims). The second project, *vLLM Explained* (107 pages, 82 diagrams),
+used this skill as it is and added the cost, resume and safety rules in this file and in `references/pitfalls.md`.
 
 You act as the **supervisor**. You plan, ask the user, delegate long work to subagents, review, track
 progress and commit. You do not write the pages yourself.
@@ -57,7 +58,13 @@ these questions, each with a proposed default (details in `references/goal-and-q
 9. Look? (Suggested: a light article look, like a long-form magazine article; dark only by a toggle.)
 10. Which commit to pin?
 11. Git: commit per stage? Push? Which author name and email?
-12. Stop after Phase 1 for a review? (Suggested: yes.)
+12. Stop after Phase 1 for a review? (Suggested: yes. If the user says "run unattended", skip the stop and
+    write that in `progress.md` as a USER INSTRUCTION.)
+13. Budget: how many subagents at the same time? A usage ceiling (for example "stay under 50 % of the weekly
+    limit")? Which model and effort for subagents? Full fact check of every batch, or budget mode
+    (`references/process.md` 7.3a)? (Suggested: 2 at a time; full fact checks.)
+14. Is there a sibling explainer site? Basics that it already teaches get a one-line recap and a link, not a
+    new page. Write the list in `basics-covered.md`.
 
 **Stop point 1.** Do not build before the user approves `plan.md`. Write the answers into `plan.md`
 section 2 with the date.
@@ -67,6 +74,8 @@ section 2 with the date.
 1. Copy the starter kit: `cp -r <this skill>/templates/. <project>-explainer/`. Fill in
    `explainer.json`: it is the only file with project values (name, repo path and URL, host, full SHA,
    language style, Prism languages). `git init`; set the author repo-local.
+   Fill in the shared briefs `notes/brief-writer.md` and `notes/brief-factcheck.md` (in the kit). Every
+   writer and fact checker reads them, so the prompts stay short and a new rule goes in one place.
 2. Run `python3 tools/gen_folder_tree.py && python3 build.py`. The example pages must build with 0 errors
    before you change anything else.
 3. Start the foundation subagent (template B): `STYLE.md` for this project, nav files with **every**
@@ -84,26 +93,31 @@ A late restyle is expensive: settle the look here.
 ### Step 3: Full build in batches
 
 1. Put a batch table in `plan.md`: batches of 4-8 pages on one topic (concepts + their module pages +
-   maybe a tour + maybe one visual), and waves of at most 6-7 parallel subagents.
+   maybe a tour + maybe one visual), and waves no larger than the user's subagent limit (question 13).
 2. For each batch, run this loop:
    - **Writer** subagent (template C). It owns its pages, `src/glossary/<batch>.json`,
      `diagrams/<batch>_*.py` and one visual. It reports new facts, wrong facts, uncertain claims and open questions.
-   - Build: 0 errors for its pages (`--preview` while other writers have broken pages).
+   - Build: 0 errors for its pages (`--preview` while other writers have broken pages). Commit the
+     writer's output as "B3a: ... (fact check pending)". Then a usage cut-off cannot mix checked and
+     unchecked work in one uncommitted tree.
    - **Fact checker** subagent (template D). It is never the writer. It checks every claim against the
      code, fixes in place and counts defects.
-   - Supervisor: merge both reports into `notes/facts.md`; add cross-page fixes to the FINAL-PASS TODO
-     list in `progress.md`; look at 1-2 pages in a browser; update `progress.md`; commit the batch.
+   - Supervisor: verify every "the code has a bug" claim from either report before it reaches a page
+     (see the rules below); merge both reports into `notes/facts.md`; add cross-page fixes to the
+     FINAL-PASS TODO list in `progress.md`; look at 1-2 pages in a browser; update `progress.md`; commit
+     the batch as "B3a fact-checked: N defects fixed".
 3. Start a fact check as soon as its writer finishes. Do not wait for the whole wave.
 
 Why a separate fact checker: a writer does not find its own errors well. In DeepInfer each batch had 16-43
-defects after writing, mostly wrong line numbers, wrong defaults and over-general claims.
+defects after writing, in vLLM 16-73. Most were wrong line numbers, wrong defaults and over-general claims.
 
 ### Step 4: Final pass
 
 1. Consistency subagent (template E): fix every FINAL-PASS TODO, sweep all pages against `notes/facts.md`,
    run every generator with `--check`.
-2. Site check subagent (template F): every page at 1280 and 390 px, deep dives open; no page overflow,
-   no JS errors, no broken links or anchors, every visual works.
+2. Site check (template F): every page at 1280 and 390 px, deep dives open; no page overflow,
+   no JS errors, no broken links or anchors, every visual works. A supervisor script is cheaper than a
+   subagent (`references/tooling.md` 6.8); use a subagent only for fixes.
 3. Write `README.md` from the template. Mark `progress.md` as done. Commit.
 
 **Stop point 3.** Push or publish only when the user asks.
@@ -124,6 +138,16 @@ defects after writing, mostly wrong line numbers, wrong defaults and over-genera
   at most 3 boxes across and 3 panels; split big diagrams; captions start with "Figure: ".
 - **Generate reference tables** from the code (env vars, config, CLI flags, folder tree). Hand-copied
   tables go wrong.
+- **Subagents never start subagents.** Put this rule in every brief and every prompt. In vLLM a fact
+  checker started 3 forks by itself, and the user's agent limit and budget were broken.
+- **No "bug" claims on pages.** Pages say what the code does, in neutral words. A writer or fact checker
+  reports a suspected bug to the supervisor with exact lines; the supervisor re-reads the control flow. In
+  vLLM a fact checker misread an indentation level, and a false bug note reached 3 pages.
+- **Trace each default to where it is finally set** (argument parsing, post-init hooks, platform code), not
+  only to the config class field. This was the most common value defect in vLLM.
+- **`notes/facts.md` is the single source for shared facts**, with status tags: [W] from a writer, [FC]
+  confirmed by a fact checker, [S] checked by the supervisor. When a fact changes, add a FINAL-PASS TODO
+  with the pages that repeat it.
 - **Parallel writers never edit shared files.** All page ids are in the nav files from Phase 1; each
   batch owns its own glossary file and diagram prefix; only the supervisor edits `build.py`, `site.css`,
   `core.json` and `notes/facts.md`.
@@ -134,6 +158,17 @@ defects after writing, mostly wrong line numbers, wrong defaults and over-genera
   Keep "Next step" current.
 - Usage limits can stop subagents in the middle of a file. Write resume notes at once, then continue the
   work after the reset instead of a restart.
+- **Resume procedure** (new session or after a limit): read `progress.md` (RESUME NOTES, Next step, USER
+  INSTRUCTIONS); run `git status` and `git log --oneline -5`; list the partial files; start a new subagent
+  with "resume: these files exist and are partial; finish them". Old subagents cannot be resumed after a
+  session ends.
+- A scheduled resume job (cron) exists only in its session; set it up again in a new session, and only if
+  the user still wants unattended work. A new agent definition (`.claude/agents/*.md`) loads only at session
+  start: test it with one reply that uses no tools before real work.
+- The supervisor cannot read the usage meter. If the user sets a usage ceiling, run one subagent at a time
+  and pause after each one so the user can check the usage.
+- If you skip a check to save budget, write which items were not checked in `progress.md` and the README.
+  Do not drop a check without a note.
 - If a safety classifier stops a writer on a harmless technical topic, do not retry. Ask the user, and
   defer the page (it stays "soon" in the menu).
 - Git: commit per stage; never rewrite pushed history; push only on request.

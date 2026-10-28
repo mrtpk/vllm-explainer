@@ -9,6 +9,21 @@ Part of the `codebase-explainer` skill. The single-file version of this playbook
 Fill in the `{...}` parts. Give every subagent the absolute paths. Tell every subagent to report back:
 what it did, files changed, build result, facts found, open questions.
 
+**Shared briefs.** After Phase 1a, the stable parts of templates C and D live in
+`notes/brief-writer.md` and `notes/brief-factcheck.md` (starter kit). Then a prompt is short:
+"Read notes/brief-writer.md first; it is binding. Batch B3a: pages ..., visual ..., glossary ids ...".
+Add each new lesson to the briefs, not to single prompts.
+
+**Rules for every subagent.** Add this block to the end of every prompt (A-G), or make sure the brief has it:
+
+```
+- Do NOT start subagents or forks. You are one of the {N} agents that the user allows. Do all the work yourself.
+- Do NOT change {TARGET_PATH}. Do NOT commit, push or publish: the supervisor commits.
+- Do NOT write on a page that the code has a bug. Re-read the control flow twice (is the line inside or
+  after the loop or if? check the caller and the callee) and report it to the supervisor with exact lines.
+- Literal tag syntax in a page ({{cite}}, <x-code>) must be escaped (&#123;&#123;cite&#125;&#125;), or the build fails.
+```
+
 #### A. Codebase survey
 
 ```
@@ -114,6 +129,10 @@ glossary text, the rules copied into the visual):
 3. Check claims with no citation. Add a citation or remove the claim.
 4. Check derived claims step by step. Reword to "earliest possible" or similar if the derivation has gaps.
 5. Check that general domain statements are correct.
+6. Trace each default to where it is finally set (argument parsing, post-init hooks, platform code), not
+   only to the config class field.
+7. Recompute the arithmetic in worked examples. Check each recap link to a sibling site against that page.
+8. A claim that the code has a bug: do not write it on a page; report it with exact lines (the supervisor checks it).
 Fix defects in place (pages, diagram scripts, glossary, visual). Keep the writer's structure and the
 language rules. Run python3 build.py (or --preview) until your pages have 0 errors.
 
@@ -155,6 +174,9 @@ table wrapping). Then build again.
 Report: numbers (pages, links, broken links, anchors, overflow before/after, JS errors), fixes made,
 problems that remain (with page and width), and 5-10 screenshot paths for the supervisor.
 ```
+
+To save budget, the supervisor can run the check script itself (tooling.md 6.8) and start this subagent
+only when there are problems to fix. vLLM Explained did this: 107 pages × 2 widths, clean.
 
 #### G. Diagram conversion (only if a diagram rule changes)
 

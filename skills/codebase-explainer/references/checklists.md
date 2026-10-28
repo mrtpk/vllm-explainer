@@ -10,7 +10,9 @@ Part of the `codebase-explainer` skill. The single-file version of this playbook
 - [ ] Survey done; you read its report and spot-checked 3-5 claims in the code.
 - [ ] `plan.md` has decisions, page list per part, page design, visuals, batches, waves, definition of done.
 - [ ] `progress.md` exists with the phase table and "Questions for the user".
-- [ ] The questions of goal-and-questions.md are asked, each with a proposed default.
+- [ ] The questions of goal-and-questions.md are asked, each with a proposed default (including the budget
+      and the subagent limit, and a sibling site).
+- [ ] The shared briefs (`notes/brief-writer.md`, `notes/brief-factcheck.md`) are filled in and forbid subagents.
 - [ ] The pinned commit (and submodule commits) are written down.
 
 ### 12.2 Before the Phase 1 review (stop here)
@@ -29,8 +31,10 @@ Part of the `codebase-explainer` skill. The single-file version of this playbook
 ### 12.3 Per batch
 - [ ] Writer prompt lists pages, visual, owned files, owned glossary ids, samples to copy.
 - [ ] Writer report has new facts, wrong facts, uncertain claims, open questions.
-- [ ] Build 0 errors for the batch pages; no template warnings.
+- [ ] Build 0 errors for the batch pages; no template warnings. Writer output committed "(fact check pending)".
 - [ ] Separate fact checker ran; defects counted and fixed; build 0 errors again.
+- [ ] Every "bug" claim from either report verified by the supervisor; no bug claims on pages.
+- [ ] Repeated defect types added to the shared briefs as accuracy lessons.
 - [ ] `notes/facts.md` updated from both reports (dated section).
 - [ ] Cross-page problems added to the FINAL-PASS TODO list with page names.
 - [ ] Supervisor looked at 1-2 pages in a browser (desktop and phone).
@@ -44,6 +48,7 @@ Part of the `codebase-explainer` skill. The single-file version of this playbook
       0 missing glossary terms, every visual works with mouse, keyboard and touch.
 - [ ] `python3 build.py` 0 errors; `--strict` warnings are only expected ones (for example links to
       deferred pages).
-- [ ] README: status, code version, how to read, how to build, layout, how the content was made.
+- [ ] README: status, code version, how to read, how to build, layout, how the content was made, and
+      any checks that were skipped to save budget.
 - [ ] `progress.md`: current phase "Done", "Next step" current, no stale running entries.
 - [ ] Final commit. Push only if the user asks.

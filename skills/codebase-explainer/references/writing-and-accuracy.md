@@ -63,6 +63,16 @@ better than an abstract sentence.
 11. General knowledge that is not about this repo needs no citation, but it must be correct and short.
     If you are not sure, leave it out.
 12. Line numbers are for the pinned commit. The build fails when the checkout is at another commit.
+13. **Defaults: trace the value to where it is finally set.** A config class field is often only the first
+    value. Argument parsing, post-init hooks, usage context, hardware size or platform code can change it.
+    (vLLM: chunked prefill, prefix caching and batch-size limits all have their real default in
+    `arg_utils.py`, not in the config class.)
+14. **"Always", "every", "all", "never"** only when you checked every path. Otherwise write "only when ...".
+15. **No bug claims on pages.** Say what the code does, in neutral words. Report a suspected bug to the
+    supervisor with exact lines. (vLLM: a checker misread an indentation level and called correct code a bug.)
+16. **Counts and call order** ("runs 5 times", "called before X") need a check of every call site.
+    (vLLM: the count of one plugin hook was corrected from 2 to 4 to 5 over three fact checks.)
+17. A recap of a sibling site (one line + link) must be true to that page. The fact checker opens it.
 
 ### 5.3 Quizzes, notes and warnings
 

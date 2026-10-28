@@ -47,6 +47,26 @@ Part of the `codebase-explainer` skill. The single-file version of this playbook
   the page, keep it as "soon".
 - The user answers questions in short form. Ask concrete questions with a proposed default.
 
+**Lessons from vLLM Explained (2026-10)**
+- Cost was the main problem. Usage limits stopped the build more than once, including the weekly limit.
+  Agree on a budget and a subagent limit before the full build (process.md 7.3a).
+- Subagents started their own forks. Forbid it in every brief from the start.
+- A fact checker can be wrong too. A false "bug" note (an indentation misread) reached 3 pages. The
+  supervisor verifies bug claims; pages stay neutral.
+- The docs were older than the code in many places (54 differences in the FAQ table). Write from the code;
+  use docs only as hints.
+- Defaults set in a config class were changed later in argument parsing. Writers cited the class field. Put
+  such traps in the shared briefs as "accuracy lessons" after the first fact check.
+- Facts changed more than once (a hook count went 2 → 4 → 5; "TP = 1" became "TP = PP = DP = 1"). The
+  status tags in `notes/facts.md` and the FINAL-PASS TODO list kept the pages consistent.
+- A cut-off left unchecked work, which the user committed. Commit after the writer, and again after the
+  fact check, so each commit says what was checked.
+- A browser setup in `/tmp` was gone after a restart. Keep the setup commands in `progress.md`.
+- A literal `{{cite}}` inside `<code>` on a page broke the build. Escape tag syntax that is text.
+- A scheduled resume job and a new agent definition are tied to the session (SKILL.md, "Keep the project
+  resumable").
+- A sibling site saved many pages: basics it already teaches got a one-line recap and a link.
+
 **Contradictions in the original DeepInfer tooling**
 
 The starter kit fixes the first five. The last two still apply to the kit.
